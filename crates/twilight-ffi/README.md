@@ -37,6 +37,6 @@ cargo build --release -p twilight-ffi --target aarch64-apple-ios
 
 ## Planned
 
-- `twilight_compute_prayer_times` --- full pipeline exposed as a C struct
-- `twilight_spectral_radiance` --- raw MCRT output for a given SZA
+- `twilight_compute_prayer_times`. full pipeline exposed as a C struct
+- `twilight_spectral_radiance`. raw MCRT output for a given SZA
 - Header file generation via `cbindgen`
