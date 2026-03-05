@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Muno459/twilight/actions"><img src="https://img.shields.io/badge/tests-424_passing-brightgreen?style=flat-square" alt="tests"/></a>
+  <a href="https://github.com/Muno459/twilight/actions"><img src="https://img.shields.io/badge/tests-446_passing-brightgreen?style=flat-square" alt="tests"/></a>
   <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/rust-pure_%23!%5Bno__std%5D_core-orange?style=flat-square" alt="rust"/></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=flat-square" alt="license"/></a>
 </p>
@@ -46,19 +46,22 @@ cargo build --release
 # Prayer times (clear sky)
 cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0
 
-# Prayer times (with aerosols)
+# With aerosols and/or clouds
 cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --aerosol urban
+cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --cloud thin-cirrus
+cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --aerosol urban --cloud thin-cirrus
 
 # Raw spectral radiance across twilight
 cargo run --release -- mcrt --lat 21.4225 --lon 39.8262 --sza-start 90 --sza-end 108
 ```
 
 Aerosol types: `continental-clean`, `continental-average`, `urban`, `maritime-clean`, `maritime-polluted`, `desert`.
+Cloud types: `thin-cirrus`, `thick-cirrus`, `altostratus`, `stratus`, `stratocumulus`, `cumulus`.
 
 
 ## How it works
 
-SPA computes the sun's position (VSOP87, ±0.0003°). The atmosphere builder creates 50 spherical shells with Rayleigh scattering, ozone absorption, and optional aerosol extinction at 41 wavelengths. For each solar zenith angle, the single-scatter integrator traces a line of sight toward the horizon, computing analytical shadow rays to the sun through each shell. CIE mesopic vision converts spectral radiance to perceived luminance. A two-pass adaptive scan finds where brightness drops below the perceptual threshold.
+SPA computes the sun's position (VSOP87, ±0.0003°). The atmosphere builder creates 50 spherical shells with Rayleigh scattering, ozone absorption, optional aerosol extinction, and optional cloud layers at 41 wavelengths. For each solar zenith angle, the single-scatter integrator traces a line of sight toward the horizon, computing analytical shadow rays to the sun through each shell. CIE mesopic vision converts spectral radiance to perceived luminance. A two-pass adaptive scan finds where brightness drops below the perceptual threshold.
 
 Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 
@@ -67,7 +70,7 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 
 1. **Solar position.** NREL SPA with full VSOP87 + 63-term nutation. Binary search for sunrise/sunset. Persistent twilight detection at high latitudes.
 
-2. **Atmosphere.** 50 shells, 0 to 100 km. Rayleigh via Bodhaine (1999) with exact Lorentz-Lorenz. O₃ via Serdyuchenko (2014). OPAC aerosol climatology (6 types) with Angstrom extinction and Henyey-Greenstein phase function. Lambertian ground reflection.
+2. **Atmosphere.** 50 shells, 0 to 100 km. Rayleigh via Bodhaine (1999) with exact Lorentz-Lorenz. O₃ via Serdyuchenko (2014). OPAC aerosol climatology (6 types) with Angstrom extinction and Henyey-Greenstein phase function. Cloud layers (6 types: cirrus to cumulus). Lambertian ground reflection.
 
 3. **Radiative transfer.** LOS integration with analytical shell-by-shell shadow rays. 41 wavelengths, 380 to 780 nm. Produces spectral radiance vectors at each SZA.
 
@@ -84,7 +87,7 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 |---|---|
 | `twilight-core` | Physics kernel. `#![no_std]`, `#![forbid(unsafe_code)]`, zero heap. Geometry, scattering, atmosphere, single-scatter integrator, MC tracer. |
 | `twilight-solar` | NREL SPA. ±0.0003° for years -2000 to 6000. |
-| `twilight-data` | Embedded data. US Std 1976, TSIS-1 solar spectrum, O₃ cross-sections, OPAC aerosols, builder. |
+| `twilight-data` | Embedded data. US Std 1976, TSIS-1 solar spectrum, O₃ cross-sections, OPAC aerosols, cloud types, builder. |
 | `twilight-threshold` | CIE vision, mesopic luminance, twilight color classification, prayer time thresholds. |
 | `twilight-cpu` | Rayon parallel backend. Simulation driver, adaptive pipeline. |
 | `twilight-ffi` | C FFI. `cdylib` + `staticlib` for iOS/Android/Flutter. |
@@ -95,20 +98,19 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 
 ## What's missing
 
-- **Multiple scattering.** Single-scatter underestimates deep twilight brightness. This is why we get ~15° instead of 18°.
-- **Clouds.** Not yet. The architecture supports it.
+- **Multiple scattering.** Single-scatter underestimates deep twilight brightness. This is why we get ~15° instead of 18°. Also limits accuracy for thick clouds (OD > ~5).
 - **Terrain, light pollution.** Planned.
 - **One atmosphere profile.** US Standard 1976 everywhere, for now.
 
 
 ## Tests
 
-424 tests, 0.2 seconds. `cargo test --workspace`
+446 tests, 0.2 seconds. `cargo test --workspace`
 
 | Crate | Tests |
 |---|---|
 | `twilight-core` | 135 |
-| `twilight-data` | 117 |
+| `twilight-data` | 139 |
 | `twilight-threshold` | 72 |
 | `twilight-cpu` | 52 |
 | `twilight-solar` | 47 |
@@ -116,8 +118,8 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 
 ## Roadmap
 
-- [x] Solar position, atmosphere model, single-scatter engine, vision model, prayer pipeline, ground reflection, aerosols, C FFI
-- [ ] Clouds, multiple scattering
+- [x] Solar position, atmosphere model, single-scatter engine, vision model, prayer pipeline, ground reflection, aerosols, cloud layers, C FFI
+- [ ] Multiple scattering (backward MC with next-event estimation)
 - [ ] Real-time weather, satellite cloud fields (GOES/Himawari/Meteosat + ML)
 - [ ] Light pollution, terrain masking
 - [ ] GPU backend, neural surrogate, mobile SDKs, WASM
