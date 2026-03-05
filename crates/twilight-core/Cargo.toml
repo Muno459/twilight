@@ -1,0 +1,13 @@
+[package]
+name = "twilight-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "no_std core physics for Monte Carlo radiative transfer"
+
+[dependencies]
+libm = { workspace = true }
+
+[features]
+default = []
+std = []

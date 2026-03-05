@@ -1,0 +1,10 @@
+[package]
+name = "twilight-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedded atmospheric data for twilight MCRT"
+
+[dependencies]
+libm = { workspace = true }
+twilight-core = { workspace = true }

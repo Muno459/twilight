@@ -1,0 +1,10 @@
+[package]
+name = "twilight-threshold"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CIE vision functions, spectral analysis, Fajr/Isha threshold logic"
+
+[dependencies]
+twilight-core = { workspace = true }
+libm = { workspace = true }

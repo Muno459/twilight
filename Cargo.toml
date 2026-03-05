@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/twilight-core",
+    "crates/twilight-solar",
+    "crates/twilight-data",
+    "crates/twilight-cpu",
+    "crates/twilight-threshold",
+    "crates/twilight-cli",
+    "crates/twilight-ffi",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Muno459/twilight"
+
+[workspace.dependencies]
+twilight-core = { path = "crates/twilight-core" }
+twilight-solar = { path = "crates/twilight-solar" }
+twilight-data = { path = "crates/twilight-data" }
+twilight-cpu = { path = "crates/twilight-cpu" }
+twilight-threshold = { path = "crates/twilight-threshold" }
+twilight-cli = { path = "crates/twilight-cli" }
+twilight-ffi = { path = "crates/twilight-ffi" }
+libm = "0.2"

@@ -1,0 +1,13 @@
+[package]
+name = "twilight-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C FFI bindings for iOS/Android/Flutter"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+twilight-core = { workspace = true }
+twilight-solar = { workspace = true }

@@ -1,0 +1,14 @@
+[package]
+name = "twilight-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface for twilight prayer time computation"
+
+[dependencies]
+twilight-core = { workspace = true }
+twilight-solar = { workspace = true }
+twilight-data = { workspace = true }
+twilight-cpu = { path = "../twilight-cpu" }
+twilight-threshold = { workspace = true }
+clap = { version = "4", features = ["derive"] }

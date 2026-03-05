@@ -1,0 +1,13 @@
+[package]
+name = "twilight-cpu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rayon-based CPU backend for twilight MCRT"
+
+[dependencies]
+twilight-core = { workspace = true }
+twilight-data = { workspace = true }
+twilight-solar = { workspace = true }
+twilight-threshold = { workspace = true }
+rayon = "1"
