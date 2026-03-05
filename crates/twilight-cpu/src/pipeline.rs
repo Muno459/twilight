@@ -25,6 +25,9 @@ use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
 use twilight_threshold::threshold::{self, ThresholdConfig, TwilightAnalysis};
 
+use twilight_terrain::horizon;
+use twilight_terrain::HorizonProfile;
+
 use crate::simulation::{self, ScatteringMode, SimulationConfig, SpectralResult};
 
 /// Input for the prayer time pipeline.
@@ -70,6 +73,9 @@ pub struct PrayerTimeInput {
     pub scattering_mode: ScatteringMode,
     /// Number of photons per wavelength for MC mode. Ignored in single mode.
     pub photons_per_wavelength: usize,
+    /// Horizon profile from terrain masking. When present, sunrise/sunset SZA
+    /// is adjusted based on terrain obstruction at the sun's azimuth.
+    pub horizon_profile: Option<HorizonProfile>,
 }
 
 impl Default for PrayerTimeInput {
@@ -93,6 +99,7 @@ impl Default for PrayerTimeInput {
             de440_path: None,
             scattering_mode: ScatteringMode::Single,
             photons_per_wavelength: 10_000,
+            horizon_profile: None,
         }
     }
 }
@@ -143,6 +150,16 @@ pub struct PrayerTimeOutput {
     pub computation_time_ms: u64,
     /// Which solar position engine was used
     pub ephemeris: EphemerisUsed,
+    /// Horizon elevation angle at sunrise azimuth (degrees). None if no terrain.
+    pub sunrise_horizon_deg: Option<f64>,
+    /// Horizon elevation angle at sunset azimuth (degrees). None if no terrain.
+    pub sunset_horizon_deg: Option<f64>,
+    /// Effective sunrise SZA after terrain adjustment (degrees). None if no terrain.
+    pub sunrise_sza_effective: Option<f64>,
+    /// Effective sunset SZA after terrain adjustment (degrees). None if no terrain.
+    pub sunset_sza_effective: Option<f64>,
+    /// Terrain source name (e.g., "Copernicus DEM GLO-30 (30m)")
+    pub terrain_source: Option<String>,
 }
 
 // ── Solar position engine abstraction ──────────────────────────────
@@ -338,9 +355,59 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
     // Step 2: Initialize solar engine (DE440 primary, SPA fallback)
     let (mut engine, ephemeris) = SolarEngine::new(input);
 
-    // Step 3: Find sunrise/sunset times
-    let sunrise_time = engine.find_zenith_crossing(90.8333, 0.0, 12.0, 0.0001);
-    let sunset_time = engine.find_zenith_crossing(90.8333, 12.0, 24.0, 0.0001);
+    // Step 3: Find sunrise/sunset times, adjusted for terrain if available
+    //
+    // Standard SZA for sunrise/sunset = 90.8333 degrees (refraction + semi-diameter).
+    // When terrain blocks the horizon, the sun must be higher to clear it,
+    // so the effective SZA is smaller (sun clears terrain later at sunrise, earlier at sunset).
+    //
+    // We first find approximate sunrise/sunset with standard SZA to determine
+    // the sun's azimuth, then look up terrain horizon angle at that azimuth,
+    // and re-find sunrise/sunset with the adjusted SZA.
+    let standard_sunrise = engine.find_zenith_crossing(90.8333, 0.0, 12.0, 0.0001);
+    let standard_sunset = engine.find_zenith_crossing(90.8333, 12.0, 24.0, 0.0001);
+
+    let (
+        sunrise_time,
+        sunset_time,
+        sunrise_horizon,
+        sunset_horizon,
+        sunrise_sza_eff,
+        sunset_sza_eff,
+    ) = if let Some(ref profile) = input.horizon_profile {
+        // Get sun's azimuth at standard sunrise/sunset to look up terrain angle
+        let (sr, sr_hz, sr_sza) = if let Some(sr_h) = standard_sunrise {
+            let az = engine.azimuth_at_hour(sr_h).unwrap_or(90.0);
+            let hz = profile.angle_at(az);
+            if hz > 0.01 {
+                let eff_sza = horizon::effective_sunrise_sza(hz);
+                let adjusted = engine.find_zenith_crossing(eff_sza, 0.0, 12.0, 0.0001);
+                (adjusted.or(standard_sunrise), Some(hz), Some(eff_sza))
+            } else {
+                (standard_sunrise, Some(hz), None)
+            }
+        } else {
+            (standard_sunrise, None, None)
+        };
+
+        let (ss, ss_hz, ss_sza) = if let Some(ss_h) = standard_sunset {
+            let az = engine.azimuth_at_hour(ss_h).unwrap_or(270.0);
+            let hz = profile.angle_at(az);
+            if hz > 0.01 {
+                let eff_sza = horizon::effective_sunrise_sza(hz);
+                let adjusted = engine.find_zenith_crossing(eff_sza, 12.0, 24.0, 0.0001);
+                (adjusted.or(standard_sunset), Some(hz), Some(eff_sza))
+            } else {
+                (standard_sunset, Some(hz), None)
+            }
+        } else {
+            (standard_sunset, None, None)
+        };
+
+        (sr, ss, sr_hz, ss_hz, sr_sza, ss_sza)
+    } else {
+        (standard_sunrise, standard_sunset, None, None, None, None)
+    };
 
     // Step 4: Check maximum SZA to detect persistent twilight
     let max_sza_deg = engine.compute_max_sza();
@@ -472,6 +539,14 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
         spectral_results: deduped_results,
         computation_time_ms: elapsed.as_millis() as u64,
         ephemeris,
+        sunrise_horizon_deg: sunrise_horizon,
+        sunset_horizon_deg: sunset_horizon,
+        sunrise_sza_effective: sunrise_sza_eff,
+        sunset_sza_effective: sunset_sza_eff,
+        terrain_source: input
+            .horizon_profile
+            .as_ref()
+            .map(|p| p.source_name.clone()),
     }
 }
 

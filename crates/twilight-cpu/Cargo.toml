@@ -10,4 +10,5 @@ twilight-core = { workspace = true }
 twilight-data = { workspace = true }
 twilight-solar = { workspace = true }
 twilight-threshold = { workspace = true }
+twilight-terrain = { workspace = true }
 rayon = "1"

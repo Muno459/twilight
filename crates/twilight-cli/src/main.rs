@@ -7,6 +7,7 @@ use twilight_data::builder;
 use twilight_data::cloud::CloudType;
 use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
+use twilight_terrain::horizon;
 use twilight_threshold::threshold::TwilightColor;
 
 /// Twilight — Monte Carlo Radiative Transfer engine for Fajr/Isha prayer times.
@@ -133,6 +134,21 @@ enum Commands {
         /// Fetch live weather data from Open-Meteo (overrides --aerosol and --cloud)
         #[arg(long)]
         weather: bool,
+        /// Enable terrain masking using digital elevation data.
+        /// Downloads Copernicus GLO-30 (30m) tiles on first use. Uses national
+        /// LiDAR when available (requires --dk-api-key for Denmark).
+        #[arg(long)]
+        terrain: bool,
+        /// Cache directory for DEM tiles (default: data/dem)
+        #[arg(long, default_value = "data/dem")]
+        dem_dir: String,
+        /// Horizon scan radius in km (default: 30)
+        #[arg(long, default_value = "30")]
+        horizon_radius: f64,
+        /// Dataforsyningen API key for Danish LiDAR (0.4m).
+        /// Register free at https://datafordeler.dk
+        #[arg(long, env = "TWILIGHT_DK_API_KEY")]
+        dk_api_key: Option<String>,
     },
 }
 
@@ -639,6 +655,10 @@ fn cmd_pray(
     photons: usize,
     verbose: bool,
     use_weather: bool,
+    use_terrain: bool,
+    dem_dir: &str,
+    horizon_radius: f64,
+    dk_api_key: Option<&str>,
 ) {
     let parts: Vec<&str> = date.split('-').collect();
     if parts.len() != 3 {
@@ -714,6 +734,52 @@ fn cmd_pray(
     };
     println!("Ephemeris:  {}", ephemeris_label);
     println!("Method:     {}", method_str);
+
+    // Terrain masking
+    let horizon_profile = if use_terrain {
+        let dem_path = std::path::Path::new(dem_dir);
+        let mut source = twilight_terrain::resolve_source(lat, lon, dem_path, dk_api_key);
+
+        // Compute bounding box for the horizon scan radius
+        let radius_deg = horizon_radius / 111.0; // approximate degrees for bbox
+        match source.prepare(
+            lat - radius_deg,
+            lon - radius_deg,
+            lat + radius_deg,
+            lon + radius_deg,
+        ) {
+            Ok(()) => {
+                println!(
+                    "Terrain:    {} (radius {:.0} km)",
+                    source.name(),
+                    horizon_radius
+                );
+                let profile = horizon::compute_horizon(source.as_ref(), lat, lon, horizon_radius);
+                let max_hz = profile.max_angle();
+                let min_hz = profile.min_angle();
+                println!(
+                    "  Observer: {:.1}m elevation, horizon range {:.3}° to {:.3}°",
+                    profile.observer_elev_m, min_hz, max_hz
+                );
+                if max_hz > 0.1 {
+                    println!(
+                        "  Terrain masking active: up to {:.1}° obstruction ({:.0} min shift)",
+                        max_hz,
+                        max_hz * 4.0
+                    );
+                }
+                Some(profile)
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to load terrain data: {}", e);
+                eprintln!("         Continuing without terrain masking.");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     println!();
 
     // When using weather API, pass custom properties directly.
@@ -744,6 +810,7 @@ fn cmd_pray(
         de440_path: de440_path.map(|s| s.to_string()),
         scattering_mode,
         photons_per_wavelength: photons,
+        horizon_profile,
         ..Default::default()
     };
 
@@ -778,6 +845,33 @@ fn cmd_pray(
             .map(|h| format_fractional_hour(h))
             .unwrap_or("N/A".to_string())
     );
+
+    // Show terrain adjustment info
+    if let Some(ref source) = output.terrain_source {
+        if let (Some(sr_hz), Some(ss_hz)) = (output.sunrise_horizon_deg, output.sunset_horizon_deg)
+        {
+            if sr_hz > 0.01 || ss_hz > 0.01 {
+                println!();
+                println!("  Terrain adjustment ({}):", source);
+                if sr_hz > 0.01 {
+                    println!(
+                        "    Sunrise horizon: {:.3}° (effective SZA: {:.4}°, ~{:.1} min later)",
+                        sr_hz,
+                        output.sunrise_sza_effective.unwrap_or(90.8333),
+                        sr_hz * 4.0
+                    );
+                }
+                if ss_hz > 0.01 {
+                    println!(
+                        "    Sunset horizon:  {:.3}° (effective SZA: {:.4}°, ~{:.1} min earlier)",
+                        ss_hz,
+                        output.sunset_sza_effective.unwrap_or(90.8333),
+                        ss_hz * 4.0
+                    );
+                }
+            }
+        }
+    }
     println!();
 
     // Persistent twilight warning
@@ -1077,6 +1171,10 @@ fn main() {
             photons,
             verbose,
             weather,
+            terrain,
+            dem_dir,
+            horizon_radius,
+            dk_api_key,
         } => {
             cmd_pray(
                 lat,
@@ -1094,6 +1192,10 @@ fn main() {
                 photons,
                 verbose,
                 weather,
+                terrain,
+                &dem_dir,
+                horizon_radius,
+                dk_api_key.as_deref(),
             );
         }
     }

@@ -6,3 +6,6 @@
 
 # Ephemeris data files (too large for git)
 data/*.bsp
+
+# DEM tile cache (downloaded on first use)
+data/dem/
