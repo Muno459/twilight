@@ -10,7 +10,7 @@ default = []
 cuda = ["dep:cudarc"]
 metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:block2"]
 vulkan = ["dep:ash", "dep:gpu-allocator"]
-webgpu = ["dep:wgpu"]
+webgpu = ["dep:wgpu", "dep:pollster"]
 
 [dependencies]
 twilight-core = { workspace = true }
@@ -37,8 +37,9 @@ block2 = { version = "0.6", optional = true }
 ash = { version = "0.38", optional = true }
 gpu-allocator = { version = "0.28", optional = true, default-features = false, features = ["vulkan", "std"] }
 
-# WebGPU backend (WASM)
+# WebGPU backend (WASM + native fallback)
 wgpu = { version = "28", optional = true }
+pollster = { version = "0.4", optional = true }
 
 [dev-dependencies]
 twilight-cpu = { workspace = true }

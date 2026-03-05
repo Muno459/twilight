@@ -32,6 +32,10 @@ pub mod vulkan;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 
+#[cfg(feature = "webgpu")]
+#[path = "wgpu_backend.rs"]
+pub mod wgpu_backend;
+
 #[cfg(test)]
 mod oracle;
 
@@ -273,10 +277,12 @@ pub fn detect_backends() -> Vec<BackendKind> {
         }
     }
 
-    // wgpu: check if feature is compiled
+    // wgpu: check if feature is compiled and a device is available
     #[cfg(feature = "webgpu")]
     {
-        available.push(BackendKind::Wgpu);
+        if probe_wgpu() {
+            available.push(BackendKind::Wgpu);
+        }
     }
 
     available
@@ -358,6 +364,11 @@ fn init_vulkan(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
 }
 
 #[cfg(feature = "webgpu")]
-fn init_wgpu(_config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
-    Err(GpuError::BackendUnavailable(BackendKind::Wgpu))
+fn probe_wgpu() -> bool {
+    wgpu_backend::probe()
+}
+
+#[cfg(feature = "webgpu")]
+fn init_wgpu(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
+    wgpu_backend::init(config)
 }
