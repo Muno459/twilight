@@ -26,6 +26,9 @@ pub mod buffers;
 #[cfg(feature = "metal")]
 pub mod metal;
 
+#[cfg(feature = "vulkan")]
+pub mod vulkan;
+
 #[cfg(test)]
 mod oracle;
 
@@ -332,8 +335,7 @@ fn probe_metal() -> bool {
 
 #[cfg(feature = "vulkan")]
 fn probe_vulkan() -> bool {
-    // Stub: will check ash Entry + enumerate_instance_extension_properties
-    false
+    vulkan::probe()
 }
 
 // ── Backend init functions (stubs for Phase 11a) ────────────────────────
@@ -349,8 +351,8 @@ fn init_metal(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
 }
 
 #[cfg(feature = "vulkan")]
-fn init_vulkan(_config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
-    Err(GpuError::BackendUnavailable(BackendKind::Vulkan))
+fn init_vulkan(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
+    vulkan::init(config)
 }
 
 #[cfg(feature = "webgpu")]
