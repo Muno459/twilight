@@ -8,6 +8,6 @@ description = "Terrain masking for twilight prayer times. Copernicus GLO-30 + na
 
 [dependencies]
 tiff = { version = "0.11", default-features = false, features = ["deflate"] }
-ureq = "2"
+ureq = "3"
 
 [dev-dependencies]

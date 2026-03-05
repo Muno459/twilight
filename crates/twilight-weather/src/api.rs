@@ -117,17 +117,19 @@ pub fn fetch_weather(lat: f64, lon: f64) -> Result<WeatherConditions, String> {
 
 /// Fetch and deserialize JSON from a URL.
 fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS))
-        .build();
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)))
+        .build()
+        .new_agent();
 
-    let response = agent
+    let mut response = agent
         .get(url)
         .call()
         .map_err(|e| format!("HTTP request failed: {}", e))?;
 
     let body = response
-        .into_string()
+        .body_mut()
+        .read_to_string()
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
     serde_json::from_str(&body).map_err(|e| {

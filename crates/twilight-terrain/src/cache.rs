@@ -4,6 +4,7 @@
 //! Uses atomic writes to prevent partial files from corrupted downloads.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 /// Ensure the cache directory exists. Creates it if needed.
@@ -55,11 +56,17 @@ pub fn download_to_cache(dir: &Path, filename: &str, url: &str) -> Result<PathBu
     eprintln!("Downloading DEM tile: {}", filename);
     eprintln!("  URL: {}", url);
 
-    let response = ureq::get(url)
+    let agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent();
+
+    let response = agent
+        .get(url)
         .call()
         .map_err(|e| format!("HTTP request failed for {}: {}", url, e))?;
 
-    let status = response.status();
+    let status = response.status().as_u16();
     if status == 404 {
         return Err(format!(
             "DEM tile not found (404): {} -- likely ocean area",
@@ -72,13 +79,16 @@ pub fn download_to_cache(dir: &Path, filename: &str, url: &str) -> Result<PathBu
 
     // Read response body
     let content_length = response
-        .header("content-length")
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(50_000_000); // default 50MB buffer
 
     let mut body = Vec::with_capacity(content_length);
     response
-        .into_reader()
+        .into_body()
+        .as_reader()
         .read_to_end(&mut body)
         .map_err(|e| format!("Failed to read response body: {}", e))?;
 
