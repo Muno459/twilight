@@ -1,24 +1,29 @@
-# twilight
+<p align="center">
+  <img src="assets/banner.svg" alt="twilight — Monte Carlo Radiative Transfer engine" width="100%"/>
+</p>
 
-A Monte Carlo Radiative Transfer engine in pure Rust that computes Fajr and Isha prayer times from first principles. Instead of using fixed solar depression angles (the standard approach since the 1970s), `twilight` simulates photon transport through a spherical atmosphere during twilight and determines when sky luminance crosses perceptual thresholds.
+<p align="center">
+  <a href="#quick-start"><code>quick start</code></a>&ensp;·&ensp;<a href="#how-it-works"><code>how it works</code></a>&ensp;·&ensp;<a href="#architecture"><code>architecture</code></a>&ensp;·&ensp;<a href="#physics"><code>physics</code></a>&ensp;·&ensp;<a href="#roadmap"><code>roadmap</code></a>
+</p>
 
-The engine currently models Rayleigh scattering, ozone absorption, and 41-band spectral resolution (380--780 nm) through a 50-shell spherical atmosphere based on the US Standard 1976 profile. It produces physically-based prayer times in under 10 ms on consumer hardware.
+<br/>
 
-## Why this exists
+Every Islamic prayer time app on the planet uses the same method: pick a solar depression angle (15, 18, 19.5 degrees depending on convention), and call it a day.
 
-Every Islamic prayer time app on the planet uses the same method: pick a solar depression angle (15, 18, 19.5 degrees depending on convention), and call it a day. This works reasonably well at mid-latitudes, but the actual onset of dawn and disappearance of twilight depend on atmospheric conditions --- aerosols, clouds, ozone, surface albedo, light pollution, altitude --- none of which a single angle captures.
+The disagreement between conventions exists because no single angle is universally correct. The actual onset of dawn and disappearance of twilight depend on atmospheric conditions --- Rayleigh scattering, ozone absorption, aerosols, clouds, surface albedo, light pollution, altitude --- none of which a fixed angle captures.
 
-The disagreement between conventions (MWL uses 18, Egyptian authority uses 15, Umm al-Qura uses 19.5) exists precisely because no single angle is universally correct. The physics varies by location, season, and weather.
+`twilight` replaces the angle with the physics. It simulates photon transport through a spherical atmosphere during twilight and determines when sky luminance crosses perceptual thresholds, producing prayer times from first principles.
 
-This project replaces the angle with the physics.
+The engine currently models 41-band spectral resolution (380--780 nm) through a 50-shell spherical atmosphere based on the US Standard 1976 profile. Full prayer time computation runs in **8 ms** on consumer hardware.
 
+<br/>
 
 ## Quick start
 
-```
+```bash
 cargo build --release
 
-# Compute prayer times for Mecca on the spring equinox
+# Compute prayer times for Mecca, spring equinox
 cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0
 
 # Solar position and conventional twilight times
@@ -28,8 +33,11 @@ cargo run --release -- solar --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 
 cargo run --release -- mcrt --lat 21.4225 --lon 39.8262 --sza-start 90 --sza-end 108
 ```
 
+<br/>
 
 ## Sample output
+
+<table><tr><td>
 
 ```
 Twilight MCRT Prayer Time Calculator
@@ -46,144 +54,162 @@ Prayer Times (MCRT-derived):
   Sunrise:              06:24:31
   Sunset:               18:31:51
 
-  Fajr (true dawn):     05:23:43  (SZA 104.97°, depression 14.97°)
-  Isha (al-abyad):      19:30:43  (SZA 104.50°, depression 14.50°)
-    └ Hanafi school — white twilight disappears
-  Isha (al-ahmar):      19:32:08  (SZA 104.83°, depression 14.83°)
+  Fajr (true dawn):     05:23:43  (depression 14.97°)
+  Isha (al-abyad):      19:30:43  (depression 14.50°)
+    └ Hanafi — white twilight disappears
+  Isha (al-ahmar):      19:32:08  (depression 14.83°)
     └ Shafi'i/Maliki/Hanbali — red glow disappears
 
 Comparison with conventional fixed-angle methods:
-  Fajr 18° (MWL/ISNA)          05:10:36  (diff: +13.1 min)
-  Fajr 15° (Egypt)             05:23:34  (diff: +0.1 min)
-  Fajr 19.5° (Umm al-Qura)     05:04:06  (diff: +19.6 min)
-  Isha 17° (MWL)               19:41:31  (diff: -9.4 min)
-  Isha 17.5° (Egypt)           19:43:41  (diff: -11.5 min)
-  Isha 18° (ISNA)              19:45:51  (diff: -13.7 min)
+  Fajr 18° (MWL/ISNA)       05:10:36  (diff: +13.1 min)
+  Fajr 15° (Egypt)           05:23:34  (diff: +0.1 min)
+  Fajr 19.5° (Umm al-Qura)  05:04:06  (diff: +19.6 min)
+  Isha 17° (MWL)             19:41:31  (diff: -9.4 min)
+  Isha 17.5° (Egypt)         19:43:41  (diff: -11.5 min)
+  Isha 18° (ISNA)            19:45:51  (diff: -13.7 min)
 ```
 
-The ~15° depression angle the engine produces for clear sky matches the Egyptian General Authority convention. Reaching the 18° conventions requires multiple scattering, which is Phase 6+.
+</td></tr></table>
 
+The ~15 degree depression angle the engine produces for clear sky matches the Egyptian General Authority convention. The 18 degree conventions require multiple scattering (Phase 7).
+
+<br/>
 
 ## How it works
 
-The pipeline runs in five stages:
+The pipeline runs in five stages.
 
-**1. Solar position (NREL SPA).** Computes topocentric solar zenith and azimuth to ±0.0003° for any date between -2000 and 6000 CE. Uses the full VSOP87 planetary theory with nutation corrections.
+**Solar position** --- NREL SPA computes topocentric solar zenith and azimuth to ±0.0003 degrees for any date between -2000 and 6000 CE. Full VSOP87 planetary theory with nutation corrections.
 
-**2. Atmosphere construction.** Builds a 50-shell spherical atmosphere from 0--100 km using the US Standard 1976 temperature/pressure/density profiles. Computes Rayleigh scattering cross-sections via the Bodhaine et al. (1999) formula with the exact Lorentz-Lorenz factor and Bates (1984) King correction. Includes Serdyuchenko (2014) ozone absorption cross-sections.
+**Atmosphere construction** --- Builds a 50-shell spherical atmosphere from 0--100 km using US Standard 1976 temperature/pressure/density profiles. Rayleigh cross-sections via Bodhaine et al. (1999) with exact Lorentz-Lorenz factor. Serdyuchenko (2014) ozone absorption.
 
-**3. Spectral radiance computation.** For each solar zenith angle in the twilight range (90--108°), performs single-scattering line-of-sight integration along the observer's viewing ray. At each point along the ray, an analytical shadow ray computes the optical depth to the sun through each atmospheric shell. The Rayleigh phase function weights the scattered contribution. This runs at 41 wavelengths from 380--780 nm.
+**Spectral radiance** --- For each solar zenith angle in the twilight range (90--108 degrees), single-scattering line-of-sight integration along the observer's viewing ray. Analytical shadow ray computes optical depth to the sun through each shell. Rayleigh phase function weights the scattered contribution. 41 wavelengths, 380--780 nm.
 
-**4. Luminance and color classification.** Converts spectral radiance to CIE photopic, scotopic, and mesopic luminance using the standard V(lambda) and V'(lambda) curves. Computes the spectral centroid to classify twilight color: Blue (early), White (shafaq al-abyad), Orange (transition), Red (shafaq al-ahmar), Dark.
+**Luminance and color** --- Converts spectral radiance to CIE photopic, scotopic, and mesopic luminance. Spectral centroid classifies twilight color through the progression: blue, white (*shafaq al-abyad*), orange, red (*shafaq al-ahmar*), dark.
 
-**5. Threshold crossing.** Finds the solar zenith angle where mesopic luminance drops below perceptual thresholds, using a two-pass adaptive scan (coarse 0.5° then fine 0.1°). Converts the threshold SZA back to clock time via binary search on the SPA.
+**Threshold crossing** --- Two-pass adaptive scan (coarse 0.5 degrees, fine 0.1 degrees) finds the SZA where mesopic luminance drops below perceptual thresholds. Binary search on the SPA converts threshold SZA back to clock time.
 
-The engine also detects persistent twilight at high latitudes in summer (e.g., London in June, Reykjavik in June).
+The engine detects persistent twilight at high latitudes in summer.
 
+<br/>
 
 ## Architecture
 
 ```
 twilight/
-  crates/
-    twilight-core/       #![no_std] — Vec3, ray-sphere, atmosphere model,
-                         Rayleigh/HG phase functions, single-scatter integrator,
-                         backward MC photon tracer, spectral cross-sections
-    twilight-solar/      NREL SPA implementation (±0.0003° accuracy)
-    twilight-data/       US Standard 1976 profiles, TSIS-1 solar spectrum,
-                         Serdyuchenko O₃ cross-sections, atmosphere builder
-    twilight-threshold/  CIE V(λ)/V'(λ) vision functions, photopic/scotopic/mesopic
-                         luminance, spectral color classification, prayer time thresholds
-    twilight-cpu/        Rayon parallel backend — simulation driver, end-to-end pipeline
-    twilight-ffi/        C FFI for iOS/Android/Flutter
-    twilight-cli/        Command-line interface (solar, mcrt, pray subcommands)
+├── twilight-core          #![no_std] #![forbid(unsafe_code)]
+│   ├── geometry.rs        Vec3, ray-sphere intersection, ECEF, solar direction
+│   ├── atmosphere.rs      50-shell spherical atmosphere model
+│   ├── spectrum.rs        Rayleigh cross-sections (Bodhaine 1999)
+│   ├── scattering.rs      Rayleigh + Henyey-Greenstein phase functions
+│   ├── single_scatter.rs  Line-of-sight integrator with analytical shadow ray
+│   └── photon.rs          Backward MC photon tracer, xorshift RNG
+│
+├── twilight-solar         NREL SPA (±0.0003°), VSOP87, nutation, zenith crossing
+├── twilight-data          US Std 1976, TSIS-1 solar spectrum, O₃ Serdyuchenko 2014
+├── twilight-threshold     CIE V(λ)/V'(λ), mesopic luminance, color classification
+├── twilight-cpu           Rayon parallel backend, simulation driver, full pipeline
+├── twilight-ffi           C FFI for iOS / Android / Flutter
+└── twilight-cli           Command-line interface (solar, mcrt, pray)
 ```
 
-`twilight-core` is `#![no_std]` and `#![forbid(unsafe_code)]`. No heap allocation, no `String`, no `Vec`. Everything uses fixed-size arrays (`[f64; 64]`). This is non-negotiable for portability to WASM, embedded, and GPU backends.
+`twilight-core` has zero heap allocation. No `String`, no `Vec`, no `std`. Fixed-size arrays only (`[f64; 64]`). This is non-negotiable for portability to WASM, embedded, and GPU backends.
 
+<br/>
 
 ## Physics
 
-Scattering model:
-- Rayleigh scattering with wavelength-dependent cross-sections (Bodhaine 1999)
-- Exact Lorentz-Lorenz factor `((n²-1)/(n²+2))²` with Peck & Reeder (1972) refractive index
-- Bates (1984) wavelength-dependent King correction factor
-- Ozone absorption (Serdyuchenko 2014 cross-sections, Chappuis + Huggins bands)
-- TSIS-1 Hybrid Solar Reference Spectrum for solar irradiance weighting
-- Validated against published Rayleigh optical depths: τ(550nm)=0.097 (ref: 0.098), τ(400nm)=0.359 (ref: 0.36)
+**Scattering**
 
-Vision model:
-- CIE 1931 photopic V(λ) and CIE 1951 scotopic V'(λ)
-- CIE 2010 mesopic luminance (adapts between rod and cone vision as sky darkens)
-- Separate red-band (>600nm) and blue-band (<500nm) luminance tracking
-- Spectral centroid for twilight color classification (blue → white → orange → red → dark)
+Rayleigh scattering with wavelength-dependent cross-sections per Bodhaine et al. (1999). Exact Lorentz-Lorenz factor `((n²-1)/(n²+2))²` with Peck & Reeder (1972) refractive index and Bates (1984) King correction. Ozone absorption from Serdyuchenko (2014), covering both Chappuis and Huggins bands. Solar irradiance weighting from the TSIS-1 Hybrid Solar Reference Spectrum.
 
-
-## Test suite
-
-362 tests across the workspace. Run them:
+Validated against published Rayleigh optical depths:
 
 ```
+τ(550nm) = 0.097    reference: 0.098
+τ(400nm) = 0.359    reference: 0.36
+```
+
+**Vision**
+
+CIE 1931 photopic V(λ) and CIE 1951 scotopic V'(λ). Mesopic luminance per CIE 2010 adapts between rod and cone vision as the sky darkens through twilight. Separate red-band (>600 nm) and blue-band (<500 nm) luminance tracking. Spectral centroid drives color classification through the twilight progression.
+
+<br/>
+
+## Tests
+
+362 tests. 0.2 seconds on Apple Silicon.
+
+```bash
 cargo test --workspace
 ```
 
-Breakdown by crate:
+```
+twilight-core        127 tests    geometry, atmosphere, Rayleigh, phase functions,
+                                  single-scatter, photon MC, spectral cross-sections
 
-| Crate | Tests | Coverage |
-|-------|------:|----------|
-| twilight-core | 127 | Vec3, ray-sphere, atmosphere, Rayleigh/HG, single-scatter, photon MC, spectral |
-| twilight-data | 64 | US Std 1976 profiles, O₃ cross-sections, solar spectrum, builder |
-| twilight-threshold | 72 | Vision functions, luminance, color classification, prayer thresholds |
-| twilight-cpu | 52 | Simulation driver, pipeline, parallel tracer |
-| twilight-solar | 47 | NREL SPA, Julian day, zenith crossing, declination, EoT, nutation |
+twilight-threshold    72 tests    vision curves, luminance, color classification,
+                                  prayer time thresholds
 
-All tests run in ~0.2 seconds on Apple Silicon.
+twilight-data         64 tests    US Std 1976 profiles, ozone, solar spectrum, builder
 
+twilight-cpu          52 tests    simulation driver, pipeline, parallel tracer
+
+twilight-solar        47 tests    NREL SPA, Julian day, declination, EoT, nutation,
+                                  zenith crossing, input validation
+```
+
+<br/>
 
 ## Roadmap
 
-Completed:
-- Phase 0: Solar position (NREL SPA) + project scaffold
-- Phase 1: Atmosphere model (clear sky, US Standard 1976)
-- Phase 2: Core MCRT (spherical geometry, single-scatter + Rayleigh + O₃)
-- Phase 3: Spectral luminance + mesopic vision + threshold model
+```
+done    Phase 0    Solar position (NREL SPA) + project scaffold
+done    Phase 1    Atmosphere model (clear sky, US Standard 1976)
+done    Phase 2    Core MCRT engine (spherical, single-scatter, Rayleigh, O₃)
+done    Phase 3    Spectral luminance + mesopic vision + threshold model
+─────────────────────────────────────────────────────────────────────
+next    Phase 4    Surface albedo in single-scatter integrator
+        Phase 5    Tropospheric aerosols (OPAC climatology)
+        Phase 6    Cloud layers (1D, Henyey-Greenstein)
+        Phase 7    Multiple scattering (backward MC, next-event estimation)
+        Phase 8    Online weather data (Open-Meteo API)
+        Phase 9    Satellite cloud fields (MERRA-2, Sentinel)
+        Phase 10   Light pollution (Falchi 2016 atlas)
+        Phase 11   Terrain horizon masking
+        Phase 12   GPU backend (wgpu / CUDA)
+        Phase 13   Neural surrogate for real-time inference
+        Phase 14   Mobile SDKs (iOS/Android via C FFI)
+        Phase 15   Web interface (WASM)
+```
 
-Next:
-- Phase 4: Surface albedo contribution in single-scatter integrator
-- Phase 5: Tropospheric aerosols (OPAC climatology)
-- Phase 6: Cloud layers (1D, Henyey-Greenstein)
-- Phase 7: Multiple scattering (backward MC with next-event estimation)
-- Phase 8: Online weather data (Open-Meteo cloud/temperature/pressure)
-- Phase 9: Satellite-derived cloud fields (MERRA-2, Sentinel)
-- Phase 10: Light pollution (Falchi atlas)
-- Phase 11: Terrain horizon masking
-- Phase 12: GPU backend (wgpu/CUDA)
-- Phase 13: Neural surrogate model for real-time inference
-- Phase 14: Mobile SDKs (iOS/Android via FFI)
-- Phase 15: Web interface (WASM)
-
-
-## Performance
-
-Full prayer time computation (two-pass adaptive scan, 41 wavelengths, 50 atmospheric shells):
-- ~8 ms on Apple Silicon (release build)
-- ~1--8 ms depending on SZA step resolution
-
-The single-scatter integrator is deterministic (no Monte Carlo noise), so results are reproducible to the last bit.
-
+<br/>
 
 ## Accuracy tiers (planned)
 
-| Tier | Data source | Target |
-|------|-------------|--------|
-| Offline | Embedded climatology (~500 KB) | ±5 min |
-| Weather-aware | Open-Meteo cloud/snow/T/P API | ±2--3 min |
-| Location-specific | MERRA-2 aerosols + Falchi light pollution | ±1--2 min |
-| Real-time 3D clouds | Satellite imagery → ML → MCRT | ±0.5--1 min |
-| Fused | Tier 3 + Tier 4 blended | Best available |
+```
+Tier 1   Offline             Embedded climatology (~500 KB)           ±5 min
+Tier 2   Weather-aware       Open-Meteo cloud/snow/T/P               ±2-3 min
+Tier 3   Location-specific   MERRA-2 aerosols + Falchi LP            ±1-2 min
+Tier 4   Real-time clouds    Satellite imagery → ML → MCRT           ±0.5-1 min
+Tier 5   Fused               Tier 3 + Tier 4 blended                 best available
+```
 
-Currently only Tier 1 (offline, clear sky) is implemented.
+Currently Tier 1 only.
 
+<br/>
+
+## Performance
+
+Full prayer time computation (two-pass adaptive scan, 41 wavelengths, 50 shells):
+
+```
+Apple Silicon (release)     ~8 ms
+```
+
+The single-scatter integrator is deterministic. No Monte Carlo noise. Results are reproducible to the last bit.
+
+<br/>
 
 ## License
 

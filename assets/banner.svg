@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 400">
+  <defs>
+    <!-- Twilight sky gradient: deep space → astronomical → nautical → civil → horizon -->
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a0a1a"/>
+      <stop offset="15%" stop-color="#0d1033"/>
+      <stop offset="30%" stop-color="#1a1a4e"/>
+      <stop offset="50%" stop-color="#2d1b69"/>
+      <stop offset="65%" stop-color="#6b2fa0"/>
+      <stop offset="78%" stop-color="#c44e52"/>
+      <stop offset="88%" stop-color="#e8824c"/>
+      <stop offset="95%" stop-color="#f2b866"/>
+      <stop offset="100%" stop-color="#fcd589"/>
+    </linearGradient>
+
+    <!-- Atmospheric glow at horizon -->
+    <radialGradient id="glow" cx="50%" cy="95%" r="60%">
+      <stop offset="0%" stop-color="#fcd589" stop-opacity="0.4"/>
+      <stop offset="40%" stop-color="#e8824c" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#1a1a4e" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Stars -->
+    <filter id="star-blur">
+      <feGaussianBlur stdDeviation="0.8"/>
+    </filter>
+  </defs>
+
+  <!-- Sky background -->
+  <rect width="1200" height="400" fill="url(#sky)"/>
+
+  <!-- Horizon glow -->
+  <rect width="1200" height="400" fill="url(#glow)"/>
+
+  <!-- Stars in the upper sky -->
+  <g fill="#ffffff" filter="url(#star-blur)" opacity="0.9">
+    <circle cx="89" cy="34" r="1.2"/>
+    <circle cx="234" cy="67" r="0.8"/>
+    <circle cx="156" cy="88" r="1.0"/>
+    <circle cx="412" cy="23" r="1.4"/>
+    <circle cx="378" cy="72" r="0.7"/>
+    <circle cx="567" cy="41" r="1.1"/>
+    <circle cx="623" cy="78" r="0.9"/>
+    <circle cx="734" cy="18" r="1.3"/>
+    <circle cx="789" cy="56" r="0.6"/>
+    <circle cx="890" cy="32" r="1.0"/>
+    <circle cx="945" cy="89" r="0.8"/>
+    <circle cx="1034" cy="45" r="1.2"/>
+    <circle cx="1100" cy="72" r="0.7"/>
+    <circle cx="1145" cy="28" r="0.9"/>
+    <circle cx="312" cy="110" r="0.6"/>
+    <circle cx="501" cy="95" r="0.8"/>
+    <circle cx="850" cy="98" r="0.7"/>
+    <circle cx="678" cy="115" r="0.5"/>
+    <circle cx="50" cy="120" r="0.6"/>
+    <circle cx="1070" cy="105" r="0.7"/>
+  </g>
+
+  <!-- Faint atmospheric shell arcs (the science) -->
+  <g fill="none" stroke-width="0.5" opacity="0.12">
+    <ellipse cx="600" cy="700" rx="650" ry="350" stroke="#8888cc"/>
+    <ellipse cx="600" cy="700" rx="680" ry="370" stroke="#9999dd"/>
+    <ellipse cx="600" cy="700" rx="720" ry="395" stroke="#aaaaee"/>
+  </g>
+
+  <!-- Earth curvature at bottom -->
+  <ellipse cx="600" cy="520" rx="800" ry="150" fill="#0a0a12" opacity="0.7"/>
+
+  <!-- Title text -->
+  <text x="600" y="195" text-anchor="middle" font-family="'SF Mono','Fira Code','JetBrains Mono','Cascadia Code',monospace" font-size="72" font-weight="700" fill="#f0e6d3" letter-spacing="12">twilight</text>
+
+  <!-- Subtitle -->
+  <text x="600" y="240" text-anchor="middle" font-family="'SF Mono','Fira Code','JetBrains Mono','Cascadia Code',monospace" font-size="15" fill="#c4a882" letter-spacing="4" opacity="0.85">MONTE CARLO RADIATIVE TRANSFER</text>
+
+  <!-- Tagline -->
+  <text x="600" y="275" text-anchor="middle" font-family="'Inter','Helvetica Neue','Segoe UI',sans-serif" font-size="13.5" fill="#a08a6e" letter-spacing="1" opacity="0.7">physically-based prayer times from first-principles atmospheric simulation</text>
+
+  <!-- Thin horizon line -->
+  <line x1="200" y1="310" x2="1000" y2="310" stroke="#f2b866" stroke-width="0.5" opacity="0.3"/>
+
+  <!-- Small wavelength ticks along the horizon line (380-780nm visual spectrum) -->
+  <g opacity="0.5">
+    <line x1="300" y1="308" x2="300" y2="312" stroke="#7700ff" stroke-width="1"/>
+    <line x1="350" y1="308" x2="350" y2="312" stroke="#0044ff" stroke-width="1"/>
+    <line x1="400" y1="308" x2="400" y2="312" stroke="#00aaff" stroke-width="1"/>
+    <line x1="450" y1="308" x2="450" y2="312" stroke="#00ff88" stroke-width="1"/>
+    <line x1="500" y1="308" x2="500" y2="312" stroke="#44ff00" stroke-width="1"/>
+    <line x1="550" y1="308" x2="550" y2="312" stroke="#aaff00" stroke-width="1"/>
+    <line x1="600" y1="308" x2="600" y2="312" stroke="#ffff00" stroke-width="1"/>
+    <line x1="650" y1="308" x2="650" y2="312" stroke="#ffaa00" stroke-width="1"/>
+    <line x1="700" y1="308" x2="700" y2="312" stroke="#ff6600" stroke-width="1"/>
+    <line x1="750" y1="308" x2="750" y2="312" stroke="#ff2200" stroke-width="1"/>
+    <line x1="800" y1="308" x2="800" y2="312" stroke="#cc0000" stroke-width="1"/>
+    <line x1="850" y1="308" x2="850" y2="312" stroke="#880022" stroke-width="1"/>
+    <line x1="900" y1="308" x2="900" y2="312" stroke="#660033" stroke-width="1"/>
+  </g>
+
+  <!-- Wavelength labels -->
+  <text x="300" y="325" text-anchor="middle" font-family="monospace" font-size="7" fill="#7700ff" opacity="0.4">380</text>
+  <text x="600" y="325" text-anchor="middle" font-family="monospace" font-size="7" fill="#ffff00" opacity="0.4">550</text>
+  <text x="900" y="325" text-anchor="middle" font-family="monospace" font-size="7" fill="#660033" opacity="0.4">780</text>
+  <text x="600" y="340" text-anchor="middle" font-family="monospace" font-size="7" fill="#a08a6e" opacity="0.3">wavelength (nm)</text>
+
+  <!-- Version / status -->
+  <text x="600" y="375" text-anchor="middle" font-family="monospace" font-size="9" fill="#665544" opacity="0.4">v0.1.0  ·  362 tests  ·  pure rust  ·  no_std core  ·  8ms</text>
+</svg>
