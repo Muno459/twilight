@@ -1,6 +1,7 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use twilight_cpu::pipeline::{self, PrayerTimeInput};
 use twilight_cpu::simulation::{self, SimulationConfig, SpectralResult};
+use twilight_data::aerosol::AerosolType;
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
 use twilight_solar::spa::{self, SpaInput};
@@ -67,6 +68,9 @@ enum Commands {
         /// View zenith angle (degrees from straight up)
         #[arg(long, default_value = "75")]
         view_zenith: f64,
+        /// Aerosol type (default: none = clear sky)
+        #[arg(long, value_enum, default_value = "none")]
+        aerosol: CliAerosol,
     },
     /// Compute physically-based Fajr and Isha prayer times using MCRT
     Pray {
@@ -94,10 +98,46 @@ enum Commands {
         /// SZA scan resolution in degrees (smaller = more accurate, slower)
         #[arg(long, default_value = "0.5")]
         sza_step: f64,
+        /// Aerosol type (default: none = clear sky)
+        #[arg(long, value_enum, default_value = "none")]
+        aerosol: CliAerosol,
         /// Show detailed twilight analysis
         #[arg(long)]
         verbose: bool,
     },
+}
+
+/// CLI aerosol type selector.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliAerosol {
+    /// No aerosols (clear sky)
+    None,
+    /// Rural/background continental
+    ContinentalClean,
+    /// Moderate continental
+    ContinentalAverage,
+    /// Urban/industrial (high soot)
+    Urban,
+    /// Open ocean sea salt
+    MaritimeClean,
+    /// Coastal/shipping lane
+    MaritimePolluted,
+    /// Mineral dust
+    Desert,
+}
+
+impl CliAerosol {
+    fn to_aerosol_type(self) -> Option<AerosolType> {
+        match self {
+            CliAerosol::None => Option::None,
+            CliAerosol::ContinentalClean => Some(AerosolType::ContinentalClean),
+            CliAerosol::ContinentalAverage => Some(AerosolType::ContinentalAverage),
+            CliAerosol::Urban => Some(AerosolType::Urban),
+            CliAerosol::MaritimeClean => Some(AerosolType::MaritimeClean),
+            CliAerosol::MaritimePolluted => Some(AerosolType::MaritimePolluted),
+            CliAerosol::Desert => Some(AerosolType::Desert),
+        }
+    }
 }
 
 /// Conventional solar depression angles for twilight boundaries.
@@ -268,6 +308,7 @@ fn cmd_mcrt(
     albedo: f64,
     solar_azimuth: f64,
     view_zenith: f64,
+    aerosol: CliAerosol,
 ) {
     println!("Twilight MCRT Simulation");
     println!("=======================");
@@ -278,7 +319,12 @@ fn cmd_mcrt(
     );
     println!("Photons/λ:    {}", photons);
     println!("Wavelengths:  380-780 nm (41 bands, 10nm steps)");
-    println!("Atmosphere:   US Standard 1976 (clear sky)");
+    let aerosol_type = aerosol.to_aerosol_type();
+    let atm_desc = match aerosol_type {
+        Some(at) => format!("US Standard 1976 + {:?} aerosol", at),
+        None => "US Standard 1976 (clear sky)".to_string(),
+    };
+    println!("Atmosphere:   {}", atm_desc);
     println!("Surface:      albedo = {:.2}", albedo);
     println!(
         "View:         zenith {:.0}°, azimuth {:.0}°",
@@ -287,7 +333,10 @@ fn cmd_mcrt(
     println!();
 
     // Build atmosphere
-    let atm = builder::build_clear_sky(AtmosphereType::UsStandard, albedo);
+    let atm = match aerosol_type {
+        Some(at) => builder::build_with_aerosols(AtmosphereType::UsStandard, albedo, at),
+        None => builder::build_clear_sky(AtmosphereType::UsStandard, albedo),
+    };
 
     let config = SimulationConfig {
         latitude: lat,
@@ -398,6 +447,7 @@ fn cmd_pray(
     albedo: f64,
     delta_t: f64,
     sza_step: f64,
+    aerosol: CliAerosol,
     verbose: bool,
 ) {
     let parts: Vec<&str> = date.split('-').collect();
@@ -417,7 +467,12 @@ fn cmd_pray(
     println!("Timezone:   UTC{:+.1}", tz);
     println!("Albedo:     {:.2}", albedo);
     println!("SZA step:   {:.2}°", sza_step);
-    println!("Atmosphere: US Standard 1976 (clear sky)");
+    let aerosol_type = aerosol.to_aerosol_type();
+    let atm_desc = match aerosol_type {
+        Some(at) => format!("US Standard 1976 + {:?} aerosol", at),
+        None => "US Standard 1976 (clear sky)".to_string(),
+    };
+    println!("Atmosphere: {}", atm_desc);
     println!("Method:     Single-scatter MCRT + CIE mesopic vision");
     println!();
 
@@ -432,6 +487,7 @@ fn cmd_pray(
         delta_t,
         surface_albedo: albedo,
         sza_step,
+        aerosol_type,
         ..Default::default()
     };
 
@@ -629,12 +685,17 @@ fn cmd_pray(
     println!();
     println!("Notes:");
     println!("  - These times are computed from first-principles radiative transfer (MCRT).");
-    println!("  - Current model: clear sky, US Standard 1976 atmosphere, single scattering.");
+    println!("  - Current model: US Standard 1976 atmosphere, single scattering.");
+    if aerosol_type.is_some() {
+        println!("  - Tropospheric aerosols included (OPAC climatology).");
+    } else {
+        println!("  - No aerosols. Use --aerosol to add tropospheric aerosols.");
+    }
     println!("  - The 'depression' angle is the equivalent fixed angle that gives the same time.");
     println!(
         "  - Differences from conventional times reflect atmospheric conditions vs fixed angles."
     );
-    println!("  - Future: clouds, aerosols, terrain, and real-time weather will improve accuracy.");
+    println!("  - Future: clouds, terrain, and real-time weather will improve accuracy.");
 }
 
 /// Get radiance at a specific wavelength from a SpectralResult.
@@ -675,6 +736,7 @@ fn main() {
             albedo,
             solar_azimuth,
             view_zenith,
+            aerosol,
         } => {
             cmd_mcrt(
                 lat,
@@ -686,6 +748,7 @@ fn main() {
                 albedo,
                 solar_azimuth,
                 view_zenith,
+                aerosol,
             );
         }
         Commands::Pray {
@@ -697,10 +760,11 @@ fn main() {
             albedo,
             delta_t,
             sza_step,
+            aerosol,
             verbose,
         } => {
             cmd_pray(
-                lat, lon, &date, tz, elevation, albedo, delta_t, sza_step, verbose,
+                lat, lon, &date, tz, elevation, albedo, delta_t, sza_step, aerosol, verbose,
             );
         }
     }

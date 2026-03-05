@@ -4,6 +4,7 @@
 //! This bridges twilight-data (raw atmospheric data) and twilight-core
 //! (the shell-based atmosphere model that the MCRT engine consumes).
 
+use crate::aerosol::{self, AerosolProperties, AerosolType};
 use crate::atmosphere_profiles::{self, AtmosphereType};
 use crate::ozone_xsec;
 use twilight_core::atmosphere::{AtmosphereModel, ShellOptics};
@@ -175,6 +176,135 @@ pub fn build_with_cloud_layer(
             // Rayleigh fraction of total scattering
             let ray_frac = if total_scat > 1e-30 {
                 rayleigh_scat / total_scat
+            } else {
+                1.0
+            };
+
+            atm.optics[s][w] = ShellOptics {
+                extinction: total_ext,
+                ssa: new_ssa,
+                asymmetry: new_g,
+                rayleigh_fraction: ray_frac,
+            };
+        }
+    }
+
+    atm
+}
+
+/// Build an atmosphere with tropospheric aerosols from OPAC climatology.
+///
+/// Starts with a clear-sky Rayleigh + O₃ atmosphere, then adds aerosol
+/// extinction, absorption, and forward scattering at each shell according
+/// to the specified aerosol type's spectral properties and vertical profile.
+///
+/// The aerosol is mixed with the existing Rayleigh/O₃ optics using the
+/// standard mixing rules for extinction-weighted SSA and scattering-weighted
+/// asymmetry parameter.
+///
+/// # Arguments
+/// * `profile` - Which AFGL standard atmosphere to use for gas properties
+/// * `surface_albedo` - Broadband surface albedo (0.0 - 1.0)
+/// * `atype` - OPAC aerosol type (determines all spectral properties)
+///
+/// # Example
+/// ```no_run
+/// use twilight_data::builder::build_with_aerosols;
+/// use twilight_data::atmosphere_profiles::AtmosphereType;
+/// use twilight_data::aerosol::AerosolType;
+///
+/// let atm = build_with_aerosols(
+///     AtmosphereType::UsStandard,
+///     0.15,
+///     AerosolType::Urban,
+/// );
+/// ```
+pub fn build_with_aerosols(
+    profile: AtmosphereType,
+    surface_albedo: f64,
+    atype: AerosolType,
+) -> AtmosphereModel {
+    let props = aerosol::default_properties(atype);
+    build_with_aerosol_properties(profile, surface_albedo, &props)
+}
+
+/// Build an atmosphere with custom aerosol properties.
+///
+/// Like `build_with_aerosols` but takes explicit aerosol properties instead
+/// of a named type. This allows fine-tuning AOD, SSA, etc. for specific
+/// conditions or for parameter sweeps.
+///
+/// # Arguments
+/// * `profile` - Which AFGL standard atmosphere to use for gas properties
+/// * `surface_albedo` - Broadband surface albedo (0.0 - 1.0)
+/// * `aerosol_props` - Custom aerosol optical properties
+pub fn build_with_aerosol_properties(
+    profile: AtmosphereType,
+    surface_albedo: f64,
+    aerosol_props: &AerosolProperties,
+) -> AtmosphereModel {
+    let mut atm = build_clear_sky(profile, surface_albedo);
+
+    if aerosol_props.aod_550 <= 0.0 {
+        return atm;
+    }
+
+    let num_shells = atm.num_shells;
+    for s in 0..num_shells {
+        let alt_mid_m = atm.shells[s].altitude_mid;
+
+        // Aerosol extinction at shell midpoint altitude
+        // (negligible above ~5 scale heights)
+        if alt_mid_m > aerosol_props.scale_height_m * 7.0 {
+            continue;
+        }
+
+        for w in 0..atm.num_wavelengths {
+            let wl = atm.wavelengths_nm[w];
+
+            let aer_ext = aerosol::aerosol_extinction(aerosol_props, wl, alt_mid_m);
+            if aer_ext < 1e-30 {
+                continue;
+            }
+
+            let aer_ssa = aerosol::aerosol_ssa(aerosol_props, wl);
+            let aer_g = aerosol::aerosol_asymmetry(aerosol_props, wl);
+
+            let aer_scat = aer_ext * aer_ssa;
+            let aer_abs = aer_ext * (1.0 - aer_ssa);
+
+            let existing = &atm.optics[s][w];
+
+            // Existing Rayleigh scattering (ssa=1 for pure Rayleigh, but
+            // may be <1 in shells with O₃ absorption)
+            let existing_scat = existing.extinction * existing.ssa;
+            let existing_ray_scat = existing_scat * existing.rayleigh_fraction;
+            let existing_nonray_scat = existing_scat * (1.0 - existing.rayleigh_fraction);
+            let existing_abs = existing.extinction * (1.0 - existing.ssa);
+
+            // Mix: total scattering = Rayleigh + existing non-Rayleigh + aerosol
+            let total_scat = existing_ray_scat + existing_nonray_scat + aer_scat;
+            let total_abs = existing_abs + aer_abs;
+            let total_ext = total_scat + total_abs;
+
+            let new_ssa = if total_ext > 1e-30 {
+                total_scat / total_ext
+            } else {
+                1.0
+            };
+
+            // Scattering-weighted asymmetry parameter:
+            // g_total = (g_ray × β_ray + g_existing × β_existing_nonray + g_aer × β_aer) / β_total_scat
+            // Rayleigh has g=0, so its term vanishes.
+            let new_g = if total_scat > 1e-30 {
+                (existing_nonray_scat * existing.asymmetry + aer_scat * aer_g) / total_scat
+            } else {
+                0.0
+            };
+
+            // Rayleigh fraction of total scattering
+            let ray_frac = if total_scat > 1e-30 {
+                existing_ray_scat / total_scat
             } else {
                 1.0
             };
@@ -535,5 +665,308 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── build_with_aerosols ──
+
+    #[test]
+    fn aerosol_increases_extinction_at_surface() {
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let aerosol = build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::Urban);
+        // At the surface shell, aerosol adds extinction at all wavelengths
+        for w in 0..clear.num_wavelengths {
+            assert!(
+                aerosol.optics[0][w].extinction > clear.optics[0][w].extinction,
+                "Aerosol should increase surface extinction at wl[{}]: {:.4e} vs {:.4e}",
+                w,
+                aerosol.optics[0][w].extinction,
+                clear.optics[0][w].extinction
+            );
+        }
+    }
+
+    #[test]
+    fn aerosol_negligible_at_high_altitude() {
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let aerosol = build_with_aerosols(
+            AtmosphereType::UsStandard,
+            0.15,
+            AerosolType::ContinentalClean,
+        );
+        // Above ~30km, aerosol contribution should be negligible
+        // (scale height is 2km, so at 30km = 15 scale heights, exp(-15) ~ 3e-7)
+        for s in 0..clear.num_shells {
+            let alt_km = clear.shells[s].altitude_mid / 1000.0;
+            if alt_km > 30.0 {
+                let w = 17; // 550nm
+                let rel_change = (aerosol.optics[s][w].extinction - clear.optics[s][w].extinction)
+                    / clear.optics[s][w].extinction.max(1e-30);
+                assert!(
+                    rel_change.abs() < 1e-4,
+                    "At {}km, aerosol should be negligible: rel_change={:.4e}",
+                    alt_km,
+                    rel_change
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aerosol_reduces_rayleigh_fraction() {
+        let aerosol = build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::Urban);
+        // In the boundary layer, Rayleigh fraction should be < 1
+        let w = 17; // 550nm
+        assert!(
+            aerosol.optics[0][w].rayleigh_fraction < 0.99,
+            "Aerosol should reduce Rayleigh fraction at surface: got {}",
+            aerosol.optics[0][w].rayleigh_fraction
+        );
+    }
+
+    #[test]
+    fn aerosol_sets_nonzero_asymmetry() {
+        let aerosol = build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::Urban);
+        // Aerosol has nonzero asymmetry, so blended value should be positive
+        let w = 17;
+        assert!(
+            aerosol.optics[0][w].asymmetry > 0.01,
+            "Aerosol should set nonzero asymmetry: got {}",
+            aerosol.optics[0][w].asymmetry
+        );
+    }
+
+    #[test]
+    fn aerosol_reduces_ssa_for_absorbing_type() {
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let aerosol = build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::Urban);
+        // Urban aerosol (SSA~0.88) should reduce the blended SSA below the
+        // clear-sky value (which is ~1.0 for pure Rayleigh)
+        let w = 17;
+        assert!(
+            aerosol.optics[0][w].ssa < clear.optics[0][w].ssa,
+            "Urban aerosol should reduce SSA: aerosol={:.4} vs clear={:.4}",
+            aerosol.optics[0][w].ssa,
+            clear.optics[0][w].ssa
+        );
+    }
+
+    #[test]
+    fn aerosol_zero_aod_is_clear_sky() {
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let zero_aerosol = build_with_aerosol_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &AerosolProperties {
+                aod_550: 0.0,
+                ssa_550: 0.90,
+                asymmetry_550: 0.70,
+                angstrom_exponent: 1.3,
+                scale_height_m: 2000.0,
+                ssa_slope: 0.0,
+                g_slope: 0.0,
+            },
+        );
+        for s in 0..clear.num_shells {
+            for w in 0..clear.num_wavelengths {
+                assert!(
+                    (zero_aerosol.optics[s][w].extinction - clear.optics[s][w].extinction).abs()
+                        < 1e-20,
+                    "Zero AOD should not change extinction at shell {}, wl {}",
+                    s,
+                    w
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn aerosol_desert_larger_effect_than_continental_clean() {
+        let desert = build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::Desert);
+        let clean = build_with_aerosols(
+            AtmosphereType::UsStandard,
+            0.15,
+            AerosolType::ContinentalClean,
+        );
+        // Desert (AOD=0.5) should have much more extinction than continental clean (AOD=0.05)
+        let w = 17; // 550nm
+        assert!(
+            desert.optics[0][w].extinction > clean.optics[0][w].extinction * 1.5,
+            "Desert ext={:.4e} should be >> continental clean ext={:.4e}",
+            desert.optics[0][w].extinction,
+            clean.optics[0][w].extinction
+        );
+    }
+
+    #[test]
+    fn aerosol_all_types_build_without_panic() {
+        use crate::aerosol::ALL_AEROSOL_TYPES;
+        for atype in &ALL_AEROSOL_TYPES {
+            let atm = build_with_aerosols(AtmosphereType::UsStandard, 0.15, *atype);
+            // Sanity: should still have 50 shells and 41 wavelengths
+            assert_eq!(atm.num_shells, 50);
+            assert_eq!(atm.num_wavelengths, 41);
+        }
+    }
+
+    #[test]
+    fn aerosol_preserves_shell_geometry() {
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let aerosol = build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::Urban);
+        // Shell geometry should be identical
+        for s in 0..clear.num_shells {
+            assert!(
+                (aerosol.shells[s].r_inner - clear.shells[s].r_inner).abs() < 1e-6,
+                "r_inner mismatch at shell {}",
+                s
+            );
+            assert!(
+                (aerosol.shells[s].r_outer - clear.shells[s].r_outer).abs() < 1e-6,
+                "r_outer mismatch at shell {}",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn aerosol_ssa_bounded() {
+        use crate::aerosol::ALL_AEROSOL_TYPES;
+        for atype in &ALL_AEROSOL_TYPES {
+            let atm = build_with_aerosols(AtmosphereType::UsStandard, 0.15, *atype);
+            for s in 0..atm.num_shells {
+                for w in 0..atm.num_wavelengths {
+                    assert!(
+                        (0.0..=1.0).contains(&atm.optics[s][w].ssa),
+                        "{:?}: SSA out of bounds at shell {}, wl {}: {}",
+                        atype,
+                        s,
+                        w,
+                        atm.optics[s][w].ssa
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aerosol_asymmetry_bounded() {
+        use crate::aerosol::ALL_AEROSOL_TYPES;
+        for atype in &ALL_AEROSOL_TYPES {
+            let atm = build_with_aerosols(AtmosphereType::UsStandard, 0.15, *atype);
+            for s in 0..atm.num_shells {
+                for w in 0..atm.num_wavelengths {
+                    assert!(
+                        (-1.0..=1.0).contains(&atm.optics[s][w].asymmetry),
+                        "{:?}: asymmetry out of bounds at shell {}, wl {}: {}",
+                        atype,
+                        s,
+                        w,
+                        atm.optics[s][w].asymmetry
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aerosol_rayleigh_fraction_bounded() {
+        use crate::aerosol::ALL_AEROSOL_TYPES;
+        for atype in &ALL_AEROSOL_TYPES {
+            let atm = build_with_aerosols(AtmosphereType::UsStandard, 0.15, *atype);
+            for s in 0..atm.num_shells {
+                for w in 0..atm.num_wavelengths {
+                    assert!(
+                        (0.0..=1.0).contains(&atm.optics[s][w].rayleigh_fraction),
+                        "{:?}: rayleigh_fraction out of bounds at shell {}, wl {}: {}",
+                        atype,
+                        s,
+                        w,
+                        atm.optics[s][w].rayleigh_fraction
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aerosol_extinction_positive_everywhere() {
+        use crate::aerosol::ALL_AEROSOL_TYPES;
+        for atype in &ALL_AEROSOL_TYPES {
+            let atm = build_with_aerosols(AtmosphereType::UsStandard, 0.15, *atype);
+            for s in 0..atm.num_shells {
+                for w in 0..atm.num_wavelengths {
+                    assert!(
+                        atm.optics[s][w].extinction >= 0.0,
+                        "{:?}: negative extinction at shell {}, wl {}: {}",
+                        atype,
+                        s,
+                        w,
+                        atm.optics[s][w].extinction
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aerosol_custom_high_aod() {
+        // Extreme AOD should still produce valid optics
+        let atm = build_with_aerosol_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &AerosolProperties {
+                aod_550: 5.0, // Very heavy dust storm
+                ssa_550: 0.85,
+                asymmetry_550: 0.75,
+                angstrom_exponent: 0.3,
+                scale_height_m: 3000.0,
+                ssa_slope: 0.0,
+                g_slope: 0.0,
+            },
+        );
+        // Extinction should be huge at the surface
+        let w = 17; // 550nm
+        let ext = atm.optics[0][w].extinction;
+        assert!(
+            ext > 1e-3,
+            "Heavy dust should give large extinction: {}",
+            ext
+        );
+        // But SSA should still be valid
+        assert!((0.0..=1.0).contains(&atm.optics[0][w].ssa));
+    }
+
+    #[test]
+    fn aerosol_maritime_clean_barely_absorbs() {
+        let atm = build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::MaritimeClean);
+        // Maritime clean has SSA=0.99, so blended SSA should still be very high
+        let w = 17;
+        assert!(
+            atm.optics[0][w].ssa > 0.95,
+            "Maritime clean should have high SSA: {}",
+            atm.optics[0][w].ssa
+        );
+    }
+
+    #[test]
+    fn aerosol_effect_strongest_at_surface() {
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let aerosol = build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::Urban);
+        let w = 17; // 550nm
+        let delta_surface = aerosol.optics[0][w].extinction - clear.optics[0][w].extinction;
+        // Find a shell at ~5km (about 3 scale heights for urban H=1.5km)
+        let mut delta_5km = 0.0;
+        for s in 0..aerosol.num_shells {
+            let alt_km = aerosol.shells[s].altitude_mid / 1000.0;
+            if alt_km > 4.5 && alt_km < 5.5 {
+                delta_5km = aerosol.optics[s][w].extinction - clear.optics[s][w].extinction;
+                break;
+            }
+        }
+        assert!(
+            delta_surface > delta_5km,
+            "Aerosol effect should be strongest at surface: delta_sfc={:.4e} vs delta_5km={:.4e}",
+            delta_surface,
+            delta_5km
+        );
     }
 }
