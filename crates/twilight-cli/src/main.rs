@@ -5,6 +5,7 @@ use twilight_data::aerosol::AerosolType;
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
 use twilight_data::cloud::CloudType;
+use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
 use twilight_threshold::threshold::TwilightColor;
 
@@ -39,6 +40,9 @@ enum Commands {
         /// Delta T (TT - UT1) in seconds
         #[arg(long, default_value = "69.184")]
         delta_t: f64,
+        /// Path to DE440 BSP file for JPL ephemeris comparison
+        #[arg(long)]
+        de440: Option<String>,
     },
     /// Run MCRT simulation across twilight solar zenith angles
     Mcrt {
@@ -108,6 +112,9 @@ enum Commands {
         /// Cloud type (default: none = clear sky)
         #[arg(long, value_enum, default_value = "none")]
         cloud: CliCloud,
+        /// Path to DE440 BSP file for JPL ephemeris (primary engine)
+        #[arg(long)]
+        de440: Option<String>,
         /// Show detailed twilight analysis
         #[arg(long)]
         verbose: bool,
@@ -239,7 +246,15 @@ fn format_fractional_hour(h: f64) -> String {
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
 
-fn cmd_solar(lat: f64, lon: f64, date: &str, tz: f64, elevation: f64, delta_t: f64) {
+fn cmd_solar(
+    lat: f64,
+    lon: f64,
+    date: &str,
+    tz: f64,
+    elevation: f64,
+    delta_t: f64,
+    de440_path: Option<&str>,
+) {
     let parts: Vec<&str> = date.split('-').collect();
     if parts.len() != 3 {
         eprintln!("Error: date must be in YYYY-MM-DD format");
@@ -255,6 +270,13 @@ fn cmd_solar(lat: f64, lon: f64, date: &str, tz: f64, elevation: f64, delta_t: f
     println!("Location:  {:.4}°N, {:.4}°E", lat, lon);
     println!("Elevation: {:.0} m", elevation);
     println!("Timezone:  UTC{:+.1}", tz);
+
+    let ephemeris_label = if de440_path.is_some() {
+        "JPL DE440 + SPA"
+    } else {
+        "NREL SPA"
+    };
+    println!("Ephemeris: {}", ephemeris_label);
     println!();
 
     let noon_input = SpaInput {
@@ -278,12 +300,49 @@ fn cmd_solar(lat: f64, lon: f64, date: &str, tz: f64, elevation: f64, delta_t: f
 
     match spa::solar_position(&noon_input) {
         Ok(noon) => {
-            println!("Solar Position at Local Noon:");
-            println!("  Zenith:       {:.4}°", noon.zenith);
-            println!("  Azimuth:      {:.4}°", noon.azimuth);
-            println!("  Declination:  {:.4}°", noon.delta);
+            println!("Solar Position at Local Noon (SPA):");
+            println!("  Zenith:       {:.4}deg", noon.zenith);
+            println!("  Azimuth:      {:.4}deg", noon.azimuth);
+            println!("  Declination:  {:.4}deg", noon.delta);
             println!("  Earth-Sun:    {:.6} AU", noon.r);
             println!("  Eq. of Time:  {:.2} min", noon.eot);
+
+            // DE440 comparison if available
+            if let Some(path) = de440_path {
+                match De440::open(path) {
+                    Ok(mut de) => {
+                        // Convert local noon to UTC
+                        let utc_hour = (12.0 - tz) as i32;
+                        let utc_minute = (((12.0 - tz) - utc_hour as f64) * 60.0) as i32;
+                        match de.solar_position(
+                            year, month, day, utc_hour, utc_minute, 0, delta_t, lat, lon, elevation,
+                        ) {
+                            Ok(topo) => {
+                                println!();
+                                println!("Solar Position at Local Noon (DE440):");
+                                println!("  Zenith:       {:.4}deg", topo.zenith);
+                                println!("  Azimuth:      {:.4}deg", topo.azimuth);
+                                println!("  RA:           {:.4}deg", topo.right_ascension);
+                                println!("  Dec:          {:.4}deg", topo.declination);
+                                println!("  Distance:     {:.0} km", topo.distance_km);
+                                println!();
+                                println!("DE440 vs SPA difference:");
+                                println!("  Zenith:  {:.6}deg", (topo.zenith - noon.zenith).abs());
+                                println!(
+                                    "  Azimuth: {:.6}deg",
+                                    (topo.azimuth - noon.azimuth).abs()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("Warning: DE440 query failed: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: failed to open DE440 file: {}", e);
+                    }
+                }
+            }
         }
         Err(e) => {
             eprintln!("Error: {:?}", e);
@@ -336,6 +395,9 @@ fn cmd_solar(lat: f64, lon: f64, date: &str, tz: f64, elevation: f64, delta_t: f
     println!();
     println!("Note: These are CONVENTIONAL times using fixed solar depression angles.");
     println!("      Use 'twilight pray' to compute physically-based times.");
+    if de440_path.is_none() {
+        println!("      Use --de440 <path> to enable JPL DE440 ephemeris comparison.");
+    }
 }
 
 fn cmd_mcrt(
@@ -494,6 +556,7 @@ fn cmd_pray(
     sza_step: f64,
     aerosol: CliAerosol,
     cloud: CliCloud,
+    de440_path: Option<&str>,
     verbose: bool,
 ) {
     let parts: Vec<&str> = date.split('-').collect();
@@ -516,6 +579,12 @@ fn cmd_pray(
     let aerosol_type = aerosol.to_aerosol_type();
     let cloud_type = cloud.to_cloud_type();
     println!("Atmosphere: {}", format_atm_desc(aerosol_type, cloud_type));
+    let ephemeris_label = if de440_path.is_some() {
+        "JPL DE440"
+    } else {
+        "NREL SPA"
+    };
+    println!("Ephemeris:  {}", ephemeris_label);
     println!("Method:     Single-scatter MCRT + CIE mesopic vision");
     println!();
 
@@ -532,12 +601,20 @@ fn cmd_pray(
         sza_step,
         aerosol_type,
         cloud_type,
+        de440_path: de440_path.map(|s| s.to_string()),
         ..Default::default()
     };
 
     println!("Computing...");
     let output = pipeline::compute_prayer_times(&input);
-    println!("Done in {} ms", output.computation_time_ms);
+    let actual_ephemeris = match output.ephemeris {
+        pipeline::EphemerisUsed::De440 => "DE440",
+        pipeline::EphemerisUsed::Spa => "SPA (fallback)",
+    };
+    println!(
+        "Done in {} ms (ephemeris: {})",
+        output.computation_time_ms, actual_ephemeris
+    );
     println!();
 
     // Print results
@@ -782,8 +859,9 @@ fn main() {
             tz,
             elevation,
             delta_t,
+            de440,
         } => {
-            cmd_solar(lat, lon, &date, tz, elevation, delta_t);
+            cmd_solar(lat, lon, &date, tz, elevation, delta_t, de440.as_deref());
         }
         Commands::Mcrt {
             lat,
@@ -823,10 +901,22 @@ fn main() {
             sza_step,
             aerosol,
             cloud,
+            de440,
             verbose,
         } => {
             cmd_pray(
-                lat, lon, &date, tz, elevation, albedo, delta_t, sza_step, aerosol, cloud, verbose,
+                lat,
+                lon,
+                &date,
+                tz,
+                elevation,
+                albedo,
+                delta_t,
+                sza_step,
+                aerosol,
+                cloud,
+                de440.as_deref(),
+                verbose,
             );
         }
     }

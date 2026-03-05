@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Muno459/twilight/actions"><img src="https://img.shields.io/badge/tests-446_passing-brightgreen?style=flat-square" alt="tests"/></a>
+  <a href="https://github.com/Muno459/twilight/actions"><img src="https://img.shields.io/badge/tests-462_passing-brightgreen?style=flat-square" alt="tests"/></a>
   <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/rust-pure_%23!%5Bno__std%5D_core-orange?style=flat-square" alt="rust"/></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=flat-square" alt="license"/></a>
 </p>
@@ -13,7 +13,7 @@
 
 <br/>
 
-`twilight` computes Fajr and Isha prayer times by simulating how sunlight actually scatters through the atmosphere. No lookup tables, no fixed depression angles. Photons in, prayer times out. 8 ms.
+`twilight` computes Fajr and Isha prayer times by simulating how sunlight actually scatters through the atmosphere. No lookup tables, no fixed depression angles. Photons in, prayer times out. 8 ms. Optional JPL DE440 ephemeris for sub-meter solar positioning.
 
 ## Why
 
@@ -51,6 +51,9 @@ cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3
 cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --cloud thin-cirrus
 cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --aerosol urban --cloud thin-cirrus
 
+# Solar position with JPL DE440 comparison
+cargo run --release -- solar --lat 21.4225 --lon 39.8262 --date 2024-06-15 --tz 3 --de440 data/de440.bsp
+
 # Raw spectral radiance across twilight
 cargo run --release -- mcrt --lat 21.4225 --lon 39.8262 --sza-start 90 --sza-end 108
 ```
@@ -68,7 +71,7 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 <details>
 <summary>Pipeline details</summary>
 
-1. **Solar position.** NREL SPA with full VSOP87 + 63-term nutation. Binary search for sunrise/sunset. Persistent twilight detection at high latitudes.
+1. **Solar position.** NREL SPA (VSOP87, ±0.0003°) as default. Optional JPL DE440 ephemeris backend with pure Rust DAF/SPK reader, Chebyshev interpolation, IAU precession-nutation, and ICRF-to-topocentric conversion. DE440 validated to 8 meters vs JPL Horizons. Binary search for sunrise/sunset. Persistent twilight detection at high latitudes.
 
 2. **Atmosphere.** 50 shells, 0 to 100 km. Rayleigh via Bodhaine (1999) with exact Lorentz-Lorenz. O₃ via Serdyuchenko (2014). OPAC aerosol climatology (6 types) with Angstrom extinction and Henyey-Greenstein phase function. Cloud layers (6 types: cirrus to cumulus). Lambertian ground reflection.
 
@@ -86,7 +89,7 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 | Crate | What |
 |---|---|
 | `twilight-core` | Physics kernel. `#![no_std]`, `#![forbid(unsafe_code)]`, zero heap. Geometry, scattering, atmosphere, single-scatter integrator, MC tracer. |
-| `twilight-solar` | NREL SPA. ±0.0003° for years -2000 to 6000. |
+| `twilight-solar` | NREL SPA (±0.0003°) + JPL DE440 ephemeris backend (±0.001"). Pure Rust DAF/SPK reader. |
 | `twilight-data` | Embedded data. US Std 1976, TSIS-1 solar spectrum, O₃ cross-sections, OPAC aerosols, cloud types, builder. |
 | `twilight-threshold` | CIE vision, mesopic luminance, twilight color classification, prayer time thresholds. |
 | `twilight-cpu` | Rayon parallel backend. Simulation driver, adaptive pipeline. |
@@ -105,20 +108,21 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 
 ## Tests
 
-446 tests, 0.2 seconds. `cargo test --workspace`
+462 tests, 0.2 seconds. `cargo test --workspace`
 
 | Crate | Tests |
 |---|---|
 | `twilight-core` | 135 |
 | `twilight-data` | 139 |
 | `twilight-threshold` | 72 |
+| `twilight-solar` | 63 (+10 DE440 integration) |
 | `twilight-cpu` | 52 |
-| `twilight-solar` | 47 |
 
 
 ## Roadmap
 
 - [x] Solar position, atmosphere model, single-scatter engine, vision model, prayer pipeline, ground reflection, aerosols, cloud layers, C FFI
+- [x] JPL DE440 ephemeris (pure Rust DAF/SPK reader, validated to 8 m vs Horizons)
 - [ ] Multiple scattering (backward MC with next-event estimation)
 - [ ] Real-time weather, satellite cloud fields (GOES/Himawari/Meteosat + ML)
 - [ ] Light pollution, terrain masking

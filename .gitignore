@@ -3,3 +3,6 @@
 *.swp
 *.swo
 .DS_Store
+
+# Ephemeris data files (too large for git)
+data/*.bsp
