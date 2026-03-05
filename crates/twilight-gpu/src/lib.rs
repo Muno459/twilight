@@ -29,6 +29,9 @@ pub mod metal;
 #[cfg(feature = "vulkan")]
 pub mod vulkan;
 
+#[cfg(feature = "cuda")]
+pub mod cuda;
+
 #[cfg(test)]
 mod oracle;
 
@@ -324,8 +327,7 @@ pub fn try_init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
 
 #[cfg(feature = "cuda")]
 fn probe_cuda() -> bool {
-    // Stub: will check cudarc::driver::CudaDevice::new(0).is_ok()
-    false
+    cuda::probe()
 }
 
 #[cfg(feature = "metal")]
@@ -341,8 +343,8 @@ fn probe_vulkan() -> bool {
 // ── Backend init functions (stubs for Phase 11a) ────────────────────────
 
 #[cfg(feature = "cuda")]
-fn init_cuda(_config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
-    Err(GpuError::BackendUnavailable(BackendKind::Cuda))
+fn init_cuda(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
+    cuda::init(config)
 }
 
 #[cfg(feature = "metal")]

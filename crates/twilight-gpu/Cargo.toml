@@ -19,7 +19,9 @@ twilight-threshold = { workspace = true }
 twilight-skyglow = { workspace = true }
 
 # CUDA backend
-cudarc = { version = "0.19", optional = true }
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+    "std", "driver", "nvrtc", "cuda-12060", "fallback-dynamic-loading",
+] }
 
 # Metal backend
 objc2 = { version = "0.6", optional = true }
