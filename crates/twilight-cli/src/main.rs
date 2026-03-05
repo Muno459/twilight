@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use twilight_cpu::pipeline::{self, PrayerTimeInput};
-use twilight_cpu::simulation::{self, SimulationConfig, SpectralResult};
+use twilight_cpu::simulation::{self, ScatteringMode, SimulationConfig, SpectralResult};
 use twilight_data::aerosol::AerosolType;
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
@@ -61,8 +61,8 @@ enum Commands {
         /// SZA step size (degrees)
         #[arg(long, default_value = "2")]
         sza_step: f64,
-        /// Number of photons per wavelength
-        #[arg(short, long, default_value = "5000")]
+        /// Number of photons per wavelength (MC mode only)
+        #[arg(short, long, default_value = "10000")]
         photons: usize,
         /// Surface albedo (0-1)
         #[arg(long, default_value = "0.15")]
@@ -79,6 +79,9 @@ enum Commands {
         /// Cloud type (default: none = clear sky)
         #[arg(long, value_enum, default_value = "none")]
         cloud: CliCloud,
+        /// Scattering mode: single (deterministic) or multiple (Monte Carlo)
+        #[arg(long, value_enum, default_value = "single")]
+        scattering: CliScattering,
     },
     /// Compute physically-based Fajr and Isha prayer times using MCRT
     Pray {
@@ -115,6 +118,12 @@ enum Commands {
         /// Path to DE440 BSP file for JPL ephemeris (primary engine)
         #[arg(long)]
         de440: Option<String>,
+        /// Scattering mode: single (deterministic) or multiple (Monte Carlo)
+        #[arg(long, value_enum, default_value = "single")]
+        scattering: CliScattering,
+        /// Number of photons per wavelength (MC mode only)
+        #[arg(short, long, default_value = "10000")]
+        photons: usize,
         /// Show detailed twilight analysis
         #[arg(long)]
         verbose: bool,
@@ -183,6 +192,24 @@ impl CliCloud {
             CliCloud::Stratus => Some(CloudType::Stratus),
             CliCloud::Stratocumulus => Some(CloudType::Stratocumulus),
             CliCloud::Cumulus => Some(CloudType::Cumulus),
+        }
+    }
+}
+
+/// CLI scattering mode selector.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliScattering {
+    /// Deterministic single-scattering (fast, no noise)
+    Single,
+    /// Monte Carlo multiple scattering (all orders, noisy)
+    Multiple,
+}
+
+impl CliScattering {
+    fn to_scattering_mode(self) -> ScatteringMode {
+        match self {
+            CliScattering::Single => ScatteringMode::Single,
+            CliScattering::Multiple => ScatteringMode::Multiple,
         }
     }
 }
@@ -412,6 +439,7 @@ fn cmd_mcrt(
     view_zenith: f64,
     aerosol: CliAerosol,
     cloud: CliCloud,
+    scattering: CliScattering,
 ) {
     println!("Twilight MCRT Simulation");
     println!("=======================");
@@ -429,6 +457,12 @@ fn cmd_mcrt(
         format_atm_desc(aerosol_type, cloud_type)
     );
     println!("Surface:      albedo = {:.2}", albedo);
+    let scattering_mode = scattering.to_scattering_mode();
+    let mode_str = match scattering_mode {
+        ScatteringMode::Single => "Single-scatter (deterministic)".to_string(),
+        ScatteringMode::Multiple => format!("Multiple-scatter MC ({} photons/wl)", photons),
+    };
+    println!("Scattering:   {}", mode_str);
     println!(
         "View:         zenith {:.0}°, azimuth {:.0}°",
         view_zenith, solar_azimuth
@@ -452,9 +486,11 @@ fn cmd_mcrt(
         solar_azimuth,
         view_zenith,
         apply_solar_irradiance: true,
+        scattering_mode,
+        photons_per_wavelength: photons,
     };
 
-    println!("Running MCRT (solar-irradiance-weighted)...");
+    println!("Running MCRT ({})...", mode_str);
     println!();
 
     let start = std::time::Instant::now();
@@ -557,6 +593,8 @@ fn cmd_pray(
     aerosol: CliAerosol,
     cloud: CliCloud,
     de440_path: Option<&str>,
+    scattering: CliScattering,
+    photons: usize,
     verbose: bool,
 ) {
     let parts: Vec<&str> = date.split('-').collect();
@@ -584,8 +622,16 @@ fn cmd_pray(
     } else {
         "NREL SPA"
     };
+    let scattering_mode = scattering.to_scattering_mode();
+    let method_str = match scattering_mode {
+        ScatteringMode::Single => "Single-scatter MCRT + CIE mesopic vision".to_string(),
+        ScatteringMode::Multiple => format!(
+            "Multiple-scatter MC ({} photons/wl) + CIE mesopic vision",
+            photons
+        ),
+    };
     println!("Ephemeris:  {}", ephemeris_label);
-    println!("Method:     Single-scatter MCRT + CIE mesopic vision");
+    println!("Method:     {}", method_str);
     println!();
 
     let input = PrayerTimeInput {
@@ -602,6 +648,8 @@ fn cmd_pray(
         aerosol_type,
         cloud_type,
         de440_path: de440_path.map(|s| s.to_string()),
+        scattering_mode,
+        photons_per_wavelength: photons,
         ..Default::default()
     };
 
@@ -806,7 +854,15 @@ fn cmd_pray(
     println!();
     println!("Notes:");
     println!("  - These times are computed from first-principles radiative transfer (MCRT).");
-    println!("  - Current model: US Standard 1976 atmosphere, single scattering.");
+    match scattering_mode {
+        ScatteringMode::Single => {
+            println!("  - Current model: US Standard 1976 atmosphere, single scattering.");
+        }
+        ScatteringMode::Multiple => {
+            println!("  - Current model: US Standard 1976 atmosphere, multiple scattering (MC).");
+            println!("  - MC noise decreases with more photons. Use --photons to adjust.");
+        }
+    }
     if aerosol_type.is_some() || cloud_type.is_some() {
         if aerosol_type.is_some() {
             println!("  - Tropospheric aerosols included (OPAC climatology).");
@@ -875,6 +931,7 @@ fn main() {
             view_zenith,
             aerosol,
             cloud,
+            scattering,
         } => {
             cmd_mcrt(
                 lat,
@@ -888,6 +945,7 @@ fn main() {
                 view_zenith,
                 aerosol,
                 cloud,
+                scattering,
             );
         }
         Commands::Pray {
@@ -902,6 +960,8 @@ fn main() {
             aerosol,
             cloud,
             de440,
+            scattering,
+            photons,
             verbose,
         } => {
             cmd_pray(
@@ -916,6 +976,8 @@ fn main() {
                 aerosol,
                 cloud,
                 de440.as_deref(),
+                scattering,
+                photons,
                 verbose,
             );
         }

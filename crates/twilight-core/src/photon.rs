@@ -133,8 +133,9 @@ pub fn trace_photon(
         pos = pos + dir * free_path;
 
         // --- Next-Event Estimation (NEE) ---
-        // Compute direct contribution from sun at this scatter point
-        let nee_contribution = compute_nee(atm, pos, sun_dir, optics, wavelength_idx, weight);
+        // Compute direct contribution from sun at this scatter point.
+        // Pass the current photon direction for correct phase function evaluation.
+        let nee_contribution = compute_nee(atm, pos, dir, sun_dir, optics, wavelength_idx, weight);
         result.weight += nee_contribution;
         result.num_scatters += 1;
 
@@ -169,10 +170,18 @@ pub fn trace_photon(
 ///
 /// Traces a shadow ray from the scatter point toward the sun, computing
 /// the transmittance along the path. Multiplied by the phase function
-/// evaluated at the angle between incoming direction and sun direction.
+/// evaluated at the angle between the photon's current direction and the
+/// sun direction.
+///
+/// In backward MC, the photon travels from observer into the atmosphere.
+/// At each scatter event, NEE asks: "what if this photon had arrived from
+/// the sun?" The phase function is evaluated at the angle between the
+/// incoming solar direction and the outgoing direction toward the observer
+/// (which is -photon_dir in backward tracing).
 fn compute_nee(
     atm: &AtmosphereModel,
     scatter_pos: Vec3,
+    photon_dir: Vec3,
     sun_dir: Vec3,
     local_optics: &crate::atmosphere::ShellOptics,
     wavelength_idx: usize,
@@ -185,13 +194,11 @@ fn compute_nee(
         return 0.0;
     }
 
-    // Phase function value for scattering toward observer
-    // (In backward MC, the "incoming" is from sun, "outgoing" is toward observer)
-    // But for NEE, we evaluate P(sun_dir → current_dir) which equals P(cos_angle)
-    // Actually for NEE in backward MC:
-    // We need the phase function for scattering from the current photon direction
-    // into the sun direction
-    let cos_angle = sun_dir.dot(scatter_pos.normalize()); // approximate — should use actual photon direction
+    // Phase function: cos(angle) between the sun direction and the
+    // direction back toward the observer (-photon_dir).
+    // This is the scattering angle for light coming from the sun being
+    // scattered toward the observer.
+    let cos_angle = sun_dir.dot(-photon_dir);
 
     let phase = if local_optics.rayleigh_fraction > 0.99 {
         rayleigh_phase(cos_angle)
@@ -249,6 +256,60 @@ fn trace_transmittance(
     }
 
     libm::exp(-total_optical_depth)
+}
+
+/// Trace multiple photons across all wavelengths and return a spectral radiance
+/// array compatible with `single_scatter_spectrum`.
+///
+/// This is the main entry point for multiple-scattering spectral computation.
+/// For each wavelength, it traces `photons_per_wavelength` backward photons
+/// and averages the NEE contributions. The result is in the same arbitrary
+/// units as `single_scatter_spectrum` (needs solar irradiance weighting by
+/// the caller).
+///
+/// # Arguments
+/// * `atm` - Atmosphere model
+/// * `observer_pos` - Observer position in ECEF [m]
+/// * `view_dir` - Initial viewing direction (unit vector)
+/// * `sun_dir` - Direction toward the sun (unit vector)
+/// * `photons_per_wavelength` - Number of photons to trace per wavelength
+/// * `base_seed` - Base RNG seed (each wavelength/photon gets a unique derived seed)
+///
+/// # Returns
+/// Spectral radiance array `[f64; 64]`, one value per wavelength channel.
+pub fn mc_scatter_spectrum(
+    atm: &AtmosphereModel,
+    observer_pos: Vec3,
+    view_dir: Vec3,
+    sun_dir: Vec3,
+    photons_per_wavelength: usize,
+    base_seed: u64,
+) -> [f64; 64] {
+    let mut radiance = [0.0f64; 64];
+    let num_wl = atm.num_wavelengths;
+
+    if photons_per_wavelength == 0 {
+        return radiance;
+    }
+
+    for w in 0..num_wl {
+        let mut total_weight = 0.0;
+        for p in 0..photons_per_wavelength {
+            // Unique seed per (wavelength, photon) pair to avoid correlation
+            let mut rng = base_seed
+                .wrapping_add(w as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(p as u64)
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(1);
+
+            let result = trace_photon(atm, observer_pos, view_dir, sun_dir, w, &mut rng);
+            total_weight += result.weight;
+        }
+        radiance[w] = total_weight / photons_per_wavelength as f64;
+    }
+
+    radiance
 }
 
 /// Sample a direction uniformly on the upper hemisphere around a normal vector.
@@ -466,5 +527,185 @@ mod tests {
     fn russian_roulette_survive_is_valid_probability() {
         assert!(RUSSIAN_ROULETTE_SURVIVE > 0.0);
         assert!(RUSSIAN_ROULETTE_SURVIVE <= 1.0);
+    }
+
+    // ── mc_scatter_spectrum ──
+
+    fn make_scattering_atmosphere() -> crate::atmosphere::AtmosphereModel {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics};
+
+        let altitudes_km = [0.0, 10.0, 50.0, 100.0];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+
+        // Shell 0 (0-10km): dense Rayleigh
+        for w in 0..3 {
+            atm.optics[0][w] = ShellOptics {
+                extinction: 1e-5
+                    * if w == 0 {
+                        4.0
+                    } else if w == 1 {
+                        1.0
+                    } else {
+                        0.3
+                    },
+                ssa: 1.0,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+        // Shell 1 (10-50km): moderate
+        for w in 0..3 {
+            atm.optics[1][w] = ShellOptics {
+                extinction: 1e-6
+                    * if w == 0 {
+                        4.0
+                    } else if w == 1 {
+                        1.0
+                    } else {
+                        0.3
+                    },
+                ssa: 1.0,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+        // Shell 2 (50-100km): thin
+        for w in 0..3 {
+            atm.optics[2][w] = ShellOptics {
+                extinction: 1e-8
+                    * if w == 0 {
+                        4.0
+                    } else if w == 1 {
+                        1.0
+                    } else {
+                        0.3
+                    },
+                ssa: 1.0,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        atm
+    }
+
+    #[test]
+    fn mc_spectrum_returns_64_elements() {
+        let atm = make_scattering_atmosphere();
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        assert_eq!(spectrum.len(), 64);
+    }
+
+    #[test]
+    fn mc_spectrum_active_wavelengths_non_negative() {
+        let atm = make_scattering_atmosphere();
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 200, 42);
+        for w in 0..atm.num_wavelengths {
+            assert!(
+                spectrum[w] >= 0.0,
+                "MC spectrum[{}] = {} should be non-negative",
+                w,
+                spectrum[w]
+            );
+        }
+    }
+
+    #[test]
+    fn mc_spectrum_unused_wavelengths_zero() {
+        let atm = make_scattering_atmosphere(); // 3 wavelengths
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        for w in atm.num_wavelengths..64 {
+            assert!(
+                spectrum[w].abs() < 1e-30,
+                "Unused wavelength index {} should be 0, got {}",
+                w,
+                spectrum[w]
+            );
+        }
+    }
+
+    #[test]
+    fn mc_spectrum_zero_photons_returns_zero() {
+        let atm = make_scattering_atmosphere();
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 0, 42);
+        for w in 0..64 {
+            assert!(
+                spectrum[w].abs() < 1e-30,
+                "Zero photons should give zero spectrum"
+            );
+        }
+    }
+
+    #[test]
+    fn mc_spectrum_deterministic_with_same_seed() {
+        let atm = make_scattering_atmosphere();
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        for w in 0..atm.num_wavelengths {
+            assert!(
+                (s1[w] - s2[w]).abs() < 1e-15,
+                "Same seed should give identical results: [{}] {} vs {}",
+                w,
+                s1[w],
+                s2[w]
+            );
+        }
+    }
+
+    #[test]
+    fn mc_spectrum_empty_atmosphere_gives_zero() {
+        let altitudes_km = [0.0, 50.0, 100.0];
+        let wavelengths = [550.0];
+        let atm = crate::atmosphere::AtmosphereModel::new(&altitudes_km, &wavelengths);
+
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
+        let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
+
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        assert!(
+            spectrum[0].abs() < 1e-20,
+            "Empty atmosphere should give ~0 MC contribution, got {}",
+            spectrum[0]
+        );
+    }
+
+    #[test]
+    fn mc_spectrum_positive_at_civil_twilight() {
+        // At SZA=92° with a scattering atmosphere, MC should produce some signal
+        let atm = make_scattering_atmosphere();
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        // Use enough photons for a reliable signal
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 1000, 42);
+        let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
+        assert!(
+            total > 0.0,
+            "MC should produce positive radiance at civil twilight, got {}",
+            total
+        );
     }
 }

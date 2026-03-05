@@ -25,7 +25,7 @@ use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
 use twilight_threshold::threshold::{self, ThresholdConfig, TwilightAnalysis};
 
-use crate::simulation::{self, SimulationConfig, SpectralResult};
+use crate::simulation::{self, ScatteringMode, SimulationConfig, SpectralResult};
 
 /// Input for the prayer time pipeline.
 #[derive(Debug, Clone)]
@@ -60,6 +60,10 @@ pub struct PrayerTimeInput {
     /// Path to DE440 BSP file. When provided, the pipeline uses JPL DE440
     /// as the primary solar position engine instead of SPA.
     pub de440_path: Option<String>,
+    /// Scattering mode: single (deterministic) or multiple (Monte Carlo).
+    pub scattering_mode: ScatteringMode,
+    /// Number of photons per wavelength for MC mode. Ignored in single mode.
+    pub photons_per_wavelength: usize,
 }
 
 impl Default for PrayerTimeInput {
@@ -79,6 +83,8 @@ impl Default for PrayerTimeInput {
             cloud_type: None,
             threshold_config: ThresholdConfig::default(),
             de440_path: None,
+            scattering_mode: ScatteringMode::Single,
+            photons_per_wavelength: 10_000,
         }
     }
 }
@@ -343,6 +349,8 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
         solar_azimuth: solar_azimuth_evening,
         view_zenith: 85.0,
         apply_solar_irradiance: true,
+        scattering_mode: input.scattering_mode,
+        photons_per_wavelength: input.photons_per_wavelength,
     };
 
     let coarse_results =

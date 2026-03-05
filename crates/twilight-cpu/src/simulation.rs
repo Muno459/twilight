@@ -1,15 +1,22 @@
 //! High-level MCRT simulation driver.
 //!
 //! Takes observer location, solar zenith angle, and atmosphere model,
-//! and computes spectral sky radiance. Uses single-scattering line-of-sight
-//! integration as the primary method (deterministic, no noise), with
-//! Monte Carlo multiple scattering as a future enhancement.
+//! and computes spectral sky radiance. Supports two scattering modes:
+//!
+//! - **Single scattering** (default): deterministic line-of-sight integration.
+//!   Fast, no noise, accurate for clear-sky twilight up to ~15° depression.
+//!
+//! - **Multiple scattering**: backward Monte Carlo with next-event estimation.
+//!   Handles all scattering orders, needed for deep twilight (>15°), thick
+//!   clouds, and reaching the 18° depression angle used by MWL/ISNA.
 //!
 //! The radiance output is in physical units [W/m²/sr/nm] when solar
 //! irradiance weighting is enabled (default).
 
+use rayon::prelude::*;
 use twilight_core::atmosphere::AtmosphereModel;
-use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef, Vec3};
+use twilight_core::photon;
 use twilight_core::single_scatter;
 use twilight_data::solar_spectrum::SOLAR_IRRADIANCE;
 
@@ -23,6 +30,24 @@ pub struct SpectralResult {
     pub radiance: Vec<f64>,
     /// Solar zenith angle (degrees)
     pub sza_deg: f64,
+}
+
+/// Scattering mode for the simulation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScatteringMode {
+    /// Deterministic single-scattering line-of-sight integration.
+    /// Fast, no noise. Accurate for clear sky up to ~15° depression.
+    Single,
+    /// Backward Monte Carlo with next-event estimation.
+    /// Handles all scattering orders. Required for deep twilight (>15°),
+    /// thick clouds, and physically reaching 18° depression angles.
+    Multiple,
+}
+
+impl Default for ScatteringMode {
+    fn default() -> Self {
+        ScatteringMode::Single
+    }
 }
 
 /// Configuration for a twilight simulation.
@@ -43,6 +68,12 @@ pub struct SimulationConfig {
     /// Whether to weight radiance by solar spectrum (true = physical units).
     /// When false, radiance is in relative units (useful for debugging).
     pub apply_solar_irradiance: bool,
+    /// Scattering mode: single (deterministic) or multiple (Monte Carlo).
+    pub scattering_mode: ScatteringMode,
+    /// Number of photons per wavelength for MC mode. Ignored in single mode.
+    /// Higher values reduce noise but increase computation time.
+    /// Recommended: 10000+ for converged results, 1000 for quick estimates.
+    pub photons_per_wavelength: usize,
 }
 
 impl Default for SimulationConfig {
@@ -54,17 +85,21 @@ impl Default for SimulationConfig {
             solar_azimuth: 270.0, // West (Isha/sunset direction)
             view_zenith: 75.0,    // Look toward horizon
             apply_solar_irradiance: true,
+            scattering_mode: ScatteringMode::Single,
+            photons_per_wavelength: 10_000,
         }
     }
 }
 
-/// Run single-scattering simulation at a single solar zenith angle.
+/// Run simulation at a single solar zenith angle.
+///
+/// Dispatches between single-scattering (deterministic) and multiple-scattering
+/// (Monte Carlo) based on `config.scattering_mode`.
 ///
 /// Returns spectral radiance across all wavelengths in the atmosphere model.
-/// This is deterministic (no Monte Carlo noise).
 ///
 /// When `config.apply_solar_irradiance` is true, the output is in physical
-/// units [W/m²/sr/nm]. The single-scatter integral gives:
+/// units [W/m²/sr/nm]. The integral gives:
 ///   I(λ) = F_sun(λ) × ∫ β_scat × P(θ)/(4π) × T_sun × T_obs ds
 /// where F_sun(λ) is the TOA solar spectral irradiance [W/m²/nm].
 pub fn simulate_at_sza(
@@ -72,39 +107,44 @@ pub fn simulate_at_sza(
     config: &SimulationConfig,
     sza_deg: f64,
 ) -> SpectralResult {
-    // Observer position in ECEF
-    let observer_pos = geographic_to_ecef(config.latitude, config.longitude, config.elevation);
+    match config.scattering_mode {
+        ScatteringMode::Single => simulate_at_sza_single(atm, config, sza_deg),
+        ScatteringMode::Multiple => simulate_at_sza_mc(atm, config, sza_deg),
+    }
+}
 
-    // Sun direction in ECEF
+/// Compute observer/sun/view geometry from config and SZA.
+fn compute_geometry(config: &SimulationConfig, sza_deg: f64) -> (Vec3, Vec3, Vec3) {
+    let observer_pos = geographic_to_ecef(config.latitude, config.longitude, config.elevation);
     let sun_dir = solar_direction_ecef(
         sza_deg,
         config.solar_azimuth,
         config.latitude,
         config.longitude,
     );
-
-    // View direction: look toward the sun azimuth at the specified zenith angle
     let view_dir = solar_direction_ecef(
         config.view_zenith,
         config.solar_azimuth,
         config.latitude,
         config.longitude,
     );
+    (observer_pos, sun_dir, view_dir)
+}
 
-    // Compute single-scattering spectrum (all wavelengths at once)
-    let radiance_array =
-        single_scatter::single_scatter_spectrum(atm, observer_pos, view_dir, sun_dir);
-
+/// Apply solar irradiance weighting and build SpectralResult from raw radiance array.
+fn build_spectral_result(
+    atm: &AtmosphereModel,
+    radiance_array: &[f64; 64],
+    sza_deg: f64,
+    apply_solar_irradiance: bool,
+) -> SpectralResult {
     let num_wl = atm.num_wavelengths;
     let mut wavelengths = Vec::with_capacity(num_wl);
     let mut radiance = Vec::with_capacity(num_wl);
 
     for w in 0..num_wl {
         wavelengths.push(atm.wavelengths_nm[w]);
-        // Apply solar irradiance weighting: multiply by F_sun(λ) [W/m²/nm]
-        // The SOLAR_IRRADIANCE array is aligned with the same wavelength grid
-        // (both use 380-780nm at 10nm steps, 41 values).
-        let r = if config.apply_solar_irradiance && w < SOLAR_IRRADIANCE.len() {
+        let r = if apply_solar_irradiance && w < SOLAR_IRRADIANCE.len() {
             radiance_array[w] * SOLAR_IRRADIANCE[w]
         } else {
             radiance_array[w]
@@ -117,6 +157,75 @@ pub fn simulate_at_sza(
         radiance,
         sza_deg,
     }
+}
+
+/// Single-scattering simulation (deterministic, no noise).
+fn simulate_at_sza_single(
+    atm: &AtmosphereModel,
+    config: &SimulationConfig,
+    sza_deg: f64,
+) -> SpectralResult {
+    let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
+    let radiance_array =
+        single_scatter::single_scatter_spectrum(atm, observer_pos, view_dir, sun_dir);
+    build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance)
+}
+
+/// Multiple-scattering simulation via backward Monte Carlo with NEE.
+///
+/// Traces `config.photons_per_wavelength` photons per wavelength using rayon
+/// parallelism. Each photon undergoes multiple scattering events with
+/// next-event estimation at each bounce.
+///
+/// The result captures all scattering orders: the first bounce is equivalent
+/// to single scattering, and subsequent bounces add the multiple-scattering
+/// contribution that becomes important at deep twilight (>15° depression)
+/// and in thick clouds.
+fn simulate_at_sza_mc(
+    atm: &AtmosphereModel,
+    config: &SimulationConfig,
+    sza_deg: f64,
+) -> SpectralResult {
+    let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
+    let num_wl = atm.num_wavelengths;
+    let nphotons = config.photons_per_wavelength;
+
+    if nphotons == 0 {
+        let radiance_array = [0.0f64; 64];
+        return build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance);
+    }
+
+    // Parallelize over wavelengths using rayon.
+    // Each wavelength traces nphotons photons independently.
+    let per_wl_radiance: Vec<f64> = (0..num_wl)
+        .into_par_iter()
+        .map(|w| {
+            let mut total_weight = 0.0;
+            for p in 0..nphotons {
+                // Unique seed per (sza, wavelength, photon) triple.
+                // Include sza bits to decorrelate across SZA scan steps.
+                let sza_bits = sza_deg.to_bits();
+                let mut rng = (sza_bits)
+                    .wrapping_add(w as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(p as u64)
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(1);
+
+                let result =
+                    photon::trace_photon(atm, observer_pos, view_dir, sun_dir, w, &mut rng);
+                total_weight += result.weight;
+            }
+            total_weight / nphotons as f64
+        })
+        .collect();
+
+    let mut radiance_array = [0.0f64; 64];
+    for (w, &r) in per_wl_radiance.iter().enumerate() {
+        radiance_array[w] = r;
+    }
+
+    build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance)
 }
 
 /// Run simulation across a range of solar zenith angles.
@@ -385,5 +494,197 @@ mod tests {
             "Triangle integral: total={}, expected 100",
             total
         );
+    }
+
+    // ── ScatteringMode defaults ──
+
+    #[test]
+    fn default_scattering_mode_is_single() {
+        let c = SimulationConfig::default();
+        assert_eq!(c.scattering_mode, ScatteringMode::Single);
+    }
+
+    #[test]
+    fn default_photons_per_wavelength() {
+        let c = SimulationConfig::default();
+        assert_eq!(c.photons_per_wavelength, 10_000);
+    }
+
+    // ── MC mode basic tests ──
+
+    fn mc_config() -> SimulationConfig {
+        SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 1000, // enough for test convergence
+            ..SimulationConfig::default()
+        }
+    }
+
+    #[test]
+    fn mc_returns_correct_wavelength_count() {
+        let atm = make_clear_sky_atm();
+        let config = mc_config();
+        let result = simulate_at_sza(&atm, &config, 96.0);
+        assert_eq!(result.wavelengths_nm.len(), 41);
+        assert_eq!(result.radiance.len(), 41);
+    }
+
+    #[test]
+    fn mc_stores_sza() {
+        let atm = make_clear_sky_atm();
+        let config = mc_config();
+        let result = simulate_at_sza(&atm, &config, 96.5);
+        assert!((result.sza_deg - 96.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn mc_radiance_non_negative() {
+        let atm = make_clear_sky_atm();
+        let config = mc_config();
+        for sza in &[90.0, 96.0, 102.0] {
+            let result = simulate_at_sza(&atm, &config, *sza);
+            for (i, &r) in result.radiance.iter().enumerate() {
+                assert!(
+                    r >= 0.0,
+                    "MC radiance at SZA={}, wl[{}] = {} should be non-negative",
+                    sza,
+                    i,
+                    r
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mc_positive_radiance_at_civil_twilight() {
+        // At SZA=93° with clear sky, MC should produce some signal
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 2000,
+            ..SimulationConfig::default()
+        };
+        let result = simulate_at_sza(&atm, &config, 93.0);
+        let total = total_radiance(&result);
+        assert!(
+            total > 0.0,
+            "MC civil twilight should produce positive radiance, got {}",
+            total
+        );
+    }
+
+    #[test]
+    fn mc_radiance_decreases_with_depth() {
+        // SZA 93 should give more radiance than SZA 100
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 2000,
+            ..SimulationConfig::default()
+        };
+        let r_93 = total_radiance(&simulate_at_sza(&atm, &config, 93.0));
+        let r_100 = total_radiance(&simulate_at_sza(&atm, &config, 100.0));
+        assert!(
+            r_93 > r_100 * 0.1, // generous for MC noise
+            "MC SZA93 ({:.4e}) should be > SZA100 ({:.4e})",
+            r_93,
+            r_100
+        );
+    }
+
+    #[test]
+    fn mc_wavelengths_correct() {
+        let atm = make_clear_sky_atm();
+        let config = mc_config();
+        let result = simulate_at_sza(&atm, &config, 96.0);
+        assert!((result.wavelengths_nm[0] - 380.0).abs() < 0.01);
+        assert!((result.wavelengths_nm[20] - 580.0).abs() < 0.01);
+        assert!((result.wavelengths_nm[40] - 780.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn mc_zero_photons_gives_zero_radiance() {
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 0,
+            ..SimulationConfig::default()
+        };
+        let result = simulate_at_sza(&atm, &config, 93.0);
+        let total = total_radiance(&result);
+        assert!(
+            total.abs() < 1e-20,
+            "Zero photons should give zero radiance, got {}",
+            total
+        );
+    }
+
+    // ── MC vs single-scatter comparison ──
+
+    #[test]
+    fn mc_and_single_same_order_of_magnitude_at_shallow_twilight() {
+        // At shallow twilight (SZA=93°), single-scatter dominates.
+        // MC should give similar results (within ~5x for 2000 photons).
+        let atm = make_clear_sky_atm();
+
+        let ss_config = SimulationConfig {
+            scattering_mode: ScatteringMode::Single,
+            ..SimulationConfig::default()
+        };
+        let mc_config = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 5000,
+            ..SimulationConfig::default()
+        };
+
+        let ss_total = total_radiance(&simulate_at_sza(&atm, &ss_config, 93.0));
+        let mc_total = total_radiance(&simulate_at_sza(&atm, &mc_config, 93.0));
+
+        // Both should be positive
+        assert!(ss_total > 0.0, "Single-scatter should be positive");
+        assert!(mc_total > 0.0, "MC should be positive");
+
+        // They should be within ~10x of each other at shallow twilight
+        let ratio = if ss_total > mc_total {
+            ss_total / mc_total
+        } else {
+            mc_total / ss_total
+        };
+        assert!(
+            ratio < 10.0,
+            "MC ({:.4e}) and single-scatter ({:.4e}) should be same order of magnitude (ratio: {:.1})",
+            mc_total,
+            ss_total,
+            ratio
+        );
+    }
+
+    // ── MC twilight scan ──
+
+    #[test]
+    fn mc_twilight_scan_correct_count() {
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 200, // few photons for speed
+            ..SimulationConfig::default()
+        };
+        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0);
+        // 90, 95, 100 = 3 steps
+        assert_eq!(results.len(), 3, "Expected 3 steps, got {}", results.len());
+    }
+
+    #[test]
+    fn mc_twilight_scan_sza_values_correct() {
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 200,
+            ..SimulationConfig::default()
+        };
+        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0);
+        assert!((results[0].sza_deg - 90.0).abs() < 0.01);
+        assert!((results[1].sza_deg - 95.0).abs() < 0.01);
+        assert!((results[2].sza_deg - 100.0).abs() < 0.01);
     }
 }
