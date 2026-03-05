@@ -73,8 +73,7 @@ unsafe impl Send for MetalBackend {}
 
 /// Lightweight probe: can we get a Metal device?
 pub fn probe() -> bool {
-    let ptr = unsafe { MTLCreateSystemDefaultDevice() };
-    !ptr.is_null()
+    MTLCreateSystemDefaultDevice().is_some()
 }
 
 // ── Init ────────────────────────────────────────────────────────────────
@@ -82,10 +81,7 @@ pub fn probe() -> bool {
 /// Initialize the Metal backend: get device, compile shaders, create pipelines.
 pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     // 1. Get default Metal device
-    let device = {
-        let ptr = unsafe { MTLCreateSystemDefaultDevice() };
-        unsafe { Retained::retain(ptr) }.ok_or(GpuError::NoDevice)?
-    };
+    let device = MTLCreateSystemDefaultDevice().ok_or(GpuError::NoDevice)?;
 
     // 2. Create command queue
     let queue = device
@@ -370,7 +366,7 @@ impl MetalBackend {
         encoder.endEncoding();
 
         cmd_buf.commit();
-        unsafe { cmd_buf.waitUntilCompleted() };
+        cmd_buf.waitUntilCompleted();
 
         Ok(())
     }
@@ -422,7 +418,7 @@ fn create_buffer_from_f32(
         device.newBufferWithBytes_length_options(
             ptr,
             byte_len,
-            MTLResourceOptions::MTLResourceStorageModeShared,
+            MTLResourceOptions::StorageModeShared,
         )
     }
     .ok_or_else(|| GpuError::BufferAllocation("Metal buffer allocation failed".into()))?;
@@ -443,7 +439,7 @@ fn create_empty_buffer(
     }
 
     device
-        .newBufferWithLength_options(byte_len, MTLResourceOptions::MTLResourceStorageModeShared)
+        .newBufferWithLength_options(byte_len, MTLResourceOptions::StorageModeShared)
         .ok_or_else(|| GpuError::BufferAllocation("Metal output buffer allocation failed".into()))
 }
 
