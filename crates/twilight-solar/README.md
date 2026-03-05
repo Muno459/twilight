@@ -23,11 +23,11 @@ The full VSOP87 planetary theory (heliocentric longitude, latitude, radius) with
 
 Key internal functions:
 
-- `julian_day` --- calendar date to JD, handles Julian/Gregorian transition
-- `earth_heliocentric_longitude` --- VSOP87 L0..L5 series evaluation
-- `nutation` --- 63-term nutation in longitude and obliquity
-- `solar_position` --- full pipeline, returns `SpaOutput` with all intermediate values
-- `find_zenith_crossing` --- binary search for the time when SZA crosses a target (used to convert threshold angles back to clock time)
+- `julian_day`. calendar date to JD, handles Julian/Gregorian transition
+- `earth_heliocentric_longitude`. VSOP87 L0..L5 series evaluation
+- `nutation`. 63-term nutation in longitude and obliquity
+- `solar_position`. full pipeline, returns `SpaOutput` with all intermediate values
+- `find_zenith_crossing`. binary search for the time when SZA crosses a target (used to convert threshold angles back to clock time)
 
 ## Data
 
