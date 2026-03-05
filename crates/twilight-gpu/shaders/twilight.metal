@@ -20,7 +20,6 @@ constant float PI = 3.14159265358979323846f;
 constant float EARTH_RADIUS_M = 6371000.0f;
 constant float TOA_ALTITUDE_M = 100000.0f;
 
-constant uint MAX_SHELLS = 64;
 constant uint MAX_WAVELENGTHS = 64;
 constant uint MAX_LOS_STEPS = 200;
 constant uint MAX_SCATTERS = 100;
@@ -31,19 +30,13 @@ constant float RUSSIAN_ROULETTE_WEIGHT = 0.01f;
 constant float RUSSIAN_ROULETTE_SURVIVE = 0.1f;
 
 // Buffer header magic
-constant uint BUFFER_MAGIC = 0x544C5754u; // "TWLT"
-constant uint BUFFER_VERSION = 1u;
-
 // Atmosphere buffer offsets (must match buffers.rs atm_offsets)
-constant uint ATM_HEADER_MAGIC    = 0;
-constant uint ATM_HEADER_VERSION  = 1;
 constant uint ATM_NUM_SHELLS      = 2;
 constant uint ATM_NUM_WAVELENGTHS = 3;
 constant uint ATM_SHELLS_START    = 4;
 constant uint ATM_SHELL_STRIDE    = 4;
 constant uint ATM_OPTICS_START    = 260;  // 4 + 4*64
 constant uint ATM_OPTICS_STRIDE   = 4;
-constant uint ATM_WAVELENGTHS_START = 16644; // 260 + 4*64*64
 constant uint ATM_ALBEDO_START    = 16708;   // 16644 + 64
 
 // Garstang constants
@@ -434,7 +427,6 @@ kernel void single_scatter_spectrum(
     float3 view_dir     = read_view_dir(params);
     float3 sun_dir      = read_sun_dir(params);
 
-    uint ns = atm_num_shells(atm);
     float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
     float surface_radius = EARTH_RADIUS_M;
 
@@ -554,8 +546,6 @@ kernel void mcrt_trace_photon(
     rng += 1ul;
 
     float surface_radius = EARTH_RADIUS_M;
-    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
-    uint ns = atm_num_shells(atm);
 
     float3 pos = observer_pos;
     float3 dir = view_dir;
@@ -642,7 +632,6 @@ float trace_secondary_chain(device const float* atm, float3 start_pos,
                             ShellOptics start_optics, thread ulong &rng) {
     float3 local_up = normalize(start_pos);
     float surface_radius = EARTH_RADIUS_M;
-    uint ns = atm_num_shells(atm);
 
     // Importance sampling: 50/50 phase-function vs upward-biased
     float xi_mix = xorshift_f32(rng);
@@ -759,7 +748,6 @@ kernel void hybrid_scatter(
     rng *= 6364136223846793005ul;
     rng += 1ul;
 
-    uint ns = atm_num_shells(atm);
     float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
     float surface_radius = EARTH_RADIUS_M;
 
@@ -870,8 +858,8 @@ kernel void garstang_zenith(
     float distance_m   = sources[base + 0];
     // sources[base + 1] = zenith_angle_rad (unused for zenith calc)
     float source_rad   = sources[base + 2];
-    // sources[base + 3] = spectrum_type
-    float source_h     = sources[base + 4];
+    // sources[base + 3] = spectrum_type (unused)
+    // sources[base + 4] = height_m (unused for zenith calc)
 
     if (distance_m < 1.0f) {
         output[tid] = 0.0f;
