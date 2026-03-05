@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Muno459/twilight/actions"><img src="https://img.shields.io/badge/tests-494_passing-brightgreen?style=flat-square" alt="tests"/></a>
+  <a href="https://github.com/Muno459/twilight/actions"><img src="https://img.shields.io/badge/tests-532_passing-brightgreen?style=flat-square" alt="tests"/></a>
   <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/rust-pure_%23!%5Bno__std%5D_core-orange?style=flat-square" alt="rust"/></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=flat-square" alt="license"/></a>
 </p>
@@ -13,7 +13,7 @@
 
 <br/>
 
-`twilight` computes Fajr and Isha prayer times by simulating how sunlight actually scatters through the atmosphere. No lookup tables, no fixed depression angles. Photons in, prayer times out. 8 ms (single-scatter) or 50 s (hybrid multi-scatter). Three scattering modes: deterministic single-scatter, backward Monte Carlo, and hybrid (exact order 1 + MC orders 2+). Optional JPL DE440 ephemeris for sub-meter solar positioning.
+`twilight` computes Fajr and Isha prayer times by simulating how sunlight actually scatters through the atmosphere. No lookup tables, no fixed depression angles. Photons in, prayer times out. 8 ms (single-scatter) or 50 s (hybrid multi-scatter). Three scattering modes: deterministic single-scatter, backward Monte Carlo, and hybrid (exact order 1 + MC orders 2+). Optional live weather data from Open-Meteo (AOD, cloud cover, visibility). Optional JPL DE440 ephemeris for sub-meter solar positioning.
 
 ## Why
 
@@ -46,7 +46,10 @@ cargo build --release
 # Prayer times (clear sky)
 cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0
 
-# With aerosols and/or clouds
+# With live weather (fetches AOD, cloud cover, visibility from Open-Meteo)
+cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --weather
+
+# With manual aerosols and/or clouds
 cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --aerosol urban
 cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --cloud thin-cirrus
 cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --aerosol urban --cloud thin-cirrus
@@ -65,6 +68,8 @@ cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3
 Aerosol types: `continental-clean`, `continental-average`, `urban`, `maritime-clean`, `maritime-polluted`, `desert`.
 Cloud types: `thin-cirrus`, `thick-cirrus`, `altostratus`, `stratus`, `stratocumulus`, `cumulus`.
 
+`--weather` fetches current conditions from [Open-Meteo](https://open-meteo.com/) (free, no API key). It overrides `--aerosol` and `--cloud` with measured AOD at 550nm, cloud cover by altitude, and visibility. The mapping: AOD determines aerosol optical depth directly, dust concentration selects desert type, AOD > 0.20 selects urban type, etc. Cloud cover by layer maps to cirrus/altostratus/stratus with optical depth scaled by fractional coverage.
+
 
 ## How it works
 
@@ -77,7 +82,7 @@ Single-scatter mode is deterministic. Same input, same output, bit-for-bit. Hybr
 
 1. **Solar position.** NREL SPA (VSOP87, ±0.0003°) as default. Optional JPL DE440 ephemeris backend with pure Rust DAF/SPK reader, Chebyshev interpolation, IAU precession-nutation, and ICRF-to-topocentric conversion. DE440 validated to 8 meters vs JPL Horizons. Binary search for sunrise/sunset. Persistent twilight detection at high latitudes.
 
-2. **Atmosphere.** 50 shells, 0 to 100 km. Rayleigh via Bodhaine (1999) with exact Lorentz-Lorenz. O₃ via Serdyuchenko (2014). OPAC aerosol climatology (6 types) with Angstrom extinction and Henyey-Greenstein phase function. Cloud layers (6 types: cirrus to cumulus). Lambertian ground reflection.
+2. **Atmosphere.** 50 shells, 0 to 100 km. Rayleigh via Bodhaine (1999) with exact Lorentz-Lorenz. O₃ via Serdyuchenko (2014). OPAC aerosol climatology (6 types) with Angstrom extinction and Henyey-Greenstein phase function. Cloud layers (6 types: cirrus to cumulus). Lambertian ground reflection. Optional live weather: Open-Meteo AOD at 550nm, cloud cover by altitude, visibility, dust concentration.
 
 3. **Radiative transfer.** Three modes: (a) single-scatter LOS integration with analytical shadow rays (8 ms, deterministic); (b) backward Monte Carlo with next-event estimation (all orders, noisy); (c) hybrid -- exact single-scatter + MC secondary chains with upward-biased importance sampling for orders 2+ (reaches 18° depression). 41 wavelengths, 380 to 780 nm.
 
@@ -96,9 +101,10 @@ Single-scatter mode is deterministic. Same input, same output, bit-for-bit. Hybr
 | `twilight-solar` | NREL SPA (±0.0003°) + JPL DE440 ephemeris backend (±0.001"). Pure Rust DAF/SPK reader. |
 | `twilight-data` | Embedded data. US Std 1976, TSIS-1 solar spectrum, O₃ cross-sections, OPAC aerosols, cloud types, builder. |
 | `twilight-threshold` | CIE vision, mesopic luminance, twilight color classification, prayer time thresholds. |
+| `twilight-weather` | Live weather integration. Open-Meteo client, AOD/cloud/visibility mapping. |
 | `twilight-cpu` | Rayon parallel backend. Simulation driver (single/MC/hybrid dispatch), adaptive pipeline. |
 | `twilight-ffi` | C FFI. `cdylib` + `staticlib` for iOS/Android/Flutter. |
-| `twilight-cli` | CLI. `solar`, `mcrt`, `pray`. |
+| `twilight-cli` | CLI. `solar`, `mcrt`, `pray`. `--weather` for live conditions. |
 
 `twilight-core` is `no_std` with no `Vec`, `String`, or `Box`. Everything is `[f64; 64]`. Same physics code runs on phone, browser, GPU.
 
@@ -113,7 +119,7 @@ Single-scatter mode is deterministic. Same input, same output, bit-for-bit. Hybr
 
 ## Tests
 
-494 tests, ~11 seconds. `cargo test --workspace`
+532 tests, ~12 seconds. `cargo test --workspace`
 
 | Crate | Tests |
 |---|---|
@@ -122,6 +128,7 @@ Single-scatter mode is deterministic. Same input, same output, bit-for-bit. Hybr
 | `twilight-threshold` | 72 |
 | `twilight-solar` | 63 (+10 DE440 integration) |
 | `twilight-cpu` | 73 |
+| `twilight-weather` | 37 |
 
 
 ## Roadmap
@@ -130,7 +137,8 @@ Single-scatter mode is deterministic. Same input, same output, bit-for-bit. Hybr
 - [x] JPL DE440 ephemeris (pure Rust DAF/SPK reader, validated to 8 m vs Horizons)
 - [x] Multiple scattering: backward MC with NEE, hybrid single-scatter + MC orders 2+
 - [x] Upward-biased importance sampling for deep twilight connectivity
-- [ ] Real-time weather, satellite cloud fields (GOES/Himawari/Meteosat + ML)
+- [x] Real-time weather via Open-Meteo (AOD, cloud cover, visibility, dust)
+- [ ] Satellite cloud fields (GOES/Himawari/Meteosat + ML)
 - [ ] Light pollution, terrain masking
 - [ ] GPU backend, neural surrogate, mobile SDKs, WASM
 

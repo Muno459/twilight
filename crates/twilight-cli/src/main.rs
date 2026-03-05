@@ -82,6 +82,9 @@ enum Commands {
         /// Scattering mode: single (deterministic) or multiple (Monte Carlo)
         #[arg(long, value_enum, default_value = "single")]
         scattering: CliScattering,
+        /// Fetch live weather data from Open-Meteo (overrides --aerosol and --cloud)
+        #[arg(long)]
+        weather: bool,
     },
     /// Compute physically-based Fajr and Isha prayer times using MCRT
     Pray {
@@ -127,6 +130,9 @@ enum Commands {
         /// Show detailed twilight analysis
         #[arg(long)]
         verbose: bool,
+        /// Fetch live weather data from Open-Meteo (overrides --aerosol and --cloud)
+        #[arg(long)]
+        weather: bool,
     },
 }
 
@@ -443,6 +449,7 @@ fn cmd_mcrt(
     aerosol: CliAerosol,
     cloud: CliCloud,
     scattering: CliScattering,
+    use_weather: bool,
 ) {
     println!("Twilight MCRT Simulation");
     println!("=======================");
@@ -453,12 +460,45 @@ fn cmd_mcrt(
     );
     println!("Photons/λ:    {}", photons);
     println!("Wavelengths:  380-780 nm (41 bands, 10nm steps)");
-    let aerosol_type = aerosol.to_aerosol_type();
-    let cloud_type = cloud.to_cloud_type();
-    println!(
-        "Atmosphere:   {}",
-        format_atm_desc(aerosol_type, cloud_type)
-    );
+
+    // Resolve atmosphere: weather API or manual flags
+    let (aerosol_props, cloud_props, atm_desc) =
+        if use_weather {
+            match twilight_weather::fetch_atmospheric_params(lat, lon) {
+                Ok(params) => {
+                    println!("Weather:      {}", params.description);
+                    let c = &params.conditions;
+                    println!(
+                    "  API data:   AOD={:.2}, cloud={:.0}% (L:{:.0}/M:{:.0}/H:{:.0}), vis={:.0}m",
+                    c.aod_550, c.cloud_cover_total, c.cloud_cover_low,
+                    c.cloud_cover_mid, c.cloud_cover_high, c.visibility_m
+                );
+                    (
+                        params.aerosol,
+                        params.cloud,
+                        format!("Live weather: {}", params.description),
+                    )
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to fetch weather: {}", e);
+                    eprintln!("Falling back to clear sky.");
+                    (
+                        None,
+                        None,
+                        "US Standard 1976 (clear sky, weather fetch failed)".to_string(),
+                    )
+                }
+            }
+        } else {
+            let aerosol_type = aerosol.to_aerosol_type();
+            let cloud_type = cloud.to_cloud_type();
+            let ap = aerosol_type.map(|at| twilight_data::aerosol::default_properties(at));
+            let cp = cloud_type.map(|ct| twilight_data::cloud::default_properties(ct));
+            let desc = format_atm_desc(aerosol_type, cloud_type);
+            (ap, cp, desc)
+        };
+
+    println!("Atmosphere:   {}", atm_desc);
     println!("Surface:      albedo = {:.2}", albedo);
     let scattering_mode = scattering.to_scattering_mode();
     let mode_str = match scattering_mode {
@@ -474,8 +514,6 @@ fn cmd_mcrt(
     println!();
 
     // Build atmosphere
-    let aerosol_props = aerosol_type.map(|at| twilight_data::aerosol::default_properties(at));
-    let cloud_props = cloud_type.map(|ct| twilight_data::cloud::default_properties(ct));
     let atm = builder::build_full(
         AtmosphereType::UsStandard,
         albedo,
@@ -600,6 +638,7 @@ fn cmd_pray(
     scattering: CliScattering,
     photons: usize,
     verbose: bool,
+    use_weather: bool,
 ) {
     let parts: Vec<&str> = date.split('-').collect();
     if parts.len() != 3 {
@@ -618,9 +657,44 @@ fn cmd_pray(
     println!("Timezone:   UTC{:+.1}", tz);
     println!("Albedo:     {:.2}", albedo);
     println!("SZA step:   {:.2}°", sza_step);
-    let aerosol_type = aerosol.to_aerosol_type();
-    let cloud_type = cloud.to_cloud_type();
-    println!("Atmosphere: {}", format_atm_desc(aerosol_type, cloud_type));
+
+    // Resolve atmosphere: weather API or manual flags
+    let (weather_aerosol, weather_cloud, atm_desc) = if use_weather {
+        match twilight_weather::fetch_atmospheric_params(lat, lon) {
+            Ok(params) => {
+                let c = &params.conditions;
+                println!(
+                    "Weather:    AOD={:.2}, cloud={:.0}% (L:{:.0}/M:{:.0}/H:{:.0}), vis={:.0}m",
+                    c.aod_550,
+                    c.cloud_cover_total,
+                    c.cloud_cover_low,
+                    c.cloud_cover_mid,
+                    c.cloud_cover_high,
+                    c.visibility_m
+                );
+                let desc = format!("Live weather: {}", params.description);
+                (params.aerosol, params.cloud, desc)
+            }
+            Err(e) => {
+                eprintln!("Warning: failed to fetch weather: {}", e);
+                eprintln!("Falling back to clear sky.");
+                (
+                    None,
+                    None,
+                    "US Standard 1976 (clear sky, weather fetch failed)".to_string(),
+                )
+            }
+        }
+    } else {
+        let aerosol_type = aerosol.to_aerosol_type();
+        let cloud_type = cloud.to_cloud_type();
+        let ap = aerosol_type.map(|at| twilight_data::aerosol::default_properties(at));
+        let cp = cloud_type.map(|ct| twilight_data::cloud::default_properties(ct));
+        let desc = format_atm_desc(aerosol_type, cloud_type);
+        (ap, cp, desc)
+    };
+
+    println!("Atmosphere: {}", atm_desc);
     let ephemeris_label = if de440_path.is_some() {
         "JPL DE440"
     } else {
@@ -642,6 +716,16 @@ fn cmd_pray(
     println!("Method:     {}", method_str);
     println!();
 
+    // When using weather API, pass custom properties directly.
+    // When using manual flags, use the type-based approach.
+    let (aerosol_type, cloud_type, custom_aerosol, custom_cloud) = if use_weather {
+        (None, None, weather_aerosol, weather_cloud)
+    } else {
+        let at = aerosol.to_aerosol_type();
+        let ct = cloud.to_cloud_type();
+        (at, ct, None, None)
+    };
+
     let input = PrayerTimeInput {
         latitude: lat,
         longitude: lon,
@@ -655,6 +739,8 @@ fn cmd_pray(
         sza_step,
         aerosol_type,
         cloud_type,
+        custom_aerosol,
+        custom_cloud,
         de440_path: de440_path.map(|s| s.to_string()),
         scattering_mode,
         photons_per_wavelength: photons,
@@ -879,21 +965,30 @@ fn cmd_pray(
             );
         }
     }
-    if aerosol_type.is_some() || cloud_type.is_some() {
-        if aerosol_type.is_some() {
+    let has_aerosol = aerosol_type.is_some() || custom_aerosol.is_some();
+    let has_cloud = cloud_type.is_some() || custom_cloud.is_some();
+    if use_weather {
+        println!("  - Atmosphere configured from live Open-Meteo weather data.");
+        if has_aerosol {
+            println!("  - Aerosol optical properties derived from measured AOD.");
+        }
+        if has_cloud {
+            println!("  - Cloud layer derived from observed cloud cover.");
+        }
+    } else if has_aerosol || has_cloud {
+        if has_aerosol {
             println!("  - Tropospheric aerosols included (OPAC climatology).");
         }
-        if cloud_type.is_some() {
+        if has_cloud {
             println!("  - Cloud layer included (Henyey-Greenstein forward scattering).");
         }
     } else {
-        println!("  - No aerosols or clouds. Use --aerosol and --cloud to add them.");
+        println!("  - No aerosols or clouds. Use --aerosol/--cloud or --weather to add them.");
     }
     println!("  - The 'depression' angle is the equivalent fixed angle that gives the same time.");
     println!(
         "  - Differences from conventional times reflect atmospheric conditions vs fixed angles."
     );
-    println!("  - Future: clouds, terrain, and real-time weather will improve accuracy.");
 }
 
 /// Format a human-readable atmosphere description.
@@ -948,6 +1043,7 @@ fn main() {
             aerosol,
             cloud,
             scattering,
+            weather,
         } => {
             cmd_mcrt(
                 lat,
@@ -962,6 +1058,7 @@ fn main() {
                 aerosol,
                 cloud,
                 scattering,
+                weather,
             );
         }
         Commands::Pray {
@@ -979,6 +1076,7 @@ fn main() {
             scattering,
             photons,
             verbose,
+            weather,
         } => {
             cmd_pray(
                 lat,
@@ -995,6 +1093,7 @@ fn main() {
                 scattering,
                 photons,
                 verbose,
+                weather,
             );
         }
     }

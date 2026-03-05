@@ -17,10 +17,10 @@
 //! falling back to NREL SPA otherwise. DE440 provides ~1000x more precise
 //! solar positions but requires the ~114 MB data file.
 
-use twilight_data::aerosol::{self, AerosolType};
+use twilight_data::aerosol::{self, AerosolProperties, AerosolType};
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
-use twilight_data::cloud::{self, CloudType};
+use twilight_data::cloud::{self, CloudProperties, CloudType};
 use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
 use twilight_threshold::threshold::{self, ThresholdConfig, TwilightAnalysis};
@@ -55,6 +55,12 @@ pub struct PrayerTimeInput {
     pub aerosol_type: Option<AerosolType>,
     /// Cloud type. None for clear sky.
     pub cloud_type: Option<CloudType>,
+    /// Custom aerosol properties (overrides aerosol_type when set).
+    /// Used by the weather API integration to pass measured AOD values.
+    pub custom_aerosol: Option<AerosolProperties>,
+    /// Custom cloud properties (overrides cloud_type when set).
+    /// Used by the weather API integration to pass derived cloud params.
+    pub custom_cloud: Option<CloudProperties>,
     /// Threshold configuration
     pub threshold_config: ThresholdConfig,
     /// Path to DE440 BSP file. When provided, the pipeline uses JPL DE440
@@ -81,6 +87,8 @@ impl Default for PrayerTimeInput {
             sza_step: 0.5,
             aerosol_type: None,
             cloud_type: None,
+            custom_aerosol: None,
+            custom_cloud: None,
             threshold_config: ThresholdConfig::default(),
             de440_path: None,
             scattering_mode: ScatteringMode::Single,
@@ -311,8 +319,15 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
     let start = std::time::Instant::now();
 
     // Step 1: Build atmosphere model
-    let aerosol_props = input.aerosol_type.map(|at| aerosol::default_properties(at));
-    let cloud_props = input.cloud_type.map(|ct| cloud::default_properties(ct));
+    // Custom properties (from weather API) take priority over type-based defaults.
+    let aerosol_props = input
+        .custom_aerosol
+        .clone()
+        .or_else(|| input.aerosol_type.map(|at| aerosol::default_properties(at)));
+    let cloud_props = input
+        .custom_cloud
+        .clone()
+        .or_else(|| input.cloud_type.map(|ct| cloud::default_properties(ct)));
     let atm = builder::build_full(
         AtmosphereType::UsStandard,
         input.surface_albedo,

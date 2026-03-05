@@ -6,6 +6,7 @@ members = [
     "crates/twilight-data",
     "crates/twilight-cpu",
     "crates/twilight-threshold",
+    "crates/twilight-weather",
     "crates/twilight-cli",
     "crates/twilight-ffi",
 ]
@@ -23,5 +24,6 @@ twilight-data = { path = "crates/twilight-data" }
 twilight-cpu = { path = "crates/twilight-cpu" }
 twilight-threshold = { path = "crates/twilight-threshold" }
 twilight-cli = { path = "crates/twilight-cli" }
+twilight-weather = { path = "crates/twilight-weather" }
 twilight-ffi = { path = "crates/twilight-ffi" }
 libm = "0.2"
