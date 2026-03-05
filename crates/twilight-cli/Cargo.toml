@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Command-line interface for twilight prayer time computation"
 
+[features]
+default = ["gpu"]
+gpu = ["dep:twilight-gpu", "twilight-cpu/gpu"]
+
 [dependencies]
 twilight-core = { workspace = true }
 twilight-solar = { workspace = true }
@@ -14,4 +18,5 @@ twilight-threshold = { workspace = true }
 twilight-weather = { workspace = true }
 twilight-terrain = { workspace = true }
 twilight-skyglow = { workspace = true }
+twilight-gpu = { workspace = true, optional = true, features = ["metal", "vulkan"] }
 clap = { version = "4", features = ["derive", "env"] }

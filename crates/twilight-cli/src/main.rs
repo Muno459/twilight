@@ -11,6 +11,9 @@ use twilight_solar::spa::{self, SpaInput};
 use twilight_terrain::horizon;
 use twilight_threshold::threshold::TwilightColor;
 
+#[cfg(feature = "gpu")]
+use twilight_gpu;
+
 /// Twilight — Monte Carlo Radiative Transfer engine for Fajr/Isha prayer times.
 #[derive(Parser)]
 #[command(name = "twilight")]
@@ -87,6 +90,12 @@ enum Commands {
         /// Fetch live weather data from Open-Meteo (overrides --aerosol and --cloud)
         #[arg(long)]
         weather: bool,
+        /// Use GPU acceleration for MCRT computation
+        #[arg(long)]
+        gpu: bool,
+        /// Preferred GPU backend: cuda, metal, vulkan, wgpu (auto-detect if omitted)
+        #[arg(long, value_enum)]
+        gpu_backend: Option<CliGpuBackend>,
     },
     /// Compute physically-based Fajr and Isha prayer times using MCRT
     Pray {
@@ -166,6 +175,12 @@ enum Commands {
         /// Default 0.5 (typical mixed modern city).
         #[arg(long, default_value = "0.5")]
         led_fraction: f64,
+        /// Use GPU acceleration for MCRT computation
+        #[arg(long)]
+        gpu: bool,
+        /// Preferred GPU backend: cuda, metal, vulkan, wgpu (auto-detect if omitted)
+        #[arg(long, value_enum)]
+        gpu_backend: Option<CliGpuBackend>,
     },
 }
 
@@ -252,6 +267,58 @@ impl CliScattering {
             CliScattering::Single => ScatteringMode::Single,
             CliScattering::Multiple => ScatteringMode::Multiple,
             CliScattering::Hybrid => ScatteringMode::Hybrid,
+        }
+    }
+}
+
+/// CLI GPU backend selector.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliGpuBackend {
+    /// NVIDIA CUDA (requires NVIDIA GPU + driver)
+    Cuda,
+    /// Apple Metal (macOS / iOS)
+    Metal,
+    /// Vulkan (cross-platform: AMD, Intel, NVIDIA, MoltenVK on macOS)
+    Vulkan,
+    /// wgpu/WebGPU (WASM browsers, native fallback)
+    Wgpu,
+}
+
+/// Try to initialize a GPU backend. Returns the backend or prints a
+/// warning and returns None (caller should fall back to CPU).
+#[cfg(feature = "gpu")]
+fn try_init_gpu(
+    preferred: Option<CliGpuBackend>,
+    photons: usize,
+) -> Option<Box<dyn twilight_gpu::GpuBackend>> {
+    let preferred_backend = preferred.map(|b| match b {
+        CliGpuBackend::Cuda => twilight_gpu::BackendKind::Cuda,
+        CliGpuBackend::Metal => twilight_gpu::BackendKind::Metal,
+        CliGpuBackend::Vulkan => twilight_gpu::BackendKind::Vulkan,
+        CliGpuBackend::Wgpu => twilight_gpu::BackendKind::Wgpu,
+    });
+
+    let config = twilight_gpu::GpuConfig {
+        preferred_backend,
+        photons_per_wavelength: photons as u32,
+        secondary_rays_per_step: photons as u32,
+        ..twilight_gpu::GpuConfig::default()
+    };
+
+    match twilight_gpu::try_init(&config) {
+        Ok(backend) => {
+            let info = backend.device_info();
+            println!(
+                "GPU:        {} ({}, {:.0} MB)",
+                info.name,
+                info.backend,
+                info.memory_bytes as f64 / (1024.0 * 1024.0),
+            );
+            Some(backend)
+        }
+        Err(e) => {
+            eprintln!("Warning: GPU init failed ({}), falling back to CPU", e);
+            None
         }
     }
 }
@@ -483,7 +550,13 @@ fn cmd_mcrt(
     cloud: CliCloud,
     scattering: CliScattering,
     use_weather: bool,
+    use_gpu: bool,
+    gpu_backend: Option<CliGpuBackend>,
 ) {
+    // Suppress unused warnings when gpu feature is disabled
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_backend;
+
     println!("Twilight MCRT Simulation");
     println!("=======================");
     println!("Location:     {:.4}°N, {:.4}°E", lat, lon);
@@ -565,11 +638,68 @@ fn cmd_mcrt(
         photons_per_wavelength: photons,
     };
 
+    // GPU initialization (if requested)
+    #[cfg(feature = "gpu")]
+    let mut gpu_backend = if use_gpu {
+        try_init_gpu(gpu_backend, photons)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "gpu"))]
+    if use_gpu {
+        eprintln!("Error: GPU support not compiled. Rebuild with --features gpu");
+        std::process::exit(1);
+    }
+
+    let compute_label = {
+        #[cfg(feature = "gpu")]
+        {
+            if gpu_backend.is_some() {
+                "GPU"
+            } else {
+                "CPU (rayon)"
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            "CPU (rayon)"
+        }
+    };
+    println!("Compute:      {}", compute_label);
     println!("Running MCRT ({})...", mode_str);
     println!();
 
     let start = std::time::Instant::now();
+
+    // GPU path: upload atmosphere and dispatch via GPU
+    #[cfg(feature = "gpu")]
+    let results = if let Some(ref mut gpu) = gpu_backend {
+        match gpu.upload_atmosphere(&atm) {
+            Ok(()) => twilight_cpu::gpu_dispatch::simulate_twilight_scan_gpu(
+                gpu.as_ref(),
+                &atm,
+                &config,
+                sza_start,
+                sza_end,
+                sza_step,
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("Warning: GPU dispatch failed ({}), falling back to CPU", e);
+                simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step)
+            }),
+            Err(e) => {
+                eprintln!("Warning: GPU upload failed ({}), falling back to CPU", e);
+                simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step)
+            }
+        }
+    } else {
+        simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step)
+    };
+
+    #[cfg(not(feature = "gpu"))]
     let results = simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step);
+
     let elapsed = start.elapsed();
 
     // Print spectral results table
@@ -680,7 +810,13 @@ fn cmd_pray(
     bortle: Option<u8>,
     radiance_nw: Option<f64>,
     led_fraction: f64,
+    use_gpu: bool,
+    gpu_backend_pref: Option<CliGpuBackend>,
 ) {
+    // Suppress unused warnings when gpu feature is disabled
+    #[cfg(not(feature = "gpu"))]
+    let _ = gpu_backend_pref;
+
     let parts: Vec<&str> = date.split('-').collect();
     if parts.len() != 3 {
         eprintln!("Error: date must be in YYYY-MM-DD format");
@@ -865,15 +1001,55 @@ fn cmd_pray(
         ..Default::default()
     };
 
+    // GPU initialization (if requested)
+    #[cfg(feature = "gpu")]
+    let mut gpu_backend = if use_gpu {
+        try_init_gpu(gpu_backend_pref, photons)
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "gpu"))]
+    if use_gpu {
+        eprintln!("Error: GPU support not compiled. Rebuild with --features gpu");
+        std::process::exit(1);
+    }
+
+    let compute_label = {
+        #[cfg(feature = "gpu")]
+        {
+            if gpu_backend.is_some() {
+                "GPU"
+            } else {
+                "CPU (rayon)"
+            }
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            "CPU (rayon)"
+        }
+    };
+    println!("Compute:    {}", compute_label);
+
     println!("Computing...");
+
+    #[cfg(feature = "gpu")]
+    let output = if let Some(ref mut gpu) = gpu_backend {
+        pipeline::compute_prayer_times_gpu(&input, gpu.as_mut())
+    } else {
+        pipeline::compute_prayer_times(&input)
+    };
+
+    #[cfg(not(feature = "gpu"))]
     let output = pipeline::compute_prayer_times(&input);
+
     let actual_ephemeris = match output.ephemeris {
         pipeline::EphemerisUsed::De440 => "DE440",
         pipeline::EphemerisUsed::Spa => "SPA (fallback)",
     };
     println!(
-        "Done in {} ms (ephemeris: {})",
-        output.computation_time_ms, actual_ephemeris
+        "Done in {} ms (ephemeris: {}, compute: {})",
+        output.computation_time_ms, actual_ephemeris, compute_label
     );
     println!();
 
@@ -1201,6 +1377,8 @@ fn main() {
             cloud,
             scattering,
             weather,
+            gpu,
+            gpu_backend,
         } => {
             cmd_mcrt(
                 lat,
@@ -1216,6 +1394,8 @@ fn main() {
                 cloud,
                 scattering,
                 weather,
+                gpu,
+                gpu_backend,
             );
         }
         Commands::Pray {
@@ -1242,6 +1422,8 @@ fn main() {
             bortle,
             radiance,
             led_fraction,
+            gpu,
+            gpu_backend,
         } => {
             cmd_pray(
                 lat,
@@ -1267,6 +1449,8 @@ fn main() {
                 bortle,
                 radiance,
                 led_fraction,
+                gpu,
+                gpu_backend,
             );
         }
     }

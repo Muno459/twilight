@@ -119,7 +119,7 @@ pub fn simulate_at_sza(
 }
 
 /// Compute observer/sun/view geometry from config and SZA.
-fn compute_geometry(config: &SimulationConfig, sza_deg: f64) -> (Vec3, Vec3, Vec3) {
+pub(crate) fn compute_geometry(config: &SimulationConfig, sza_deg: f64) -> (Vec3, Vec3, Vec3) {
     let observer_pos = geographic_to_ecef(config.latitude, config.longitude, config.elevation);
     let sun_dir = solar_direction_ecef(
         sza_deg,

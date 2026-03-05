@@ -332,6 +332,28 @@ impl SolarEngine {
     }
 }
 
+// ── Build helpers ──────────────────────────────────────────────────
+
+/// Build the atmosphere model from pipeline input.
+///
+/// Custom properties (from weather API) take priority over type-based defaults.
+fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::AtmosphereModel {
+    let aerosol_props = input
+        .custom_aerosol
+        .clone()
+        .or_else(|| input.aerosol_type.map(|at| aerosol::default_properties(at)));
+    let cloud_props = input
+        .custom_cloud
+        .clone()
+        .or_else(|| input.cloud_type.map(|ct| cloud::default_properties(ct)));
+    builder::build_full(
+        AtmosphereType::UsStandard,
+        input.surface_albedo,
+        aerosol_props.as_ref(),
+        cloud_props.as_ref(),
+    )
+}
+
 // ── Main pipeline ──────────────────────────────────────────────────
 
 /// Run the full prayer time computation pipeline.
@@ -345,24 +367,71 @@ impl SolarEngine {
 /// When `de440_path` is set in the input, the pipeline uses JPL DE440
 /// for all solar position computations. Otherwise falls back to SPA.
 pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
-    let start = std::time::Instant::now();
+    let atm = build_atmosphere(input);
+    compute_prayer_times_inner(input, &atm, |atm, config, start, end, step| {
+        simulation::simulate_twilight_scan(atm, config, start, end, step)
+    })
+}
 
-    // Step 1: Build atmosphere model
-    // Custom properties (from weather API) take priority over type-based defaults.
-    let aerosol_props = input
-        .custom_aerosol
-        .clone()
-        .or_else(|| input.aerosol_type.map(|at| aerosol::default_properties(at)));
-    let cloud_props = input
-        .custom_cloud
-        .clone()
-        .or_else(|| input.cloud_type.map(|ct| cloud::default_properties(ct)));
-    let atm = builder::build_full(
-        AtmosphereType::UsStandard,
-        input.surface_albedo,
-        aerosol_props.as_ref(),
-        cloud_props.as_ref(),
-    );
+/// Run the prayer time pipeline with GPU-accelerated MCRT simulation.
+///
+/// Uploads the atmosphere model to the GPU, then uses the GPU backend for
+/// both coarse and fine scan passes. If any GPU operation fails, falls back
+/// to the CPU pipeline automatically.
+///
+/// The caller must have already initialized the GPU backend via
+/// `twilight_gpu::try_init()`. The atmosphere is uploaded here.
+#[cfg(feature = "gpu")]
+pub fn compute_prayer_times_gpu(
+    input: &PrayerTimeInput,
+    gpu: &mut dyn twilight_gpu::GpuBackend,
+) -> PrayerTimeOutput {
+    use crate::gpu_dispatch;
+
+    let atm = build_atmosphere(input);
+
+    // Upload atmosphere to GPU. On failure, fall back to CPU entirely.
+    if let Err(e) = gpu.upload_atmosphere(&atm) {
+        eprintln!(
+            "Warning: GPU atmosphere upload failed ({}), falling back to CPU",
+            e
+        );
+        return compute_prayer_times_inner(input, &atm, |atm, config, start, end, step| {
+            simulation::simulate_twilight_scan(atm, config, start, end, step)
+        });
+    }
+
+    // Reborrow as shared for dispatch (upload is done, no more &mut needed).
+    let gpu_ref: &dyn twilight_gpu::GpuBackend = &*gpu;
+    compute_prayer_times_inner(input, &atm, |atm, config, start, end, step| {
+        gpu_dispatch::simulate_twilight_scan_gpu(gpu_ref, atm, config, start, end, step)
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "Warning: GPU dispatch error ({}), CPU fallback for this scan",
+                    e
+                );
+                simulation::simulate_twilight_scan(atm, config, start, end, step)
+            })
+    })
+}
+
+/// Inner pipeline implementation parameterized by scan function.
+///
+/// Both `compute_prayer_times` (CPU) and `compute_prayer_times_gpu` delegate
+/// to this function. The only difference is the `scan` closure that produces
+/// `Vec<SpectralResult>` for a given SZA range.
+fn compute_prayer_times_inner(
+    input: &PrayerTimeInput,
+    atm: &twilight_core::atmosphere::AtmosphereModel,
+    scan: impl Fn(
+        &twilight_core::atmosphere::AtmosphereModel,
+        &SimulationConfig,
+        f64,
+        f64,
+        f64,
+    ) -> Vec<SpectralResult>,
+) -> PrayerTimeOutput {
+    let start = std::time::Instant::now();
 
     // Step 2: Initialize solar engine (DE440 primary, SPA fallback)
     let (mut engine, ephemeris) = SolarEngine::new(input);
@@ -447,8 +516,7 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
         photons_per_wavelength: input.photons_per_wavelength,
     };
 
-    let coarse_results =
-        simulation::simulate_twilight_scan(&atm, &config, 90.0, sza_upper, input.sza_step);
+    let coarse_results = scan(atm, &config, 90.0, sza_upper, input.sza_step);
 
     let coarse_analyses: Vec<TwilightAnalysis> = coarse_results
         .iter()
@@ -484,7 +552,7 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
     let mut fine_results: Vec<SpectralResult> = Vec::new();
 
     for (lo, hi) in &refine_regions {
-        let region = simulation::simulate_twilight_scan(&atm, &config, *lo, *hi, fine_step);
+        let region = scan(atm, &config, *lo, *hi, fine_step);
         fine_results.extend(region);
     }
 
