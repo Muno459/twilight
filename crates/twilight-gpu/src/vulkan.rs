@@ -6,12 +6,30 @@
 
 use std::cell::UnsafeCell;
 use std::ffi::CStr;
+use std::mem::ManuallyDrop;
+use std::sync::OnceLock;
 
 use ash::vk;
 use gpu_allocator::vulkan::{
     Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc,
 };
 use gpu_allocator::MemoryLocation;
+
+// ── Cached Vulkan entry point ───────────────────────────────────────────
+//
+// Loading the Vulkan library with `ash::Entry::load()` calls `dlopen`.
+// Dropping the Entry calls `dlclose`. On macOS, MoltenVK does not survive
+// being dlclose'd and dlopen'd in the same process (SIGSEGV). We cache
+// the Entry in a OnceLock so it's loaded once and never dropped.
+
+static VK_ENTRY: OnceLock<Result<ash::Entry, String>> = OnceLock::new();
+
+fn load_entry() -> Result<&'static ash::Entry, String> {
+    VK_ENTRY
+        .get_or_init(|| unsafe { ash::Entry::load() }.map_err(|e| format!("{}", e)))
+        .as_ref()
+        .map_err(|e| e.clone())
+}
 
 use crate::buffers::{
     dispatch_groups, PackedAtmosphere, PackedDispatchParams, PackedLightSource,
@@ -50,7 +68,8 @@ struct VkBuffer {
 /// Uses `ash` for the Vulkan API and `gpu-allocator` for memory management.
 /// All four compute kernels are loaded from pre-compiled SPIR-V at init time.
 pub struct VulkanBackend {
-    _entry: ash::Entry,
+    // Entry is now cached in VK_ENTRY OnceLock (never dropped).
+    // We keep a reference lifetime tied to 'static.
     instance: ash::Instance,
     device: ash::Device,
     queue: vk::Queue,
@@ -75,7 +94,10 @@ pub struct VulkanBackend {
     // Memory allocator (UnsafeCell because gpu-allocator requires &mut
     // for allocate/free, but our dispatch methods take &self. Safety is
     // ensured by single-threaded dispatch with fence synchronization.)
-    allocator: UnsafeCell<Allocator>,
+    //
+    // ManuallyDrop because the Allocator must be dropped BEFORE
+    // destroy_device() -- its Drop accesses the Vulkan device internally.
+    allocator: UnsafeCell<ManuallyDrop<Allocator>>,
 
     // Uploaded atmosphere buffer (persisted between dispatches)
     buf_atm: Option<VkBuffer>,
@@ -98,7 +120,7 @@ unsafe impl Send for VulkanBackend {}
 
 /// Lightweight probe: can we load the Vulkan library and find a compute device?
 pub fn probe() -> bool {
-    let entry = match unsafe { ash::Entry::load() } {
+    let entry = match load_entry() {
         Ok(e) => e,
         Err(_) => return false,
     };
@@ -146,8 +168,8 @@ pub fn probe() -> bool {
 /// Initialize the Vulkan backend: load library, create device, compile
 /// pipelines from embedded SPIR-V, allocate command pool and fence.
 pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
-    // 1. Load Vulkan entry
-    let entry = unsafe { ash::Entry::load() }
+    // 1. Load Vulkan entry (cached -- never dropped to avoid MoltenVK dlclose crash)
+    let entry = load_entry()
         .map_err(|e| GpuError::Platform(format!("failed to load Vulkan library: {}", e)))?;
 
     // 2. Create instance
@@ -337,7 +359,6 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     };
 
     Ok(Box::new(VulkanBackend {
-        _entry: entry,
         instance,
         device,
         queue,
@@ -350,7 +371,7 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
         pipeline_garstang,
         cmd_pool,
         fence,
-        allocator: UnsafeCell::new(allocator),
+        allocator: UnsafeCell::new(ManuallyDrop::new(allocator)),
         buf_atm: None,
         buf_solar,
         buf_vision,
@@ -583,7 +604,7 @@ impl VulkanBackend {
     /// 2. VulkanBackend is not Sync (only Send), so no concurrent &self access
     /// 3. The allocator is only accessed through this method
     fn allocator_mut(&self) -> &mut Allocator {
-        unsafe { &mut *self.allocator.get() }
+        unsafe { &mut **self.allocator.get() }
     }
 
     /// Dispatch a compute kernel with the given storage buffers.
@@ -745,6 +766,11 @@ impl Drop for VulkanBackend {
             free_buffer(&self.device, alloc, solar);
             free_buffer(&self.device, alloc, vision);
 
+            // Drop the allocator BEFORE destroying the device.
+            // gpu-allocator's Allocator::drop() accesses the Vulkan device
+            // internally, so it must run while the device is still valid.
+            ManuallyDrop::drop(self.allocator.get_mut());
+
             // Destroy Vulkan objects
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.cmd_pool, None);
@@ -759,9 +785,6 @@ impl Drop for VulkanBackend {
                 .destroy_descriptor_pool(self.desc_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.desc_set_layout, None);
-
-            // Allocator drops automatically (before device, which is correct
-            // since allocator holds a clone of the ash::Device)
 
             self.device.destroy_device(None);
             self.instance.destroy_instance(None);
