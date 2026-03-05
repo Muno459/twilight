@@ -179,6 +179,73 @@ pub fn next_shell_boundary(
     None
 }
 
+// ── Atmospheric refraction at shell boundaries ─────────────────────────
+
+/// Result of applying Snell's law at a spherical shell boundary.
+#[derive(Debug, Clone, Copy)]
+pub enum RefractResult {
+    /// Ray was refracted into the new medium. Contains the new unit direction.
+    Refracted(Vec3),
+    /// Total internal reflection occurred (grazing ray from denser to rarer
+    /// medium). Contains the reflected unit direction. The photon remains
+    /// in the original shell.
+    TotalReflection(Vec3),
+}
+
+/// Apply Snell's law at a concentric spherical shell boundary.
+///
+/// Refracts (or reflects) a ray crossing from a medium with refractive
+/// index `n_from` to one with `n_to`. The boundary is a sphere centered
+/// at the origin; `boundary_pos` is the exact position on that sphere.
+///
+/// # Fast path
+///
+/// When `n_from == n_to` (within 1e-15), this returns the original
+/// direction unchanged. This means that when the atmosphere model has
+/// all refractive indices set to 1.0 (the default), every boundary
+/// crossing is a no-op and the transport is identical to straight-line.
+///
+/// # Physics
+///
+/// For a spherically symmetric atmosphere with piecewise-constant n,
+/// Bouger's invariant n*r*sin(alpha) = const reduces to standard
+/// Snell's law at each shell boundary because the surface normal is
+/// the radial direction.
+pub fn refract_at_boundary(dir: Vec3, boundary_pos: Vec3, n_from: f64, n_to: f64) -> RefractResult {
+    // Fast path: no refraction when indices match (includes n=1 everywhere).
+    if libm::fabs(n_from - n_to) < 1e-15 {
+        return RefractResult::Refracted(dir);
+    }
+
+    let outward_normal = boundary_pos.normalize();
+
+    // The interface normal must point toward the side the ray is arriving
+    // from (standard Snell convention). Determine by checking whether the
+    // ray is traveling inward or outward relative to the sphere.
+    let cos_dir_normal = dir.dot(outward_normal);
+    let normal = if cos_dir_normal < 0.0 {
+        outward_normal // ray going inward: normal points outward (toward incoming side)
+    } else {
+        -outward_normal // ray going outward: normal points inward (toward incoming side)
+    };
+
+    let cos_i = -(dir.dot(normal)); // always >= 0 by construction
+    let eta = n_from / n_to;
+    let k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+
+    if k < 0.0 {
+        // Total internal reflection (possible for extremely grazing rays
+        // going from denser to rarer medium -- creates atmospheric ducts,
+        // the mechanism behind mirages).
+        let reflected = dir + normal * (2.0 * cos_i);
+        return RefractResult::TotalReflection(reflected.normalize());
+    }
+
+    let cos_t = sqrt(k);
+    let refracted = dir * eta + normal * (eta * cos_i - cos_t);
+    RefractResult::Refracted(refracted.normalize())
+}
+
 /// Convert geographic coordinates (latitude, longitude, altitude) to
 /// Earth-Centered Earth-Fixed (ECEF) Cartesian coordinates.
 ///
@@ -659,6 +726,425 @@ mod tests {
                 dir.dot(up),
                 cos_sza
             );
+        }
+    }
+
+    // ── refract_at_boundary ──
+
+    #[test]
+    fn refract_identity_when_indices_equal() {
+        // n_from == n_to: direction should be unchanged
+        let dir = Vec3::new(0.3, -0.9, 0.1).normalize();
+        let boundary_pos = Vec3::new(100.0, 0.0, 0.0); // on a sphere of r=100
+        match refract_at_boundary(dir, boundary_pos, 1.000293, 1.000293) {
+            RefractResult::Refracted(d) => {
+                assert!((d.x - dir.x).abs() < 1e-14);
+                assert!((d.y - dir.y).abs() < 1e-14);
+                assert!((d.z - dir.z).abs() < 1e-14);
+            }
+            RefractResult::TotalReflection(_) => {
+                panic!("Should not get TIR when n_from == n_to");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_identity_when_both_one() {
+        // The default case: n=1.0 everywhere. Fast path.
+        let dir = Vec3::new(0.0, 0.5, -0.866).normalize();
+        let boundary_pos = Vec3::new(6_371_100.0, 0.0, 0.0);
+        match refract_at_boundary(dir, boundary_pos, 1.0, 1.0) {
+            RefractResult::Refracted(d) => {
+                assert!((d.x - dir.x).abs() < 1e-14);
+                assert!((d.y - dir.y).abs() < 1e-14);
+                assert!((d.z - dir.z).abs() < 1e-14);
+            }
+            RefractResult::TotalReflection(_) => {
+                panic!("Should not get TIR when n=1");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_normal_incidence_no_deflection() {
+        // A ray traveling exactly radially should not deflect at any n ratio.
+        // Outward ray on a sphere at r=100, boundary at (100,0,0).
+        let dir = Vec3::new(1.0, 0.0, 0.0); // radially outward
+        let boundary_pos = Vec3::new(100.0, 0.0, 0.0);
+        let n_from = 1.000293;
+        let n_to = 1.000200;
+        match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+            RefractResult::Refracted(d) => {
+                // At normal incidence, sin(theta_i) = 0, so sin(theta_t) = 0.
+                // The refracted direction should be the same as the incident.
+                assert!(
+                    (d.x - dir.x).abs() < 1e-10,
+                    "Normal incidence should not deflect: d={:?}",
+                    d
+                );
+                assert!(d.y.abs() < 1e-10);
+                assert!(d.z.abs() < 1e-10);
+            }
+            RefractResult::TotalReflection(_) => {
+                panic!("Normal incidence should never produce TIR");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_normal_incidence_inward() {
+        // Inward radial ray should also pass through undeflected
+        let dir = Vec3::new(-1.0, 0.0, 0.0); // radially inward
+        let boundary_pos = Vec3::new(100.0, 0.0, 0.0);
+        match refract_at_boundary(dir, boundary_pos, 1.000293, 1.000100) {
+            RefractResult::Refracted(d) => {
+                assert!(
+                    (d.x - (-1.0)).abs() < 1e-10,
+                    "Inward normal incidence should not deflect"
+                );
+                assert!(d.y.abs() < 1e-10);
+                assert!(d.z.abs() < 1e-10);
+            }
+            RefractResult::TotalReflection(_) => {
+                panic!("Normal incidence should never produce TIR");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_output_is_unit_vector() {
+        // For various directions and n ratios, output must be unit length.
+        let boundary_pos = Vec3::new(6_371_000.0 + 10_000.0, 0.0, 0.0);
+        let dirs = [
+            Vec3::new(0.3, -0.9, 0.1),
+            Vec3::new(0.0, -1.0, 0.0),
+            Vec3::new(0.99, -0.1, 0.0),
+            Vec3::new(-0.5, -0.5, 0.707),
+        ];
+        let n_pairs = [(1.000293, 1.000200), (1.000200, 1.000293), (1.0003, 1.0)];
+
+        for d in &dirs {
+            let dir = d.normalize();
+            for &(n_from, n_to) in &n_pairs {
+                match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(r) | RefractResult::TotalReflection(r) => {
+                        assert!(
+                            (r.length() - 1.0).abs() < 1e-10,
+                            "Output must be unit: |d|={}, n={}/{}",
+                            r.length(),
+                            n_from,
+                            n_to
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refract_snell_law_sin_ratio() {
+        // Verify sin(theta_t)/sin(theta_i) = n_from/n_to for a known case.
+        // Ray in the x-y plane hitting a sphere at (R, 0, 0).
+        let r = 100.0;
+        let boundary_pos = Vec3::new(r, 0.0, 0.0);
+        let normal = boundary_pos.normalize(); // (1, 0, 0)
+
+        // Incident angle ~30 degrees from normal (outward ray in x-y plane)
+        let theta_i = 30.0_f64 * core::f64::consts::PI / 180.0;
+        let dir = Vec3::new(libm::cos(theta_i), libm::sin(theta_i), 0.0);
+
+        let n_from = 1.000293;
+        let n_to = 1.000100;
+
+        match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+            RefractResult::Refracted(d) => {
+                // sin(theta_i) = |dir x normal| (for unit vectors)
+                let sin_i = dir.cross(normal).length();
+                let sin_t = d.cross(normal).length();
+
+                // Snell: n_from * sin_i = n_to * sin_t
+                let lhs = n_from * sin_i;
+                let rhs = n_to * sin_t;
+                assert!(
+                    (lhs - rhs).abs() < 1e-8,
+                    "Snell's law violated: n1*sin_i={}, n2*sin_t={}",
+                    lhs,
+                    rhs
+                );
+            }
+            RefractResult::TotalReflection(_) => {
+                panic!("Should not get TIR at 30 deg with near-unity indices");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_denser_to_rarer_bends_away_from_normal() {
+        // Going from denser to rarer medium, the ray bends away from the
+        // normal (theta_t > theta_i).
+        let r = 100.0;
+        let boundary_pos = Vec3::new(r, 0.0, 0.0);
+        let normal = boundary_pos.normalize();
+
+        let theta_i = 20.0_f64 * core::f64::consts::PI / 180.0;
+        // Outward ray
+        let dir = Vec3::new(libm::cos(theta_i), libm::sin(theta_i), 0.0);
+
+        let n_from = 1.0003; // denser
+        let n_to = 1.0001; // rarer
+
+        match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+            RefractResult::Refracted(d) => {
+                let sin_i = dir.cross(normal).length();
+                let sin_t = d.cross(normal).length();
+                assert!(
+                    sin_t > sin_i,
+                    "Denser to rarer: sin_t={} should be > sin_i={}",
+                    sin_t,
+                    sin_i
+                );
+            }
+            RefractResult::TotalReflection(_) => {
+                panic!("Should not get TIR at 20 deg");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_rarer_to_denser_bends_toward_normal() {
+        // Going from rarer to denser medium, the ray bends toward the normal.
+        let r = 100.0;
+        let boundary_pos = Vec3::new(r, 0.0, 0.0);
+        let normal = boundary_pos.normalize();
+
+        let theta_i = 20.0_f64 * core::f64::consts::PI / 180.0;
+        // Inward ray
+        let dir = Vec3::new(-libm::cos(theta_i), libm::sin(theta_i), 0.0);
+
+        let n_from = 1.0001; // rarer
+        let n_to = 1.0003; // denser
+
+        match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+            RefractResult::Refracted(d) => {
+                // The normal flips for inward rays, so compute angles
+                // relative to the inward normal
+                let inward_normal = -normal;
+                let sin_i = dir.cross(inward_normal).length();
+                let sin_t = d.cross(inward_normal).length();
+                assert!(
+                    sin_t < sin_i,
+                    "Rarer to denser: sin_t={} should be < sin_i={}",
+                    sin_t,
+                    sin_i
+                );
+            }
+            RefractResult::TotalReflection(_) => {
+                panic!("Should not get TIR going rarer to denser");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_total_internal_reflection() {
+        // TIR occurs when going from denser to much rarer medium at grazing angle.
+        // Use exaggerated n values to force TIR.
+        let boundary_pos = Vec3::new(100.0, 0.0, 0.0);
+
+        // Nearly tangential outward ray
+        let dir = Vec3::new(0.01, 0.99995, 0.0).normalize();
+
+        let n_from = 1.5; // glass-like
+        let n_to = 1.0; // vacuum
+
+        match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+            RefractResult::TotalReflection(r) => {
+                // Reflected ray should be unit length
+                assert!(
+                    (r.length() - 1.0).abs() < 1e-10,
+                    "Reflected ray should be unit: |r|={}",
+                    r.length()
+                );
+                // The reflected ray should be on the same side of the boundary
+                // (dot with outward normal should have same sign or be reflected)
+                let normal = boundary_pos.normalize();
+                let dot_in = dir.dot(normal);
+                let dot_out = r.dot(normal);
+                // For TIR, the ray reflects, so the radial component flips sign
+                // relative to the original -- but both can be positive since the
+                // ray was nearly tangential to begin with. What matters is the
+                // angle of reflection equals the angle of incidence.
+                let cos_i = libm::fabs(dot_in);
+                let cos_r = libm::fabs(dot_out);
+                assert!(
+                    (cos_i - cos_r).abs() < 1e-8,
+                    "Reflection angle should equal incidence: cos_i={}, cos_r={}",
+                    cos_i,
+                    cos_r
+                );
+            }
+            RefractResult::Refracted(_) => {
+                panic!("Expected TIR for grazing ray from n=1.5 to n=1.0");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_no_tir_at_moderate_angles() {
+        // With real atmospheric indices between adjacent shells, TIR requires
+        // extremely grazing rays. For typical shell-to-shell transitions
+        // (e.g., n=1.000293 to n=1.000200), the critical angle is:
+        // arcsin(1.000200/1.000293) ~ 89.22 deg.
+        // Verify that a 70-degree zenith angle ray does NOT produce TIR.
+        let boundary_pos = Vec3::new(6_371_000.0, 0.0, 0.0);
+        let theta = 70.0_f64 * core::f64::consts::PI / 180.0;
+        let dir = Vec3::new(libm::cos(theta), libm::sin(theta), 0.0);
+
+        match refract_at_boundary(dir, boundary_pos, 1.000293, 1.000200) {
+            RefractResult::Refracted(_) => { /* expected */ }
+            RefractResult::TotalReflection(_) => {
+                panic!("70 deg should not produce TIR with atmospheric shell indices");
+            }
+        }
+
+        // Even at 85 degrees, no TIR for adjacent-shell index change
+        let theta_85 = 85.0_f64 * core::f64::consts::PI / 180.0;
+        let dir_85 = Vec3::new(libm::cos(theta_85), libm::sin(theta_85), 0.0);
+        match refract_at_boundary(dir_85, boundary_pos, 1.000293, 1.000200) {
+            RefractResult::Refracted(_) => { /* expected */ }
+            RefractResult::TotalReflection(_) => {
+                panic!("85 deg should not produce TIR with adjacent shell indices");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_tir_critical_angle_atmospheric() {
+        // For the extreme case of surface-to-vacuum (n=1.000293 to n=1.0),
+        // the critical angle is arcsin(1.0/1.000293) ~ 88.6 deg.
+        // A ray at 89 degrees (beyond critical) should TIR.
+        let boundary_pos = Vec3::new(6_371_000.0, 0.0, 0.0);
+        let theta = 89.0_f64 * core::f64::consts::PI / 180.0;
+        let dir = Vec3::new(libm::cos(theta), libm::sin(theta), 0.0);
+
+        match refract_at_boundary(dir, boundary_pos, 1.000293, 1.0) {
+            RefractResult::TotalReflection(_) => { /* expected: beyond critical angle */ }
+            RefractResult::Refracted(_) => {
+                panic!("89 deg from n=1.000293 to n=1.0 should produce TIR (critical ~88.6 deg)");
+            }
+        }
+
+        // A ray at 80 degrees (below critical) should refract normally
+        let theta_80 = 80.0_f64 * core::f64::consts::PI / 180.0;
+        let dir_80 = Vec3::new(libm::cos(theta_80), libm::sin(theta_80), 0.0);
+        match refract_at_boundary(dir_80, boundary_pos, 1.000293, 1.0) {
+            RefractResult::Refracted(_) => { /* expected */ }
+            RefractResult::TotalReflection(_) => {
+                panic!("80 deg from n=1.000293 to n=1.0 should refract, not TIR");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_preserves_plane_of_incidence() {
+        // The refracted ray must lie in the same plane as the incident ray
+        // and the surface normal. This means (dir x normal) and (refracted x normal)
+        // should be parallel.
+        let boundary_pos = Vec3::new(100.0, 0.0, 0.0);
+        let dir = Vec3::new(0.5, 0.7, 0.3).normalize();
+        let normal = boundary_pos.normalize();
+
+        match refract_at_boundary(dir, boundary_pos, 1.000293, 1.000100) {
+            RefractResult::Refracted(d) => {
+                let cross_in = dir.cross(normal);
+                let cross_out = d.cross(normal);
+                // Parallel means their cross product is zero
+                let cross_cross = cross_in.cross(cross_out);
+                assert!(
+                    cross_cross.length() < 1e-8,
+                    "Refracted ray should be in the plane of incidence: cross={:?}",
+                    cross_cross
+                );
+            }
+            RefractResult::TotalReflection(_) => {
+                panic!("Should not get TIR");
+            }
+        }
+    }
+
+    #[test]
+    fn refract_symmetry_inward_outward() {
+        // A ray refracted outward through a boundary, then refracted inward
+        // through the same boundary at the same point, should recover the
+        // original direction (time-reversal symmetry of Snell's law).
+        let boundary_pos = Vec3::new(100.0, 0.0, 0.0);
+        let n_inner = 1.000293;
+        let n_outer = 1.000100;
+
+        let original_dir = Vec3::new(0.5, 0.7, 0.3).normalize();
+
+        // Refract outward (inner -> outer)
+        let refracted = match refract_at_boundary(original_dir, boundary_pos, n_inner, n_outer) {
+            RefractResult::Refracted(d) => d,
+            RefractResult::TotalReflection(_) => panic!("Should not TIR"),
+        };
+
+        // Reverse direction and refract inward (outer -> inner)
+        let reversed = -refracted;
+        let back = match refract_at_boundary(reversed, boundary_pos, n_outer, n_inner) {
+            RefractResult::Refracted(d) => d,
+            RefractResult::TotalReflection(_) => panic!("Should not TIR on return"),
+        };
+
+        // Should recover -original_dir
+        let expected = -original_dir;
+        assert!(
+            (back.x - expected.x).abs() < 1e-8,
+            "Time reversal failed: back={:?}, expected={:?}",
+            back,
+            expected
+        );
+        assert!((back.y - expected.y).abs() < 1e-8);
+        assert!((back.z - expected.z).abs() < 1e-8);
+    }
+
+    #[test]
+    fn refract_deflection_magnitude_realistic() {
+        // For atmospheric refraction, the total bending over the full atmosphere
+        // is ~0.57 degrees at the horizon. A single shell boundary with
+        // delta_n = 0.000093 should produce a very small deflection.
+        let r = 6_371_000.0 + 10_000.0; // 10 km altitude
+        let boundary_pos = Vec3::new(r, 0.0, 0.0);
+
+        // Ray at 45 degrees from radial
+        let theta = 45.0_f64 * core::f64::consts::PI / 180.0;
+        let dir = Vec3::new(libm::cos(theta), libm::sin(theta), 0.0);
+
+        let n_from = 1.000293; // sea level
+        let n_to = 1.000200; // ~3.2 km scale height
+
+        match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+            RefractResult::Refracted(d) => {
+                // The angular deflection should be tiny (< 0.01 degrees per boundary)
+                let cos_angle = dir.dot(d);
+                let angle_rad = libm::acos(if cos_angle > 1.0 {
+                    1.0
+                } else if cos_angle < -1.0 {
+                    -1.0
+                } else {
+                    cos_angle
+                });
+                let angle_deg = angle_rad * 180.0 / core::f64::consts::PI;
+                assert!(
+                    angle_deg < 0.01,
+                    "Single boundary deflection should be < 0.01 deg, got {} deg",
+                    angle_deg
+                );
+                assert!(
+                    angle_deg > 0.0,
+                    "Deflection should be nonzero for different n"
+                );
+            }
+            RefractResult::TotalReflection(_) => panic!("Should not TIR"),
         }
     }
 }

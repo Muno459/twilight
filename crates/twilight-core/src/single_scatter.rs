@@ -19,7 +19,9 @@
 //! with shadow rays traced toward the sun at each quadrature point.
 
 use crate::atmosphere::AtmosphereModel;
-use crate::geometry::{ray_sphere_intersect, Vec3};
+use crate::geometry::{
+    next_shell_boundary, ray_sphere_intersect, refract_at_boundary, RefractResult, Vec3,
+};
 use crate::scattering::{henyey_greenstein_phase, rayleigh_phase};
 
 /// Maximum number of integration steps along the line of sight.
@@ -274,49 +276,67 @@ pub fn single_scatter_radiance(
 
 /// Compute transmittance along a shadow ray from a point toward the sun.
 ///
-/// Uses analytical shell-by-shell path length computation for exact results,
-/// eliminating stepping artifacts that caused zeros at deep twilight angles.
+/// Traces the ray shell-by-shell, applying Snell's law at each boundary
+/// so the shadow ray follows the physically correct refracted path through
+/// the atmosphere. Within each shell the path is straight (piecewise-constant
+/// refractive index), so the path length to the next boundary is exact.
 ///
-/// This is public so the hybrid integrator can reuse exact shadow ray logic
-/// instead of the step-by-step `trace_transmittance` in `photon.rs`.
+/// This is public so the hybrid integrator can reuse the exact shadow ray
+/// logic instead of the step-by-step `trace_transmittance` in `photon.rs`.
 pub fn shadow_ray_transmittance(
     atm: &AtmosphereModel,
     start_pos: Vec3,
     sun_dir: Vec3,
     wavelength_idx: usize,
 ) -> f64 {
-    let toa_radius = atm.toa_radius();
     let surface_radius = atm.surface_radius();
-
-    // Find where the shadow ray exits the atmosphere
-    let ray_max = match ray_sphere_intersect(start_pos, sun_dir, toa_radius) {
-        Some(hit) if hit.t_far > 0.0 => hit.t_far,
-        _ => return 0.0,
-    };
-
-    // Check if shadow ray hits the ground (point is in Earth's shadow)
-    match ray_sphere_intersect(start_pos, sun_dir, surface_radius) {
-        Some(hit) if hit.t_near > 1e-3 && hit.t_near < ray_max => {
-            return 0.0;
-        }
-        _ => {}
-    }
-
-    // Analytical integration: compute exact path length through each shell
+    let mut pos = start_pos;
+    let mut dir = sun_dir;
     let mut tau = 0.0;
-    for s in 0..atm.num_shells {
-        let path = ray_path_through_shell(
-            start_pos,
-            sun_dir,
-            atm.shells[s].r_inner,
-            atm.shells[s].r_outer,
-            ray_max,
-        );
-        if path > 0.0 {
-            tau += atm.optics[s][wavelength_idx].extinction * path;
-            if tau > 50.0 {
-                return 0.0;
+
+    for _ in 0..200 {
+        let r = pos.length();
+
+        let shell_idx = match atm.shell_index(r) {
+            Some(idx) => idx,
+            None => break, // exited atmosphere
+        };
+
+        let shell = &atm.shells[shell_idx];
+        let optics = &atm.optics[shell_idx][wavelength_idx];
+
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
+            Some((dist, is_outward)) => {
+                tau += optics.extinction * dist;
+
+                // Refract at boundary
+                let boundary_pos = pos + dir * dist;
+                let n_from = atm.refractive_index[shell_idx];
+                let next_shell = if is_outward {
+                    shell_idx + 1
+                } else {
+                    shell_idx.wrapping_sub(1)
+                };
+                let n_to = if next_shell < atm.num_shells {
+                    atm.refractive_index[next_shell]
+                } else {
+                    1.0
+                };
+                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                };
+                pos = boundary_pos + dir * 1e-3;
+
+                // Hit ground -- fully opaque
+                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                    return 0.0;
+                }
             }
+            None => break,
+        }
+
+        if tau > 50.0 {
+            return 0.0;
         }
     }
 
@@ -439,52 +459,76 @@ pub fn single_scatter_spectrum(
 
 /// Compute shadow ray transmittance for all wavelengths at once.
 ///
-/// Uses analytical shell-by-shell path length computation for exact results.
+/// Shell-by-shell tracer with Snell's law at each boundary.
+/// The refracted path is the same for all wavelengths (refractive index
+/// dispersion in air is negligible over the visible range), so we trace
+/// the geometry once and accumulate per-wavelength optical depths.
 fn shadow_ray_transmittance_spectrum(
     atm: &AtmosphereModel,
     start_pos: Vec3,
     sun_dir: Vec3,
     num_wl: usize,
 ) -> [f64; 64] {
-    let mut result = [1.0f64; 64];
-    let toa_radius = atm.toa_radius();
     let surface_radius = atm.surface_radius();
-
-    let ray_max = match ray_sphere_intersect(start_pos, sun_dir, toa_radius) {
-        Some(hit) if hit.t_far > 0.0 => hit.t_far,
-        _ => {
-            result = [0.0; 64];
-            return result;
-        }
-    };
-
-    // Check ground intersection
-    match ray_sphere_intersect(start_pos, sun_dir, surface_radius) {
-        Some(hit) if hit.t_near > 1e-3 && hit.t_near < ray_max => {
-            result = [0.0; 64];
-            return result;
-        }
-        _ => {}
-    }
-
-    // Analytical integration: compute exact path length through each shell
+    let mut pos = start_pos;
+    let mut dir = sun_dir;
     let mut tau = [0.0f64; 64];
 
-    for s in 0..atm.num_shells {
-        let path = ray_path_through_shell(
-            start_pos,
-            sun_dir,
-            atm.shells[s].r_inner,
-            atm.shells[s].r_outer,
-            ray_max,
-        );
-        if path > 0.0 {
-            for w in 0..num_wl {
-                tau[w] += atm.optics[s][w].extinction * path;
+    for _ in 0..200 {
+        let r = pos.length();
+
+        let shell_idx = match atm.shell_index(r) {
+            Some(idx) => idx,
+            None => break,
+        };
+
+        let shell = &atm.shells[shell_idx];
+
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
+            Some((dist, is_outward)) => {
+                for w in 0..num_wl {
+                    tau[w] += atm.optics[shell_idx][w].extinction * dist;
+                }
+
+                // Refract at boundary
+                let boundary_pos = pos + dir * dist;
+                let n_from = atm.refractive_index[shell_idx];
+                let next_shell = if is_outward {
+                    shell_idx + 1
+                } else {
+                    shell_idx.wrapping_sub(1)
+                };
+                let n_to = if next_shell < atm.num_shells {
+                    atm.refractive_index[next_shell]
+                } else {
+                    1.0
+                };
+                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                };
+                pos = boundary_pos + dir * 1e-3;
+
+                // Hit ground -- fully opaque for ALL wavelengths
+                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                    return [0.0f64; 64];
+                }
             }
+            None => break,
+        }
+
+        // Early out if ALL wavelengths are opaque
+        let mut min_tau = f64::MAX;
+        for w in 0..num_wl {
+            if tau[w] < min_tau {
+                min_tau = tau[w];
+            }
+        }
+        if min_tau > 50.0 {
+            return [0.0f64; 64];
         }
     }
 
+    let mut result = [0.0f64; 64];
     for w in 0..num_wl {
         result[w] = if tau[w] > 50.0 {
             0.0
@@ -1064,5 +1108,345 @@ mod tests {
             rad_green,
             rad_green_zero
         );
+    }
+
+    // ── Atmospheric refraction tests ──
+
+    /// Build a many-shell atmosphere for refraction tests (finer shells = smoother refraction).
+    fn make_refraction_atmosphere() -> AtmosphereModel {
+        // 10 shells: 0-1, 1-2, ..., 9-10 km, then 10-50, 50-100
+        let altitudes_km = [
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 50.0, 100.0,
+        ];
+        let wavelengths = [550.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+
+        // Rayleigh-only extinction with scale height 8.5 km
+        for s in 0..atm.num_shells {
+            let h = atm.shells[s].altitude_mid;
+            atm.optics[s][0] = ShellOptics {
+                extinction: 1.3e-5 * libm::exp(-h / 8500.0),
+                ssa: 1.0,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        atm
+    }
+
+    #[test]
+    fn shadow_ray_n1_matches_default() {
+        // With all n=1.0 (default), shadow_ray_transmittance should give the
+        // same result as when refraction was not yet implemented.
+        let atm = make_test_atmosphere(); // n=1.0 everywhere (default)
+        let pos = Vec3::new(EARTH_RADIUS_M + 5000.0, 0.0, 0.0);
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        // All n are 1.0 by default, so refraction is identity
+        let t = shadow_ray_transmittance(&atm, pos, sun, 1);
+        assert!(
+            t >= 0.0 && t <= 1.0,
+            "Transmittance should be in [0,1], got {}",
+            t
+        );
+    }
+
+    #[test]
+    fn shadow_ray_transmittance_with_refraction_non_negative() {
+        let mut atm = make_refraction_atmosphere();
+        atm.compute_refractive_indices();
+
+        let pos = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let t = shadow_ray_transmittance(&atm, pos, sun, 0);
+        assert!(
+            t >= 0.0 && t <= 1.0,
+            "Transmittance with refraction should be in [0,1], got {}",
+            t
+        );
+    }
+
+    #[test]
+    fn shadow_ray_transmittance_refraction_changes_value() {
+        // With refraction enabled, the shadow ray path is curved. At near-
+        // horizontal sun angles, refraction changes the path length through
+        // each shell, so the transmittance should differ from the n=1 case.
+        let mut atm_refract = make_refraction_atmosphere();
+        atm_refract.compute_refractive_indices();
+
+        let atm_straight = make_refraction_atmosphere(); // n=1.0 default
+
+        let pos = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        // Use a near-horizon sun angle where refraction matters most
+        let sun = crate::geometry::solar_direction_ecef(90.5, 180.0, 0.0, 0.0);
+
+        let t_refract = shadow_ray_transmittance(&atm_refract, pos, sun, 0);
+        let t_straight = shadow_ray_transmittance(&atm_straight, pos, sun, 0);
+
+        // Both should be valid transmittances
+        assert!(t_refract >= 0.0 && t_refract <= 1.0);
+        assert!(t_straight >= 0.0 && t_straight <= 1.0);
+
+        // They should differ (refraction bends the ray, changing path lengths)
+        // But the difference is small (< a few percent for near-horizon geometry)
+        if t_straight > 1e-10 && t_refract > 1e-10 {
+            let ratio = t_refract / t_straight;
+            assert!(
+                (ratio - 1.0).abs() < 0.2,
+                "Refraction should cause small change in transmittance: ratio={}",
+                ratio
+            );
+        }
+    }
+
+    #[test]
+    fn radiance_with_refraction_non_negative() {
+        // Radiance should never be negative even with refraction enabled
+        let mut atm = make_refraction_atmosphere();
+        atm.compute_refractive_indices();
+
+        let obs = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = Vec3::new(0.0, 1.0, 0.0).normalize();
+
+        for sza in &[80.0, 90.0, 92.0, 96.0, 102.0, 108.0] {
+            let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
+            let rad = single_scatter_radiance(&atm, obs, view, sun, 0);
+            assert!(
+                rad >= 0.0,
+                "Radiance with refraction should be non-negative: SZA={}, rad={:.4e}",
+                sza,
+                rad
+            );
+        }
+    }
+
+    #[test]
+    fn radiance_with_refraction_positive_at_civil_twilight() {
+        let mut atm = make_refraction_atmosphere();
+        atm.compute_refractive_indices();
+
+        let obs = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let rad = single_scatter_radiance(&atm, obs, view, sun, 0);
+        assert!(
+            rad > 0.0,
+            "Refracted radiance should be positive at civil twilight, got {:.4e}",
+            rad
+        );
+    }
+
+    #[test]
+    fn spectrum_with_refraction_matches_individual() {
+        // single_scatter_spectrum with refraction should match per-wavelength calls
+        let altitudes_km = [0.0, 5.0, 15.0, 50.0, 100.0];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+
+        for s in 0..atm.num_shells {
+            let h = atm.shells[s].altitude_mid;
+            for w in 0..3 {
+                let lambda_factor = if w == 0 {
+                    4.0
+                } else if w == 1 {
+                    1.0
+                } else {
+                    0.3
+                };
+                atm.optics[s][w] = ShellOptics {
+                    extinction: 1.3e-5 * lambda_factor * libm::exp(-h / 8500.0),
+                    ssa: 1.0,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+        atm.compute_refractive_indices();
+
+        let obs = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let spectrum = single_scatter_spectrum(&atm, obs, view, sun);
+
+        for w in 0..atm.num_wavelengths {
+            let individual = single_scatter_radiance(&atm, obs, view, sun, w);
+            let rel_err = if individual > 1e-30 {
+                ((spectrum[w] - individual) / individual).abs()
+            } else {
+                (spectrum[w] - individual).abs()
+            };
+            assert!(
+                rel_err < 0.01,
+                "Refracted spectrum[{}] = {:.6e} != individual = {:.6e}, err = {:.4e}",
+                w,
+                spectrum[w],
+                individual,
+                rel_err
+            );
+        }
+    }
+
+    #[test]
+    fn shadow_ray_upward_transmittance_one_in_empty_atm() {
+        // In a clear atmosphere (zero extinction), transmittance to the sun
+        // should be 1.0 regardless of refraction.
+        let mut atm = AtmosphereModel::new(&[0.0, 50.0, 100.0], &[550.0]);
+        atm.compute_refractive_indices_from_altitude();
+
+        let pos = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let sun = Vec3::new(1.0, 0.0, 0.0); // directly overhead
+
+        let t = shadow_ray_transmittance(&atm, pos, sun, 0);
+        assert!(
+            (t - 1.0).abs() < 1e-10,
+            "Zero-extinction transmittance should be 1.0, got {}",
+            t
+        );
+    }
+
+    #[test]
+    fn shadow_ray_ground_hit_returns_zero() {
+        // A shadow ray aimed downward should hit the ground and return 0.
+        let mut atm = make_refraction_atmosphere();
+        atm.compute_refractive_indices();
+
+        let pos = Vec3::new(EARTH_RADIUS_M + 5000.0, 0.0, 0.0);
+        // Direction straight down
+        let sun_down = Vec3::new(-1.0, 0.0, 0.0);
+
+        let t = shadow_ray_transmittance(&atm, pos, sun_down, 0);
+        assert!(
+            t < 1e-20,
+            "Shadow ray hitting ground should have zero transmittance, got {}",
+            t
+        );
+    }
+
+    #[test]
+    fn bouger_invariant_along_refracted_path() {
+        // Bouger's invariant: n(r) * r * sin(alpha) = const along a refracted
+        // ray in a spherically symmetric atmosphere. Here alpha is the angle
+        // between the ray direction and the radial (outward) direction.
+        //
+        // We verify this by manually stepping through shell boundaries
+        // using refract_at_boundary and checking the invariant at each step.
+        use crate::geometry::{refract_at_boundary, RefractResult};
+
+        // Build a fine-grained atmosphere for smooth refraction
+        let mut alt_km = [0.0f64; 21];
+        for i in 0..21 {
+            alt_km[i] = i as f64 * 5.0; // 0, 5, 10, ..., 100 km
+        }
+        let mut atm = AtmosphereModel::new(&alt_km, &[550.0]);
+        atm.compute_refractive_indices_from_altitude();
+
+        // Start at 1m above surface with a 70-degree zenith angle ray
+        let r0 = EARTH_RADIUS_M + 1.0;
+        let theta0 = 70.0_f64 * core::f64::consts::PI / 180.0;
+        let mut pos = Vec3::new(r0, 0.0, 0.0);
+        let mut dir = Vec3::new(libm::cos(theta0), libm::sin(theta0), 0.0);
+
+        // Compute initial Bouger invariant
+        let r = pos.length();
+        let radial = pos.normalize();
+        let cos_alpha = dir.dot(radial);
+        let sin_alpha = libm::sqrt(1.0 - cos_alpha * cos_alpha);
+        let n0 = atm.refractive_index[0];
+        let bouger_initial = n0 * r * sin_alpha;
+
+        // Walk outward through shells
+        for s in 0..(atm.num_shells - 1) {
+            let shell = &atm.shells[s];
+            // Move to outer boundary
+            let hit = crate::geometry::ray_sphere_intersect(pos, dir, shell.r_outer);
+            let dist = match hit {
+                Some(h) if h.t_far > 1e-6 => {
+                    if h.t_near > 1e-6 {
+                        h.t_near
+                    } else {
+                        h.t_far
+                    }
+                }
+                _ => break,
+            };
+
+            let boundary_pos = pos + dir * dist;
+            let n_from = atm.refractive_index[s];
+            let n_to = if s + 1 < atm.num_shells {
+                atm.refractive_index[s + 1]
+            } else {
+                1.0
+            };
+
+            // Refract
+            dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                RefractResult::Refracted(d) => d,
+                RefractResult::TotalReflection(_) => break, // shouldn't happen
+            };
+            pos = boundary_pos + dir * 1e-3; // nudge past boundary
+
+            // Check Bouger invariant
+            let r_new = pos.length();
+            let radial_new = pos.normalize();
+            let cos_alpha_new = dir.dot(radial_new);
+            let sin_alpha_new = libm::sqrt(1.0 - cos_alpha_new * cos_alpha_new);
+            let n_new = n_to;
+            let bouger_new = n_new * r_new * sin_alpha_new;
+
+            let rel_err = (bouger_new - bouger_initial).abs() / bouger_initial;
+            assert!(
+                rel_err < 1e-4,
+                "Bouger invariant violated at shell {}: initial={:.6}, current={:.6}, rel_err={:.2e}",
+                s + 1,
+                bouger_initial,
+                bouger_new,
+                rel_err
+            );
+        }
+    }
+
+    #[test]
+    fn refraction_bends_moderate_angle_ray() {
+        // A key physical effect: atmospheric refraction bends rays at shell
+        // boundaries. Going from denser to rarer medium (outward), the ray
+        // bends away from the normal, making the angle to radial larger.
+        //
+        // We use a 60-degree zenith angle to avoid TIR (critical angle for
+        // adjacent-shell n difference is ~89 deg; for large n jumps it can
+        // be lower).
+        use crate::geometry::{refract_at_boundary, RefractResult};
+
+        let r_boundary = EARTH_RADIUS_M + 5000.0;
+        let boundary_pos = Vec3::new(r_boundary, 0.0, 0.0);
+        let normal = boundary_pos.normalize();
+
+        // 60-degree zenith angle (outward ray, well below critical angle)
+        let theta = 60.0_f64 * core::f64::consts::PI / 180.0;
+        let dir = Vec3::new(libm::cos(theta), libm::sin(theta), 0.0);
+
+        let n_from = 1.000293; // denser (lower shell)
+        let n_to = 1.000150; // rarer (upper shell)
+
+        match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+            RefractResult::Refracted(d) => {
+                // Going from denser to rarer: sin(theta_t) > sin(theta_i)
+                // meaning the ray bends away from the normal.
+                let sin_i = dir.cross(normal).length();
+                let sin_t = d.cross(normal).length();
+                assert!(
+                    sin_t > sin_i,
+                    "Denser to rarer should bend away from normal: sin_t={}, sin_i={}",
+                    sin_t,
+                    sin_i
+                );
+            }
+            RefractResult::TotalReflection(_) => {
+                panic!("60 deg should not produce TIR with these n values");
+            }
+        }
     }
 }

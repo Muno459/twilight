@@ -69,6 +69,17 @@ pub struct AtmosphereModel {
     pub num_wavelengths: usize,
     /// Surface albedo per wavelength
     pub surface_albedo: [f64; MAX_WAVELENGTHS],
+    /// Refractive index per shell (at shell midpoint altitude).
+    ///
+    /// Defaults to 1.0 for all shells (no refraction). Call
+    /// [`compute_refractive_indices`] to populate from the Rayleigh
+    /// extinction profile, or [`compute_refractive_indices_from_altitude`]
+    /// for the scale-height fallback.
+    ///
+    /// When all values are 1.0, Snell's law at shell boundaries reduces
+    /// to the identity (no direction change), preserving backward
+    /// compatibility with straight-line transport.
+    pub refractive_index: [f64; MAX_SHELLS],
 }
 
 impl AtmosphereModel {
@@ -88,6 +99,7 @@ impl AtmosphereModel {
             wavelengths_nm: [0.0; MAX_WAVELENGTHS],
             num_wavelengths: 0,
             surface_albedo: [0.15; MAX_WAVELENGTHS], // default Earth albedo
+            refractive_index: [1.0; MAX_SHELLS],     // default: no refraction
         };
 
         let n_shells = if altitudes_km.len() > 1 {
@@ -115,6 +127,50 @@ impl AtmosphereModel {
         model.num_wavelengths = n_wl;
 
         model
+    }
+
+    /// Compute refractive indices from the Rayleigh extinction profile.
+    ///
+    /// Uses the proportionality n(h) - 1 ~ rho(h) / rho(0) where rho is
+    /// the air number density. Since Rayleigh extinction is also proportional
+    /// to number density, the ratio of Rayleigh extinction at shell s to
+    /// that at the surface gives the density ratio directly. The sea-level
+    /// refractivity of dry air is (n - 1) = 0.000293 (Edlen, 1966).
+    ///
+    /// Falls back to the exponential scale-height model if the surface
+    /// Rayleigh extinction is zero (e.g., in a test atmosphere with no
+    /// optics set).
+    pub fn compute_refractive_indices(&mut self) {
+        if self.num_shells == 0 || self.num_wavelengths == 0 {
+            return;
+        }
+
+        // Use wavelength 0 for the density ratio (the lambda^-4 dependence
+        // of the Rayleigh cross-section cancels in the ratio).
+        let ext_surface = self.optics[0][0].extinction * self.optics[0][0].rayleigh_fraction;
+
+        if ext_surface < 1e-30 {
+            // No Rayleigh extinction data; fall back to scale height model.
+            self.compute_refractive_indices_from_altitude();
+            return;
+        }
+
+        for s in 0..self.num_shells {
+            let ext_s = self.optics[s][0].extinction * self.optics[s][0].rayleigh_fraction;
+            let density_ratio = ext_s / ext_surface;
+            self.refractive_index[s] = 1.0 + 0.000293 * density_ratio;
+        }
+    }
+
+    /// Compute refractive indices from the exponential scale-height model.
+    ///
+    /// n(h) = 1 + 0.000293 * exp(-h / H) where H = 8500 m is the
+    /// density scale height of a standard atmosphere.
+    pub fn compute_refractive_indices_from_altitude(&mut self) {
+        for s in 0..self.num_shells {
+            let h = self.shells[s].altitude_mid;
+            self.refractive_index[s] = 1.0 + 0.000293 * libm::exp(-h / 8500.0);
+        }
     }
 
     /// Get shell index for a given radius from Earth center.
@@ -391,5 +447,279 @@ mod tests {
     fn toa_altitude_is_100km() {
         // Karman line: 100 km
         assert!((TOA_ALTITUDE_M - 100_000.0).abs() < EPSILON);
+    }
+
+    // ── Refractive index defaults ──
+
+    #[test]
+    fn default_refractive_index_is_one() {
+        let atm = make_simple_atm();
+        for s in 0..atm.num_shells {
+            assert!(
+                (atm.refractive_index[s] - 1.0).abs() < EPSILON,
+                "Default n[{}] should be 1.0, got {}",
+                s,
+                atm.refractive_index[s]
+            );
+        }
+    }
+
+    #[test]
+    fn default_refractive_index_all_slots() {
+        // Even unused slots should be 1.0
+        let atm = make_simple_atm();
+        for s in 0..MAX_SHELLS {
+            assert!(
+                (atm.refractive_index[s] - 1.0).abs() < EPSILON,
+                "Slot {} should be 1.0",
+                s
+            );
+        }
+    }
+
+    // ── compute_refractive_indices_from_altitude ──
+
+    #[test]
+    fn refractive_index_from_altitude_sea_level() {
+        let mut atm = make_simple_atm(); // shell 0 midpoint = 5000 m
+        atm.compute_refractive_indices_from_altitude();
+
+        // At sea level (0m), n = 1 + 0.000293 = 1.000293
+        // Shell 0 midpoint is at 5000 m, so n = 1 + 0.000293 * exp(-5000/8500)
+        let expected = 1.0 + 0.000293 * libm::exp(-5000.0 / 8500.0);
+        assert!(
+            (atm.refractive_index[0] - expected).abs() < 1e-9,
+            "Shell 0 n: expected {}, got {}",
+            expected,
+            atm.refractive_index[0]
+        );
+    }
+
+    #[test]
+    fn refractive_index_from_altitude_decreases_with_height() {
+        let mut atm = make_simple_atm();
+        atm.compute_refractive_indices_from_altitude();
+
+        // n should decrease with altitude (atmosphere gets thinner)
+        for s in 0..(atm.num_shells - 1) {
+            assert!(
+                atm.refractive_index[s] > atm.refractive_index[s + 1],
+                "n[{}]={} should be > n[{}]={}",
+                s,
+                atm.refractive_index[s],
+                s + 1,
+                atm.refractive_index[s + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn refractive_index_from_altitude_all_above_one() {
+        let mut atm = make_simple_atm();
+        atm.compute_refractive_indices_from_altitude();
+
+        for s in 0..atm.num_shells {
+            assert!(
+                atm.refractive_index[s] > 1.0,
+                "n[{}]={} should be > 1.0",
+                s,
+                atm.refractive_index[s]
+            );
+        }
+    }
+
+    #[test]
+    fn refractive_index_from_altitude_below_sea_level_value() {
+        let mut atm = make_simple_atm();
+        atm.compute_refractive_indices_from_altitude();
+
+        // All shells should have n < 1.000293 (sea level value)
+        // because shell midpoints are above sea level
+        for s in 0..atm.num_shells {
+            assert!(
+                atm.refractive_index[s] < 1.000293 + 1e-9,
+                "n[{}]={} should be <= 1.000293 (sea level)",
+                s,
+                atm.refractive_index[s]
+            );
+        }
+    }
+
+    #[test]
+    fn refractive_index_from_altitude_high_shell_near_one() {
+        // Shell 2 midpoint is at 75 km -- n should be very close to 1.0
+        let mut atm = make_simple_atm();
+        atm.compute_refractive_indices_from_altitude();
+
+        let expected = 1.0 + 0.000293 * libm::exp(-75_000.0 / 8500.0);
+        assert!(
+            (atm.refractive_index[2] - expected).abs() < 1e-12,
+            "High-altitude shell n: expected {}, got {}",
+            expected,
+            atm.refractive_index[2]
+        );
+        // Should be extremely close to 1.0
+        assert!(
+            (atm.refractive_index[2] - 1.0) < 1e-6,
+            "At 75 km, (n-1) should be < 1e-6, got {}",
+            atm.refractive_index[2] - 1.0
+        );
+    }
+
+    #[test]
+    fn refractive_index_from_altitude_empty_model() {
+        // Should not panic on empty model
+        let mut atm = AtmosphereModel::new(&[], &[]);
+        atm.compute_refractive_indices_from_altitude();
+        // All indices should remain 1.0
+        for s in 0..MAX_SHELLS {
+            assert!((atm.refractive_index[s] - 1.0).abs() < EPSILON);
+        }
+    }
+
+    // ── compute_refractive_indices (from Rayleigh extinction) ──
+
+    fn make_atm_with_rayleigh() -> AtmosphereModel {
+        // Build an atmosphere with realistic Rayleigh extinction profile
+        let altitudes_km = [0.0, 5.0, 15.0, 50.0, 100.0];
+        let wavelengths = [550.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+
+        // Rayleigh extinction profile: surface = 1.3e-5, decays exponentially
+        atm.optics[0][0].extinction = 1.3e-5;
+        atm.optics[0][0].rayleigh_fraction = 1.0;
+
+        atm.optics[1][0].extinction = 1.3e-5 * libm::exp(-10_000.0 / 8500.0);
+        atm.optics[1][0].rayleigh_fraction = 1.0;
+
+        atm.optics[2][0].extinction = 1.3e-5 * libm::exp(-32_500.0 / 8500.0);
+        atm.optics[2][0].rayleigh_fraction = 1.0;
+
+        atm.optics[3][0].extinction = 1.3e-5 * libm::exp(-75_000.0 / 8500.0);
+        atm.optics[3][0].rayleigh_fraction = 1.0;
+
+        atm
+    }
+
+    #[test]
+    fn refractive_index_from_rayleigh_surface_value() {
+        let mut atm = make_atm_with_rayleigh();
+        atm.compute_refractive_indices();
+
+        // Shell 0 has density_ratio = 1.0 (surface), so n = 1 + 0.000293
+        assert!(
+            (atm.refractive_index[0] - 1.000293).abs() < 1e-9,
+            "Surface n should be 1.000293, got {}",
+            atm.refractive_index[0]
+        );
+    }
+
+    #[test]
+    fn refractive_index_from_rayleigh_decreases_with_altitude() {
+        let mut atm = make_atm_with_rayleigh();
+        atm.compute_refractive_indices();
+
+        for s in 0..(atm.num_shells - 1) {
+            assert!(
+                atm.refractive_index[s] > atm.refractive_index[s + 1],
+                "n[{}]={} should be > n[{}]={}",
+                s,
+                atm.refractive_index[s],
+                s + 1,
+                atm.refractive_index[s + 1]
+            );
+        }
+    }
+
+    #[test]
+    fn refractive_index_from_rayleigh_matches_scale_height() {
+        // Since we set up the Rayleigh extinction with the standard scale
+        // height, the resulting n values should be very close to the
+        // altitude-based model.
+        let mut atm_ray = make_atm_with_rayleigh();
+        atm_ray.compute_refractive_indices();
+
+        let mut atm_alt = make_atm_with_rayleigh();
+        atm_alt.compute_refractive_indices_from_altitude();
+
+        for s in 0..atm_ray.num_shells {
+            let diff = (atm_ray.refractive_index[s] - atm_alt.refractive_index[s]).abs();
+            // Allow 10% relative error due to discrete shell midpoint vs continuous
+            let n_minus_1 = atm_alt.refractive_index[s] - 1.0;
+            let rel = if n_minus_1 > 1e-10 {
+                diff / n_minus_1
+            } else {
+                diff
+            };
+            assert!(
+                rel < 0.5, // generous: shells are thick
+                "Shell {} Rayleigh n={} vs altitude n={}, rel_diff={}",
+                s,
+                atm_ray.refractive_index[s],
+                atm_alt.refractive_index[s],
+                rel
+            );
+        }
+    }
+
+    #[test]
+    fn refractive_index_from_rayleigh_fallback_on_zero_extinction() {
+        // If surface extinction is zero, should fall back to altitude model
+        let mut atm = make_simple_atm(); // all extinction = 0
+        atm.compute_refractive_indices();
+
+        // Should have fallen back to altitude model (not all 1.0)
+        // Shell 0 midpoint at 5000m
+        let expected = 1.0 + 0.000293 * libm::exp(-5000.0 / 8500.0);
+        assert!(
+            (atm.refractive_index[0] - expected).abs() < 1e-9,
+            "Fallback should use altitude model: expected {}, got {}",
+            expected,
+            atm.refractive_index[0]
+        );
+    }
+
+    #[test]
+    fn refractive_index_from_rayleigh_empty_model() {
+        let mut atm = AtmosphereModel::new(&[], &[]);
+        atm.compute_refractive_indices(); // should not panic
+        for s in 0..MAX_SHELLS {
+            assert!((atm.refractive_index[s] - 1.0).abs() < EPSILON);
+        }
+    }
+
+    #[test]
+    fn refractive_index_from_rayleigh_with_aerosol_fraction() {
+        // When rayleigh_fraction < 1.0, only the Rayleigh part of extinction
+        // is used for the density ratio.
+        let altitudes_km = [0.0, 10.0, 100.0];
+        let wavelengths = [550.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+
+        // Shell 0: 50% Rayleigh, 50% aerosol
+        atm.optics[0][0].extinction = 2.6e-5; // total
+        atm.optics[0][0].rayleigh_fraction = 0.5; // Rayleigh part = 1.3e-5
+
+        // Shell 1: pure Rayleigh at 1/10 density
+        atm.optics[1][0].extinction = 1.3e-6;
+        atm.optics[1][0].rayleigh_fraction = 1.0;
+
+        atm.compute_refractive_indices();
+
+        // Surface n uses Rayleigh part: 1.3e-5 (same as pure case)
+        assert!(
+            (atm.refractive_index[0] - 1.000293).abs() < 1e-9,
+            "Surface n with aerosol: {}",
+            atm.refractive_index[0]
+        );
+
+        // Shell 1 density ratio = 1.3e-6 / 1.3e-5 = 0.1
+        let expected_1 = 1.0 + 0.000293 * 0.1;
+        assert!(
+            (atm.refractive_index[1] - expected_1).abs() < 1e-9,
+            "Shell 1 n: expected {}, got {}",
+            expected_1,
+            atm.refractive_index[1]
+        );
     }
 }

@@ -5,7 +5,7 @@
 //! making it compilable to any target (CPU, GPU via WGSL, WASM, CUDA PTX).
 
 use crate::atmosphere::AtmosphereModel;
-use crate::geometry::{next_shell_boundary, Vec3};
+use crate::geometry::{next_shell_boundary, refract_at_boundary, RefractResult, Vec3};
 use crate::scattering::{
     henyey_greenstein_phase, rayleigh_phase, sample_henyey_greenstein, sample_rayleigh_analytic,
     scatter_direction,
@@ -19,6 +19,38 @@ pub const RUSSIAN_ROULETTE_WEIGHT: f64 = 0.01;
 
 /// Russian roulette survival probability.
 pub const RUSSIAN_ROULETTE_SURVIVE: f64 = 0.1;
+
+/// Apply refraction at a shell boundary and advance the photon past it.
+///
+/// Returns the new (position, direction) after crossing. For total
+/// internal reflection the direction is reflected and the photon stays
+/// in the same shell (the caller should `continue` the bounce loop).
+#[inline]
+fn cross_boundary(
+    pos: Vec3,
+    dir: Vec3,
+    boundary_dist: f64,
+    is_outward: bool,
+    shell_idx: usize,
+    atm: &AtmosphereModel,
+) -> (Vec3, Vec3) {
+    let boundary_pos = pos + dir * boundary_dist;
+    let n_from = atm.refractive_index[shell_idx];
+    let next_shell = if is_outward {
+        shell_idx + 1
+    } else {
+        shell_idx.wrapping_sub(1)
+    };
+    let n_to = if next_shell < atm.num_shells {
+        atm.refractive_index[next_shell]
+    } else {
+        1.0 // vacuum above TOA / ground below
+    };
+    let new_dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+        RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+    };
+    (boundary_pos + new_dir * 1e-3, new_dir)
+}
 
 /// Result of tracing a single photon.
 #[derive(Debug, Clone, Copy)]
@@ -83,10 +115,13 @@ pub fn trace_photon(
 
         // If extinction is zero, photon passes through without interaction
         if optics.extinction < 1e-20 {
-            // Move to next shell boundary
+            // Move to next shell boundary (with refraction)
             match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
-                Some((dist, _)) => {
-                    pos = pos + dir * (dist + 1e-3); // small nudge past boundary
+                Some((dist, is_outward)) => {
+                    let (new_pos, new_dir) =
+                        cross_boundary(pos, dir, dist, is_outward, shell_idx, atm);
+                    pos = new_pos;
+                    dir = new_dir;
                     continue;
                 }
                 None => {
@@ -104,9 +139,12 @@ pub fn trace_photon(
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((boundary_dist, is_outward)) => {
                 if free_path >= boundary_dist {
-                    // Photon exits this shell without scattering
-                    // Apply transmittance
-                    pos = pos + dir * (boundary_dist + 1e-3);
+                    // Photon exits this shell without scattering.
+                    // Apply refraction at the boundary.
+                    let (new_pos, new_dir) =
+                        cross_boundary(pos, dir, boundary_dist, is_outward, shell_idx, atm);
+                    pos = new_pos;
+                    dir = new_dir;
 
                     // Check if we hit the ground
                     if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
@@ -214,8 +252,9 @@ fn compute_nee(
 
 /// Compute transmittance along a ray through the atmosphere.
 ///
-/// Integrates optical depth from `start_pos` in `direction` until the ray
-/// exits the atmosphere. Returns exp(-total_optical_depth).
+/// Traces the ray shell-by-shell, applying Snell's law at each boundary
+/// so the shadow ray follows the physically correct curved path.
+/// Returns exp(-total_optical_depth).
 fn trace_transmittance(
     atm: &AtmosphereModel,
     start_pos: Vec3,
@@ -223,6 +262,7 @@ fn trace_transmittance(
     wavelength_idx: usize,
 ) -> f64 {
     let mut pos = start_pos;
+    let mut dir = direction;
     let mut total_optical_depth = 0.0;
 
     for _ in 0..200 {
@@ -236,12 +276,16 @@ fn trace_transmittance(
         let shell = &atm.shells[shell_idx];
         let optics = &atm.optics[shell_idx][wavelength_idx];
 
-        match next_shell_boundary(pos, direction, shell.r_inner, shell.r_outer) {
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
                 total_optical_depth += optics.extinction * dist;
-                pos = pos + direction * (dist + 1e-3);
 
-                // Hit ground — fully opaque
+                // Refract at the boundary
+                let (new_pos, new_dir) = cross_boundary(pos, dir, dist, is_outward, shell_idx, atm);
+                pos = new_pos;
+                dir = new_dir;
+
+                // Hit ground -- fully opaque
                 if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
                     return 0.0;
                 }
@@ -555,8 +599,11 @@ fn trace_secondary_chain(
 
         if optics.extinction < 1e-20 {
             match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                Some((dist, _)) => {
-                    pos = pos + current_dir * (dist + 1e-3);
+                Some((dist, is_outward)) => {
+                    let (new_pos, new_dir) =
+                        cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
+                    pos = new_pos;
+                    current_dir = new_dir;
                     continue;
                 }
                 None => break,
@@ -570,7 +617,10 @@ fn trace_secondary_chain(
         match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
             Some((boundary_dist, is_outward)) => {
                 if free_path >= boundary_dist {
-                    pos = pos + current_dir * (boundary_dist + 1e-3);
+                    let (new_pos, new_dir) =
+                        cross_boundary(pos, current_dir, boundary_dist, is_outward, shell_idx, atm);
+                    pos = new_pos;
+                    current_dir = new_dir;
 
                     // Ground reflection
                     if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
@@ -1164,5 +1214,195 @@ mod tests {
                 s2[w]
             );
         }
+    }
+
+    // ── Refraction in MCRT transport ──
+
+    fn make_refraction_scattering_atmosphere() -> crate::atmosphere::AtmosphereModel {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics};
+
+        let altitudes_km = [0.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+
+        for s in 0..atm.num_shells {
+            let h = atm.shells[s].altitude_mid;
+            for w in 0..3 {
+                let lambda_factor = if w == 0 {
+                    4.0
+                } else if w == 1 {
+                    1.0
+                } else {
+                    0.3
+                };
+                atm.optics[s][w] = ShellOptics {
+                    extinction: 1.3e-5 * lambda_factor * libm::exp(-h / 8500.0),
+                    ssa: 1.0,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+
+        atm
+    }
+
+    #[test]
+    fn trace_photon_with_refraction_terminates() {
+        let mut atm = make_refraction_scattering_atmosphere();
+        atm.compute_refractive_indices();
+
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+        let mut rng: u64 = 42;
+
+        let result = trace_photon(&atm, obs, view, sun, 1, &mut rng);
+        assert!(result.terminated, "Photon should always terminate");
+    }
+
+    #[test]
+    fn trace_photon_with_refraction_non_negative() {
+        let mut atm = make_refraction_scattering_atmosphere();
+        atm.compute_refractive_indices();
+
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        for seed in 0..50u64 {
+            let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let result = trace_photon(&atm, obs, view, sun, 1, &mut rng);
+            assert!(
+                result.weight >= 0.0,
+                "Photon weight should be non-negative: seed={}, weight={}",
+                seed,
+                result.weight
+            );
+        }
+    }
+
+    #[test]
+    fn mc_spectrum_with_refraction_positive_at_civil_twilight() {
+        let mut atm = make_refraction_scattering_atmosphere();
+        atm.compute_refractive_indices();
+
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 500, 42);
+        let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
+        assert!(
+            total > 0.0,
+            "MC with refraction should produce positive radiance at SZA=92, got {}",
+            total
+        );
+    }
+
+    #[test]
+    fn mc_spectrum_with_refraction_deterministic() {
+        let mut atm = make_refraction_scattering_atmosphere();
+        atm.compute_refractive_indices();
+
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        for w in 0..atm.num_wavelengths {
+            assert!(
+                (s1[w] - s2[w]).abs() < 1e-15,
+                "Refracted MC should be deterministic: [{}] {} vs {}",
+                w,
+                s1[w],
+                s2[w]
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_spectrum_with_refraction_non_negative() {
+        let mut atm = make_refraction_scattering_atmosphere();
+        atm.compute_refractive_indices();
+
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+
+        for sza in &[92.0, 96.0, 102.0] {
+            let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
+            let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42);
+            for w in 0..atm.num_wavelengths {
+                assert!(
+                    spectrum[w] >= 0.0,
+                    "Hybrid with refraction should be non-negative: SZA={}, wl={}, val={:.4e}",
+                    sza,
+                    w,
+                    spectrum[w]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_spectrum_with_refraction_positive_at_civil_twilight() {
+        let mut atm = make_refraction_scattering_atmosphere();
+        atm.compute_refractive_indices();
+
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42);
+        let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
+        assert!(
+            total > 0.0,
+            "Hybrid with refraction should produce positive radiance at SZA=92, got {}",
+            total
+        );
+    }
+
+    #[test]
+    fn cross_boundary_with_n1_preserves_direction() {
+        // When all n=1.0, cross_boundary should not change direction
+        let atm = make_scattering_atmosphere(); // n=1.0 default
+
+        let pos = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 5000.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(0.3, 0.9, 0.1).normalize();
+        let boundary_dist = 100.0;
+
+        let (new_pos, new_dir) = cross_boundary(pos, dir, boundary_dist, true, 0, &atm);
+
+        // Direction should be identical
+        assert!(
+            (new_dir.x - dir.x).abs() < 1e-10,
+            "n=1 should preserve direction"
+        );
+        assert!((new_dir.y - dir.y).abs() < 1e-10);
+        assert!((new_dir.z - dir.z).abs() < 1e-10);
+
+        // Position should be boundary + 1e-3 nudge
+        let expected_pos = pos + dir * boundary_dist + dir * 1e-3;
+        assert!((new_pos.x - expected_pos.x).abs() < 1e-6);
+        assert!((new_pos.y - expected_pos.y).abs() < 1e-6);
+        assert!((new_pos.z - expected_pos.z).abs() < 1e-6);
+    }
+
+    #[test]
+    fn trace_photon_empty_atm_with_refraction_escapes() {
+        // Refraction indices set but zero extinction: photon should still escape
+        let mut atm = crate::atmosphere::AtmosphereModel::new(&[0.0, 50.0, 100.0], &[550.0]);
+        atm.compute_refractive_indices_from_altitude();
+
+        let obs = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0); // radially outward
+        let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
+        let mut rng: u64 = 42;
+
+        let result = trace_photon(&atm, obs, view, sun, 0, &mut rng);
+        assert!(result.terminated);
+        assert_eq!(result.num_scatters, 0);
+        assert!(result.weight.abs() < 1e-20);
     }
 }
