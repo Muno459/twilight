@@ -1,4 +1,14 @@
 //! Rayleigh and Mie/Henyey-Greenstein scattering phase functions.
+//!
+//! This module provides both scalar (unpolarized) and full Stokes vector
+//! (polarized) scattering. The scalar functions are used when the `--fast`
+//! flag is set; the Stokes/Mueller framework is used by default for
+//! physically rigorous polarized radiative transfer.
+//!
+//! Stokes vector convention: S = (I, Q, U, V) where I is total intensity,
+//! Q and U describe linear polarization, V describes circular polarization.
+//! The reference plane for Q/U is the scattering plane (containing the
+//! incident and scattered ray directions).
 
 use libm::cos;
 
@@ -148,6 +158,335 @@ pub fn scatter_direction(
         sin_theta * cos_phi * u.z + sin_theta * sin_phi * v.z + cos_theta * w.z,
     )
     .normalize()
+}
+
+// ── Stokes vector polarized radiative transfer ─────────────────────────
+
+/// Stokes vector: (I, Q, U, V).
+///
+/// I = total intensity, Q = linear polarization (0/90 deg), U = linear
+/// polarization (45/135 deg), V = circular polarization.
+///
+/// The reference plane is the local scattering plane. When a photon
+/// changes scattering plane between bounces, a rotation matrix must be
+/// applied (see [`rotation_mueller`]).
+#[derive(Debug, Clone, Copy)]
+pub struct StokesVector {
+    pub s: [f64; 4],
+}
+
+impl StokesVector {
+    /// Unpolarized light with given intensity.
+    #[inline]
+    pub const fn unpolarized(intensity: f64) -> Self {
+        Self {
+            s: [intensity, 0.0, 0.0, 0.0],
+        }
+    }
+
+    /// Create from explicit components.
+    #[inline]
+    pub const fn new(i: f64, q: f64, u: f64, v: f64) -> Self {
+        Self { s: [i, q, u, v] }
+    }
+
+    /// Total intensity (first Stokes parameter).
+    #[inline]
+    pub fn intensity(&self) -> f64 {
+        self.s[0]
+    }
+
+    /// Degree of polarization: sqrt(Q^2 + U^2 + V^2) / I.
+    #[inline]
+    pub fn degree_of_polarization(&self) -> f64 {
+        let i = self.s[0];
+        if i < 1e-30 {
+            return 0.0;
+        }
+        let q = self.s[1];
+        let u = self.s[2];
+        let v = self.s[3];
+        libm::sqrt(q * q + u * u + v * v) / i
+    }
+
+    /// Degree of linear polarization: sqrt(Q^2 + U^2) / I.
+    #[inline]
+    pub fn degree_of_linear_polarization(&self) -> f64 {
+        let i = self.s[0];
+        if i < 1e-30 {
+            return 0.0;
+        }
+        libm::sqrt(self.s[1] * self.s[1] + self.s[2] * self.s[2]) / i
+    }
+
+    /// Scale all components by a factor.
+    #[inline]
+    pub fn scale(&self, factor: f64) -> Self {
+        Self {
+            s: [
+                self.s[0] * factor,
+                self.s[1] * factor,
+                self.s[2] * factor,
+                self.s[3] * factor,
+            ],
+        }
+    }
+
+    /// Add two Stokes vectors (incoherent superposition).
+    #[inline]
+    pub fn add(&self, other: &Self) -> Self {
+        Self {
+            s: [
+                self.s[0] + other.s[0],
+                self.s[1] + other.s[1],
+                self.s[2] + other.s[2],
+                self.s[3] + other.s[3],
+            ],
+        }
+    }
+}
+
+/// 4x4 Mueller matrix for polarized scattering.
+///
+/// Transforms a Stokes vector: S_out = M * S_in.
+/// Row-major storage: m[row][col].
+#[derive(Debug, Clone, Copy)]
+pub struct MuellerMatrix {
+    pub m: [[f64; 4]; 4],
+}
+
+impl MuellerMatrix {
+    /// Identity Mueller matrix (no change to Stokes vector).
+    #[inline]
+    pub const fn identity() -> Self {
+        Self {
+            m: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// Zero Mueller matrix.
+    #[inline]
+    pub const fn zero() -> Self {
+        Self { m: [[0.0; 4]; 4] }
+    }
+
+    /// Multiply this Mueller matrix by a Stokes vector: S_out = M * S_in.
+    #[inline]
+    pub fn apply(&self, s: &StokesVector) -> StokesVector {
+        let mut out = [0.0f64; 4];
+        for i in 0..4 {
+            out[i] = self.m[i][0] * s.s[0]
+                + self.m[i][1] * s.s[1]
+                + self.m[i][2] * s.s[2]
+                + self.m[i][3] * s.s[3];
+        }
+        StokesVector { s: out }
+    }
+
+    /// Multiply two Mueller matrices: C = A * B (self = A).
+    #[inline]
+    pub fn mul(&self, other: &Self) -> Self {
+        let mut out = [[0.0f64; 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                out[i][j] = self.m[i][0] * other.m[0][j]
+                    + self.m[i][1] * other.m[1][j]
+                    + self.m[i][2] * other.m[2][j]
+                    + self.m[i][3] * other.m[3][j];
+            }
+        }
+        Self { m: out }
+    }
+
+    /// Scale all elements by a factor.
+    #[inline]
+    pub fn scale(&self, factor: f64) -> Self {
+        let mut out = self.m;
+        for row in &mut out {
+            for val in row.iter_mut() {
+                *val *= factor;
+            }
+        }
+        Self { m: out }
+    }
+}
+
+/// Rayleigh scattering Mueller matrix.
+///
+/// For scattering angle theta (given cos_theta), the exact Rayleigh
+/// scattering matrix is:
+///
+/// ```text
+///         3     [ cos^2(t)+1   cos^2(t)-1       0        0     ]
+/// M = --------- [  cos^2(t)-1  cos^2(t)+1       0        0     ]
+///       4       [      0           0         2cos(t)      0     ]
+///               [      0           0            0      2cos(t)  ]
+/// ```
+///
+/// This is in the scattering plane reference frame. The M(1,1) element
+/// (top-left) equals the scalar Rayleigh phase function: 0.75*(1+cos^2(t)).
+///
+/// Reference: Chandrasekhar (1960), van de Hulst (1981).
+pub fn rayleigh_mueller(cos_theta: f64) -> MuellerMatrix {
+    let c2 = cos_theta * cos_theta;
+    let a = c2 + 1.0;
+    let b = c2 - 1.0;
+    let d = 2.0 * cos_theta;
+
+    MuellerMatrix {
+        m: [
+            [0.75 * a, 0.75 * b, 0.0, 0.0],
+            [0.75 * b, 0.75 * a, 0.0, 0.0],
+            [0.0, 0.0, 0.75 * d, 0.0],
+            [0.0, 0.0, 0.0, 0.75 * d],
+        ],
+    }
+}
+
+/// Henyey-Greenstein Mueller matrix (approximate).
+///
+/// The HG phase function has no analytical polarization matrix because
+/// it is a phenomenological fit, not derived from Mie theory. Following
+/// standard practice (Hovenier & van der Mee, 1983), we use the scalar
+/// HG phase function as the M(1,1) element with the off-diagonal
+/// structure of a general spherical particle scattering matrix:
+///
+/// ```text
+///     [ P11   P12   0    0  ]
+/// M = [ P12   P22   0    0  ]
+///     [  0     0   P33  P34 ]
+///     [  0     0  -P34  P44 ]
+/// ```
+///
+/// For the HG approximation, we set P22 = P11 (which is exact for
+/// spherical droplets in the far field) and P12 = P33 = P34 = P44 = 0.
+/// This makes HG scattering effectively unpolarizing -- the intensity
+/// transforms according to the HG phase function, but no polarization
+/// is induced. This is a common and physically reasonable approximation
+/// for aerosol/cloud scattering when Mie-computed phase matrices are
+/// not available.
+pub fn hg_mueller(cos_theta: f64, g: f64) -> MuellerMatrix {
+    let p11 = henyey_greenstein_phase(cos_theta, g);
+    MuellerMatrix {
+        m: [
+            [p11, 0.0, 0.0, 0.0],
+            [0.0, p11, 0.0, 0.0],
+            [0.0, 0.0, p11, 0.0],
+            [0.0, 0.0, 0.0, p11],
+        ],
+    }
+}
+
+/// Mueller matrix for rotation of the reference plane by angle phi.
+///
+/// When the scattering plane changes between successive scattering events,
+/// the Stokes vector must be rotated from the old scattering plane to the
+/// new one. This rotation only affects Q and U (the linear polarization
+/// components); I and V are invariant.
+///
+/// ```text
+///     [ 1     0         0       0 ]
+/// R = [ 0   cos(2phi)  sin(2phi) 0 ]
+///     [ 0  -sin(2phi)  cos(2phi) 0 ]
+///     [ 0     0         0       1 ]
+/// ```
+///
+/// `phi` is the angle between the old and new scattering planes,
+/// measured in radians.
+pub fn rotation_mueller(phi: f64) -> MuellerMatrix {
+    let c = libm::cos(2.0 * phi);
+    let s = libm::sin(2.0 * phi);
+    MuellerMatrix {
+        m: [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, c, s, 0.0],
+            [0.0, -s, c, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+    }
+}
+
+/// Compute the rotation angle between two scattering planes.
+///
+/// Given the previous ray direction (`dir_in`), the current ray direction
+/// after scattering (`dir_out`), and the new scattering direction
+/// (`dir_next`), compute the angle phi needed to rotate the Stokes
+/// reference frame from the old scattering plane (dir_in, dir_out)
+/// to the new scattering plane (dir_out, dir_next).
+///
+/// The scattering plane is defined by the cross product of the incident
+/// and scattered directions. The rotation angle is the angle between
+/// the two planes' normal vectors.
+pub fn scattering_plane_rotation(
+    dir_in: crate::geometry::Vec3,
+    dir_out: crate::geometry::Vec3,
+    dir_next: crate::geometry::Vec3,
+) -> f64 {
+    // Normal to old scattering plane
+    let n_old = dir_in.cross(dir_out);
+    let n_old_len = n_old.length();
+
+    // Normal to new scattering plane
+    let n_new = dir_out.cross(dir_next);
+    let n_new_len = n_new.length();
+
+    // If either plane is degenerate (forward/backward scattering), no rotation needed
+    if n_old_len < 1e-12 || n_new_len < 1e-12 {
+        return 0.0;
+    }
+
+    let n_old_unit = n_old * (1.0 / n_old_len);
+    let n_new_unit = n_new * (1.0 / n_new_len);
+
+    // cos(phi) = n_old . n_new
+    let cos_phi = n_old_unit.dot(n_new_unit);
+    // sin(phi) = (n_old x n_new) . dir_out (signed angle)
+    let sin_phi = n_old_unit.cross(n_new_unit).dot(dir_out);
+
+    libm::atan2(sin_phi, cos_phi)
+}
+
+/// Compute the combined Mueller matrix for a scattering event,
+/// including reference frame rotation.
+///
+/// This is the full polarized scattering operation: rotate the Stokes
+/// vector from the old scattering plane to the new one, then apply
+/// the scattering Mueller matrix.
+///
+/// `M_total = M_scatter * R(phi)`
+///
+/// where R(phi) rotates from the old plane to the current scattering plane.
+pub fn scatter_mueller(
+    cos_theta: f64,
+    rayleigh_fraction: f64,
+    asymmetry: f64,
+    rotation_angle: f64,
+) -> MuellerMatrix {
+    let rot = rotation_mueller(rotation_angle);
+
+    let scatter = if rayleigh_fraction > 0.99 {
+        rayleigh_mueller(cos_theta)
+    } else if rayleigh_fraction < 0.01 {
+        hg_mueller(cos_theta, asymmetry)
+    } else {
+        // Weighted combination of Rayleigh and HG Mueller matrices
+        let mr = rayleigh_mueller(cos_theta).scale(rayleigh_fraction);
+        let mh = hg_mueller(cos_theta, asymmetry).scale(1.0 - rayleigh_fraction);
+        let mut m = MuellerMatrix::zero();
+        for i in 0..4 {
+            for j in 0..4 {
+                m.m[i][j] = mr.m[i][j] + mh.m[i][j];
+            }
+        }
+        m
+    };
+
+    scatter.mul(&rot)
 }
 
 #[cfg(test)]
@@ -514,5 +853,484 @@ mod tests {
                 dir
             );
         }
+    }
+
+    // ── StokesVector ──
+
+    #[test]
+    fn stokes_unpolarized_has_zero_qvu() {
+        let s = StokesVector::unpolarized(1.0);
+        assert!((s.s[0] - 1.0).abs() < EPSILON);
+        assert!(s.s[1].abs() < EPSILON);
+        assert!(s.s[2].abs() < EPSILON);
+        assert!(s.s[3].abs() < EPSILON);
+    }
+
+    #[test]
+    fn stokes_degree_of_polarization_unpolarized() {
+        let s = StokesVector::unpolarized(5.0);
+        assert!(s.degree_of_polarization() < EPSILON);
+    }
+
+    #[test]
+    fn stokes_degree_of_polarization_fully_polarized() {
+        // Fully linearly polarized: Q = I, U = V = 0
+        let s = StokesVector::new(1.0, 1.0, 0.0, 0.0);
+        assert!((s.degree_of_polarization() - 1.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn stokes_degree_of_polarization_partially_polarized() {
+        let s = StokesVector::new(1.0, 0.5, 0.0, 0.0);
+        assert!((s.degree_of_polarization() - 0.5).abs() < EPSILON);
+    }
+
+    #[test]
+    fn stokes_degree_of_linear_polarization() {
+        let s = StokesVector::new(1.0, 0.3, 0.4, 0.0);
+        let expected = libm::sqrt(0.3 * 0.3 + 0.4 * 0.4);
+        assert!((s.degree_of_linear_polarization() - expected).abs() < EPSILON);
+    }
+
+    #[test]
+    fn stokes_scale() {
+        let s = StokesVector::new(1.0, 0.5, -0.3, 0.1);
+        let s2 = s.scale(2.0);
+        assert!((s2.s[0] - 2.0).abs() < EPSILON);
+        assert!((s2.s[1] - 1.0).abs() < EPSILON);
+        assert!((s2.s[2] - (-0.6)).abs() < EPSILON);
+        assert!((s2.s[3] - 0.2).abs() < EPSILON);
+    }
+
+    #[test]
+    fn stokes_add() {
+        let a = StokesVector::new(1.0, 0.5, 0.0, 0.0);
+        let b = StokesVector::new(1.0, -0.5, 0.3, 0.1);
+        let c = a.add(&b);
+        assert!((c.s[0] - 2.0).abs() < EPSILON);
+        assert!((c.s[1] - 0.0).abs() < EPSILON);
+        assert!((c.s[2] - 0.3).abs() < EPSILON);
+        assert!((c.s[3] - 0.1).abs() < EPSILON);
+    }
+
+    #[test]
+    fn stokes_intensity_method() {
+        let s = StokesVector::new(3.14, 0.1, 0.2, 0.3);
+        assert!((s.intensity() - 3.14).abs() < EPSILON);
+    }
+
+    #[test]
+    fn stokes_zero_intensity_dop() {
+        let s = StokesVector::new(0.0, 0.0, 0.0, 0.0);
+        assert!(s.degree_of_polarization() < EPSILON);
+    }
+
+    // ── MuellerMatrix ──
+
+    #[test]
+    fn mueller_identity_preserves_stokes() {
+        let m = MuellerMatrix::identity();
+        let s = StokesVector::new(1.0, 0.5, -0.3, 0.1);
+        let out = m.apply(&s);
+        for i in 0..4 {
+            assert!(
+                (out.s[i] - s.s[i]).abs() < EPSILON,
+                "Identity should preserve component {}: {} vs {}",
+                i,
+                out.s[i],
+                s.s[i]
+            );
+        }
+    }
+
+    #[test]
+    fn mueller_zero_zeroes_stokes() {
+        let m = MuellerMatrix::zero();
+        let s = StokesVector::new(1.0, 0.5, -0.3, 0.1);
+        let out = m.apply(&s);
+        for i in 0..4 {
+            assert!(out.s[i].abs() < EPSILON);
+        }
+    }
+
+    #[test]
+    fn mueller_mul_identity_is_identity() {
+        let id = MuellerMatrix::identity();
+        let m = rayleigh_mueller(0.5);
+        let result = m.mul(&id);
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (result.m[i][j] - m.m[i][j]).abs() < EPSILON,
+                    "M*I should equal M at [{},{}]",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mueller_scale() {
+        let m = rayleigh_mueller(0.5);
+        let ms = m.scale(2.0);
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (ms.m[i][j] - 2.0 * m.m[i][j]).abs() < EPSILON,
+                    "Scale 2x failed at [{},{}]",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    // ── Rayleigh Mueller matrix ──
+
+    #[test]
+    fn rayleigh_mueller_forward_scattering() {
+        // cos_theta = 1 (forward): M should be 0.75 * [[2,0,0,0],[0,2,0,0],[0,0,2,0],[0,0,0,2]]
+        // = 1.5 * I
+        let m = rayleigh_mueller(1.0);
+        assert!((m.m[0][0] - 1.5).abs() < EPSILON);
+        assert!((m.m[1][1] - 1.5).abs() < EPSILON);
+        assert!((m.m[2][2] - 1.5).abs() < EPSILON);
+        assert!((m.m[3][3] - 1.5).abs() < EPSILON);
+        assert!(m.m[0][1].abs() < EPSILON); // off-diag zero at theta=0
+        assert!(m.m[1][0].abs() < EPSILON);
+    }
+
+    #[test]
+    fn rayleigh_mueller_backward_scattering() {
+        // cos_theta = -1: same as forward (Rayleigh is symmetric)
+        let m = rayleigh_mueller(-1.0);
+        assert!((m.m[0][0] - 1.5).abs() < EPSILON);
+        assert!((m.m[0][1]).abs() < EPSILON);
+    }
+
+    #[test]
+    fn rayleigh_mueller_90_degree_scattering() {
+        // cos_theta = 0 (90 deg): maximum polarization
+        let m = rayleigh_mueller(0.0);
+        // M(1,1) = 0.75*(0+1) = 0.75
+        assert!((m.m[0][0] - 0.75).abs() < EPSILON);
+        // M(1,2) = 0.75*(0-1) = -0.75
+        assert!((m.m[0][1] - (-0.75)).abs() < EPSILON);
+        // M(2,1) = -0.75
+        assert!((m.m[1][0] - (-0.75)).abs() < EPSILON);
+        // M(3,3) = 0.75 * 2*0 = 0
+        assert!(m.m[2][2].abs() < EPSILON);
+        assert!(m.m[3][3].abs() < EPSILON);
+    }
+
+    #[test]
+    fn rayleigh_mueller_m11_equals_scalar_phase() {
+        // The M(1,1) element should equal the scalar Rayleigh phase function
+        for cos_theta in &[-1.0, -0.5, 0.0, 0.5, 1.0] {
+            let m = rayleigh_mueller(*cos_theta);
+            let p = rayleigh_phase(*cos_theta);
+            assert!(
+                (m.m[0][0] - p).abs() < EPSILON,
+                "M[0][0]={} != P(cos_theta={})={}",
+                m.m[0][0],
+                cos_theta,
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn rayleigh_mueller_unpolarized_gives_scalar_result() {
+        // Applying Rayleigh Mueller to unpolarized light should give
+        // intensity = scalar phase function * I_in.
+        let cos_theta = 0.6;
+        let m = rayleigh_mueller(cos_theta);
+        let s_in = StokesVector::unpolarized(1.0);
+        let s_out = m.apply(&s_in);
+        let expected_i = rayleigh_phase(cos_theta);
+        assert!(
+            (s_out.s[0] - expected_i).abs() < EPSILON,
+            "Unpolarized: I_out={}, expected {}",
+            s_out.s[0],
+            expected_i
+        );
+    }
+
+    #[test]
+    fn rayleigh_mueller_90deg_produces_max_polarization() {
+        // At 90 degrees, unpolarized light becomes fully linearly polarized.
+        let m = rayleigh_mueller(0.0);
+        let s_in = StokesVector::unpolarized(1.0);
+        let s_out = m.apply(&s_in);
+        // DOP should be 1.0 (fully polarized)
+        let dop = s_out.degree_of_polarization();
+        assert!(
+            (dop - 1.0).abs() < EPSILON,
+            "90-deg Rayleigh should fully polarize: DOP={}",
+            dop
+        );
+    }
+
+    #[test]
+    fn rayleigh_mueller_symmetric_in_cos_theta() {
+        // P(mu) = P(-mu) for M(1,1), and M(1,2) should also be symmetric
+        for mu in &[0.1, 0.3, 0.5, 0.7, 0.9] {
+            let mp = rayleigh_mueller(*mu);
+            let mn = rayleigh_mueller(-*mu);
+            assert!((mp.m[0][0] - mn.m[0][0]).abs() < EPSILON);
+            assert!((mp.m[0][1] - mn.m[0][1]).abs() < EPSILON);
+        }
+    }
+
+    // ── HG Mueller matrix ──
+
+    #[test]
+    fn hg_mueller_m11_equals_scalar_phase() {
+        let g = 0.7;
+        for cos_theta in &[-1.0, -0.5, 0.0, 0.5, 1.0] {
+            let m = hg_mueller(*cos_theta, g);
+            let p = henyey_greenstein_phase(*cos_theta, g);
+            assert!(
+                (m.m[0][0] - p).abs() < EPSILON,
+                "HG M[0][0]={} != P={}",
+                m.m[0][0],
+                p
+            );
+        }
+    }
+
+    #[test]
+    fn hg_mueller_is_diagonal() {
+        // Our HG Mueller approximation is diagonal (no polarization induced)
+        let m = hg_mueller(0.5, 0.85);
+        for i in 0..4 {
+            for j in 0..4 {
+                if i != j {
+                    assert!(
+                        m.m[i][j].abs() < EPSILON,
+                        "HG Mueller off-diagonal [{},{}]={}",
+                        i,
+                        j,
+                        m.m[i][j]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hg_mueller_unpolarized_gives_scalar_result() {
+        let cos_theta = 0.3;
+        let g = 0.85;
+        let m = hg_mueller(cos_theta, g);
+        let s_in = StokesVector::unpolarized(1.0);
+        let s_out = m.apply(&s_in);
+        let expected = henyey_greenstein_phase(cos_theta, g);
+        assert!(
+            (s_out.s[0] - expected).abs() < EPSILON,
+            "HG unpolarized: I_out={}, expected {}",
+            s_out.s[0],
+            expected
+        );
+    }
+
+    // ── Rotation Mueller matrix ──
+
+    #[test]
+    fn rotation_mueller_zero_angle_is_identity() {
+        let r = rotation_mueller(0.0);
+        let id = MuellerMatrix::identity();
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (r.m[i][j] - id.m[i][j]).abs() < EPSILON,
+                    "R(0) should be identity at [{},{}]",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rotation_mueller_preserves_intensity() {
+        // Rotation should not change I or V
+        let r = rotation_mueller(0.7);
+        let s = StokesVector::new(1.0, 0.5, 0.3, 0.1);
+        let out = r.apply(&s);
+        assert!((out.s[0] - 1.0).abs() < EPSILON, "I should be preserved");
+        assert!((out.s[3] - 0.1).abs() < EPSILON, "V should be preserved");
+    }
+
+    #[test]
+    fn rotation_mueller_preserves_dop() {
+        // Rotation should not change the degree of polarization
+        let s = StokesVector::new(1.0, 0.5, 0.3, 0.1);
+        let dop_before = s.degree_of_polarization();
+        let r = rotation_mueller(1.23);
+        let out = r.apply(&s);
+        let dop_after = out.degree_of_polarization();
+        assert!(
+            (dop_before - dop_after).abs() < 1e-8,
+            "Rotation should preserve DOP: {} -> {}",
+            dop_before,
+            dop_after
+        );
+    }
+
+    #[test]
+    fn rotation_mueller_pi_flips_qu() {
+        // Rotating by pi: cos(2pi) = 1, sin(2pi) = 0 → identity
+        // Actually R(pi): cos(2*pi) = 1, sin(2*pi) ≈ 0 → identity!
+        // Rotating by pi/2: cos(pi) = -1, sin(pi) = 0 → Q → -Q, U → -U
+        let r = rotation_mueller(core::f64::consts::PI / 2.0);
+        let s = StokesVector::new(1.0, 0.5, 0.3, 0.1);
+        let out = r.apply(&s);
+        assert!((out.s[0] - 1.0).abs() < EPSILON);
+        assert!((out.s[1] - (-0.5)).abs() < EPSILON);
+        assert!((out.s[2] - (-0.3)).abs() < EPSILON);
+        assert!((out.s[3] - 0.1).abs() < EPSILON);
+    }
+
+    #[test]
+    fn rotation_mueller_quarter_rotation() {
+        // phi = pi/4: cos(pi/2) = 0, sin(pi/2) = 1
+        // Q_out = 0*Q + 1*U = U
+        // U_out = -1*Q + 0*U = -Q
+        let r = rotation_mueller(core::f64::consts::PI / 4.0);
+        let s = StokesVector::new(1.0, 0.6, 0.3, 0.0);
+        let out = r.apply(&s);
+        assert!((out.s[0] - 1.0).abs() < EPSILON);
+        assert!((out.s[1] - 0.3).abs() < EPSILON, "Q_out should be U_in");
+        assert!((out.s[2] - (-0.6)).abs() < EPSILON, "U_out should be -Q_in");
+    }
+
+    #[test]
+    fn rotation_mueller_double_rotation_adds() {
+        // R(a) * R(b) should equal R(a+b) for the Q,U block
+        let a = 0.3;
+        let b = 0.7;
+        let ra = rotation_mueller(a);
+        let rb = rotation_mueller(b);
+        let rab = ra.mul(&rb);
+        let r_sum = rotation_mueller(a + b);
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (rab.m[i][j] - r_sum.m[i][j]).abs() < 1e-8,
+                    "R(a)*R(b) != R(a+b) at [{},{}]",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    // ── scattering_plane_rotation ──
+
+    #[test]
+    fn scattering_plane_rotation_same_plane() {
+        // If all three directions are coplanar, phi should be 0
+        let dir_in = Vec3::new(0.0, 0.0, 1.0);
+        let dir_out = Vec3::new(0.0, 0.5, 0.866).normalize();
+        let dir_next = Vec3::new(0.0, 0.866, 0.5).normalize();
+        let phi = scattering_plane_rotation(dir_in, dir_out, dir_next);
+        assert!(
+            phi.abs() < 1e-6,
+            "Coplanar directions should give phi=0, got {}",
+            phi
+        );
+    }
+
+    #[test]
+    fn scattering_plane_rotation_forward_scatter() {
+        // Forward scattering (dir_in = dir_out) → degenerate plane → phi = 0
+        let dir = Vec3::new(0.0, 0.0, 1.0);
+        let dir_next = Vec3::new(0.5, 0.0, 0.866).normalize();
+        let phi = scattering_plane_rotation(dir, dir, dir_next);
+        assert!(
+            phi.abs() < EPSILON,
+            "Forward scatter should give phi=0, got {}",
+            phi
+        );
+    }
+
+    // ── scatter_mueller (combined) ──
+
+    #[test]
+    fn scatter_mueller_pure_rayleigh_at_zero_rotation() {
+        let cos_theta = 0.5;
+        let m = scatter_mueller(cos_theta, 1.0, 0.0, 0.0);
+        let mr = rayleigh_mueller(cos_theta);
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (m.m[i][j] - mr.m[i][j]).abs() < EPSILON,
+                    "Pure Rayleigh at rotation=0 should match at [{},{}]",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scatter_mueller_pure_hg_at_zero_rotation() {
+        let cos_theta = 0.5;
+        let g = 0.85;
+        let m = scatter_mueller(cos_theta, 0.0, g, 0.0);
+        let mh = hg_mueller(cos_theta, g);
+        for i in 0..4 {
+            for j in 0..4 {
+                assert!(
+                    (m.m[i][j] - mh.m[i][j]).abs() < EPSILON,
+                    "Pure HG at rotation=0 should match at [{},{}]",
+                    i,
+                    j
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scatter_mueller_mixed_interpolates() {
+        // With 50% Rayleigh, 50% HG, M(1,1) should be average of both
+        let cos_theta = 0.5;
+        let g = 0.7;
+        let m = scatter_mueller(cos_theta, 0.5, g, 0.0);
+        let expected_m11 =
+            0.5 * rayleigh_phase(cos_theta) + 0.5 * henyey_greenstein_phase(cos_theta, g);
+        assert!(
+            (m.m[0][0] - expected_m11).abs() < EPSILON,
+            "Mixed M[0][0]={}, expected {}",
+            m.m[0][0],
+            expected_m11
+        );
+    }
+
+    #[test]
+    fn scatter_mueller_unpolarized_intensity_matches_scalar() {
+        // For unpolarized input, the output intensity from the Mueller
+        // framework should exactly match the scalar phase function
+        let cos_theta = 0.3;
+        let s_in = StokesVector::unpolarized(1.0);
+
+        // Pure Rayleigh
+        let m_r = scatter_mueller(cos_theta, 1.0, 0.0, 0.0);
+        let s_r = m_r.apply(&s_in);
+        assert!(
+            (s_r.s[0] - rayleigh_phase(cos_theta)).abs() < EPSILON,
+            "Rayleigh scalar mismatch"
+        );
+
+        // Pure HG
+        let g = 0.85;
+        let m_h = scatter_mueller(cos_theta, 0.0, g, 0.0);
+        let s_h = m_h.apply(&s_in);
+        assert!(
+            (s_h.s[0] - henyey_greenstein_phase(cos_theta, g)).abs() < EPSILON,
+            "HG scalar mismatch"
+        );
     }
 }
