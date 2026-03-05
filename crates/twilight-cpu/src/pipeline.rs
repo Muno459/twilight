@@ -25,6 +25,7 @@ use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
 use twilight_threshold::threshold::{self, ThresholdConfig, TwilightAnalysis};
 
+use twilight_skyglow::SkyglowResult;
 use twilight_terrain::horizon;
 use twilight_terrain::HorizonProfile;
 
@@ -76,6 +77,10 @@ pub struct PrayerTimeInput {
     /// Horizon profile from terrain masking. When present, sunrise/sunset SZA
     /// is adjusted based on terrain obstruction at the sun's azimuth.
     pub horizon_profile: Option<HorizonProfile>,
+    /// Light pollution skyglow result. When present, the artificial spectral
+    /// radiance is added to the MCRT-computed natural twilight radiance before
+    /// threshold analysis, shifting Fajr/Isha times.
+    pub skyglow: Option<SkyglowResult>,
 }
 
 impl Default for PrayerTimeInput {
@@ -100,6 +105,7 @@ impl Default for PrayerTimeInput {
             scattering_mode: ScatteringMode::Single,
             photons_per_wavelength: 10_000,
             horizon_profile: None,
+            skyglow: None,
         }
     }
 }
@@ -160,6 +166,12 @@ pub struct PrayerTimeOutput {
     pub sunset_sza_effective: Option<f64>,
     /// Terrain source name (e.g., "Copernicus DEM GLO-30 (30m)")
     pub terrain_source: Option<String>,
+    /// Artificial sky brightness at zenith (mcd/m^2). None if no skyglow model.
+    pub skyglow_zenith_mcd: Option<f64>,
+    /// Effective Bortle class (1-9). None if no skyglow model.
+    pub skyglow_bortle: Option<u8>,
+    /// Estimated prayer time shift due to light pollution (minutes).
+    pub skyglow_shift_minutes: Option<f64>,
 }
 
 // ── Solar position engine abstraction ──────────────────────────────
@@ -491,7 +503,19 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
         deduped_results.push(r);
     }
 
-    // Step 9: Re-analyze with combined high-resolution data
+    // Step 9: Inject skyglow (light pollution) if configured.
+    // Add artificial spectral radiance to the MCRT-computed natural radiance.
+    // This shifts the threshold crossings to account for urban sky brightness.
+    if let Some(ref sg) = input.skyglow {
+        for sr in &mut deduped_results {
+            let n = sr.radiance.len().min(sg.num_wavelengths);
+            for i in 0..n {
+                sr.radiance[i] += sg.spectral_radiance[i];
+            }
+        }
+    }
+
+    // Re-analyze with combined high-resolution data (now including skyglow if set)
     let all_analyses: Vec<TwilightAnalysis> = deduped_results
         .iter()
         .map(|sr| {
@@ -547,6 +571,15 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
             .horizon_profile
             .as_ref()
             .map(|p| p.source_name.clone()),
+        skyglow_zenith_mcd: input.skyglow.as_ref().map(|sg| {
+            twilight_skyglow::bortle::radiance_to_zenith_luminance(sg.integrated_radiance)
+        }),
+        skyglow_bortle: input.skyglow.as_ref().map(|sg| sg.bortle_class),
+        skyglow_shift_minutes: input.skyglow.as_ref().map(|sg| {
+            let lum =
+                twilight_skyglow::bortle::radiance_to_zenith_luminance(sg.integrated_radiance);
+            twilight_skyglow::bortle::estimated_prayer_shift_minutes(lum)
+        }),
     }
 }
 

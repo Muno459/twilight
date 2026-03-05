@@ -8,6 +8,7 @@ members = [
     "crates/twilight-threshold",
     "crates/twilight-weather",
     "crates/twilight-terrain",
+    "crates/twilight-skyglow",
     "crates/twilight-cli",
     "crates/twilight-ffi",
 ]
@@ -27,5 +28,6 @@ twilight-threshold = { path = "crates/twilight-threshold" }
 twilight-cli = { path = "crates/twilight-cli" }
 twilight-weather = { path = "crates/twilight-weather" }
 twilight-terrain = { path = "crates/twilight-terrain" }
+twilight-skyglow = { path = "crates/twilight-skyglow" }
 twilight-ffi = { path = "crates/twilight-ffi" }
 libm = "0.2"

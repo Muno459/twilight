@@ -13,4 +13,5 @@ twilight-cpu = { path = "../twilight-cpu" }
 twilight-threshold = { workspace = true }
 twilight-weather = { workspace = true }
 twilight-terrain = { workspace = true }
+twilight-skyglow = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }

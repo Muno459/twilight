@@ -1,0 +1,13 @@
+[package]
+name = "twilight-skyglow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Light pollution skyglow model for twilight prayer times"
+
+[dependencies]
+twilight-core = { workspace = true }
+twilight-data = { workspace = true }
+
+[dev-dependencies]

@@ -5,6 +5,7 @@ use twilight_data::aerosol::AerosolType;
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
 use twilight_data::cloud::CloudType;
+use twilight_skyglow;
 use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
 use twilight_terrain::horizon;
@@ -149,6 +150,22 @@ enum Commands {
         /// Register free at https://datafordeler.dk
         #[arg(long, env = "TWILIGHT_DK_API_KEY")]
         dk_api_key: Option<String>,
+        /// Enable light pollution skyglow model.
+        /// Adds artificial sky brightness to MCRT luminance, shifting prayer times.
+        #[arg(long)]
+        skyglow: bool,
+        /// Bortle dark-sky class (1-9). Alternative to --radiance.
+        /// 1=pristine, 5=suburban, 8=city, 9=inner city.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+        bortle: Option<u8>,
+        /// VIIRS nighttime radiance at the observer (nW/cm^2/sr).
+        /// Use instead of --bortle for precise input.
+        #[arg(long)]
+        radiance: Option<f64>,
+        /// LED fraction of local lighting (0.0 = all HPS sodium, 1.0 = all LED).
+        /// Default 0.5 (typical mixed modern city).
+        #[arg(long, default_value = "0.5")]
+        led_fraction: f64,
     },
 }
 
@@ -659,6 +676,10 @@ fn cmd_pray(
     dem_dir: &str,
     horizon_radius: f64,
     dk_api_key: Option<&str>,
+    use_skyglow: bool,
+    bortle: Option<u8>,
+    radiance_nw: Option<f64>,
+    led_fraction: f64,
 ) {
     let parts: Vec<&str> = date.split('-').collect();
     if parts.len() != 3 {
@@ -780,6 +801,35 @@ fn cmd_pray(
         None
     };
 
+    // Light pollution skyglow
+    let skyglow_result = if use_skyglow || bortle.is_some() || radiance_nw.is_some() {
+        let radiance = if let Some(r) = radiance_nw {
+            r
+        } else if let Some(b) = bortle {
+            twilight_skyglow::bortle::bortle_to_radiance(b)
+        } else {
+            // Default: suburban (Bortle 5) -- a reasonable guess for someone
+            // who enabled --skyglow without specifying a value
+            twilight_skyglow::bortle::bortle_to_radiance(5)
+        };
+
+        let result = twilight_skyglow::quick_estimate_at_angle(radiance, led_fraction, 10.0);
+        let lum_mcd = twilight_skyglow::bortle::radiance_to_zenith_luminance(radiance);
+        println!(
+            "Skyglow:    Bortle {}, zenith {:.2} mcd/m^2, LED fraction {:.0}%",
+            result.bortle_class,
+            lum_mcd,
+            led_fraction * 100.0
+        );
+        let shift = twilight_skyglow::bortle::estimated_prayer_shift_minutes(lum_mcd);
+        if shift > 0.5 {
+            println!("  Estimated prayer time shift: ~{:.0} minutes", shift);
+        }
+        Some(result)
+    } else {
+        None
+    };
+
     println!();
 
     // When using weather API, pass custom properties directly.
@@ -811,6 +861,7 @@ fn cmd_pray(
         scattering_mode,
         photons_per_wavelength: photons,
         horizon_profile,
+        skyglow: skyglow_result,
         ..Default::default()
     };
 
@@ -873,6 +924,18 @@ fn cmd_pray(
         }
     }
     println!();
+
+    // Show light pollution info
+    if let Some(bortle) = output.skyglow_bortle {
+        if let Some(shift) = output.skyglow_shift_minutes {
+            if shift > 0.5 {
+                println!(
+                    "  Light pollution: Bortle {} (~{:.0} min shift)",
+                    bortle, shift
+                );
+            }
+        }
+    }
 
     // Persistent twilight warning
     if output.persistent_twilight {
@@ -1175,6 +1238,10 @@ fn main() {
             dem_dir,
             horizon_radius,
             dk_api_key,
+            skyglow,
+            bortle,
+            radiance,
+            led_fraction,
         } => {
             cmd_pray(
                 lat,
@@ -1196,6 +1263,10 @@ fn main() {
                 &dem_dir,
                 horizon_radius,
                 dk_api_key.as_deref(),
+                skyglow,
+                bortle,
+                radiance,
+                led_fraction,
             );
         }
     }
