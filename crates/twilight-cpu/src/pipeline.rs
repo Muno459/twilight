@@ -13,9 +13,10 @@
 //! 6. Threshold: compute luminance, classify twilight, find crossings
 //! 7. SPA: convert threshold SZA -> clock time via binary search
 
-use twilight_data::aerosol::AerosolType;
+use twilight_data::aerosol::{self, AerosolType};
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
+use twilight_data::cloud::{self, CloudType};
 use twilight_solar::spa::{self, SpaInput};
 use twilight_threshold::threshold::{self, ThresholdConfig, TwilightAnalysis};
 
@@ -47,6 +48,8 @@ pub struct PrayerTimeInput {
     pub sza_step: f64,
     /// Aerosol type. None for clear sky.
     pub aerosol_type: Option<AerosolType>,
+    /// Cloud type. None for clear sky.
+    pub cloud_type: Option<CloudType>,
     /// Threshold configuration
     pub threshold_config: ThresholdConfig,
 }
@@ -65,6 +68,7 @@ impl Default for PrayerTimeInput {
             surface_albedo: 0.15,
             sza_step: 0.5,
             aerosol_type: None,
+            cloud_type: None,
             threshold_config: ThresholdConfig::default(),
         }
     }
@@ -118,12 +122,14 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
     let start = std::time::Instant::now();
 
     // Step 1: Build atmosphere model
-    let atm = match input.aerosol_type {
-        Some(atype) => {
-            builder::build_with_aerosols(AtmosphereType::UsStandard, input.surface_albedo, atype)
-        }
-        None => builder::build_clear_sky(AtmosphereType::UsStandard, input.surface_albedo),
-    };
+    let aerosol_props = input.aerosol_type.map(|at| aerosol::default_properties(at));
+    let cloud_props = input.cloud_type.map(|ct| cloud::default_properties(ct));
+    let atm = builder::build_full(
+        AtmosphereType::UsStandard,
+        input.surface_albedo,
+        aerosol_props.as_ref(),
+        cloud_props.as_ref(),
+    );
 
     // Step 2: Find sunrise/sunset times using SPA
     let spa_input = SpaInput {

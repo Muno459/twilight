@@ -6,6 +6,7 @@
 
 use crate::aerosol::{self, AerosolProperties, AerosolType};
 use crate::atmosphere_profiles::{self, AtmosphereType};
+use crate::cloud::{self, CloudProperties, CloudType};
 use crate::ozone_xsec;
 use twilight_core::atmosphere::{AtmosphereModel, ShellOptics};
 use twilight_core::spectrum::rayleigh_scattering_coeff;
@@ -303,6 +304,157 @@ pub fn build_with_aerosol_properties(
             };
 
             // Rayleigh fraction of total scattering
+            let ray_frac = if total_scat > 1e-30 {
+                existing_ray_scat / total_scat
+            } else {
+                1.0
+            };
+
+            atm.optics[s][w] = ShellOptics {
+                extinction: total_ext,
+                ssa: new_ssa,
+                asymmetry: new_g,
+                rayleigh_fraction: ray_frac,
+            };
+        }
+    }
+
+    atm
+}
+
+/// Build an atmosphere with a named cloud type.
+///
+/// Equivalent to calling `build_with_cloud_layer` with the default
+/// properties for the given cloud type.
+pub fn build_with_cloud(
+    profile: AtmosphereType,
+    surface_albedo: f64,
+    ctype: CloudType,
+) -> AtmosphereModel {
+    let props = cloud::default_properties(ctype);
+    build_with_cloud_layer(
+        profile,
+        surface_albedo,
+        props.base_km,
+        props.top_km,
+        props.optical_depth,
+        props.ssa,
+        props.asymmetry,
+    )
+}
+
+/// Build an atmosphere with custom cloud properties.
+pub fn build_with_cloud_properties(
+    profile: AtmosphereType,
+    surface_albedo: f64,
+    cloud_props: &CloudProperties,
+) -> AtmosphereModel {
+    build_with_cloud_layer(
+        profile,
+        surface_albedo,
+        cloud_props.base_km,
+        cloud_props.top_km,
+        cloud_props.optical_depth,
+        cloud_props.ssa,
+        cloud_props.asymmetry,
+    )
+}
+
+/// Build an atmosphere with both aerosols and a cloud layer.
+///
+/// Starts with clear sky, adds aerosol, then adds cloud on top.
+/// This is the most realistic single-layer configuration.
+pub fn build_with_aerosols_and_cloud(
+    profile: AtmosphereType,
+    surface_albedo: f64,
+    atype: AerosolType,
+    ctype: CloudType,
+) -> AtmosphereModel {
+    let aerosol_props = aerosol::default_properties(atype);
+    let cloud_props = cloud::default_properties(ctype);
+    build_full(
+        profile,
+        surface_albedo,
+        Some(&aerosol_props),
+        Some(&cloud_props),
+    )
+}
+
+/// Build an atmosphere with optional aerosol and optional cloud.
+///
+/// The most general builder. Pass `None` for either to omit.
+pub fn build_full(
+    profile: AtmosphereType,
+    surface_albedo: f64,
+    aerosol_props: Option<&AerosolProperties>,
+    cloud_props: Option<&CloudProperties>,
+) -> AtmosphereModel {
+    let mut atm = match aerosol_props {
+        Some(props) => build_with_aerosol_properties(profile, surface_albedo, props),
+        None => build_clear_sky(profile, surface_albedo),
+    };
+
+    let cloud_props = match cloud_props {
+        Some(props) => props,
+        None => return atm,
+    };
+
+    if cloud_props.optical_depth <= 0.0 {
+        return atm;
+    }
+
+    let cloud_thickness_m = (cloud_props.top_km - cloud_props.base_km) * 1000.0;
+    if cloud_thickness_m <= 0.0 {
+        return atm;
+    }
+
+    let cloud_ext = cloud_props.optical_depth / cloud_thickness_m;
+
+    let num_shells = atm.num_shells;
+    for s in 0..num_shells {
+        let shell_base_km =
+            (atm.shells[s].r_inner - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
+        let shell_top_km =
+            (atm.shells[s].r_outer - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
+
+        let overlap_base = shell_base_km.max(cloud_props.base_km);
+        let overlap_top = shell_top_km.min(cloud_props.top_km);
+        if overlap_top <= overlap_base {
+            continue;
+        }
+
+        let shell_thickness_km = shell_top_km - shell_base_km;
+        let overlap_fraction = (overlap_top - overlap_base) / shell_thickness_km;
+
+        for w in 0..atm.num_wavelengths {
+            let existing = &atm.optics[s][w];
+
+            let c_ext = cloud_ext * overlap_fraction;
+            let c_scat = c_ext * cloud_props.ssa;
+            let c_abs = c_ext * (1.0 - cloud_props.ssa);
+
+            let existing_scat = existing.extinction * existing.ssa;
+            let existing_ray_scat = existing_scat * existing.rayleigh_fraction;
+            let existing_nonray_scat = existing_scat * (1.0 - existing.rayleigh_fraction);
+            let existing_abs = existing.extinction * (1.0 - existing.ssa);
+
+            let total_scat = existing_ray_scat + existing_nonray_scat + c_scat;
+            let total_abs = existing_abs + c_abs;
+            let total_ext = total_scat + total_abs;
+
+            let new_ssa = if total_ext > 1e-30 {
+                total_scat / total_ext
+            } else {
+                1.0
+            };
+
+            let new_g = if total_scat > 1e-30 {
+                (existing_nonray_scat * existing.asymmetry + c_scat * cloud_props.asymmetry)
+                    / total_scat
+            } else {
+                0.0
+            };
+
             let ray_frac = if total_scat > 1e-30 {
                 existing_ray_scat / total_scat
             } else {
@@ -968,5 +1120,208 @@ mod tests {
             delta_surface,
             delta_5km
         );
+    }
+
+    // ── build_with_cloud (named type) ──
+
+    #[test]
+    fn named_cloud_all_types_build() {
+        use crate::cloud::ALL_CLOUD_TYPES;
+        for ctype in &ALL_CLOUD_TYPES {
+            let atm = build_with_cloud(AtmosphereType::UsStandard, 0.15, *ctype);
+            assert_eq!(atm.num_shells, 50);
+            assert_eq!(atm.num_wavelengths, 41);
+        }
+    }
+
+    #[test]
+    fn named_cloud_matches_manual() {
+        // build_with_cloud should produce the same result as calling
+        // build_with_cloud_layer with the default properties
+        let named = build_with_cloud(AtmosphereType::UsStandard, 0.15, CloudType::Stratus);
+        let props = cloud::default_properties(CloudType::Stratus);
+        let manual = build_with_cloud_layer(
+            AtmosphereType::UsStandard,
+            0.15,
+            props.base_km,
+            props.top_km,
+            props.optical_depth,
+            props.ssa,
+            props.asymmetry,
+        );
+        for s in 0..named.num_shells {
+            for w in 0..named.num_wavelengths {
+                assert!(
+                    (named.optics[s][w].extinction - manual.optics[s][w].extinction).abs() < 1e-20,
+                    "Named vs manual mismatch at shell {}, wl {}",
+                    s,
+                    w
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stratus_much_thicker_than_thin_cirrus() {
+        let stratus = build_with_cloud(AtmosphereType::UsStandard, 0.15, CloudType::Stratus);
+        let cirrus = build_with_cloud(AtmosphereType::UsStandard, 0.15, CloudType::ThinCirrus);
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+
+        // Both should increase extinction over clear sky, but stratus much more
+        let w = 17;
+        let mut stratus_max_delta = 0.0f64;
+        let mut cirrus_max_delta = 0.0f64;
+        for s in 0..clear.num_shells {
+            let sd = stratus.optics[s][w].extinction - clear.optics[s][w].extinction;
+            let cd = cirrus.optics[s][w].extinction - clear.optics[s][w].extinction;
+            stratus_max_delta = stratus_max_delta.max(sd);
+            cirrus_max_delta = cirrus_max_delta.max(cd);
+        }
+        assert!(
+            stratus_max_delta > cirrus_max_delta * 5.0,
+            "Stratus delta ({:.4e}) should be >> thin cirrus delta ({:.4e})",
+            stratus_max_delta,
+            cirrus_max_delta
+        );
+    }
+
+    // ── build_with_aerosols_and_cloud ──
+
+    #[test]
+    fn combined_aerosol_cloud_builds() {
+        let atm = build_with_aerosols_and_cloud(
+            AtmosphereType::UsStandard,
+            0.15,
+            AerosolType::Urban,
+            CloudType::Stratus,
+        );
+        assert_eq!(atm.num_shells, 50);
+        assert_eq!(atm.num_wavelengths, 41);
+    }
+
+    #[test]
+    fn combined_more_extinction_than_either_alone() {
+        let aerosol_only =
+            build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::Urban);
+        let cloud_only = build_with_cloud(AtmosphereType::UsStandard, 0.15, CloudType::Stratus);
+        let combined = build_with_aerosols_and_cloud(
+            AtmosphereType::UsStandard,
+            0.15,
+            AerosolType::Urban,
+            CloudType::Stratus,
+        );
+
+        let w = 17;
+        // In the cloud layer, combined should exceed aerosol-only
+        for s in 0..combined.num_shells {
+            let alt_km = combined.shells[s].altitude_mid / 1000.0;
+            if alt_km > 0.5 && alt_km < 1.5 {
+                assert!(
+                    combined.optics[s][w].extinction > aerosol_only.optics[s][w].extinction,
+                    "Combined should exceed aerosol-only in cloud layer at {:.1}km",
+                    alt_km
+                );
+            }
+        }
+        // At the surface (below cloud), combined should have aerosol effect
+        assert!(
+            combined.optics[0][w].extinction > cloud_only.optics[0][w].extinction,
+            "Combined should have aerosol at surface"
+        );
+    }
+
+    #[test]
+    fn combined_ssa_and_asymmetry_bounded() {
+        // Test a few combinations
+        let aerosol_types = [AerosolType::Urban, AerosolType::Desert];
+        let cloud_types = [CloudType::Stratus, CloudType::ThinCirrus];
+        for atype in &aerosol_types {
+            for ctype in &cloud_types {
+                let atm =
+                    build_with_aerosols_and_cloud(AtmosphereType::UsStandard, 0.15, *atype, *ctype);
+                for s in 0..atm.num_shells {
+                    for w in 0..atm.num_wavelengths {
+                        assert!(
+                            (0.0..=1.0).contains(&atm.optics[s][w].ssa),
+                            "{:?}+{:?}: SSA out of bounds at shell {}, wl {}",
+                            atype,
+                            ctype,
+                            s,
+                            w
+                        );
+                        assert!(
+                            (-1.0..=1.0).contains(&atm.optics[s][w].asymmetry),
+                            "{:?}+{:?}: asymmetry out of bounds at shell {}, wl {}",
+                            atype,
+                            ctype,
+                            s,
+                            w
+                        );
+                        assert!(
+                            (0.0..=1.0).contains(&atm.optics[s][w].rayleigh_fraction),
+                            "{:?}+{:?}: rayleigh_fraction out of bounds at shell {}, wl {}",
+                            atype,
+                            ctype,
+                            s,
+                            w
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // ── build_full ──
+
+    #[test]
+    fn build_full_no_aerosol_no_cloud_is_clear() {
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let full = build_full(AtmosphereType::UsStandard, 0.15, None, None);
+        for s in 0..clear.num_shells {
+            for w in 0..clear.num_wavelengths {
+                assert!(
+                    (full.optics[s][w].extinction - clear.optics[s][w].extinction).abs() < 1e-20,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_full_aerosol_only_matches() {
+        let expected = build_with_aerosols(AtmosphereType::UsStandard, 0.15, AerosolType::Urban);
+        let props = aerosol::default_properties(AerosolType::Urban);
+        let full = build_full(AtmosphereType::UsStandard, 0.15, Some(&props), None);
+        for s in 0..expected.num_shells {
+            for w in 0..expected.num_wavelengths {
+                assert!(
+                    (full.optics[s][w].extinction - expected.optics[s][w].extinction).abs() < 1e-20,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_full_cloud_only_matches() {
+        let expected = build_with_cloud(AtmosphereType::UsStandard, 0.15, CloudType::Stratus);
+        let props = cloud::default_properties(CloudType::Stratus);
+        let full = build_full(AtmosphereType::UsStandard, 0.15, None, Some(&props));
+        for s in 0..expected.num_shells {
+            for w in 0..expected.num_wavelengths {
+                // Cloud-only via build_full goes through the build_full cloud path,
+                // while build_with_cloud goes through build_with_cloud_layer.
+                // The original build_with_cloud_layer uses (rayleigh_scat * 0.0)
+                // for Rayleigh g, while build_full properly tracks existing_nonray_scat.
+                // For clear-sky input (rayleigh_fraction=1), they should agree.
+                let diff = (full.optics[s][w].extinction - expected.optics[s][w].extinction).abs();
+                assert!(
+                    diff < 1e-15,
+                    "Mismatch at shell {}, wl {}: full={:.6e} vs expected={:.6e}",
+                    s,
+                    w,
+                    full.optics[s][w].extinction,
+                    expected.optics[s][w].extinction
+                );
+            }
+        }
     }
 }

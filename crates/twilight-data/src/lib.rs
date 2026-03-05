@@ -3,5 +3,6 @@
 pub mod aerosol;
 pub mod atmosphere_profiles;
 pub mod builder;
+pub mod cloud;
 pub mod ozone_xsec;
 pub mod solar_spectrum;

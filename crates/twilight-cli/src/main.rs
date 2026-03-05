@@ -4,6 +4,7 @@ use twilight_cpu::simulation::{self, SimulationConfig, SpectralResult};
 use twilight_data::aerosol::AerosolType;
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
+use twilight_data::cloud::CloudType;
 use twilight_solar::spa::{self, SpaInput};
 use twilight_threshold::threshold::TwilightColor;
 
@@ -71,6 +72,9 @@ enum Commands {
         /// Aerosol type (default: none = clear sky)
         #[arg(long, value_enum, default_value = "none")]
         aerosol: CliAerosol,
+        /// Cloud type (default: none = clear sky)
+        #[arg(long, value_enum, default_value = "none")]
+        cloud: CliCloud,
     },
     /// Compute physically-based Fajr and Isha prayer times using MCRT
     Pray {
@@ -101,6 +105,9 @@ enum Commands {
         /// Aerosol type (default: none = clear sky)
         #[arg(long, value_enum, default_value = "none")]
         aerosol: CliAerosol,
+        /// Cloud type (default: none = clear sky)
+        #[arg(long, value_enum, default_value = "none")]
+        cloud: CliCloud,
         /// Show detailed twilight analysis
         #[arg(long)]
         verbose: bool,
@@ -136,6 +143,39 @@ impl CliAerosol {
             CliAerosol::MaritimeClean => Some(AerosolType::MaritimeClean),
             CliAerosol::MaritimePolluted => Some(AerosolType::MaritimePolluted),
             CliAerosol::Desert => Some(AerosolType::Desert),
+        }
+    }
+}
+
+/// CLI cloud type selector.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliCloud {
+    /// No cloud (clear sky)
+    None,
+    /// Thin high-altitude ice cloud
+    ThinCirrus,
+    /// Thick high-altitude ice cloud
+    ThickCirrus,
+    /// Mid-level overcast
+    Altostratus,
+    /// Low grey overcast
+    Stratus,
+    /// Low lumpy cloud sheet
+    Stratocumulus,
+    /// Fair-weather puffy clouds
+    Cumulus,
+}
+
+impl CliCloud {
+    fn to_cloud_type(self) -> Option<CloudType> {
+        match self {
+            CliCloud::None => Option::None,
+            CliCloud::ThinCirrus => Some(CloudType::ThinCirrus),
+            CliCloud::ThickCirrus => Some(CloudType::ThickCirrus),
+            CliCloud::Altostratus => Some(CloudType::Altostratus),
+            CliCloud::Stratus => Some(CloudType::Stratus),
+            CliCloud::Stratocumulus => Some(CloudType::Stratocumulus),
+            CliCloud::Cumulus => Some(CloudType::Cumulus),
         }
     }
 }
@@ -309,6 +349,7 @@ fn cmd_mcrt(
     solar_azimuth: f64,
     view_zenith: f64,
     aerosol: CliAerosol,
+    cloud: CliCloud,
 ) {
     println!("Twilight MCRT Simulation");
     println!("=======================");
@@ -320,11 +361,11 @@ fn cmd_mcrt(
     println!("Photons/λ:    {}", photons);
     println!("Wavelengths:  380-780 nm (41 bands, 10nm steps)");
     let aerosol_type = aerosol.to_aerosol_type();
-    let atm_desc = match aerosol_type {
-        Some(at) => format!("US Standard 1976 + {:?} aerosol", at),
-        None => "US Standard 1976 (clear sky)".to_string(),
-    };
-    println!("Atmosphere:   {}", atm_desc);
+    let cloud_type = cloud.to_cloud_type();
+    println!(
+        "Atmosphere:   {}",
+        format_atm_desc(aerosol_type, cloud_type)
+    );
     println!("Surface:      albedo = {:.2}", albedo);
     println!(
         "View:         zenith {:.0}°, azimuth {:.0}°",
@@ -333,10 +374,14 @@ fn cmd_mcrt(
     println!();
 
     // Build atmosphere
-    let atm = match aerosol_type {
-        Some(at) => builder::build_with_aerosols(AtmosphereType::UsStandard, albedo, at),
-        None => builder::build_clear_sky(AtmosphereType::UsStandard, albedo),
-    };
+    let aerosol_props = aerosol_type.map(|at| twilight_data::aerosol::default_properties(at));
+    let cloud_props = cloud_type.map(|ct| twilight_data::cloud::default_properties(ct));
+    let atm = builder::build_full(
+        AtmosphereType::UsStandard,
+        albedo,
+        aerosol_props.as_ref(),
+        cloud_props.as_ref(),
+    );
 
     let config = SimulationConfig {
         latitude: lat,
@@ -448,6 +493,7 @@ fn cmd_pray(
     delta_t: f64,
     sza_step: f64,
     aerosol: CliAerosol,
+    cloud: CliCloud,
     verbose: bool,
 ) {
     let parts: Vec<&str> = date.split('-').collect();
@@ -468,11 +514,8 @@ fn cmd_pray(
     println!("Albedo:     {:.2}", albedo);
     println!("SZA step:   {:.2}°", sza_step);
     let aerosol_type = aerosol.to_aerosol_type();
-    let atm_desc = match aerosol_type {
-        Some(at) => format!("US Standard 1976 + {:?} aerosol", at),
-        None => "US Standard 1976 (clear sky)".to_string(),
-    };
-    println!("Atmosphere: {}", atm_desc);
+    let cloud_type = cloud.to_cloud_type();
+    println!("Atmosphere: {}", format_atm_desc(aerosol_type, cloud_type));
     println!("Method:     Single-scatter MCRT + CIE mesopic vision");
     println!();
 
@@ -488,6 +531,7 @@ fn cmd_pray(
         surface_albedo: albedo,
         sza_step,
         aerosol_type,
+        cloud_type,
         ..Default::default()
     };
 
@@ -686,16 +730,31 @@ fn cmd_pray(
     println!("Notes:");
     println!("  - These times are computed from first-principles radiative transfer (MCRT).");
     println!("  - Current model: US Standard 1976 atmosphere, single scattering.");
-    if aerosol_type.is_some() {
-        println!("  - Tropospheric aerosols included (OPAC climatology).");
+    if aerosol_type.is_some() || cloud_type.is_some() {
+        if aerosol_type.is_some() {
+            println!("  - Tropospheric aerosols included (OPAC climatology).");
+        }
+        if cloud_type.is_some() {
+            println!("  - Cloud layer included (Henyey-Greenstein forward scattering).");
+        }
     } else {
-        println!("  - No aerosols. Use --aerosol to add tropospheric aerosols.");
+        println!("  - No aerosols or clouds. Use --aerosol and --cloud to add them.");
     }
     println!("  - The 'depression' angle is the equivalent fixed angle that gives the same time.");
     println!(
         "  - Differences from conventional times reflect atmospheric conditions vs fixed angles."
     );
     println!("  - Future: clouds, terrain, and real-time weather will improve accuracy.");
+}
+
+/// Format a human-readable atmosphere description.
+fn format_atm_desc(aerosol: Option<AerosolType>, cloud: Option<CloudType>) -> String {
+    match (aerosol, cloud) {
+        (None, None) => "US Standard 1976 (clear sky)".to_string(),
+        (Some(at), None) => format!("US Standard 1976 + {:?} aerosol", at),
+        (None, Some(ct)) => format!("US Standard 1976 + {:?} cloud", ct),
+        (Some(at), Some(ct)) => format!("US Standard 1976 + {:?} aerosol + {:?} cloud", at, ct),
+    }
 }
 
 /// Get radiance at a specific wavelength from a SpectralResult.
@@ -737,6 +796,7 @@ fn main() {
             solar_azimuth,
             view_zenith,
             aerosol,
+            cloud,
         } => {
             cmd_mcrt(
                 lat,
@@ -749,6 +809,7 @@ fn main() {
                 solar_azimuth,
                 view_zenith,
                 aerosol,
+                cloud,
             );
         }
         Commands::Pray {
@@ -761,10 +822,11 @@ fn main() {
             delta_t,
             sza_step,
             aerosol,
+            cloud,
             verbose,
         } => {
             cmd_pray(
-                lat, lon, &date, tz, elevation, albedo, delta_t, sza_step, aerosol, verbose,
+                lat, lon, &date, tz, elevation, albedo, delta_t, sza_step, aerosol, cloud, verbose,
             );
         }
     }
