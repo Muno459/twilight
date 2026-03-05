@@ -147,20 +147,16 @@ pub fn single_scatter_radiance(
     };
 
     // Check if LOS hits the ground
-    let los_end = match ray_sphere_intersect(observer_pos, view_dir, surface_radius) {
-        Some(hit) if hit.t_near > 1e-3 => {
-            // LOS hits ground before exiting atmosphere
-            hit.t_near
-        }
+    let ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+    let hits_ground = matches!(ground_hit, Some(ref hit) if hit.t_near > 1e-3);
+    let los_end = match ground_hit {
+        Some(ref hit) if hit.t_near > 1e-3 => hit.t_near,
         _ => los_max,
     };
 
     if los_end <= 0.0 {
         return 0.0;
     }
-
-    // Compute optical depth from observer along LOS (for T_obs)
-    // We'll compute this incrementally as we integrate
 
     // Adaptive step size: smaller steps near the observer (denser atmosphere),
     // larger steps higher up
@@ -242,6 +238,37 @@ pub fn single_scatter_radiance(
         tau_obs += optics.extinction * ds_base;
     }
 
+    // Ground reflection: Lambertian BRDF = albedo / π
+    //
+    // If the LOS hits the ground, the surface reflects sunlight toward the
+    // observer. The contribution is:
+    //   I_ground = (A/π) × cos(θ_sun) × T_sun_to_ground × T_ground_to_observer
+    //
+    // where θ_sun is the solar incidence angle at the ground point and A is
+    // the surface albedo. This only contributes when the ground point is
+    // illuminated (sun above local horizon at that point).
+    if hits_ground {
+        let albedo = atm.surface_albedo[wavelength_idx];
+        if albedo > 1e-10 {
+            let ground_pos = observer_pos + view_dir * los_end;
+            let ground_normal = ground_pos.normalize();
+            let cos_sun_incidence = sun_dir.dot(ground_normal);
+
+            // Sun must be above the local horizon at the ground point
+            if cos_sun_incidence > 0.0 {
+                let t_sun_ground =
+                    shadow_ray_transmittance(atm, ground_pos, sun_dir, wavelength_idx);
+                // tau_obs at this point is the full LOS optical depth to the ground
+                let t_obs_ground = libm::exp(-tau_obs);
+
+                radiance += albedo / core::f64::consts::PI
+                    * cos_sun_incidence
+                    * t_sun_ground
+                    * t_obs_ground;
+            }
+        }
+    }
+
     radiance
 }
 
@@ -310,15 +337,17 @@ pub fn single_scatter_spectrum(
     let surface_radius = atm.surface_radius();
 
     // Find LOS extent
-    let los_end = match ray_sphere_intersect(observer_pos, view_dir, toa_radius) {
-        Some(hit) if hit.t_far > 0.0 => {
-            // Check ground intersection
-            match ray_sphere_intersect(observer_pos, view_dir, surface_radius) {
-                Some(gh) if gh.t_near > 1e-3 && gh.t_near < hit.t_far => gh.t_near,
-                _ => hit.t_far,
-            }
-        }
+    let los_max = match ray_sphere_intersect(observer_pos, view_dir, toa_radius) {
+        Some(hit) if hit.t_far > 0.0 => hit.t_far,
         _ => return radiance,
+    };
+
+    let ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+    let hits_ground =
+        matches!(ground_hit, Some(ref hit) if hit.t_near > 1e-3 && hit.t_near < los_max);
+    let los_end = match ground_hit {
+        Some(ref hit) if hit.t_near > 1e-3 && hit.t_near < los_max => hit.t_near,
+        _ => los_max,
     };
 
     let num_steps = MAX_LOS_STEPS.min((los_end / 500.0) as usize + 20);
@@ -377,6 +406,28 @@ pub fn single_scatter_spectrum(
                 beta_scat * phase / (4.0 * core::f64::consts::PI) * t_sun[w] * t_obs * ds;
 
             tau_obs[w] += optics.extinction * ds;
+        }
+    }
+
+    // Ground reflection (Lambertian BRDF = albedo / π)
+    if hits_ground {
+        let ground_pos = observer_pos + view_dir * los_end;
+        let ground_normal = ground_pos.normalize();
+        let cos_sun_incidence = sun_dir.dot(ground_normal);
+
+        if cos_sun_incidence > 0.0 {
+            let t_sun_ground = shadow_ray_transmittance_spectrum(atm, ground_pos, sun_dir, num_wl);
+
+            for w in 0..num_wl {
+                let albedo = atm.surface_albedo[w];
+                if albedo > 1e-10 && t_sun_ground[w] > 1e-30 {
+                    let t_obs_ground = libm::exp(-tau_obs[w]);
+                    radiance[w] += albedo / core::f64::consts::PI
+                        * cos_sun_incidence
+                        * t_sun_ground[w]
+                        * t_obs_ground;
+                }
+            }
         }
     }
 
@@ -796,5 +847,219 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Ground reflection (Phase 4) ──
+
+    /// Build a test atmosphere with nonzero surface albedo.
+    fn make_test_atmosphere_with_albedo(albedo: f64) -> AtmosphereModel {
+        let mut atm = make_test_atmosphere();
+        for w in 0..atm.num_wavelengths {
+            atm.surface_albedo[w] = albedo;
+        }
+        atm
+    }
+
+    #[test]
+    fn albedo_zero_matches_no_reflection() {
+        // With albedo=0, ground reflection contributes nothing. Verify by
+        // comparing the same atmosphere with albedo=0 vs albedo=0.5: the
+        // atmospheric scattering component should be present in both, and
+        // the albedo=0 case should have strictly less (or equal) radiance.
+        let atm_no = make_test_atmosphere_with_albedo(0.0);
+        let atm_yes = make_test_atmosphere_with_albedo(0.5);
+        let obs = observer_on_surface();
+        let view = Vec3::new(0.0, 0.0, 1.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
+
+        for w in 0..atm_no.num_wavelengths {
+            let r_no = single_scatter_radiance(&atm_no, obs, view, sun, w);
+            let r_yes = single_scatter_radiance(&atm_yes, obs, view, sun, w);
+            assert!(
+                r_yes >= r_no,
+                "albedo=0.5 should give >= albedo=0: wl[{}] {:.4e} vs {:.4e}",
+                w,
+                r_yes,
+                r_no
+            );
+        }
+    }
+
+    #[test]
+    fn ground_reflection_increases_radiance() {
+        // With nonzero albedo and sun above horizon, ground reflection
+        // should add radiance compared to albedo=0.
+        let atm_no = make_test_atmosphere(); // albedo=0
+        let atm_yes = make_test_atmosphere_with_albedo(0.3);
+        let obs = observer_on_surface();
+
+        // Look toward the horizon (the LOS will hit the ground far away)
+        // At the observer position (R+1, 0, 0), looking in +z is horizontal
+        let view = Vec3::new(0.0, 0.0, 1.0).normalize();
+        // Sun well above horizon so ground is illuminated
+        let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
+
+        let rad_no = single_scatter_radiance(&atm_no, obs, view, sun, 1);
+        let rad_yes = single_scatter_radiance(&atm_yes, obs, view, sun, 1);
+
+        assert!(
+            rad_yes >= rad_no,
+            "Albedo=0.3 should give >= radiance than albedo=0: {:.4e} vs {:.4e}",
+            rad_yes,
+            rad_no
+        );
+    }
+
+    #[test]
+    fn ground_reflection_scales_with_albedo() {
+        // Higher albedo should give more ground-reflected radiance.
+        let atm_low = make_test_atmosphere_with_albedo(0.1);
+        let atm_high = make_test_atmosphere_with_albedo(0.9);
+        let obs = observer_on_surface();
+        let view = Vec3::new(0.0, 0.0, 1.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
+
+        let rad_low = single_scatter_radiance(&atm_low, obs, view, sun, 1);
+        let rad_high = single_scatter_radiance(&atm_high, obs, view, sun, 1);
+
+        assert!(
+            rad_high >= rad_low,
+            "Higher albedo should give more radiance: 0.9→{:.4e} vs 0.1→{:.4e}",
+            rad_high,
+            rad_low
+        );
+    }
+
+    #[test]
+    fn ground_reflection_zero_when_ground_in_shadow() {
+        // At deep twilight (SZA=120°), the ground point should be in shadow,
+        // so albedo shouldn't matter.
+        let atm_no = make_test_atmosphere();
+        let atm_yes = make_test_atmosphere_with_albedo(1.0); // maximum albedo
+        let obs = observer_on_surface();
+        let view = Vec3::new(0.0, 0.0, 1.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(120.0, 180.0, 0.0, 0.0);
+
+        let rad_no = single_scatter_radiance(&atm_no, obs, view, sun, 1);
+        let rad_yes = single_scatter_radiance(&atm_yes, obs, view, sun, 1);
+
+        assert!(
+            (rad_no - rad_yes).abs() < 1e-25,
+            "In deep shadow, albedo shouldn't matter: {:.4e} vs {:.4e}",
+            rad_no,
+            rad_yes
+        );
+    }
+
+    #[test]
+    fn ground_reflection_non_negative() {
+        let atm = make_test_atmosphere_with_albedo(0.5);
+        let obs = observer_on_surface();
+
+        for sza in &[30.0, 60.0, 80.0, 90.0, 96.0, 108.0, 120.0] {
+            let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
+            let view = Vec3::new(0.0, 0.0, 1.0).normalize();
+            for w in 0..atm.num_wavelengths {
+                let rad = single_scatter_radiance(&atm, obs, view, sun, w);
+                assert!(
+                    rad >= 0.0,
+                    "Radiance with albedo should be non-negative: SZA={}, wl={}, rad={:.4e}",
+                    sza,
+                    w,
+                    rad
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ground_reflection_spectrum_matches_individual() {
+        // single_scatter_spectrum with albedo should match per-wavelength calls
+        let atm = make_test_atmosphere_with_albedo(0.3);
+        let obs = observer_on_surface();
+        let view = Vec3::new(0.0, 0.0, 1.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
+
+        let spectrum = single_scatter_spectrum(&atm, obs, view, sun);
+
+        for w in 0..atm.num_wavelengths {
+            let individual = single_scatter_radiance(&atm, obs, view, sun, w);
+            let rel_err = if individual > 1e-30 {
+                ((spectrum[w] - individual) / individual).abs()
+            } else {
+                (spectrum[w] - individual).abs()
+            };
+            assert!(
+                rel_err < 0.01,
+                "Spectrum with albedo[{}] = {:.6e} != individual = {:.6e}, err = {:.4e}",
+                w,
+                spectrum[w],
+                individual,
+                rel_err
+            );
+        }
+    }
+
+    #[test]
+    fn ground_reflection_only_when_los_hits_ground() {
+        // Looking straight up (zenith) should NOT hit the ground, so albedo
+        // should not matter.
+        let atm_no = make_test_atmosphere();
+        let atm_yes = make_test_atmosphere_with_albedo(1.0);
+        let obs = observer_on_surface();
+        // Observer at (R+1,0,0), looking radially outward = straight up
+        let view = Vec3::new(1.0, 0.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(60.0, 180.0, 0.0, 0.0);
+
+        let rad_no = single_scatter_radiance(&atm_no, obs, view, sun, 1);
+        let rad_yes = single_scatter_radiance(&atm_yes, obs, view, sun, 1);
+
+        assert!(
+            (rad_no - rad_yes).abs() < 1e-25,
+            "Upward LOS should not hit ground: albedo=0 {:.4e} vs albedo=1 {:.4e}",
+            rad_no,
+            rad_yes
+        );
+    }
+
+    #[test]
+    fn ground_reflection_per_wavelength_albedo() {
+        // Test that per-wavelength albedo works: set albedo=0 for blue,
+        // albedo=0.5 for green, albedo=0 for red.
+        let mut atm = make_test_atmosphere();
+        atm.surface_albedo[0] = 0.0; // 400nm
+        atm.surface_albedo[1] = 0.5; // 550nm
+        atm.surface_albedo[2] = 0.0; // 700nm
+
+        let atm_zero = make_test_atmosphere(); // all albedo=0
+
+        let obs = observer_on_surface();
+        let view = Vec3::new(0.0, 0.0, 1.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
+
+        // Blue and red should be unchanged
+        let rad_blue = single_scatter_radiance(&atm, obs, view, sun, 0);
+        let rad_blue_zero = single_scatter_radiance(&atm_zero, obs, view, sun, 0);
+        assert!(
+            (rad_blue - rad_blue_zero).abs() < 1e-25,
+            "Blue (albedo=0) should be unchanged"
+        );
+
+        let rad_red = single_scatter_radiance(&atm, obs, view, sun, 2);
+        let rad_red_zero = single_scatter_radiance(&atm_zero, obs, view, sun, 2);
+        assert!(
+            (rad_red - rad_red_zero).abs() < 1e-25,
+            "Red (albedo=0) should be unchanged"
+        );
+
+        // Green should be >= the zero-albedo case
+        let rad_green = single_scatter_radiance(&atm, obs, view, sun, 1);
+        let rad_green_zero = single_scatter_radiance(&atm_zero, obs, view, sun, 1);
+        assert!(
+            rad_green >= rad_green_zero,
+            "Green (albedo=0.5) should be >= zero-albedo: {:.4e} vs {:.4e}",
+            rad_green,
+            rad_green_zero
+        );
     }
 }
