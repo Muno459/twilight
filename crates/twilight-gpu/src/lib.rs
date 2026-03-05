@@ -23,6 +23,9 @@
 
 pub mod buffers;
 
+#[cfg(feature = "metal")]
+pub mod metal;
+
 #[cfg(test)]
 mod oracle;
 
@@ -324,8 +327,7 @@ fn probe_cuda() -> bool {
 
 #[cfg(feature = "metal")]
 fn probe_metal() -> bool {
-    // Stub: will check objc2_metal::MTLCreateSystemDefaultDevice().is_some()
-    false
+    metal::probe()
 }
 
 #[cfg(feature = "vulkan")]
@@ -342,8 +344,8 @@ fn init_cuda(_config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
 }
 
 #[cfg(feature = "metal")]
-fn init_metal(_config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
-    Err(GpuError::BackendUnavailable(BackendKind::Metal))
+fn init_metal(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
+    metal::init(config)
 }
 
 #[cfg(feature = "vulkan")]

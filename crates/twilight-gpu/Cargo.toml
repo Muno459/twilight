@@ -27,7 +27,7 @@ objc2-foundation = { version = "0.2", optional = true, features = ["NSError", "N
 objc2-metal = { version = "0.2", optional = true, features = [
     "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLComputeCommandEncoder",
     "MTLComputePipeline", "MTLLibrary", "MTLResource", "MTLBuffer",
-    "MTLArgument", "MTLCommandEncoder",
+    "MTLArgument", "MTLCommandEncoder", "MTLTypes",
 ] }
 block2 = { version = "0.5", optional = true }
 
