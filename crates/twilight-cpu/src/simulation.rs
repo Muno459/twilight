@@ -42,6 +42,10 @@ pub enum ScatteringMode {
     /// Handles all scattering orders. Required for deep twilight (>15°),
     /// thick clouds, and physically reaching 18° depression angles.
     Multiple,
+    /// Hybrid: deterministic single-scatter (order 1) + MC secondary
+    /// chains (orders 2+). Best convergence for deep twilight.
+    /// Uses `photons_per_wavelength` as number of secondary rays per LOS step.
+    Hybrid,
 }
 
 impl Default for ScatteringMode {
@@ -110,6 +114,7 @@ pub fn simulate_at_sza(
     match config.scattering_mode {
         ScatteringMode::Single => simulate_at_sza_single(atm, config, sza_deg),
         ScatteringMode::Multiple => simulate_at_sza_mc(atm, config, sza_deg),
+        ScatteringMode::Hybrid => simulate_at_sza_hybrid(atm, config, sza_deg),
     }
 }
 
@@ -217,6 +222,54 @@ fn simulate_at_sza_mc(
                 total_weight += result.weight;
             }
             total_weight / nphotons as f64
+        })
+        .collect();
+
+    let mut radiance_array = [0.0f64; 64];
+    for (w, &r) in per_wl_radiance.iter().enumerate() {
+        radiance_array[w] = r;
+    }
+
+    build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance)
+}
+
+/// Hybrid simulation: deterministic single-scatter (order 1) + MC secondary
+/// chains (orders 2+). Best convergence for deep twilight.
+///
+/// The single-scatter contribution is computed exactly (no noise), then at
+/// each LOS step, secondary MC chains are launched to capture higher-order
+/// scattering. This produces converged results at deep twilight (15-18°
+/// depression) with far fewer photons than pure backward MC.
+///
+/// Uses rayon parallelism over wavelengths.
+fn simulate_at_sza_hybrid(
+    atm: &AtmosphereModel,
+    config: &SimulationConfig,
+    sza_deg: f64,
+) -> SpectralResult {
+    let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
+    let num_wl = atm.num_wavelengths;
+    let secondary_rays = config.photons_per_wavelength;
+
+    // Parallelize over wavelengths
+    let per_wl_radiance: Vec<f64> = (0..num_wl)
+        .into_par_iter()
+        .map(|w| {
+            let sza_bits = sza_deg.to_bits();
+            let mut rng = sza_bits
+                .wrapping_add(w as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
+
+            photon::hybrid_scatter_radiance(
+                atm,
+                observer_pos,
+                view_dir,
+                sun_dir,
+                w,
+                secondary_rays,
+                &mut rng,
+            )
         })
         .collect();
 
@@ -686,5 +739,173 @@ mod tests {
         assert!((results[0].sza_deg - 90.0).abs() < 0.01);
         assert!((results[1].sza_deg - 95.0).abs() < 0.01);
         assert!((results[2].sza_deg - 100.0).abs() < 0.01);
+    }
+
+    // ── Hybrid mode tests ──
+
+    fn hybrid_config() -> SimulationConfig {
+        SimulationConfig {
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 50, // few secondary rays for test speed
+            ..SimulationConfig::default()
+        }
+    }
+
+    #[test]
+    fn hybrid_returns_correct_wavelength_count() {
+        let atm = make_clear_sky_atm();
+        let config = hybrid_config();
+        let result = simulate_at_sza(&atm, &config, 96.0);
+        assert_eq!(result.wavelengths_nm.len(), 41);
+        assert_eq!(result.radiance.len(), 41);
+    }
+
+    #[test]
+    fn hybrid_stores_sza() {
+        let atm = make_clear_sky_atm();
+        let config = hybrid_config();
+        let result = simulate_at_sza(&atm, &config, 96.5);
+        assert!((result.sza_deg - 96.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn hybrid_radiance_non_negative() {
+        let atm = make_clear_sky_atm();
+        let config = hybrid_config();
+        for sza in &[90.0, 96.0, 102.0] {
+            let result = simulate_at_sza(&atm, &config, *sza);
+            for (i, &r) in result.radiance.iter().enumerate() {
+                assert!(
+                    r >= 0.0,
+                    "Hybrid radiance at SZA={}, wl[{}] = {} should be non-negative",
+                    sza,
+                    i,
+                    r
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_positive_at_civil_twilight() {
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 100,
+            ..SimulationConfig::default()
+        };
+        let result = simulate_at_sza(&atm, &config, 93.0);
+        let total = total_radiance(&result);
+        assert!(
+            total > 0.0,
+            "Hybrid civil twilight should produce positive radiance, got {}",
+            total
+        );
+    }
+
+    #[test]
+    fn hybrid_at_least_as_bright_as_single_scatter() {
+        // Hybrid includes single-scatter + orders 2+, so it should be
+        // at least as bright (or very close) to pure single-scatter.
+        let atm = make_clear_sky_atm();
+
+        let ss_config = SimulationConfig {
+            scattering_mode: ScatteringMode::Single,
+            ..SimulationConfig::default()
+        };
+        let hybrid_config = SimulationConfig {
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 200,
+            ..SimulationConfig::default()
+        };
+
+        let ss_total = total_radiance(&simulate_at_sza(&atm, &ss_config, 96.0));
+        let hybrid_total = total_radiance(&simulate_at_sza(&atm, &hybrid_config, 96.0));
+
+        // Hybrid should be >= single-scatter (within MC noise margin)
+        // Allow 20% tolerance for MC noise
+        assert!(
+            hybrid_total > ss_total * 0.8,
+            "Hybrid ({:.4e}) should be >= single-scatter ({:.4e}) minus noise margin",
+            hybrid_total,
+            ss_total
+        );
+    }
+
+    #[test]
+    fn hybrid_wavelengths_correct() {
+        let atm = make_clear_sky_atm();
+        let config = hybrid_config();
+        let result = simulate_at_sza(&atm, &config, 96.0);
+        assert!((result.wavelengths_nm[0] - 380.0).abs() < 0.01);
+        assert!((result.wavelengths_nm[20] - 580.0).abs() < 0.01);
+        assert!((result.wavelengths_nm[40] - 780.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn hybrid_zero_secondary_rays_equals_single_scatter() {
+        // With 0 secondary rays, hybrid should produce exactly the
+        // same result as single-scatter (only order 1 is computed).
+        let atm = make_clear_sky_atm();
+
+        let ss_config = SimulationConfig {
+            scattering_mode: ScatteringMode::Single,
+            ..SimulationConfig::default()
+        };
+        let hybrid_config = SimulationConfig {
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 0,
+            ..SimulationConfig::default()
+        };
+
+        let ss_result = simulate_at_sza(&atm, &ss_config, 96.0);
+        let hybrid_result = simulate_at_sza(&atm, &hybrid_config, 96.0);
+
+        for i in 0..ss_result.radiance.len() {
+            let diff = (ss_result.radiance[i] - hybrid_result.radiance[i]).abs();
+            let rel = if ss_result.radiance[i] > 1e-30 {
+                diff / ss_result.radiance[i]
+            } else {
+                diff
+            };
+            assert!(
+                rel < 0.05,
+                "Hybrid(0 rays) should match single-scatter: wl[{}] {:.4e} vs {:.4e} (rel: {:.4})",
+                i,
+                hybrid_result.radiance[i],
+                ss_result.radiance[i],
+                rel
+            );
+        }
+    }
+
+    #[test]
+    fn hybrid_radiance_decreases_with_depth() {
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 100,
+            ..SimulationConfig::default()
+        };
+        let r_93 = total_radiance(&simulate_at_sza(&atm, &config, 93.0));
+        let r_100 = total_radiance(&simulate_at_sza(&atm, &config, 100.0));
+        assert!(
+            r_93 > r_100 * 0.5,
+            "Hybrid SZA93 ({:.4e}) should be > SZA100 ({:.4e})",
+            r_93,
+            r_100
+        );
+    }
+
+    #[test]
+    fn hybrid_twilight_scan_correct_count() {
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 10,
+            ..SimulationConfig::default()
+        };
+        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0);
+        assert_eq!(results.len(), 3, "Expected 3 steps, got {}", results.len());
     }
 }

@@ -35,8 +35,8 @@ const MAX_SHADOW_STEPS: usize = 300;
 /// Returns the total distance the ray `origin + t*direction` spends inside the
 /// shell for `0 <= t <= t_max`.
 ///
-/// This is exact (analytical) — no stepping artifacts.
-fn ray_path_through_shell(
+/// This is exact (analytical) -- no stepping artifacts.
+pub fn ray_path_through_shell(
     origin: Vec3,
     direction: Vec3,
     r_inner: f64,
@@ -276,7 +276,10 @@ pub fn single_scatter_radiance(
 ///
 /// Uses analytical shell-by-shell path length computation for exact results,
 /// eliminating stepping artifacts that caused zeros at deep twilight angles.
-fn shadow_ray_transmittance(
+///
+/// This is public so the hybrid integrator can reuse exact shadow ray logic
+/// instead of the step-by-step `trace_transmittance` in `photon.rs`.
+pub fn shadow_ray_transmittance(
     atm: &AtmosphereModel,
     start_pos: Vec3,
     sun_dir: Vec3,

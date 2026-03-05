@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Muno459/twilight/actions"><img src="https://img.shields.io/badge/tests-462_passing-brightgreen?style=flat-square" alt="tests"/></a>
+  <a href="https://github.com/Muno459/twilight/actions"><img src="https://img.shields.io/badge/tests-494_passing-brightgreen?style=flat-square" alt="tests"/></a>
   <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/rust-pure_%23!%5Bno__std%5D_core-orange?style=flat-square" alt="rust"/></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=flat-square" alt="license"/></a>
 </p>
@@ -13,7 +13,7 @@
 
 <br/>
 
-`twilight` computes Fajr and Isha prayer times by simulating how sunlight actually scatters through the atmosphere. No lookup tables, no fixed depression angles. Photons in, prayer times out. 8 ms. Optional JPL DE440 ephemeris for sub-meter solar positioning.
+`twilight` computes Fajr and Isha prayer times by simulating how sunlight actually scatters through the atmosphere. No lookup tables, no fixed depression angles. Photons in, prayer times out. 8 ms (single-scatter) or 50 s (hybrid multi-scatter). Three scattering modes: deterministic single-scatter, backward Monte Carlo, and hybrid (exact order 1 + MC orders 2+). Optional JPL DE440 ephemeris for sub-meter solar positioning.
 
 ## Why
 
@@ -56,6 +56,10 @@ cargo run --release -- solar --lat 21.4225 --lon 39.8262 --date 2024-06-15 --tz 
 
 # Raw spectral radiance across twilight
 cargo run --release -- mcrt --lat 21.4225 --lon 39.8262 --sza-start 90 --sza-end 108
+
+# Hybrid multi-scatter mode (reaches 18° depression)
+cargo run --release -- mcrt --lat 21.4225 --lon 39.8262 --scattering hybrid --photons 1000
+cargo run --release -- pray --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --scattering hybrid --photons 500
 ```
 
 Aerosol types: `continental-clean`, `continental-average`, `urban`, `maritime-clean`, `maritime-polluted`, `desert`.
@@ -64,9 +68,9 @@ Cloud types: `thin-cirrus`, `thick-cirrus`, `altostratus`, `stratus`, `stratocum
 
 ## How it works
 
-SPA computes the sun's position (VSOP87, ±0.0003°). The atmosphere builder creates 50 spherical shells with Rayleigh scattering, ozone absorption, optional aerosol extinction, and optional cloud layers at 41 wavelengths. For each solar zenith angle, the single-scatter integrator traces a line of sight toward the horizon, computing analytical shadow rays to the sun through each shell. CIE mesopic vision converts spectral radiance to perceived luminance. A two-pass adaptive scan finds where brightness drops below the perceptual threshold.
+SPA computes the sun's position (VSOP87, ±0.0003°). The atmosphere builder creates 50 spherical shells with Rayleigh scattering, ozone absorption, optional aerosol extinction, and optional cloud layers at 41 wavelengths. For each solar zenith angle, the integrator traces a line of sight toward the horizon. In single-scatter mode, analytical shadow rays are computed through each shell (deterministic, fast). In hybrid mode, each LOS step also launches MC secondary chains that scatter upward to sunlit altitudes and back down, capturing orders 2+ of scattering. CIE mesopic vision converts spectral radiance to perceived luminance. A two-pass adaptive scan finds where brightness drops below the perceptual threshold.
 
-Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
+Single-scatter mode is deterministic. Same input, same output, bit-for-bit. Hybrid mode uses MC for orders 2+ and converges with ~500-1000 secondary rays per step.
 
 <details>
 <summary>Pipeline details</summary>
@@ -75,7 +79,7 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 
 2. **Atmosphere.** 50 shells, 0 to 100 km. Rayleigh via Bodhaine (1999) with exact Lorentz-Lorenz. O₃ via Serdyuchenko (2014). OPAC aerosol climatology (6 types) with Angstrom extinction and Henyey-Greenstein phase function. Cloud layers (6 types: cirrus to cumulus). Lambertian ground reflection.
 
-3. **Radiative transfer.** LOS integration with analytical shell-by-shell shadow rays. 41 wavelengths, 380 to 780 nm. Produces spectral radiance vectors at each SZA.
+3. **Radiative transfer.** Three modes: (a) single-scatter LOS integration with analytical shadow rays (8 ms, deterministic); (b) backward Monte Carlo with next-event estimation (all orders, noisy); (c) hybrid -- exact single-scatter + MC secondary chains with upward-biased importance sampling for orders 2+ (reaches 18° depression). 41 wavelengths, 380 to 780 nm.
 
 4. **Vision model.** CIE photopic/scotopic/mesopic luminance. Spectral centroid classifies twilight color: blue, white (*shafaq al-abyad*), orange, red (*shafaq al-ahmar*), dark.
 
@@ -88,11 +92,11 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 
 | Crate | What |
 |---|---|
-| `twilight-core` | Physics kernel. `#![no_std]`, `#![forbid(unsafe_code)]`, zero heap. Geometry, scattering, atmosphere, single-scatter integrator, MC tracer. |
+| `twilight-core` | Physics kernel. `#![no_std]`, `#![forbid(unsafe_code)]`, zero heap. Geometry, scattering, atmosphere, single-scatter integrator, backward MC tracer, hybrid multi-scatter engine. |
 | `twilight-solar` | NREL SPA (±0.0003°) + JPL DE440 ephemeris backend (±0.001"). Pure Rust DAF/SPK reader. |
 | `twilight-data` | Embedded data. US Std 1976, TSIS-1 solar spectrum, O₃ cross-sections, OPAC aerosols, cloud types, builder. |
 | `twilight-threshold` | CIE vision, mesopic luminance, twilight color classification, prayer time thresholds. |
-| `twilight-cpu` | Rayon parallel backend. Simulation driver, adaptive pipeline. |
+| `twilight-cpu` | Rayon parallel backend. Simulation driver (single/MC/hybrid dispatch), adaptive pipeline. |
 | `twilight-ffi` | C FFI. `cdylib` + `staticlib` for iOS/Android/Flutter. |
 | `twilight-cli` | CLI. `solar`, `mcrt`, `pray`. |
 
@@ -101,29 +105,31 @@ Deterministic. No Monte Carlo noise. Same input, same output, bit-for-bit.
 
 ## What's missing
 
-- **Multiple scattering.** Single-scatter underestimates deep twilight brightness. This is why we get ~15° instead of 18°. Also limits accuracy for thick clouds (OD > ~5).
+- **Thick cloud multi-scatter convergence.** Hybrid mode reaches 18° in clear sky and thin clouds, but thick clouds (stratus OD=10) still attenuate the signal below threshold. Needs more secondary rays or smarter importance sampling in the cloud layer.
 - **Terrain, light pollution.** Planned.
 - **One atmosphere profile.** US Standard 1976 everywhere, for now.
+- **GPU acceleration.** Hybrid mode takes ~50s on Apple Silicon. CUDA/WGSL backend would bring this under 1s.
 
 
 ## Tests
 
-462 tests, 0.2 seconds. `cargo test --workspace`
+494 tests, ~11 seconds. `cargo test --workspace`
 
 | Crate | Tests |
 |---|---|
-| `twilight-core` | 135 |
+| `twilight-core` | 147 |
 | `twilight-data` | 139 |
 | `twilight-threshold` | 72 |
 | `twilight-solar` | 63 (+10 DE440 integration) |
-| `twilight-cpu` | 52 |
+| `twilight-cpu` | 73 |
 
 
 ## Roadmap
 
 - [x] Solar position, atmosphere model, single-scatter engine, vision model, prayer pipeline, ground reflection, aerosols, cloud layers, C FFI
 - [x] JPL DE440 ephemeris (pure Rust DAF/SPK reader, validated to 8 m vs Horizons)
-- [ ] Multiple scattering (backward MC with next-event estimation)
+- [x] Multiple scattering: backward MC with NEE, hybrid single-scatter + MC orders 2+
+- [x] Upward-biased importance sampling for deep twilight connectivity
 - [ ] Real-time weather, satellite cloud fields (GOES/Himawari/Meteosat + ML)
 - [ ] Light pollution, terrain masking
 - [ ] GPU backend, neural surrogate, mobile SDKs, WASM

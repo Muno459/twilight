@@ -203,6 +203,8 @@ enum CliScattering {
     Single,
     /// Monte Carlo multiple scattering (all orders, noisy)
     Multiple,
+    /// Hybrid: exact single-scatter + MC for orders 2+ (recommended)
+    Hybrid,
 }
 
 impl CliScattering {
@@ -210,6 +212,7 @@ impl CliScattering {
         match self {
             CliScattering::Single => ScatteringMode::Single,
             CliScattering::Multiple => ScatteringMode::Multiple,
+            CliScattering::Hybrid => ScatteringMode::Hybrid,
         }
     }
 }
@@ -461,6 +464,7 @@ fn cmd_mcrt(
     let mode_str = match scattering_mode {
         ScatteringMode::Single => "Single-scatter (deterministic)".to_string(),
         ScatteringMode::Multiple => format!("Multiple-scatter MC ({} photons/wl)", photons),
+        ScatteringMode::Hybrid => format!("Hybrid SS+MC ({} secondary rays/step)", photons),
     };
     println!("Scattering:   {}", mode_str);
     println!(
@@ -627,6 +631,10 @@ fn cmd_pray(
         ScatteringMode::Single => "Single-scatter MCRT + CIE mesopic vision".to_string(),
         ScatteringMode::Multiple => format!(
             "Multiple-scatter MC ({} photons/wl) + CIE mesopic vision",
+            photons
+        ),
+        ScatteringMode::Hybrid => format!(
+            "Hybrid SS+MC ({} sec. rays/step) + CIE mesopic vision",
             photons
         ),
     };
@@ -861,6 +869,14 @@ fn cmd_pray(
         ScatteringMode::Multiple => {
             println!("  - Current model: US Standard 1976 atmosphere, multiple scattering (MC).");
             println!("  - MC noise decreases with more photons. Use --photons to adjust.");
+        }
+        ScatteringMode::Hybrid => {
+            println!(
+                "  - Current model: US Standard 1976 atmosphere, hybrid single+multi scatter."
+            );
+            println!(
+                "  - Order 1 is exact, orders 2+ are MC. Use --photons to adjust convergence."
+            );
         }
     }
     if aerosol_type.is_some() || cloud_type.is_some() {
