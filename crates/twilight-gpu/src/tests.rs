@@ -3040,3 +3040,122 @@ fn test_parity_coverage_report() {
         pass,
     );
 }
+
+/// Diagnostic: Compare GPU hybrid radiance vs CPU hybrid radiance at deep
+/// twilight using the SAME geometry as the prayer pipeline (Mecca,
+/// view_zenith=85°, solar_azimuth=270°).
+///
+/// Not a pass/fail test -- purely diagnostic output via eprintln.
+#[test]
+fn diagnostic_hybrid_gpu_vs_cpu_deep_twilight() {
+    let mut backends = init_all_backends();
+    if backends.is_empty() {
+        eprintln!("DIAG: No GPU backends available, skipping");
+        return;
+    }
+
+    // Build clear-sky atmosphere (same as prayer pipeline)
+    let atm = twilight_data::builder::build_clear_sky(
+        twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+        0.15,
+    );
+    for (_, gpu) in backends.iter_mut() {
+        gpu.upload_atmosphere(&atm).unwrap();
+    }
+
+    // Mecca coordinates, view near horizon (same as prayer pipeline)
+    let lat = 21.4225;
+    let lon = 39.8262;
+    let solar_azimuth = 270.0; // evening
+    let view_zenith = 85.0;
+
+    let obs_pos = twilight_core::geometry::geographic_to_ecef(lat, lon, 0.0);
+    let view = twilight_core::geometry::solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+    let obs_arr = [obs_pos.x, obs_pos.y, obs_pos.z];
+    let view_arr = [view.x, view.y, view.z];
+
+    let secondary_rays: usize = 100;
+    for &sza_deg in &[92.0, 96.0, 100.0, 102.0, 104.0, 105.0, 106.0] {
+        let sun = twilight_core::geometry::solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+        let sun_arr = [sun.x, sun.y, sun.z];
+
+        // CPU hybrid (f64 ground truth)
+        let mut cpu_radiance = [0.0f64; 64];
+        let num_wl = atm.num_wavelengths;
+        for w in 0..num_wl {
+            let sza_bits = sza_deg.to_bits();
+            let mut rng = sza_bits
+                .wrapping_add(w as u64)
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1);
+            cpu_radiance[w] = twilight_core::photon::hybrid_scatter_radiance(
+                &atm,
+                obs_pos,
+                view,
+                sun,
+                w,
+                secondary_rays,
+                &mut rng,
+            );
+        }
+
+        // GPU hybrid
+        for (kind, gpu) in backends.iter() {
+            let gpu_result = gpu
+                .hybrid_scatter(
+                    obs_arr,
+                    view_arr,
+                    sun_arr,
+                    secondary_rays as u32,
+                    sza_deg.to_bits(),
+                )
+                .unwrap();
+
+            let diag_wl_idxs = [0usize, 5, 10, 17, 25, 30, 35, 40];
+            eprintln!(
+                "\nDIAG [{:?}] SZA={:.1}  (secondary_rays={})",
+                kind, sza_deg, secondary_rays
+            );
+            eprintln!(
+                "  {:>6}  {:>14}  {:>14}  {:>10}",
+                "wl_idx", "CPU(f64)", "GPU(f32)", "ratio"
+            );
+
+            let mut cpu_total = 0.0f64;
+            let mut gpu_total = 0.0f64;
+
+            for &wi in &diag_wl_idxs {
+                if wi >= num_wl {
+                    continue;
+                }
+                let c = cpu_radiance[wi];
+                let g = gpu_result.radiance[wi];
+                let ratio = if c.abs() > 1e-30 {
+                    g / c
+                } else if g.abs() > 1e-30 {
+                    f64::INFINITY
+                } else {
+                    1.0
+                };
+                eprintln!("  {:>6}  {:>14.6e}  {:>14.6e}  {:>10.4}", wi, c, g, ratio);
+            }
+
+            for w in 0..num_wl {
+                cpu_total += cpu_radiance[w];
+                gpu_total += gpu_result.radiance[w];
+            }
+
+            let total_ratio = if cpu_total > 1e-30 {
+                gpu_total / cpu_total
+            } else if gpu_total > 1e-30 {
+                f64::INFINITY
+            } else {
+                1.0
+            };
+            eprintln!(
+                "  {:>6}  {:>14.6e}  {:>14.6e}  {:>10.4}",
+                "TOTAL", cpu_total, gpu_total, total_ratio
+            );
+        }
+    }
+}

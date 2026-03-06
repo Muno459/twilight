@@ -14,12 +14,6 @@ use crate::scattering::{
 /// Maximum number of scattering events before terminating a photon.
 pub const MAX_SCATTERS: usize = 100;
 
-/// Minimum photon weight before Russian roulette.
-pub const RUSSIAN_ROULETTE_WEIGHT: f64 = 0.01;
-
-/// Russian roulette survival probability.
-pub const RUSSIAN_ROULETTE_SURVIVE: f64 = 0.1;
-
 /// Apply refraction at a shell boundary and advance the photon past it.
 ///
 /// Returns the new (position, direction) after crossing. For total
@@ -179,16 +173,6 @@ pub fn trace_photon(
 
         // Apply single scattering albedo (probability of scattering vs absorption)
         weight *= optics.ssa;
-
-        // Russian roulette for low-weight photons
-        if weight < RUSSIAN_ROULETTE_WEIGHT {
-            let xi_rr = xorshift_f64(rng_state);
-            if xi_rr > RUSSIAN_ROULETTE_SURVIVE {
-                result.terminated = true;
-                break;
-            }
-            weight /= RUSSIAN_ROULETTE_SURVIVE;
-        }
 
         // Sample new direction based on phase function
         let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
@@ -486,16 +470,6 @@ pub fn trace_photon_polarized(
 
         // Apply SSA
         weight *= optics.ssa;
-
-        // Russian roulette
-        if weight < RUSSIAN_ROULETTE_WEIGHT {
-            let xi_rr = xorshift_f64(rng_state);
-            if xi_rr > RUSSIAN_ROULETTE_SURVIVE {
-                result.terminated = true;
-                break;
-            }
-            weight /= RUSSIAN_ROULETTE_SURVIVE;
-        }
 
         // Sample new direction
         let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
@@ -904,15 +878,6 @@ fn trace_secondary_chain(
         // Apply SSA
         weight *= optics.ssa;
 
-        // Russian roulette
-        if weight < RUSSIAN_ROULETTE_WEIGHT {
-            let xi_rr = xorshift_f64(rng_state);
-            if xi_rr > RUSSIAN_ROULETTE_SURVIVE {
-                break;
-            }
-            weight /= RUSSIAN_ROULETTE_SURVIVE;
-        }
-
         // Sample new direction
         let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(rng_state))
@@ -1177,18 +1142,6 @@ mod tests {
         // and < 10000 (avoid infinite loops)
         assert!(MAX_SCATTERS >= 10);
         assert!(MAX_SCATTERS <= 10000);
-    }
-
-    #[test]
-    fn russian_roulette_weight_is_small() {
-        assert!(RUSSIAN_ROULETTE_WEIGHT > 0.0);
-        assert!(RUSSIAN_ROULETTE_WEIGHT < 1.0);
-    }
-
-    #[test]
-    fn russian_roulette_survive_is_valid_probability() {
-        assert!(RUSSIAN_ROULETTE_SURVIVE > 0.0);
-        assert!(RUSSIAN_ROULETTE_SURVIVE <= 1.0);
     }
 
     // ── mc_scatter_spectrum ──

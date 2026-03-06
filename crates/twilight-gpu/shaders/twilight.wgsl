@@ -635,12 +635,6 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
 
         weight *= op.ssa;
 
-        if weight < 0.01 {
-            let xi_rr = xorshift_f32(&rng);
-            if xi_rr > 0.1 { break; }
-            weight /= 0.1;
-        }
-
         var cos_theta_s: f32;
         if xorshift_f32(&rng) < op.rayleigh_fraction {
             cos_theta_s = sample_rayleigh_analytic(xorshift_f32(&rng));
@@ -733,12 +727,6 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
         }
 
         weight *= op.ssa;
-
-        if weight < 0.01 {
-            let xi_rr = xorshift_f32(rng);
-            if xi_rr > 0.1 { break; }
-            weight /= 0.1;
-        }
 
         var cos_theta_s: f32;
         if xorshift_f32(rng) < op.rayleigh_fraction {
@@ -852,7 +840,10 @@ fn hybrid_scatter(
         let di_single = my_beta_scat * phase_1 / (4.0 * PI) * t_sun * t_obs * ds;
         contribution += di_single;
 
-        if secondary_rays_count > 0u {
+        // Skip MC chains when direct solar transmittance is negligible --
+        // f32 shadow rays inside MC chains produce spurious nonzero values
+        // at deep twilight due to accumulated rounding over many shells.
+        if secondary_rays_count > 0u && t_sun > 1e-20 {
             var mc_sum = kahan_init();
             for (var ray = 0u; ray < secondary_rays_count; ray++) {
                 mc_sum = kahan_add(mc_sum,

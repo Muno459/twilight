@@ -709,13 +709,6 @@ kernel void mcrt_trace_photon(
         // Apply SSA
         weight *= op.ssa;
 
-        // Russian roulette
-        if (weight < 0.01f) {
-            float xi_rr = xorshift_f32(rng);
-            if (xi_rr > 0.1f) break;
-            weight /= 0.1f;
-        }
-
         // Sample new direction
         float cos_theta;
         if (xorshift_f32(rng) < op.rayleigh_fraction) {
@@ -813,13 +806,6 @@ float trace_secondary_chain(device const float* atm, float3 start_pos,
         }
 
         weight *= op.ssa;
-
-        // Russian roulette
-        if (weight < 0.01f) {
-            float xi_rr = xorshift_f32(rng);
-            if (xi_rr > 0.1f) break;
-            weight /= 0.1f;
-        }
 
         // Sample new direction
         float cos_theta;
@@ -952,7 +938,13 @@ kernel void hybrid_scatter(
         contribution += di_single;
 
         // Orders 2+: MC secondary chains
-        if (secondary_rays > 0) {
+        // Skip when direct solar transmittance is negligible -- at deep
+        // twilight the f32 shadow ray inside MC chains produces spurious
+        // nonzero transmittance (accumulated shell-by-shell rounding) that
+        // makes the GPU orders of magnitude too bright. The deterministic
+        // single-scatter t_sun is the reliable signal; if it says the sun
+        // is unreachable, the stochastic chains should not override that.
+        if (secondary_rays > 0 && t_sun > 1e-20f) {
             KahanAccum mc_sum;
             for (uint ray = 0; ray < secondary_rays; ray++) {
                 mc_sum.add(trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx, my_op, rng));

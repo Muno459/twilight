@@ -640,12 +640,6 @@ void main() {
 
         weight *= op.ssa;
 
-        if (weight < 0.01) {
-            float xi_rr = xorshift_f32(rng);
-            if (xi_rr > 0.1) break;
-            weight /= 0.1;
-        }
-
         float cos_theta_s;
         if (xorshift_f32(rng) < op.rayleigh_fraction) {
             cos_theta_s = sample_rayleigh_analytic(xorshift_f32(rng));
@@ -742,12 +736,6 @@ float trace_secondary_chain(vec3 start_pos, vec3 sun_dir, uint wl_idx,
         }
 
         weight *= op.ssa;
-
-        if (weight < 0.01) {
-            float xi_rr = xorshift_f32(rng);
-            if (xi_rr > 0.1) break;
-            weight /= 0.1;
-        }
 
         float cos_theta_s;
         if (xorshift_f32(rng) < op.rayleigh_fraction) {
@@ -858,7 +846,10 @@ void main() {
         float di_single = my_beta_scat * phase_1 / (4.0 * PI) * t_sun * t_obs * ds;
         contribution += di_single;
 
-        if (secondary_rays_count > 0u) {
+        // Skip MC chains when direct solar transmittance is negligible --
+        // f32 shadow rays inside MC chains produce spurious nonzero values
+        // at deep twilight due to accumulated rounding over many shells.
+        if (secondary_rays_count > 0u && t_sun > 1e-20) {
             vec2 mc_sum = kahan_init();
             for (uint ray = 0u; ray < secondary_rays_count; ray++) {
                 mc_sum = kahan_add(mc_sum,

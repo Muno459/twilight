@@ -677,12 +677,6 @@ void mcrt_trace_photon(const float* atm, const float* params, float* output,
 
         weight *= op.ssa;
 
-        if (weight < 0.01f) {
-            float xi_rr = xorshift_f32(rng);
-            if (xi_rr > 0.1f) break;
-            weight /= 0.1f;
-        }
-
         float cos_theta_s;
         if (xorshift_f32(rng) < op.rayleigh_fraction) {
             cos_theta_s = sample_rayleigh_analytic(xorshift_f32(rng));
@@ -775,12 +769,6 @@ __device__ float trace_secondary_chain(const float* atm, float3 start_pos,
         }
 
         weight *= op.ssa;
-
-        if (weight < 0.01f) {
-            float xi_rr = xorshift_f32(rng);
-            if (xi_rr > 0.1f) break;
-            weight /= 0.1f;
-        }
 
         float cos_theta_s;
         if (xorshift_f32(rng) < op.rayleigh_fraction) {
@@ -898,7 +886,10 @@ void hybrid_scatter(const float* atm, const float* params, float* output,
         float di_single = my_beta_scat * phase_1 / (4.0f * PI) * t_sun * t_obs * ds;
         contribution += di_single;
 
-        if (secondary_rays_count > 0) {
+        // Skip MC chains when direct solar transmittance is negligible --
+        // f32 shadow rays inside MC chains produce spurious nonzero values
+        // at deep twilight due to accumulated rounding over many shells.
+        if (secondary_rays_count > 0 && t_sun > 1e-20f) {
             KahanAccum mc_sum;
             for (unsigned int ray = 0; ray < secondary_rays_count; ray++) {
                 mc_sum.add(trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx, my_op, rng));
