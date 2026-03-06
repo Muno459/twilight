@@ -141,6 +141,19 @@ pub struct GpuConfig {
     pub rng_seed: u64,
     /// Enable debug buffer output (shader printf / debug values).
     pub debug: bool,
+    /// Enable full Stokes [I,Q,U,V] polarization tracking (default: true).
+    ///
+    /// When true (the default), the GPU shaders propagate full 4-component
+    /// Stokes vectors through scattering events, capturing polarization-
+    /// intensity coupling (Rayleigh + aerosol Mueller matrices).
+    ///
+    /// When false (`--fast` mode), the shaders use scalar radiance tracking
+    /// (P11 phase function only). This is slightly faster but loses the
+    /// ~0.5-2% polarization correction to intensity.
+    ///
+    /// NOTE: GPU shaders currently always run Stokes internally. This flag
+    /// is reserved for a future scalar shader path optimization.
+    pub polarized: bool,
 }
 
 impl Default for GpuConfig {
@@ -152,6 +165,7 @@ impl Default for GpuConfig {
             secondary_rays_per_step: 100,
             rng_seed: 42,
             debug: false,
+            polarized: true,
         }
     }
 }

@@ -78,6 +78,15 @@ pub struct SimulationConfig {
     /// Higher values reduce noise but increase computation time.
     /// Recommended: 10000+ for converged results, 1000 for quick estimates.
     pub photons_per_wavelength: usize,
+    /// Enable full Stokes [I,Q,U,V] polarization tracking (default: true).
+    ///
+    /// When true (the default), the hybrid/MC CPU engine propagates full
+    /// 4-component Stokes vectors through Mueller matrices, capturing
+    /// polarization-intensity coupling from Rayleigh and aerosol scattering.
+    ///
+    /// When false (`--fast` mode), uses scalar phase function (P11 only).
+    /// Slightly faster, loses ~0.5-2% polarization correction.
+    pub polarized: bool,
 }
 
 impl Default for SimulationConfig {
@@ -91,6 +100,7 @@ impl Default for SimulationConfig {
             apply_solar_irradiance: true,
             scattering_mode: ScatteringMode::Single,
             photons_per_wavelength: 10_000,
+            polarized: true,
         }
     }
 }

@@ -96,6 +96,11 @@ enum Commands {
         /// Preferred GPU backend: cuda, metal, vulkan, wgpu (auto-detect if omitted)
         #[arg(long, value_enum)]
         gpu_backend: Option<CliGpuBackend>,
+        /// Scalar radiance mode (skip Stokes polarization tracking).
+        /// Default is full Stokes [I,Q,U,V]. Use --fast for ~10% speedup
+        /// at the cost of ~0.5-2% polarization correction to intensity.
+        #[arg(long)]
+        fast: bool,
     },
     /// Compute physically-based Fajr and Isha prayer times using MCRT
     Pray {
@@ -181,6 +186,11 @@ enum Commands {
         /// Preferred GPU backend: cuda, metal, vulkan, wgpu (auto-detect if omitted)
         #[arg(long, value_enum)]
         gpu_backend: Option<CliGpuBackend>,
+        /// Scalar radiance mode (skip Stokes polarization tracking).
+        /// Default is full Stokes [I,Q,U,V]. Use --fast for ~10% speedup
+        /// at the cost of ~0.5-2% polarization correction to intensity.
+        #[arg(long)]
+        fast: bool,
     },
 }
 
@@ -556,6 +566,7 @@ fn cmd_mcrt(
     use_weather: bool,
     force_cpu: bool,
     gpu_backend: Option<CliGpuBackend>,
+    fast: bool,
 ) {
     // Suppress unused warnings when gpu feature is disabled
     #[cfg(not(feature = "gpu"))]
@@ -619,12 +630,19 @@ fn cmd_mcrt(
     println!("Atmosphere:   {}", atm_desc);
     println!("Surface:      albedo = {:.2}", albedo);
     let scattering_mode = scattering.to_scattering_mode();
+    let polarized = !fast;
     let mode_str = match scattering_mode {
         ScatteringMode::Single => "Single-scatter (deterministic)".to_string(),
         ScatteringMode::Multiple => format!("Multiple-scatter MC ({} photons/wl)", photons),
         ScatteringMode::Hybrid => format!("Hybrid SS+MC ({} secondary rays/step)", photons),
     };
     println!("Scattering:   {}", mode_str);
+    let pol_str = if polarized {
+        "Stokes [I,Q,U,V]"
+    } else {
+        "Scalar (--fast)"
+    };
+    println!("Polarization: {}", pol_str);
     println!(
         "View:         zenith {:.0}°, azimuth {:.0}°",
         view_zenith, solar_azimuth
@@ -659,6 +677,7 @@ fn cmd_mcrt(
         apply_solar_irradiance: true,
         scattering_mode,
         photons_per_wavelength: photons,
+        polarized,
     };
 
     // GPU initialization (default unless --cpu is passed).
@@ -833,6 +852,7 @@ fn cmd_pray(
     led_fraction: f64,
     force_cpu: bool,
     gpu_backend_pref: Option<CliGpuBackend>,
+    fast: bool,
 ) {
     // Suppress unused warnings when gpu feature is disabled
     #[cfg(not(feature = "gpu"))]
@@ -911,6 +931,7 @@ fn cmd_pray(
         "NREL SPA"
     };
     let scattering_mode = scattering.to_scattering_mode();
+    let polarized = !fast;
     let method_str = match scattering_mode {
         ScatteringMode::Single => "Single-scatter MCRT + CIE mesopic vision".to_string(),
         ScatteringMode::Multiple => format!(
@@ -924,6 +945,12 @@ fn cmd_pray(
     };
     println!("Ephemeris:  {}", ephemeris_label);
     println!("Method:     {}", method_str);
+    let pol_str = if polarized {
+        "Stokes [I,Q,U,V]"
+    } else {
+        "Scalar (--fast)"
+    };
+    println!("Polarize:   {}", pol_str);
 
     // Terrain masking
     let horizon_profile = if use_terrain {
@@ -1037,6 +1064,7 @@ fn cmd_pray(
         skyglow: skyglow_result,
         o3_column_du: o3_du,
         no2_surface_density: no2_density,
+        polarized,
         ..Default::default()
     };
 
@@ -1420,6 +1448,7 @@ fn main() {
             weather,
             cpu,
             gpu_backend,
+            fast,
         } => {
             cmd_mcrt(
                 lat,
@@ -1437,6 +1466,7 @@ fn main() {
                 weather,
                 cpu,
                 gpu_backend,
+                fast,
             );
         }
         Commands::Pray {
@@ -1465,6 +1495,7 @@ fn main() {
             led_fraction,
             cpu,
             gpu_backend,
+            fast,
         } => {
             cmd_pray(
                 lat,
@@ -1492,6 +1523,7 @@ fn main() {
                 led_fraction,
                 cpu,
                 gpu_backend,
+                fast,
             );
         }
     }

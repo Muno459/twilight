@@ -88,6 +88,9 @@ pub struct PrayerTimeInput {
     /// Override surface NO2 density (molecules/m^3). When set, the standard
     /// atmosphere NO2 profile is scaled so the surface value matches.
     pub no2_surface_density: Option<f64>,
+    /// Enable full Stokes [I,Q,U,V] polarization tracking (default: true).
+    /// When false (`--fast` mode), uses scalar phase function only.
+    pub polarized: bool,
 }
 
 impl Default for PrayerTimeInput {
@@ -115,6 +118,7 @@ impl Default for PrayerTimeInput {
             skyglow: None,
             o3_column_du: None,
             no2_surface_density: None,
+            polarized: true,
         }
     }
 }
@@ -536,6 +540,7 @@ fn compute_prayer_times_inner(
         apply_solar_irradiance: true,
         scattering_mode: input.scattering_mode,
         photons_per_wavelength: input.photons_per_wavelength,
+        polarized: input.polarized,
     };
 
     let coarse_results = scan(atm, &config, 90.0, sza_upper, input.sza_step);
