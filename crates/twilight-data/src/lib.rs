@@ -1,3 +1,4 @@
+#![allow(clippy::manual_clamp)]
 //! Embedded atmospheric data for the twilight MCRT engine.
 
 pub mod aerosol;

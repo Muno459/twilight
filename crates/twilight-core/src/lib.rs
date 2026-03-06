@@ -1,5 +1,13 @@
 #![no_std]
 #![forbid(unsafe_code)]
+#![allow(
+    clippy::manual_clamp,
+    clippy::manual_memcpy,
+    clippy::manual_find,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::doc_overindented_list_items
+)]
 
 pub mod atmosphere;
 pub mod gas_absorption;

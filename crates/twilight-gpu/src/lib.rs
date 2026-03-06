@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop, clippy::manual_c_str_literals)]
 //! GPU compute backends for the Twilight MCRT engine.
 //!
 //! Provides four native GPU backends for maximum performance on every platform:
