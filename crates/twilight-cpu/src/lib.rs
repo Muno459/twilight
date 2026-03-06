@@ -1,4 +1,3 @@
-#![allow(clippy::needless_range_loop)]
 //! Rayon-based CPU backend for parallel photon tracing.
 
 #[cfg(feature = "gpu")]

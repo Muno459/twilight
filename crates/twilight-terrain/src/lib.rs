@@ -1,4 +1,3 @@
-#![allow(clippy::needless_range_loop, clippy::if_same_then_else)]
 //! Terrain masking for twilight prayer times.
 //!
 //! Provides elevation data from multiple sources (Copernicus GLO-30 globally,

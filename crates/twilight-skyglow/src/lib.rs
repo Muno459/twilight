@@ -1,4 +1,3 @@
-#![allow(clippy::manual_clamp)]
 //! Light pollution skyglow model for twilight prayer times.
 //!
 //! This crate models the contribution of artificial light (skyglow) to the

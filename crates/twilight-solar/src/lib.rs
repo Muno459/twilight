@@ -1,4 +1,3 @@
-#![allow(clippy::inconsistent_digit_grouping, clippy::too_many_arguments)]
 //! Solar position algorithms for twilight computation.
 //!
 //! Provides two backends for computing solar zenith angle and azimuth:

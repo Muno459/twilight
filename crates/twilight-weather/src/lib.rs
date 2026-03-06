@@ -1,4 +1,3 @@
-#![allow(clippy::manual_clamp, clippy::needless_range_loop)]
 //! Real-time weather data for twilight MCRT simulations.
 //!
 //! Fetches current atmospheric conditions from the Open-Meteo API (no key
