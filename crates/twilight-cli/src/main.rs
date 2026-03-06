@@ -90,9 +90,9 @@ enum Commands {
         /// Fetch live weather data from Open-Meteo (overrides --aerosol and --cloud)
         #[arg(long)]
         weather: bool,
-        /// Use GPU acceleration for MCRT computation
+        /// Force CPU-only computation (skip GPU)
         #[arg(long)]
-        gpu: bool,
+        cpu: bool,
         /// Preferred GPU backend: cuda, metal, vulkan, wgpu (auto-detect if omitted)
         #[arg(long, value_enum)]
         gpu_backend: Option<CliGpuBackend>,
@@ -175,9 +175,9 @@ enum Commands {
         /// Default 0.5 (typical mixed modern city).
         #[arg(long, default_value = "0.5")]
         led_fraction: f64,
-        /// Use GPU acceleration for MCRT computation
+        /// Force CPU-only computation (skip GPU)
         #[arg(long)]
-        gpu: bool,
+        cpu: bool,
         /// Preferred GPU backend: cuda, metal, vulkan, wgpu (auto-detect if omitted)
         #[arg(long, value_enum)]
         gpu_backend: Option<CliGpuBackend>,
@@ -550,7 +550,7 @@ fn cmd_mcrt(
     cloud: CliCloud,
     scattering: CliScattering,
     use_weather: bool,
-    use_gpu: bool,
+    force_cpu: bool,
     gpu_backend: Option<CliGpuBackend>,
 ) {
     // Suppress unused warnings when gpu feature is disabled
@@ -657,19 +657,13 @@ fn cmd_mcrt(
         photons_per_wavelength: photons,
     };
 
-    // GPU initialization (if requested)
+    // GPU initialization (default unless --cpu is passed)
     #[cfg(feature = "gpu")]
-    let mut gpu_backend = if use_gpu {
-        try_init_gpu(gpu_backend, photons)
-    } else {
+    let mut gpu_backend = if force_cpu {
         None
+    } else {
+        try_init_gpu(gpu_backend, photons)
     };
-
-    #[cfg(not(feature = "gpu"))]
-    if use_gpu {
-        eprintln!("Error: GPU support not compiled. Rebuild with --features gpu");
-        std::process::exit(1);
-    }
 
     let compute_label = {
         #[cfg(feature = "gpu")]
@@ -682,6 +676,7 @@ fn cmd_mcrt(
         }
         #[cfg(not(feature = "gpu"))]
         {
+            let _ = force_cpu;
             "CPU (rayon)"
         }
     };
@@ -829,7 +824,7 @@ fn cmd_pray(
     bortle: Option<u8>,
     radiance_nw: Option<f64>,
     led_fraction: f64,
-    use_gpu: bool,
+    force_cpu: bool,
     gpu_backend_pref: Option<CliGpuBackend>,
 ) {
     // Suppress unused warnings when gpu feature is disabled
@@ -1038,19 +1033,13 @@ fn cmd_pray(
         ..Default::default()
     };
 
-    // GPU initialization (if requested)
+    // GPU initialization (default unless --cpu is passed)
     #[cfg(feature = "gpu")]
-    let mut gpu_backend = if use_gpu {
-        try_init_gpu(gpu_backend_pref, photons)
-    } else {
+    let mut gpu_backend = if force_cpu {
         None
+    } else {
+        try_init_gpu(gpu_backend_pref, photons)
     };
-
-    #[cfg(not(feature = "gpu"))]
-    if use_gpu {
-        eprintln!("Error: GPU support not compiled. Rebuild with --features gpu");
-        std::process::exit(1);
-    }
 
     let compute_label = {
         #[cfg(feature = "gpu")]
@@ -1063,6 +1052,7 @@ fn cmd_pray(
         }
         #[cfg(not(feature = "gpu"))]
         {
+            let _ = force_cpu;
             "CPU (rayon)"
         }
     };
@@ -1417,7 +1407,7 @@ fn main() {
             cloud,
             scattering,
             weather,
-            gpu,
+            cpu,
             gpu_backend,
         } => {
             cmd_mcrt(
@@ -1434,7 +1424,7 @@ fn main() {
                 cloud,
                 scattering,
                 weather,
-                gpu,
+                cpu,
                 gpu_backend,
             );
         }
@@ -1462,7 +1452,7 @@ fn main() {
             bortle,
             radiance,
             led_fraction,
-            gpu,
+            cpu,
             gpu_backend,
         } => {
             cmd_pray(
@@ -1489,7 +1479,7 @@ fn main() {
                 bortle,
                 radiance,
                 led_fraction,
-                gpu,
+                cpu,
                 gpu_backend,
             );
         }

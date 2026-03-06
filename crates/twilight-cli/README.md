@@ -45,7 +45,11 @@ Runs the two-pass adaptive MCRT scan, reports Fajr, Isha al-abyad, and Isha al-a
 | `--photons <N>` | MC photons per wavelength per SZA step |
 | `--polarized` | Full Stokes vector polarized RT |
 | `--de440 <path>` | Use JPL DE440 ephemeris file |
+| `--cpu` | Force CPU-only computation (GPU is the default) |
+| `--gpu-backend <backend>` | Preferred GPU: cuda, metal, vulkan, wgpu (auto-detect if omitted) |
 | `--elevation <m>` | Observer elevation in meters |
 | `--albedo <0-1>` | Surface reflectance (default 0.15) |
 | `--tz <hours>` | Timezone offset from UTC |
 | `--delta-t <sec>` | TT-UT1 in seconds (default 69.184) |
+
+GPU acceleration is enabled by default. The CLI auto-detects the best available backend (Metal on macOS, Vulkan on Linux/Windows). Use `--cpu` to force CPU-only computation. Build with `--no-default-features` to compile without GPU support entirely.
