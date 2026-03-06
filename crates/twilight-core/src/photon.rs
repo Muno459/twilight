@@ -8,7 +8,7 @@ use crate::atmosphere::AtmosphereModel;
 use crate::geometry::{next_shell_boundary, refract_at_boundary, RefractResult, Vec3};
 use crate::scattering::{
     henyey_greenstein_phase, rayleigh_phase, sample_henyey_greenstein, sample_rayleigh_analytic,
-    scatter_direction, scatter_mueller, scattering_plane_rotation, StokesVector,
+    scatter_direction, scatter_stokes_fast, scattering_plane_cos_sin, StokesVector,
 };
 
 /// Maximum number of scattering events before terminating a photon.
@@ -511,19 +511,18 @@ fn compute_nee_polarized(
     // to the current one (prev_dir, photon_dir) -> (photon_dir, -sun_dir is
     // the "virtual" next direction). For NEE, the "next direction" is the sun
     // direction (reversed, since we compute scattering of sunlight).
-    let rotation_angle = scattering_plane_rotation(prev_dir, photon_dir, sun_dir);
+    let (rot_c, rot_s) = scattering_plane_cos_sin(prev_dir, photon_dir, sun_dir);
 
-    // Full Mueller matrix: rotation + scattering
-    let mueller = scatter_mueller(
+    // Direct Stokes scatter+rotate (no matrices, no trig)
+    let solar_stokes = StokesVector::unpolarized(1.0);
+    let scattered = scatter_stokes_fast(
+        &solar_stokes,
         cos_angle,
         local_optics.rayleigh_fraction,
         local_optics.asymmetry,
-        rotation_angle,
+        rot_c,
+        rot_s,
     );
-
-    // Apply Mueller matrix to unpolarized sunlight (I=1, Q=U=V=0)
-    let solar_stokes = StokesVector::unpolarized(1.0);
-    let scattered = mueller.apply(&solar_stokes);
 
     // Scale by weight, transmittance, and 1/(4pi)
     let factor = weight * transmittance / (4.0 * core::f64::consts::PI);
@@ -758,7 +757,7 @@ fn trace_secondary_chain(
     start_optics: &crate::atmosphere::ShellOptics,
     rng_state: &mut u64,
 ) -> crate::scattering::StokesVector {
-    use crate::scattering::{scatter_mueller, scattering_plane_rotation, StokesVector};
+    use crate::scattering::{scatter_stokes_fast, scattering_plane_cos_sin, StokesVector};
     use crate::single_scatter::shadow_ray_transmittance;
 
     let local_up = start_pos.normalize();
@@ -779,17 +778,18 @@ fn trace_secondary_chain(
         (d, cos_theta_init)
     };
 
-    // Initialize Stokes state: apply first scatter's Mueller to [1,0,0,0]
-    let mut stokes = StokesVector::unpolarized(1.0);
+    // Initialize Stokes state: apply first scatter to [1,0,0,0]
+    let mut stokes;
     {
-        let rot0 = scattering_plane_rotation(prev_dir_in, sun_dir, dir);
-        let mueller0 = scatter_mueller(
+        let (c0, s0) = scattering_plane_cos_sin(prev_dir_in, sun_dir, dir);
+        stokes = scatter_stokes_fast(
+            &StokesVector::unpolarized(1.0),
             cos_theta_init,
             start_optics.rayleigh_fraction,
             start_optics.asymmetry,
-            rot0,
+            c0,
+            s0,
         );
-        stokes = mueller0.apply(&stokes);
         // Normalize by I (importance weighting)
         let i_val = stokes.intensity();
         if i_val > 1e-30 {
@@ -865,14 +865,15 @@ fn trace_secondary_chain(
 
         if t_sun_secondary > 1e-30 {
             let cos_angle_nee = sun_dir.dot(-current_dir);
-            let rot_nee = scattering_plane_rotation(prev_dir, current_dir, -sun_dir);
-            let mueller_nee = scatter_mueller(
+            let (cn, sn) = scattering_plane_cos_sin(prev_dir, current_dir, -sun_dir);
+            let nee_stokes = scatter_stokes_fast(
+                &stokes,
                 cos_angle_nee,
                 optics.rayleigh_fraction,
                 optics.asymmetry,
-                rot_nee,
+                cn,
+                sn,
             );
-            let nee_stokes = mueller_nee.apply(&stokes);
 
             let scale = weight * t_sun_secondary / (4.0 * core::f64::consts::PI);
             total_stokes = total_stokes.add(&nee_stokes.scale(scale));
@@ -893,11 +894,16 @@ fn trace_secondary_chain(
         let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
         let new_dir = scatter_direction(current_dir, cos_theta, phi);
 
-        // Update Stokes through this scatter
-        let rot_s = scattering_plane_rotation(prev_dir, current_dir, new_dir);
-        let mueller_s =
-            scatter_mueller(cos_theta, optics.rayleigh_fraction, optics.asymmetry, rot_s);
-        stokes = mueller_s.apply(&stokes);
+        // Update Stokes through this scatter (fused, no matrices, no trig)
+        let (cs, ss) = scattering_plane_cos_sin(prev_dir, current_dir, new_dir);
+        stokes = scatter_stokes_fast(
+            &stokes,
+            cos_theta,
+            optics.rayleigh_fraction,
+            optics.asymmetry,
+            cs,
+            ss,
+        );
 
         // Normalize by I (importance weighting -- keeps stokes I = 1)
         let i_val = stokes.intensity();

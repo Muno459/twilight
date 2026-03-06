@@ -489,6 +489,112 @@ pub fn scatter_mueller(
     scatter.mul(&rot)
 }
 
+// ── Trig-free fused scatter+rotate+apply for the hot path ──────────────
+//
+// The standard path builds two 4x4 matrices (scatter, rotation), multiplies
+// them (64 muls + 48 adds), then applies to a 4-vector (16 muls + 12 adds).
+// Total: ~140 FP ops + 3 libm trig calls (atan2, cos, sin).
+//
+// For our atmosphere (Rayleigh + spherical HG), Mueller symmetries give:
+//   P22 = P11, P33 = P44, P34 = 0, P12_HG = 0
+// which reduces M_scatter * R(phi) * S to 4 scalar equations with 3 params
+// (A, B, C) and trig-free double-angle rotation. Total: ~20 FP ops, 0 trig.
+
+/// Compute cos(phi) and sin(phi) for the scattering plane rotation.
+///
+/// Same geometry as [`scattering_plane_rotation`], but returns the
+/// raw (cos, sin) pair instead of the angle. This avoids the atan2 call.
+#[inline(always)]
+pub fn scattering_plane_cos_sin(
+    dir_in: crate::geometry::Vec3,
+    dir_out: crate::geometry::Vec3,
+    dir_next: crate::geometry::Vec3,
+) -> (f64, f64) {
+    let n_old = dir_in.cross(dir_out);
+    let n_old_len = n_old.length();
+
+    let n_new = dir_out.cross(dir_next);
+    let n_new_len = n_new.length();
+
+    if n_old_len < 1e-12 || n_new_len < 1e-12 {
+        return (1.0, 0.0); // phi = 0 -> cos=1, sin=0
+    }
+
+    let inv_old = 1.0 / n_old_len;
+    let inv_new = 1.0 / n_new_len;
+    let n_old_unit = n_old * inv_old;
+    let n_new_unit = n_new * inv_new;
+
+    let cos_phi = n_old_unit.dot(n_new_unit);
+    let sin_phi = n_old_unit.cross(n_new_unit).dot(dir_out);
+    (cos_phi, sin_phi)
+}
+
+/// Apply scatter + rotate directly to a Stokes vector without building matrices.
+///
+/// Exploits Mueller symmetries of Rayleigh (P22=P11, P33=P44, P34=0) and
+/// spherical HG (diagonal, P12=0) to reduce the combined operation
+/// `M_scatter * R(phi) * S` to 4 scalar equations:
+///
+/// ```text
+///   A = alpha*P11_R + (1-alpha)*P11_HG    // mixed scalar phase function
+///   B = alpha*P12_R                        // polarization coupling
+///   C = alpha*P33_R + (1-alpha)*P11_HG    // cross-pol + HG diagonal
+///
+///   c2 = 2*cos(phi)^2 - 1   // double-angle, no trig
+///   s2 = 2*sin(phi)*cos(phi)
+///
+///   I' = A*I + B*(c2*Q + s2*U)
+///   Q' = B*I + A*(c2*Q + s2*U)     // D=A for Rayleigh symmetry
+///   U' = C*(c2*U - s2*Q)
+///   V' = C*V                        // E=C for Rayleigh symmetry
+/// ```
+///
+/// Cost: ~20 FP ops, 0 trig calls. Replaces scatter_mueller().apply() which
+/// costs ~140 FP ops + 3 libm trig calls.
+#[inline(always)]
+pub fn scatter_stokes_fast(
+    stokes: &StokesVector,
+    cos_theta: f64,
+    rayleigh_fraction: f64,
+    asymmetry: f64,
+    cos_phi: f64,
+    sin_phi: f64,
+) -> StokesVector {
+    // Rayleigh components (3/4 normalization)
+    let ct2 = cos_theta * cos_theta;
+    let p11_r = 0.75 * (ct2 + 1.0);
+    let p12_r = 0.75 * (ct2 - 1.0);
+    let p33_r = 1.5 * cos_theta;
+
+    // HG component
+    let p11_h = henyey_greenstein_phase(cos_theta, asymmetry);
+
+    // Mixed A, B, C
+    let alpha = rayleigh_fraction;
+    let one_minus_alpha = 1.0 - alpha;
+    let a = alpha * p11_r + one_minus_alpha * p11_h;
+    let b = alpha * p12_r;
+    let c = alpha * p33_r + one_minus_alpha * p11_h;
+
+    // Double-angle rotation (no trig)
+    let c2 = 2.0 * cos_phi * cos_phi - 1.0;
+    let s2 = 2.0 * sin_phi * cos_phi;
+
+    // Rotated Q, U terms
+    let q_rot = c2 * stokes.s[1] + s2 * stokes.s[2];
+    let u_rot = c2 * stokes.s[2] - s2 * stokes.s[1];
+
+    StokesVector {
+        s: [
+            a * stokes.s[0] + b * q_rot,
+            b * stokes.s[0] + a * q_rot, // D = A (Rayleigh symmetry)
+            c * u_rot,
+            c * stokes.s[3], // E = C (Rayleigh symmetry)
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
