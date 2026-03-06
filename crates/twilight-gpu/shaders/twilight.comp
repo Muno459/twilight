@@ -736,6 +736,8 @@ void main() {
 
     vec3 pos = observer_pos;
     vec3 dir = view_dir;
+    vec3 prev_dir = dir;
+    vec4 stokes = vec4(1.0, 0.0, 0.0, 0.0);
     float weight = 1.0;
     vec2 result_weight = kahan_init();
 
@@ -764,12 +766,15 @@ void main() {
         if (free_path >= bnd.dist) {
             vec3 boundary_pos = pos + dir * bnd.dist;
 
+            // Ground reflection: depolarizes
             if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
                 float albedo = read_albedo(wl_idx);
                 weight *= albedo;
                 vec3 normal = normalize(boundary_pos);
+                prev_dir = dir;
                 dir = sample_hemisphere(normal, rng);
                 pos = radial_nudge(boundary_pos, true);
+                stokes = vec4(1.0, 0.0, 0.0, 0.0);
                 continue;
             }
 
@@ -779,15 +784,21 @@ void main() {
 
         pos = pos + dir * free_path;
 
+        // NEE: apply Mueller to photon's current Stokes state
         float t_sun = shadow_ray_transmittance(pos, sun_dir, wl_idx);
         if (t_sun > 1e-30) {
             float cos_angle = dot(sun_dir, -dir);
-            float phase = mixed_phase(cos_angle, op);
-            result_weight = kahan_add(result_weight, weight * t_sun * phase / (4.0 * PI));
+            float A_nee, B_nee, C_nee;
+            stokes_ABC(cos_angle, op, A_nee, B_nee, C_nee);
+            float cos2phi_nee, sin2phi_nee;
+            scattering_plane_rotation(prev_dir, dir, -sun_dir, cos2phi_nee, sin2phi_nee);
+            vec4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
+            result_weight = kahan_add(result_weight, weight * t_sun * nee_stokes.x / (4.0 * PI));
         }
 
         weight *= op.ssa;
 
+        // Sample new direction and update Stokes state
         float cos_theta_s;
         if (xorshift_f32(rng) < op.rayleigh_fraction) {
             cos_theta_s = sample_rayleigh_analytic(xorshift_f32(rng));
@@ -795,7 +806,21 @@ void main() {
             cos_theta_s = sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry);
         }
         float phi = 2.0 * PI * xorshift_f32(rng);
-        dir = scatter_direction(dir, cos_theta_s, phi);
+        vec3 new_dir = scatter_direction(dir, cos_theta_s, phi);
+
+        float A_s, B_s, C_s;
+        stokes_ABC(cos_theta_s, op, A_s, B_s, C_s);
+        float cos2phi_s, sin2phi_s;
+        scattering_plane_rotation(prev_dir, dir, new_dir, cos2phi_s, sin2phi_s);
+        stokes = scatter_stokes(A_s, B_s, C_s, cos2phi_s, sin2phi_s, stokes);
+        if (stokes.x > 1e-30) {
+            stokes *= 1.0 / stokes.x;
+        } else {
+            stokes = vec4(1.0, 0.0, 0.0, 0.0);
+        }
+
+        prev_dir = dir;
+        dir = new_dir;
     }
 
     output_buf.data[tid] = kahan_result(result_weight);

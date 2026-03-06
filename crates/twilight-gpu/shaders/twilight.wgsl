@@ -723,6 +723,8 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
 
     var pos = observer_pos;
     var dir = view_dir;
+    var prev_dir = dir;
+    var stokes = vec4f(1.0, 0.0, 0.0, 0.0);
     var weight = 1.0f;
     var result_weight = kahan_init();
 
@@ -751,12 +753,15 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
         if free_path >= bnd.dist {
             let boundary_pos = pos + dir * bnd.dist;
 
+            // Ground reflection: depolarizes
             if !bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M {
                 let albedo = read_albedo(wl_idx);
                 weight *= albedo;
                 let normal = normalize(boundary_pos);
+                prev_dir = dir;
                 dir = sample_hemisphere(normal, &rng);
                 pos = radial_nudge(boundary_pos, true);
+                stokes = vec4f(1.0, 0.0, 0.0, 0.0);
                 continue;
             }
 
@@ -766,15 +771,19 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
 
         pos = pos + dir * free_path;
 
+        // NEE: apply Mueller to photon's current Stokes state
         let t_sun = shadow_ray_transmittance(pos, sun_dir, wl_idx);
         if t_sun > 1e-30 {
             let cos_angle = dot(sun_dir, -dir);
-            let phase = mixed_phase(cos_angle, op);
-            result_weight = kahan_add(result_weight, weight * t_sun * phase / (4.0 * PI));
+            let abc_nee = compute_stokes_ABC(cos_angle, op);
+            let rot_nee = scattering_plane_rotation(prev_dir, dir, -sun_dir);
+            let nee_stokes = scatter_stokes_vec(abc_nee, rot_nee, stokes);
+            result_weight = kahan_add(result_weight, weight * t_sun * nee_stokes.x / (4.0 * PI));
         }
 
         weight *= op.ssa;
 
+        // Sample new direction and update Stokes state
         var cos_theta_s: f32;
         if xorshift_f32(&rng) < op.rayleigh_fraction {
             cos_theta_s = sample_rayleigh_analytic(xorshift_f32(&rng));
@@ -782,7 +791,19 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
             cos_theta_s = sample_henyey_greenstein(xorshift_f32(&rng), op.asymmetry);
         }
         let phi = 2.0 * PI * xorshift_f32(&rng);
-        dir = scatter_direction(dir, cos_theta_s, phi);
+        let new_dir = scatter_direction(dir, cos_theta_s, phi);
+
+        let abc_s = compute_stokes_ABC(cos_theta_s, op);
+        let rot_s = scattering_plane_rotation(prev_dir, dir, new_dir);
+        stokes = scatter_stokes_vec(abc_s, rot_s, stokes);
+        if stokes.x > 1e-30 {
+            stokes *= 1.0 / stokes.x;
+        } else {
+            stokes = vec4f(1.0, 0.0, 0.0, 0.0);
+        }
+
+        prev_dir = dir;
+        dir = new_dir;
     }
 
     output_buf[tid] = kahan_result(result_weight);

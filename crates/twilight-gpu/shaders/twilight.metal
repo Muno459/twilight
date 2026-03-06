@@ -842,6 +842,8 @@ kernel void mcrt_trace_photon(
 
     float3 pos = observer_pos;
     float3 dir = view_dir;
+    float3 prev_dir = dir; // for Stokes scattering plane tracking
+    float4 stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
     float weight = 1.0f;
     KahanAccum result_weight;
 
@@ -872,14 +874,15 @@ kernel void mcrt_trace_photon(
             // Exit shell without scattering
             float3 boundary_pos = pos + dir * bnd.dist;
 
-            // Ground reflection check
+            // Ground reflection: depolarizes
             if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
                 float albedo = read_albedo(atm, wl_idx);
                 weight *= albedo;
                 float3 normal = normalize(boundary_pos);
+                prev_dir = dir;
                 dir = sample_hemisphere(normal, rng);
-                // Nudge outward from ground
                 pos = radial_nudge(boundary_pos, true);
+                stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
                 continue;
             }
 
@@ -891,18 +894,22 @@ kernel void mcrt_trace_photon(
         // Scattering event
         pos = pos + dir * free_path;
 
-        // NEE: direct solar contribution
+        // NEE: apply Mueller to photon's current Stokes state
         float t_sun = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
             float cos_angle = dot(sun_dir, -dir);
-            float phase = mixed_phase(cos_angle, op);
-            result_weight.add(weight * t_sun * phase / (4.0f * PI));
+            float A_nee, B_nee, C_nee;
+            stokes_ABC(cos_angle, op, A_nee, B_nee, C_nee);
+            float cos2phi_nee, sin2phi_nee;
+            scattering_plane_rotation(prev_dir, dir, -sun_dir, cos2phi_nee, sin2phi_nee);
+            float4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
+            result_weight.add(weight * t_sun * nee_stokes.x / (4.0f * PI));
         }
 
         // Apply SSA
         weight *= op.ssa;
 
-        // Sample new direction
+        // Sample new direction and update Stokes state
         float cos_theta;
         if (xorshift_f32(rng) < op.rayleigh_fraction) {
             cos_theta = sample_rayleigh_analytic(xorshift_f32(rng));
@@ -910,7 +917,22 @@ kernel void mcrt_trace_photon(
             cos_theta = sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry);
         }
         float phi = 2.0f * PI * xorshift_f32(rng);
-        dir = scatter_direction(dir, cos_theta, phi);
+        float3 new_dir = scatter_direction(dir, cos_theta, phi);
+
+        // Update Stokes through this scatter
+        float A_s, B_s, C_s;
+        stokes_ABC(cos_theta, op, A_s, B_s, C_s);
+        float cos2phi_s, sin2phi_s;
+        scattering_plane_rotation(prev_dir, dir, new_dir, cos2phi_s, sin2phi_s);
+        stokes = scatter_stokes(A_s, B_s, C_s, cos2phi_s, sin2phi_s, stokes);
+        if (stokes.x > 1e-30f) {
+            stokes *= 1.0f / stokes.x;
+        } else {
+            stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+        prev_dir = dir;
+        dir = new_dir;
     }
 
     output[tid] = result_weight.result();
