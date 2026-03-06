@@ -427,6 +427,18 @@ impl GpuBackend for MetalBackend {
 
         let wg_size = self.config.workgroup_size;
 
+        // ── ONE encoder for ALL dispatches ──────────────────────────────
+        //
+        // Metal allows multiple setComputePipelineState + setBuffer +
+        // dispatchThreadgroups calls within a single compute encoder.
+        // Creating one encoder per dispatch (the old code) adds ~0.5ms
+        // of Metal runtime overhead per encoder, which dominates for
+        // lightweight kernels like single_scatter (50 dispatches of ~10
+        // threads each). One encoder eliminates this overhead entirely.
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| GpuError::Dispatch("failed to create compute encoder".into()))?;
+
         for (i, s) in slices.iter().enumerate() {
             let pipeline = match s.kernel {
                 BatchKernel::SingleScatter => &self.pso_single_scatter,
@@ -436,22 +448,12 @@ impl GpuBackend for MetalBackend {
 
             let is_hybrid = matches!(s.kernel, BatchKernel::Hybrid { .. });
 
-            // For non-hybrid kernels: total_threads = raw_len (1 thread/output).
-            // For hybrid: dispatch nw threadgroups of HYBRID_THREADGROUP_SIZE threads.
-            // The hybrid kernel indexes by threadgroup_position_in_grid (wl_idx)
-            // and thread_position_in_threadgroup (step_idx).
             if !is_hybrid && s.raw_len == 0 {
                 continue;
             }
 
-            let encoder = cmd_buf
-                .computeCommandEncoder()
-                .ok_or_else(|| GpuError::Dispatch("failed to create compute encoder".into()))?;
-
             encoder.setComputePipelineState(pipeline);
 
-            // Bind shared atmosphere at offset 0, then per-dispatch params
-            // and output regions via byte offsets into the mega-buffers.
             let params_byte_offset = i * PARAMS_STRIDE * std::mem::size_of::<f32>();
             let output_byte_offset = s.offset_f32 * std::mem::size_of::<f32>();
 
@@ -462,7 +464,6 @@ impl GpuBackend for MetalBackend {
             }
 
             let (grid_size, threadgroup_size) = if is_hybrid {
-                // Hybrid: nw threadgroups, each with HYBRID_THREADGROUP_SIZE threads
                 let num_tg = nw as u32;
                 (
                     MTLSize {
@@ -477,7 +478,6 @@ impl GpuBackend for MetalBackend {
                     },
                 )
             } else {
-                // Non-hybrid: flat dispatch
                 let total_threads = s.raw_len as u32;
                 let num_groups = dispatch_groups(total_threads, wg_size);
                 (
@@ -495,8 +495,9 @@ impl GpuBackend for MetalBackend {
             };
 
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-            encoder.endEncoding();
         }
+
+        encoder.endEncoding();
 
         // ONE commit, ONE wait -- the whole point of batching.
         cmd_buf.commit();

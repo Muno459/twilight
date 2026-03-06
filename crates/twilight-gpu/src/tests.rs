@@ -2060,12 +2060,11 @@ fn benchmark_batch_vs_serial_single_scatter() {
             kind, serial_elapsed, batch_elapsed, speedup,
         );
 
-        // Under test parallelism, GPU contention from concurrent tests can
-        // make batch slower than serial (observed 0.6x under full suite).
-        // In isolation the batch path is faster. Use a generous floor.
+        // Batch should never be slower than serial -- if it is, the batch
+        // implementation has a real performance bug that needs fixing.
         assert!(
-            speedup > 0.3,
-            "{}: batch ({:?}) catastrophically slower than serial ({:?}), got {:.1}x",
+            speedup > 1.0,
+            "{}: batch ({:?}) should not be slower than serial ({:?}), got {:.1}x",
             kind,
             batch_elapsed,
             serial_elapsed,
