@@ -8,18 +8,23 @@ Sources:
   O3   -- Serdyuchenko et al. (2014), doi:10.5281/zenodo.5793207, CC-BY 4.0
   O2   -- HITRAN 2020 line list (Gordon et al. 2022), Voigt profiles
   H2O  -- HITRAN 2020 line list (Gordon et al. 2022), Voigt profiles
-  NO2  -- Vandaele et al. (1998), HITRAN UV cross-sections
-  O4   -- Thalman & Volkamer (2013), HITRAN CIA recommended
+  NO2  -- HITRAN UV cross-section database (measured, 220K and 294K)
+  O4   -- HITRAN 2024 CIA database (O2-O2 collision-induced absorption)
+  Atm  -- US Standard Atmosphere 1976 + WMO O3 profile
 
 Usage:
   1. Download Serdyuchenko data:
        curl -L "https://zenodo.org/api/records/5793207/files/SerdyuchenkoGorshelev5digits_latest.dat/content" \
             -o data/xsec/SerdyuchenkoGorshelev5digits_latest.dat
-  2. pip install hitran-api numpy
-  3. python tools/gen_gas_xsec.py
+  2. Download HITRAN data to /tmp/hitran_data/:
+       - NO2 XSC files (220K, 294K)
+       - O2-O2 CIA file (O2-O2_2024.cia)
+       - O2.data and H2O.data line parameter files
+  3. pip install hitran-api numpy
+  4. python tools/gen_gas_xsec.py
 """
 
-import sys, os, struct, math, pathlib
+import sys, os, math, pathlib
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -33,18 +38,28 @@ N_WL = int((WL_MAX - WL_MIN) / WL_STEP) + 1  # 401
 WAVELENGTHS_NM = np.arange(WL_MIN, WL_MAX + 0.5 * WL_STEP, WL_STEP)[:N_WL]
 WAVENUMBERS_CM = 1e7 / WAVELENGTHS_NM  # cm^-1, descending
 
-# (P in atm, T in K) conditions for line-absorber cross-sections
-PT_CONDITIONS = [
-    (1.0,      296.0),   # sea level
-    (0.4935,   260.0),   # ~5.5 km
-    (0.2961,   230.0),   # ~9 km (upper trop)
-    (0.04935,  210.0),   # ~21 km (lower strat)
-]
+# 2D (P, T) grid for O2/H2O cross-sections.
+# 5 pressures x 4 temperatures = 20 conditions.
+PRESSURES_HPA = [1013.25, 500.0, 300.0, 100.0, 50.0]
+TEMPERATURES_K = [296.0, 260.0, 230.0, 210.0]
+
+# H2O line intensity threshold for visible range
+H2O_S_THRESHOLD = 1e-25
+
+# Visible wavenumber range
+WN_VIS_MIN = 1e7 / 780.0  # ~12821 cm-1
+WN_VIS_MAX = 1e7 / 380.0  # ~26316 cm-1
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SERDYUCHENKO_FILE = REPO / "data" / "xsec" / "SerdyuchenkoGorshelev5digits_latest.dat"
 HITRAN_DB = "/tmp/hitran_data"
 OUT_RS = REPO / "crates" / "twilight-core" / "src" / "gas_absorption_data.rs"
+
+NO2_XSC_294 = pathlib.Path(HITRAN_DB) / "NO2_294.0_0.0_15002.0-42002.3_00.xsc"
+NO2_XSC_220 = pathlib.Path(HITRAN_DB) / "NO2_220.0_0.0_15002.0-42002.3_00.xsc"
+CIA_FILE = pathlib.Path(HITRAN_DB) / "O2-O2_2024.cia"
+O2_LINE_FILE = pathlib.Path(HITRAN_DB) / "O2.data"
+H2O_LINE_FILE = pathlib.Path(HITRAN_DB) / "H2O.data"
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +103,7 @@ def load_serdyuchenko_o3():
         xs = np.array(xs_raw[t])
         o3_data[t] = np.interp(WAVELENGTHS_NM, wl_raw, xs)
 
-    # Validate against known optical depths
+    # Validation against known optical depths
     xs_293 = o3_data[293]
     idx_550 = int(550 - WL_MIN)
     idx_602 = int(602 - WL_MIN)
@@ -103,11 +118,218 @@ def load_serdyuchenko_o3():
 
 
 # ---------------------------------------------------------------------------
-# O2 and H2O: HITRAN line-by-line via HAPI
+# NO2: Real HITRAN XSC measured cross-sections
 # ---------------------------------------------------------------------------
-def compute_hitran_xsec(table_name, molecule_id, isotope_id):
-    """Compute absorption cross-sections from HITRAN line data using HAPI.
-    Returns dict mapping (P_atm, T_K) -> cross-section array [cm^2/molecule].
+def parse_hitran_xsc(filepath):
+    """Parse a HITRAN XSC (cross-section) file.
+    Returns (wavenumber_grid_cm1, cross_sections_cm2, temperature).
+
+    HITRAN XSC header is fixed-width (100 chars):
+      cols  0-19: molecule name (right-justified in 20 chars)
+      cols 20-29: numin (10 chars)
+      cols 30-39: numax (10 chars)
+      cols 40-46: npnts (7 chars)
+      cols 47-53: temperature (7 chars)
+      cols 54-59: pressure (6 chars)
+      ... rest: sigma_max, resolution, common name, etc.
+    """
+    with open(filepath, 'r') as f:
+        # Header line
+        header = f.readline()
+        # Fixed-width parsing
+        numin = float(header[20:30])
+        numax = float(header[30:40])
+        npnts = int(header[40:47])
+        temp = float(header[47:54])
+
+        # Read data values (10 per line)
+        values = []
+        for line in f:
+            for val_str in line.split():
+                values.append(float(val_str))
+                if len(values) >= npnts:
+                    break
+            if len(values) >= npnts:
+                break
+
+    values = np.array(values[:npnts])
+    wn_grid = np.linspace(numin, numax, npnts)
+
+    return wn_grid, values, temp
+
+
+def load_no2_xsc():
+    """Load real NO2 cross-sections from HITRAN XSC files at 294K and 220K.
+    Interpolates to our 1nm wavelength grid.
+    Returns (no2_294k, no2_220k) arrays of length N_WL.
+    """
+    print("Loading NO2 cross-sections from HITRAN XSC files...")
+
+    for path, label in [(NO2_XSC_294, "294K"), (NO2_XSC_220, "220K")]:
+        if not path.exists():
+            print(f"ERROR: {path} not found.")
+            sys.exit(1)
+
+    # Parse both files
+    wn_294, xs_294, temp_294 = parse_hitran_xsc(NO2_XSC_294)
+    wn_220, xs_220, temp_220 = parse_hitran_xsc(NO2_XSC_220)
+
+    print(f"  294K: {len(xs_294)} points, wn=[{wn_294[0]:.1f}, {wn_294[-1]:.1f}] cm-1, "
+          f"wl=[{1e7/wn_294[-1]:.1f}, {1e7/wn_294[0]:.1f}] nm, max={xs_294.max():.4e}")
+    print(f"  220K: {len(xs_220)} points, wn=[{wn_220[0]:.1f}, {wn_220[-1]:.1f}] cm-1, "
+          f"wl=[{1e7/wn_220[-1]:.1f}, {1e7/wn_220[0]:.1f}] nm, max={xs_220.max():.4e}")
+
+    # Convert our wavelength grid to wavenumber (descending)
+    wn_target = WAVENUMBERS_CM  # descending
+
+    # HITRAN XSC wavenumber grids are ascending. Interpolate.
+    # np.interp needs ascending x.
+    no2_294k = np.interp(wn_target, wn_294, xs_294, left=0.0, right=0.0)
+    no2_220k = np.interp(wn_target, wn_220, xs_220, left=0.0, right=0.0)
+
+    # XSC coverage ends at ~667nm (15002 cm-1); above that, values should be zero.
+    # The np.interp with left=0.0 handles this: wavenumbers below 15002 get zero.
+    # But wavenumber is descending in our grid, so we need to check:
+    # wn_target at 667nm = 15002, at 780nm = 12821.
+    # Since wn_294 goes from 15002 to 42002, anything below 15002 (i.e. 667-780nm) gets 0.
+    # Verify:
+    idx_667 = int(667 - WL_MIN)
+    idx_670 = int(670 - WL_MIN)
+    print(f"  Boundary check: sigma(667nm)={no2_294k[idx_667]:.4e}, sigma(670nm)={no2_294k[idx_670]:.4e}")
+
+    # Ensure non-negative (measurement noise could produce tiny negatives)
+    no2_294k = np.maximum(no2_294k, 0.0)
+    no2_220k = np.maximum(no2_220k, 0.0)
+
+    # Validation
+    idx_400 = int(400 - WL_MIN)
+    print(f"  sigma_NO2(400nm, 294K) = {no2_294k[idx_400]:.4e} cm^2 (Vandaele had 6.30e-19)")
+    print(f"  sigma_NO2(400nm, 220K) = {no2_220k[idx_400]:.4e} cm^2")
+
+    return no2_294k, no2_220k
+
+
+# ---------------------------------------------------------------------------
+# O2-O2 CIA: Real HITRAN 2024 CIA data
+# ---------------------------------------------------------------------------
+def parse_cia_file(filepath):
+    """Parse HITRAN CIA file. Returns list of band segments:
+    [(temp, wn_array, cia_array), ...]
+    """
+    segments = []
+    with open(filepath, 'r') as f:
+        while True:
+            header = f.readline()
+            if not header or not header.strip():
+                break
+
+            parts = header.split()
+            if len(parts) < 5:
+                break
+
+            # Header: O2-O2  nu_min  nu_max  n_points  temperature  ...
+            try:
+                nu_min = float(parts[1])
+                nu_max = float(parts[2])
+                n_points = int(parts[3])
+                temperature = float(parts[4])
+            except (ValueError, IndexError):
+                break
+
+            wn_arr = []
+            cia_arr = []
+            for _ in range(n_points):
+                line = f.readline()
+                if not line:
+                    break
+                vals = line.split()
+                if len(vals) >= 2:
+                    wn_arr.append(float(vals[0]))
+                    cia_arr.append(float(vals[1]))
+
+            segments.append((temperature, np.array(wn_arr), np.array(cia_arr)))
+
+    return segments
+
+
+def load_o4_cia():
+    """Load O2-O2 CIA from HITRAN 2024 CIA file.
+    Returns composite CIA spectrum at room temperature on our 1nm grid.
+    """
+    print("Loading O2-O2 CIA from HITRAN 2024...")
+
+    if not CIA_FILE.exists():
+        print(f"ERROR: {CIA_FILE} not found.")
+        sys.exit(1)
+
+    segments = parse_cia_file(CIA_FILE)
+    print(f"  Parsed {len(segments)} band segments total")
+
+    # Filter to visible range and room temperature (T >= 280K)
+    # Our visible wavenumber range: 12821 to 26316 cm-1
+    visible_segments = []
+    for temp, wn, cia in segments:
+        # Check if segment overlaps with visible range
+        if wn[-1] < WN_VIS_MIN or wn[0] > WN_VIS_MAX:
+            continue
+        visible_segments.append((temp, wn, cia))
+
+    print(f"  {len(visible_segments)} segments overlap visible range")
+
+    # For each temperature, list segments
+    temps_seen = sorted(set(s[0] for s in visible_segments))
+    print(f"  Temperatures with visible data: {temps_seen}")
+
+    # We want a composite at the best available near-room-temperature.
+    # Strategy: For each wavelength, use the highest-temperature segment
+    # that covers it, preferring temps closest to 296K.
+    # First, build a composite from all segments, giving priority to
+    # higher-temperature data (more relevant for surface conditions).
+
+    # Sort segments by temperature (descending) so room-temp data wins
+    visible_segments.sort(key=lambda s: -s[0])
+
+    # Initialize with zeros on our wavenumber grid
+    cia_composite = np.zeros(N_WL)
+
+    for temp, wn, cia in visible_segments:
+        # Clamp negative CIA values (measurement artifacts)
+        cia_clean = np.maximum(cia, 0.0)
+
+        # Interpolate this segment onto our wavelength grid
+        # Our WAVENUMBERS_CM is descending; np.interp needs ascending
+        # CIA data may be ascending or descending in wavenumber
+        if wn[0] > wn[-1]:
+            wn = wn[::-1]
+            cia_clean = cia_clean[::-1]
+
+        # Interpolate, returning 0 outside segment range
+        segment_on_grid = np.interp(WAVENUMBERS_CM, wn, cia_clean, left=0.0, right=0.0)
+
+        # Composite: where we have nonzero data from a higher-temp segment,
+        # keep it; otherwise fill with this segment's data.
+        mask = (cia_composite == 0.0) & (segment_on_grid > 0.0)
+        cia_composite[mask] = segment_on_grid[mask]
+
+    # Validation
+    idx_477 = int(477 - WL_MIN)
+    idx_577 = int(577 - WL_MIN)
+    idx_630 = int(630 - WL_MIN)
+    print(f"  Composite CIA:")
+    print(f"    477nm: {cia_composite[idx_477]:.4e} cm^5/mol^2 (Gaussian approx had 1.27e-46)")
+    print(f"    577nm: {cia_composite[idx_577]:.4e} cm^5/mol^2 (Gaussian approx had 1.58e-46)")
+    print(f"    630nm: {cia_composite[idx_630]:.4e} cm^5/mol^2")
+
+    return cia_composite
+
+
+# ---------------------------------------------------------------------------
+# O2 and H2O: HITRAN line-by-line via HAPI (2D P,T grid)
+# ---------------------------------------------------------------------------
+def compute_hitran_xsec_2d(table_name, molecule_id, isotope_id):
+    """Compute absorption cross-sections from HITRAN line data using HAPI
+    on a 2D (P, T) grid.
+    Returns dict mapping (P_hpa, T_K) -> cross-section array [cm^2/molecule].
     """
     from hapi import db_begin, absorptionCoefficient_Voigt, getColumn
     db_begin(HITRAN_DB)
@@ -115,148 +337,96 @@ def compute_hitran_xsec(table_name, molecule_id, isotope_id):
     n_lines = len(getColumn(table_name, 'nu'))
     print(f"  {table_name}: {n_lines} lines in database")
 
-    # We compute on the wavenumber grid (descending from 26316 to 12820 cm^-1).
     # HAPI needs ascending wavenumbers.
     wn_grid = np.sort(WAVENUMBERS_CM)  # ascending
 
     xsec_data = {}
-    for p_atm, t_k in PT_CONDITIONS:
-        print(f"    Computing Voigt profile at P={p_atm:.4f} atm, T={t_k:.0f} K ...", end='', flush=True)
-        try:
-            nu, coef = absorptionCoefficient_Voigt(
-                SourceTables=table_name,
-                Environment={'p': p_atm, 'T': t_k},
-                WavenumberGrid=wn_grid,
-                HITRAN_units=True,   # cm^2/molecule
-            )
-            # coef is on ascending wavenumber grid; map back to our wavelength grid
-            # Our wavelength grid is ascending (380..780nm), wavenumber is descending.
-            # np.interp needs ascending x, so interpolate on wavenumber.
-            wn_target = WAVENUMBERS_CM  # descending
-            # The result from HAPI is on wn_grid (ascending). Map to our wavelengths:
-            xsec = np.interp(wn_target, nu, coef)
-            xsec_data[(p_atm, t_k)] = xsec
-            print(f" max sigma = {xsec.max():.4e} cm^2")
-        except Exception as e:
-            print(f" FAILED: {e}")
-            xsec_data[(p_atm, t_k)] = np.zeros(N_WL)
+    for p_hpa in PRESSURES_HPA:
+        for t_k in TEMPERATURES_K:
+            p_atm = p_hpa / 1013.25
+            print(f"    P={p_hpa:.1f} hPa, T={t_k:.0f} K ...", end='', flush=True)
+            try:
+                nu, coef = absorptionCoefficient_Voigt(
+                    SourceTables=table_name,
+                    Environment={'p': p_atm, 'T': t_k},
+                    WavenumberGrid=wn_grid,
+                    HITRAN_units=True,   # cm^2/molecule
+                )
+                # Map back to our wavelength grid (ascending wavelength = descending wavenumber)
+                xsec = np.interp(WAVENUMBERS_CM, nu, coef)
+                xsec_data[(p_hpa, t_k)] = xsec
+                print(f" max={xsec.max():.4e} cm^2")
+            except Exception as e:
+                print(f" FAILED: {e}")
+                xsec_data[(p_hpa, t_k)] = np.zeros(N_WL)
 
     return xsec_data
 
 
 # ---------------------------------------------------------------------------
-# O2-O2 CIA: approximate from published band parameters
-# (Thalman & Volkamer 2013)
+# O2 and H2O line parameters for runtime Voigt computation
 # ---------------------------------------------------------------------------
-def compute_o4_cia():
-    """O2-O2 collision-induced absorption cross-sections [cm^5/molecule^2].
-    Based on Thalman & Volkamer (2013) band parameters.
+def parse_hitran_line_params(filepath, wn_min, wn_max, s_threshold=0.0):
+    """Parse HITRAN 160-char fixed-width line parameter file.
+    Returns list of (nu, sw, gamma_air, gamma_self, elower, n_air) tuples.
+    Filters to wavenumber range and intensity threshold.
     """
-    print("Computing O2-O2 CIA from Thalman & Volkamer (2013) band parameters...")
+    lines = []
+    with open(filepath, 'r') as f:
+        for line in f:
+            if len(line) < 60:
+                continue
+            nu = float(line[3:15])
+            sw = float(line[15:25])
+            if nu < wn_min or nu > wn_max:
+                continue
+            if sw < s_threshold:
+                continue
+            gamma_air = float(line[35:40])
+            gamma_self = float(line[40:45])
+            elower = float(line[45:55])
+            n_air = float(line[55:59])
+            lines.append((nu, sw, gamma_air, gamma_self, elower, n_air))
 
-    # CIA band parameters: (center_nm, fwhm_nm, peak_xs_cm5)
-    # From Thalman & Volkamer (2013), Table 2, at 296K
-    bands = [
-        (344.0,  12.0, 4.68e-47),  # UV band
-        (360.5,  15.0, 3.20e-47),  # UV band
-        (380.2,  10.0, 1.58e-47),  # near-UV band
-        (446.7,  18.0, 3.20e-47),  # blue band
-        (477.3,  14.0, 1.27e-46),  # strong blue-green band
-        (532.2,  12.0, 2.00e-47),  # green band
-        (577.2,  16.0, 1.58e-46),  # strong yellow band
-        (630.0,  22.0, 4.00e-47),  # red band
-    ]
-
-    cia = np.zeros(N_WL)
-    for center, fwhm, peak in bands:
-        sigma = fwhm / (2.0 * math.sqrt(2.0 * math.log(2.0)))
-        cia += peak * np.exp(-0.5 * ((WAVELENGTHS_NM - center) / sigma) ** 2)
-
-    print(f"  Peak CIA at 477nm: {cia[int(477 - WL_MIN)]:.4e} cm^5/mol^2")
-    print(f"  Peak CIA at 577nm: {cia[int(577 - WL_MIN)]:.4e} cm^5/mol^2")
-    return cia
+    # Sort by wavenumber
+    lines.sort(key=lambda x: x[0])
+    return lines
 
 
-# ---------------------------------------------------------------------------
-# NO2: Vandaele et al. (1998) parameterization
-# For the visible band, NO2 has smooth cross-sections that can be
-# well-represented by measured data. Since HITRAN stores NO2 as UV
-# cross-sections (not line-by-line), we use the absorption cross-section
-# parameterization from Vandaele et al. (1998) at 294K and 220K.
-#
-# The visible NO2 absorption is a structured continuum from predissociation.
-# We'll try to fetch it from HITRAN's cross-section database. If that fails,
-# we use a polynomial fit to the Vandaele data.
-# ---------------------------------------------------------------------------
-def compute_no2_xsec():
-    """NO2 absorption cross-sections at 294K and 220K [cm^2/molecule].
-    Tries HITRAN xsec download first, falls back to Vandaele parameterization.
+def load_line_params():
+    """Load O2 and H2O line parameters for visible range.
+    Returns (o2_lines, h2o_lines) where each is a list of
+    (nu, sw, gamma_air, gamma_self, elower, n_air) tuples.
     """
-    print("Computing NO2 cross-sections...")
+    print("\nExtracting line parameters for runtime Voigt computation...")
 
-    # Try fetching from HITRAN cross-section database
-    no2_294k = None
-    no2_220k = None
+    # O2: all 481 lines are in visible range
+    print("  Parsing O2 line parameters...")
+    if not O2_LINE_FILE.exists():
+        print(f"ERROR: {O2_LINE_FILE} not found.")
+        sys.exit(1)
+    o2_lines = parse_hitran_line_params(O2_LINE_FILE, WN_VIS_MIN, WN_VIS_MAX)
+    print(f"    O2: {len(o2_lines)} lines in visible range")
+    if o2_lines:
+        sws = [l[1] for l in o2_lines]
+        print(f"    S range: {min(sws):.3e} to {max(sws):.3e}")
 
-    try:
-        from hapi import fetch_xsec, db_begin
-        db_begin(HITRAN_DB)
-        # Try to get NO2 cross-sections
-        # This may or may not work depending on HAPI version
-        raise NotImplementedError("HAPI xsec fetch not reliable for NO2")
-    except:
-        pass
+    # H2O: filter to S > 1e-25
+    print("  Parsing H2O line parameters...")
+    if not H2O_LINE_FILE.exists():
+        print(f"ERROR: {H2O_LINE_FILE} not found.")
+        sys.exit(1)
+    h2o_lines = parse_hitran_line_params(
+        H2O_LINE_FILE, WN_VIS_MIN, WN_VIS_MAX, s_threshold=H2O_S_THRESHOLD
+    )
+    print(f"    H2O: {len(h2o_lines)} lines in visible range (S > {H2O_S_THRESHOLD:.0e})")
+    if h2o_lines:
+        sws = [l[1] for l in h2o_lines]
+        print(f"    S range: {min(sws):.3e} to {max(sws):.3e}")
+        nbytes = len(h2o_lines) * 6 * 8
+        print(f"    Estimated data size: {nbytes/1024:.1f} KB")
 
-    if no2_294k is None:
-        print("  Using Vandaele et al. (1998) polynomial parameterization...")
-        # NO2 visible absorption: smooth structured continuum
-        # Parameterization based on published Vandaele et al. (1998) data
-        # Valid 380-660nm, negligible above 660nm
-        #
-        # The NO2 cross-section in the visible can be approximated as:
-        # sigma(lambda) = A * exp(-((lambda - lambda0)/w)^2) * (1 + B*cos(2*pi*(lambda-380)/period))
-        # where the cosine term captures the vibrational modulation.
-        #
-        # More accurate approach: digitized Vandaele (1998) envelope at key wavelengths
-        # then cubic interpolation.
-
-        # Anchor points from Vandaele et al. (1998) at 294K [nm, cm^2/molecule]
-        # These are band-center values (the vibronic structure averages out at ~5nm)
-        anchors_294k = np.array([
-            [380, 5.60e-19], [385, 5.75e-19], [390, 5.90e-19], [395, 6.10e-19],
-            [400, 6.30e-19], [405, 6.25e-19], [410, 6.05e-19], [415, 5.80e-19],
-            [420, 5.55e-19], [425, 5.30e-19], [430, 5.05e-19], [435, 4.78e-19],
-            [440, 4.50e-19], [445, 4.22e-19], [450, 3.95e-19], [455, 3.68e-19],
-            [460, 3.42e-19], [465, 3.15e-19], [470, 2.88e-19], [475, 2.62e-19],
-            [480, 2.38e-19], [485, 2.14e-19], [490, 1.92e-19], [495, 1.72e-19],
-            [500, 1.52e-19], [505, 1.34e-19], [510, 1.18e-19], [515, 1.03e-19],
-            [520, 8.90e-20], [525, 7.65e-20], [530, 6.50e-20], [535, 5.50e-20],
-            [540, 4.60e-20], [545, 3.82e-20], [550, 3.15e-20], [555, 2.55e-20],
-            [560, 2.05e-20], [565, 1.62e-20], [570, 1.28e-20], [575, 9.80e-21],
-            [580, 7.50e-21], [585, 5.60e-21], [590, 4.10e-21], [595, 2.95e-21],
-            [600, 2.10e-21], [605, 1.48e-21], [610, 1.02e-21], [615, 6.90e-22],
-            [620, 4.60e-22], [625, 3.00e-22], [630, 1.90e-22], [635, 1.20e-22],
-            [640, 7.50e-23], [645, 4.50e-23], [650, 2.60e-23], [655, 1.50e-23],
-            [660, 8.00e-24],
-        ])
-
-        wl_anch = anchors_294k[:, 0]
-        xs_anch = anchors_294k[:, 1]
-        no2_294k = np.zeros(N_WL)
-        mask = WAVELENGTHS_NM <= 660
-        no2_294k[mask] = np.interp(WAVELENGTHS_NM[mask], wl_anch, xs_anch)
-
-        # At 220K, NO2 cross-sections are ~10-15% lower in the blue, ~5% lower in the green
-        # Temperature coefficient from Vandaele (1998): sigma(T) = sigma(294) * (1 + alpha*(T-294))
-        # alpha ~ -0.002 to -0.001 per K (depends on wavelength)
-        alpha = -0.0015 + 0.001 * (WAVELENGTHS_NM - 380) / 400  # weaker T-dep at longer wl
-        no2_220k = no2_294k * (1 + alpha * (220 - 294))
-        no2_220k = np.maximum(no2_220k, 0)
-
-    # Validation
-    idx_400 = int(400 - WL_MIN)
-    print(f"  sigma_NO2(400nm, 294K) = {no2_294k[idx_400]:.4e} cm^2 (expect ~6.3e-19)")
-    return no2_294k, no2_220k
+    return o2_lines, h2o_lines
 
 
 # ---------------------------------------------------------------------------
@@ -264,14 +434,10 @@ def compute_no2_xsec():
 # ---------------------------------------------------------------------------
 def standard_atmosphere():
     """Return standard atmosphere profiles at fixed altitude grid."""
-    # Altitude (km), Temperature (K), Pressure (hPa), O3 (molecules/m^3)
-    # Source: US Standard Atmosphere 1976 + standard O3 profile (WMO)
     alts = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 20, 25, 30, 35, 40, 45, 50, 60, 70, 80, 90, 100]
     temps = [288.15, 281.65, 275.15, 268.66, 262.17, 255.68, 249.19, 242.70, 236.22, 229.73, 223.25, 216.65, 216.65, 216.65, 221.55, 226.51, 236.51, 250.35, 264.16, 270.65, 247.02, 214.65, 196.65, 186.87, 195.08]
     pressures = [1013.25, 898.76, 795.01, 701.21, 616.60, 540.48, 472.17, 411.05, 356.51, 308.00, 264.99, 193.99, 121.11, 55.293, 25.492, 11.970, 5.746, 2.871, 1.491, 0.798, 0.220, 0.052, 0.010, 0.0016, 0.00032]
 
-    # O3 number density (molecules/m^3) -- standard mid-latitude profile
-    # Peak at ~22km. Total column ~300 DU.
     o3_density = [
         5.40e+17, 5.40e+17, 5.40e+17, 5.40e+17, 5.40e+17, 5.50e+17,
         5.60e+17, 6.00e+17, 6.60e+17, 7.50e+17, 8.60e+17, 1.20e+18,
@@ -280,12 +446,9 @@ def standard_atmosphere():
         5.00e+14
     ]
 
-    # Air number density from ideal gas law: n = P / (k_B * T)
-    k_B = 1.380649e-23  # J/K
-    air_density = [p * 100 / (k_B * t) for p, t in zip(pressures, temps)]  # molecules/m^3
+    k_B = 1.380649e-23
+    air_density = [p * 100 / (k_B * t) for p, t in zip(pressures, temps)]
 
-    # NO2 number density (molecules/m^3) -- clean continental profile
-    # Concentrated in boundary layer (0-2km), negligible above 10km
     no2_density = [
         4.0e+15, 3.0e+15, 2.0e+15, 1.2e+15, 7.0e+14, 4.0e+14,
         2.0e+14, 1.0e+14, 5.0e+13, 2.0e+13, 1.0e+13, 3.0e+12,
@@ -316,7 +479,9 @@ def fmt_f64(val):
     return f"{val:.6e}"
 
 
-def write_rust_source(o3_data, o3_temps, o2_xsec, h2o_xsec, no2_294k, no2_220k, o4_cia, std_atm):
+def write_rust_source(o3_data, o3_temps, o2_xsec, h2o_xsec,
+                      no2_294k, no2_220k, o4_cia, std_atm,
+                      o2_lines, h2o_lines):
     """Write the gas_absorption_data.rs file."""
     print(f"\nWriting Rust source to {OUT_RS}...")
 
@@ -329,11 +494,15 @@ def write_rust_source(o3_data, o3_temps, o2_xsec, h2o_xsec, no2_294k, no2_220k, 
     lines.append("//   O3  : Serdyuchenko et al. (2014), doi:10.5281/zenodo.5793207, CC-BY 4.0")
     lines.append("//   O2  : HITRAN 2020 line list (Gordon et al. 2022), Voigt profiles")
     lines.append("//   H2O : HITRAN 2020 line list (Gordon et al. 2022), Voigt profiles")
-    lines.append("//   NO2 : Vandaele et al. (1998), parameterized cross-sections")
-    lines.append("//   O4  : Thalman & Volkamer (2013), CIA band parameters")
+    lines.append("//   NO2 : HITRAN cross-section database (measured at 220K and 294K)")
+    lines.append("//   O4  : HITRAN 2024 CIA database (O2-O2 collision-induced absorption)")
     lines.append("//   Atm : US Standard Atmosphere 1976 + WMO O3 profile")
     lines.append("//")
     lines.append(f"// Wavelength grid: {WL_MIN}-{WL_MAX} nm at {WL_STEP} nm spacing ({N_WL} points)")
+    lines.append(f"// O2/H2O grid: {len(PRESSURES_HPA)} pressures x {len(TEMPERATURES_K)} temperatures = "
+                 f"{len(PRESSURES_HPA) * len(TEMPERATURES_K)} conditions")
+    lines.append(f"// O2 line params: {len(o2_lines)} lines")
+    lines.append(f"// H2O line params: {len(h2o_lines)} lines (S > {H2O_S_THRESHOLD:.0e})")
     lines.append("//")
     lines.append("")
     lines.append(f"/// Number of wavelength points in the reference grid.")
@@ -344,11 +513,11 @@ def write_rust_source(o3_data, o3_temps, o2_xsec, h2o_xsec, no2_294k, no2_220k, 
     lines.append(f"pub const GAS_WL_STEP_NM: f64 = {WL_STEP};")
     lines.append("")
 
-    # O3
+    # ---- O3 ----
     lines.append(f"/// Number of temperature points for O3 cross-sections.")
     lines.append(f"pub const O3_N_TEMPS: usize = {len(o3_temps)};")
-    lines.append(f"/// O3 temperature grid [K] (293 to 193 in 10K steps).")
     temps_str = ", ".join(f"{t:.1f}" for t in o3_temps)
+    lines.append(f"/// O3 temperature grid [K] (293 to 193 in 10K steps).")
     lines.append(f"pub const O3_TEMPS_K: [f64; {len(o3_temps)}] = [{temps_str}];")
     lines.append(f"/// O3 absorption cross-sections [cm^2/molecule].")
     lines.append(f"/// Indexed: [temp_idx][wl_idx] where wl = {WL_MIN} + wl_idx nm.")
@@ -361,49 +530,122 @@ def write_rust_source(o3_data, o3_temps, o2_xsec, h2o_xsec, no2_294k, no2_220k, 
     lines.append("];")
     lines.append("")
 
-    # O2 / H2O
-    n_pt = len(PT_CONDITIONS)
-    p_str = ", ".join(f"{p * 1013.25:.2f}" for p, _ in PT_CONDITIONS)
-    t_str = ", ".join(f"{t:.1f}" for _, t in PT_CONDITIONS)
-    lines.append(f"/// Number of (P,T) conditions for O2/H2O cross-sections.")
-    lines.append(f"pub const PT_N_CONDITIONS: usize = {n_pt};")
-    lines.append(f"/// Pressure grid for O2/H2O [hPa].")
-    lines.append(f"pub const PT_PRESSURES_HPA: [f64; {n_pt}] = [{p_str}];")
-    lines.append(f"/// Temperature grid for O2/H2O [K].")
-    lines.append(f"pub const PT_TEMPS_K: [f64; {n_pt}] = [{t_str}];")
+    # ---- O2/H2O 2D (P, T) grid ----
+    n_p = len(PRESSURES_HPA)
+    n_t = len(TEMPERATURES_K)
+    n_cond = n_p * n_t
+
+    lines.append(f"/// Number of pressure points in the O2/H2O grid.")
+    lines.append(f"pub const PT_N_PRESSURES: usize = {n_p};")
+    lines.append(f"/// Number of temperature points in the O2/H2O grid.")
+    lines.append(f"pub const PT_N_TEMPS: usize = {n_t};")
+    p_str = ", ".join(f"{p:.2f}" for p in PRESSURES_HPA)
+    t_str = ", ".join(f"{t:.1f}" for t in TEMPERATURES_K)
+    lines.append(f"/// Pressure grid for O2/H2O [hPa] (descending).")
+    lines.append(f"pub const PT_PRESSURES_HPA: [f64; {n_p}] = [{p_str}];")
+    lines.append(f"/// Temperature grid for O2/H2O [K] (descending).")
+    lines.append(f"pub const PT_TEMPS_K: [f64; {n_t}] = [{t_str}];")
     lines.append("")
 
+    # Emit O2 and H2O as 3D arrays [p_idx][t_idx][wl_idx]
     for name, xsec_dict in [("O2", o2_xsec), ("H2O", h2o_xsec)]:
         lines.append(f"/// {name} absorption cross-sections [cm^2/molecule].")
-        lines.append(f"/// Indexed: [pt_idx][wl_idx]. Voigt profile at each (P,T).")
-        lines.append(f"pub const {name}_XS: [[f64; {N_WL}]; {n_pt}] = [")
-        for i, (p, t) in enumerate(PT_CONDITIONS):
-            xs = xsec_dict.get((p, t), np.zeros(N_WL))
-            vals = ", ".join(fmt_f64(v) for v in xs)
-            lines.append(f"    // P={p*1013.25:.1f} hPa, T={t:.0f} K")
-            lines.append(f"    [{vals}],")
+        lines.append(f"/// Indexed: [{name}_XS[p_idx][t_idx][wl_idx]].")
+        lines.append(f"/// Voigt profiles computed at each (P,T) grid point.")
+        lines.append(f"pub const {name}_XS: [[[f64; {N_WL}]; {n_t}]; {n_p}] = [")
+        for pi, p_hpa in enumerate(PRESSURES_HPA):
+            lines.append(f"    // P = {p_hpa:.1f} hPa")
+            lines.append(f"    [")
+            for ti, t_k in enumerate(TEMPERATURES_K):
+                xs = xsec_dict.get((p_hpa, t_k), np.zeros(N_WL))
+                vals = ", ".join(fmt_f64(v) for v in xs)
+                lines.append(f"        // T = {t_k:.0f} K")
+                lines.append(f"        [{vals}],")
+            lines.append(f"    ],")
         lines.append("];")
         lines.append("")
 
-    # NO2
+    # ---- NO2 ----
     lines.append(f"/// NO2 absorption cross-sections at 294K [cm^2/molecule].")
-    lines.append(f"/// Source: Vandaele et al. (1998).")
+    lines.append(f"/// Source: HITRAN cross-section database (measured).")
     vals = ", ".join(fmt_f64(v) for v in no2_294k)
     lines.append(f"pub const NO2_XS_294K: [f64; {N_WL}] = [{vals}];")
     lines.append(f"/// NO2 absorption cross-sections at 220K [cm^2/molecule].")
+    lines.append(f"/// Source: HITRAN cross-section database (measured).")
     vals = ", ".join(fmt_f64(v) for v in no2_220k)
     lines.append(f"pub const NO2_XS_220K: [f64; {N_WL}] = [{vals}];")
     lines.append("")
 
-    # O2-O2 CIA
+    # ---- O4 CIA ----
     lines.append(f"/// O2-O2 collision-induced absorption cross-sections [cm^5/molecule^2].")
     lines.append(f"/// Multiply by [O2]^2 (in molecules/cm^3)^2 to get extinction [cm^-1].")
-    lines.append(f"/// Source: Thalman & Volkamer (2013).")
+    lines.append(f"/// Source: HITRAN 2024 CIA database (O2-O2, room temperature composite).")
     vals = ", ".join(fmt_f64(v) for v in o4_cia)
     lines.append(f"pub const O4_CIA_XS: [f64; {N_WL}] = [{vals}];")
     lines.append("")
 
-    # Standard atmosphere
+    # ---- Line parameters for runtime Voigt ----
+    def emit_line_params(name, line_list):
+        n = len(line_list)
+        lines.append(f"/// Number of {name} spectral lines for runtime Voigt computation.")
+        lines.append(f"pub const {name}_N_LINES: usize = {n};")
+
+        # Each parameter as separate array for better cache locality
+        nus = [l[0] for l in line_list]
+        sws = [l[1] for l in line_list]
+        gammas_air = [l[2] for l in line_list]
+        gammas_self = [l[3] for l in line_list]
+        elowers = [l[4] for l in line_list]
+        n_airs = [l[5] for l in line_list]
+
+        lines.append(f"/// {name} line centers [cm^-1].")
+        lines.append(f"pub const {name}_LINE_NU: [f64; {n}] = [")
+        # Write in rows of 8
+        for i in range(0, n, 8):
+            chunk = nus[i:i+8]
+            lines.append("    " + ", ".join(f"{v:.6f}" for v in chunk) + ",")
+        lines.append("];")
+
+        lines.append(f"/// {name} line intensities at 296K [cm^-1/(molecule*cm^-2)].")
+        lines.append(f"pub const {name}_LINE_SW: [f64; {n}] = [")
+        for i in range(0, n, 8):
+            chunk = sws[i:i+8]
+            lines.append("    " + ", ".join(fmt_f64(v) for v in chunk) + ",")
+        lines.append("];")
+
+        lines.append(f"/// {name} air-broadened half-widths at 296K [cm^-1/atm].")
+        lines.append(f"pub const {name}_LINE_GAMMA_AIR: [f64; {n}] = [")
+        for i in range(0, n, 8):
+            chunk = gammas_air[i:i+8]
+            lines.append("    " + ", ".join(f"{v:.5f}" for v in chunk) + ",")
+        lines.append("];")
+
+        lines.append(f"/// {name} self-broadened half-widths at 296K [cm^-1/atm].")
+        lines.append(f"pub const {name}_LINE_GAMMA_SELF: [f64; {n}] = [")
+        for i in range(0, n, 8):
+            chunk = gammas_self[i:i+8]
+            lines.append("    " + ", ".join(f"{v:.4f}" for v in chunk) + ",")
+        lines.append("];")
+
+        lines.append(f"/// {name} lower state energies [cm^-1].")
+        lines.append(f"pub const {name}_LINE_ELOWER: [f64; {n}] = [")
+        for i in range(0, n, 8):
+            chunk = elowers[i:i+8]
+            lines.append("    " + ", ".join(f"{v:.4f}" for v in chunk) + ",")
+        lines.append("];")
+
+        lines.append(f"/// {name} temperature exponent for air-broadened half-width.")
+        lines.append(f"pub const {name}_LINE_N_AIR: [f64; {n}] = [")
+        for i in range(0, n, 8):
+            chunk = n_airs[i:i+8]
+            lines.append("    " + ", ".join(f"{v:.2f}" for v in chunk) + ",")
+        lines.append("];")
+        lines.append("")
+
+    emit_line_params("O2", o2_lines)
+    emit_line_params("H2O", h2o_lines)
+
+    # ---- Standard atmosphere ----
     n_alts = std_atm['n_alts']
     lines.append(f"/// Standard atmosphere altitude grid [km].")
     lines.append(f"pub const STD_N_ALTS: usize = {n_alts};")
@@ -444,33 +686,39 @@ def write_rust_source(o3_data, o3_temps, o2_xsec, h2o_xsec, no2_294k, no2_220k, 
 # ---------------------------------------------------------------------------
 def main():
     print("=== Gas Absorption Cross-Section Generator ===")
-    print(f"Grid: {WL_MIN}-{WL_MAX} nm, {WL_STEP} nm step, {N_WL} points\n")
+    print(f"Grid: {WL_MIN}-{WL_MAX} nm, {WL_STEP} nm step, {N_WL} points")
+    print(f"O2/H2O grid: {len(PRESSURES_HPA)} pressures x {len(TEMPERATURES_K)} temperatures\n")
 
     # O3 from Serdyuchenko data file
     o3_data, o3_temps = load_serdyuchenko_o3()
 
-    # O2 from HITRAN line-by-line
-    print("\nComputing O2 cross-sections from HITRAN...")
-    o2_xsec = compute_hitran_xsec('O2', 7, 1)
-
-    # H2O from HITRAN line-by-line
-    print("\nComputing H2O cross-sections from HITRAN...")
-    h2o_xsec = compute_hitran_xsec('H2O', 1, 1)
-
-    # NO2 from Vandaele parameterization
+    # NO2 from real HITRAN XSC measured data
     print()
-    no2_294k, no2_220k = compute_no2_xsec()
+    no2_294k, no2_220k = load_no2_xsc()
 
-    # O2-O2 CIA
+    # O2-O2 CIA from real HITRAN 2024 data
     print()
-    o4_cia = compute_o4_cia()
+    o4_cia = load_o4_cia()
+
+    # O2 from HITRAN line-by-line (2D grid)
+    print("\nComputing O2 cross-sections from HITRAN (2D P,T grid)...")
+    o2_xsec = compute_hitran_xsec_2d('O2', 7, 1)
+
+    # H2O from HITRAN line-by-line (2D grid)
+    print("\nComputing H2O cross-sections from HITRAN (2D P,T grid)...")
+    h2o_xsec = compute_hitran_xsec_2d('H2O', 1, 1)
+
+    # Line parameters for runtime Voigt
+    o2_lines, h2o_lines = load_line_params()
 
     # Standard atmosphere
     print("\nBuilding US Standard Atmosphere 1976 profiles...")
     std_atm = standard_atmosphere()
 
     # Generate Rust source
-    write_rust_source(o3_data, o3_temps, o2_xsec, h2o_xsec, no2_294k, no2_220k, o4_cia, std_atm)
+    write_rust_source(o3_data, o3_temps, o2_xsec, h2o_xsec,
+                      no2_294k, no2_220k, o4_cia, std_atm,
+                      o2_lines, h2o_lines)
 
     print("\nDone! Review the generated file and run `cargo test -p twilight-core`.")
 
