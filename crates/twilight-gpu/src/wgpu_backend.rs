@@ -303,7 +303,11 @@ impl GpuBackend for WgpuBackend {
             PackedDispatchParams::new(observer_pos, view_dir, sun_dir, 0, secondary_rays, seed);
         let nw = self.num_wavelengths as usize;
 
-        let output = self.dispatch_compute(&self.pipeline_hybrid, buf_atm, &params.data, nw)?;
+        // Hybrid v2: dispatch nw workgroups of 256 threads (hardcoded in WGSL
+        // via @workgroup_size(256)). Each workgroup handles one wavelength;
+        // threads within the group each handle one LOS step with secondary
+        // chain tracing, then reduce via subgroupAdd() + workgroup shared memory.
+        let output = self.dispatch_hybrid(buf_atm, &params.data, nw)?;
 
         Ok(GpuSpectralResult {
             radiance: output.iter().map(|&v| v as f64).collect(),
@@ -389,6 +393,44 @@ impl WgpuBackend {
         params_data: &[f32],
         output_count: usize,
     ) -> Result<Vec<f32>, GpuError> {
+        self.dispatch_with_workgroups(
+            pipeline,
+            input_buf,
+            params_data,
+            output_count,
+            dispatch_groups(output_count as u32, self.config.workgroup_size),
+        )
+    }
+
+    /// Dispatch the hybrid kernel with exactly `num_wavelengths` workgroups.
+    ///
+    /// The WGSL hybrid kernel has `@workgroup_size(256)` hardcoded. Each
+    /// workgroup handles one wavelength; threads within the group each
+    /// handle one LOS step and reduce via subgroupAdd() + workgroup shared memory.
+    fn dispatch_hybrid(
+        &self,
+        input_buf: &wgpu::Buffer,
+        params_data: &[f32],
+        num_wavelengths: usize,
+    ) -> Result<Vec<f32>, GpuError> {
+        self.dispatch_with_workgroups(
+            &self.pipeline_hybrid,
+            input_buf,
+            params_data,
+            num_wavelengths,
+            num_wavelengths as u32,
+        )
+    }
+
+    /// Shared dispatch implementation: create buffers, encode, submit, readback.
+    fn dispatch_with_workgroups(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        input_buf: &wgpu::Buffer,
+        params_data: &[f32],
+        output_count: usize,
+        num_workgroups: u32,
+    ) -> Result<Vec<f32>, GpuError> {
         let buf_params = self
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -431,8 +473,6 @@ impl WgpuBackend {
             ],
         });
 
-        let num_groups = dispatch_groups(output_count as u32, self.config.workgroup_size);
-
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -446,7 +486,7 @@ impl WgpuBackend {
             });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(num_groups, 1, 1);
+            pass.dispatch_workgroups(num_workgroups, 1, 1);
         }
 
         encoder.copy_buffer_to_buffer(&buf_output, 0, &buf_staging, 0, output_size);

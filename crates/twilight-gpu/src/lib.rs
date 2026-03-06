@@ -40,6 +40,9 @@ pub mod wgpu_backend;
 mod oracle;
 
 #[cfg(test)]
+pub(crate) mod parity;
+
+#[cfg(test)]
 mod tests;
 
 // ── Error types ─────────────────────────────────────────────────────────
@@ -167,6 +170,34 @@ pub struct GpuSpectralResult {
     pub num_wavelengths: usize,
 }
 
+/// Which kernel to dispatch for a batched scan request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchKernel {
+    /// Deterministic single-scatter kernel.
+    SingleScatter,
+    /// Full backward MC photon tracing kernel.
+    McrtTrace {
+        photons_per_wavelength: u32,
+        seed: u64,
+    },
+    /// Hybrid single-scatter + MC secondary chain kernel.
+    Hybrid {
+        secondary_rays: u32,
+        seed: u64,
+    },
+}
+
+/// A single request within a batched GPU scan.
+///
+/// Each request represents one SZA point with its pre-computed geometry.
+#[derive(Debug, Clone)]
+pub struct BatchRequest {
+    pub observer_pos: [f64; 3],
+    pub view_dir: [f64; 3],
+    pub sun_dir: [f64; 3],
+    pub kernel: BatchKernel,
+}
+
 /// Trait implemented by each GPU backend (CUDA, Metal, Vulkan, wgpu).
 ///
 /// The lifecycle is:
@@ -233,6 +264,52 @@ pub trait GpuBackend: Send {
         observer_pos: [f64; 3],
         sources: &[buffers::PackedLightSource],
     ) -> Result<f64, GpuError>;
+
+    /// Dispatch multiple SZA points in a single GPU submission.
+    ///
+    /// Encodes all N dispatches into one command buffer (Metal) or command
+    /// submission (Vulkan/CUDA), avoiding the per-dispatch synchronization
+    /// overhead that makes serial dispatch ~25x slower than CPU for prayer
+    /// pipeline scans (~50 SZA points).
+    ///
+    /// The default implementation falls back to serial dispatch for backends
+    /// that haven't implemented batching yet.
+    fn scan_batch(
+        &self,
+        requests: &[BatchRequest],
+    ) -> Result<Vec<GpuSpectralResult>, GpuError> {
+        // Default: serial fallback -- call per-SZA methods in a loop.
+        let mut results = Vec::with_capacity(requests.len());
+        for req in requests {
+            let r = match req.kernel {
+                BatchKernel::SingleScatter => {
+                    self.single_scatter(req.observer_pos, req.view_dir, req.sun_dir)?
+                }
+                BatchKernel::McrtTrace {
+                    photons_per_wavelength,
+                    seed,
+                } => self.mcrt_trace(
+                    req.observer_pos,
+                    req.view_dir,
+                    req.sun_dir,
+                    photons_per_wavelength,
+                    seed,
+                )?,
+                BatchKernel::Hybrid {
+                    secondary_rays,
+                    seed,
+                } => self.hybrid_scatter(
+                    req.observer_pos,
+                    req.view_dir,
+                    req.sun_dir,
+                    secondary_rays,
+                    seed,
+                )?,
+            };
+            results.push(r);
+        }
+        Ok(results)
+    }
 }
 
 // ── Backend auto-detection ──────────────────────────────────────────────

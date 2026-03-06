@@ -66,8 +66,8 @@ enum Commands {
         /// SZA step size (degrees)
         #[arg(long, default_value = "2")]
         sza_step: f64,
-        /// Number of photons per wavelength (MC mode only)
-        #[arg(short, long, default_value = "10000")]
+        /// Number of secondary rays per wavelength per step (hybrid/MC modes)
+        #[arg(short, long, default_value = "100")]
         photons: usize,
         /// Surface albedo (0-1)
         #[arg(long, default_value = "0.15")]
@@ -84,8 +84,8 @@ enum Commands {
         /// Cloud type (default: none = clear sky)
         #[arg(long, value_enum, default_value = "none")]
         cloud: CliCloud,
-        /// Scattering mode: single (deterministic) or multiple (Monte Carlo)
-        #[arg(long, value_enum, default_value = "single")]
+        /// Scattering mode: single, mc, or hybrid (default: hybrid)
+        #[arg(long, value_enum, default_value = "hybrid")]
         scattering: CliScattering,
         /// Fetch live weather data from Open-Meteo (overrides --aerosol and --cloud)
         #[arg(long)]
@@ -132,11 +132,11 @@ enum Commands {
         /// Path to DE440 BSP file for JPL ephemeris (primary engine)
         #[arg(long)]
         de440: Option<String>,
-        /// Scattering mode: single (deterministic) or multiple (Monte Carlo)
-        #[arg(long, value_enum, default_value = "single")]
+        /// Scattering mode: single, mc, or hybrid (default: hybrid)
+        #[arg(long, value_enum, default_value = "hybrid")]
         scattering: CliScattering,
-        /// Number of photons per wavelength (MC mode only)
-        #[arg(short, long, default_value = "10000")]
+        /// Number of secondary rays per wavelength per step (hybrid/MC modes)
+        #[arg(short, long, default_value = "100")]
         photons: usize,
         /// Show detailed twilight analysis
         #[arg(long)]
@@ -308,12 +308,16 @@ fn try_init_gpu(
     match twilight_gpu::try_init(&config) {
         Ok(backend) => {
             let info = backend.device_info();
-            println!(
-                "GPU:        {} ({}, {:.0} MB)",
-                info.name,
-                info.backend,
-                info.memory_bytes as f64 / (1024.0 * 1024.0),
-            );
+            if info.memory_bytes > 0 {
+                println!(
+                    "GPU:        {} ({}, {:.0} MB)",
+                    info.name,
+                    info.backend,
+                    info.memory_bytes as f64 / (1024.0 * 1024.0),
+                );
+            } else {
+                println!("GPU:        {} ({})", info.name, info.backend);
+            }
             Some(backend)
         }
         Err(e) => {
@@ -657,7 +661,10 @@ fn cmd_mcrt(
         photons_per_wavelength: photons,
     };
 
-    // GPU initialization (default unless --cpu is passed)
+    // GPU initialization (default unless --cpu is passed).
+    // TODO: GPU dispatch currently sends one SZA at a time synchronously.
+    // Batching all SZA points into a single dispatch would significantly
+    // improve GPU throughput for the prayer pipeline.
     #[cfg(feature = "gpu")]
     let mut gpu_backend = if force_cpu {
         None
@@ -1033,7 +1040,11 @@ fn cmd_pray(
         ..Default::default()
     };
 
-    // GPU initialization (default unless --cpu is passed)
+    // GPU initialization. GPU is the default compute backend for all modes.
+    // Single-scatter benefits from batched dispatch (2.5x faster than serial).
+    // MC/hybrid benefits from massive parallelism across photons/wavelengths.
+    // Use --cpu to opt out.
+
     #[cfg(feature = "gpu")]
     let mut gpu_backend = if force_cpu {
         None

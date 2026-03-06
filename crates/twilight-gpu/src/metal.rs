@@ -20,7 +20,14 @@ use crate::buffers::{
     dispatch_groups, PackedAtmosphere, PackedDispatchParams, PackedLightSource,
     PackedSolarSpectrum, PackedVisionLuts,
 };
-use crate::{BackendKind, GpuBackend, GpuConfig, GpuDeviceInfo, GpuError, GpuSpectralResult};
+use crate::{
+    BackendKind, BatchKernel, BatchRequest, GpuBackend, GpuConfig, GpuDeviceInfo, GpuError,
+    GpuSpectralResult,
+};
+
+/// Threadgroup size for the hybrid kernel. Must match HYBRID_THREADGROUP_SIZE
+/// in twilight.metal (256 threads = 8 SIMD groups of 32).
+const HYBRID_THREADGROUP_SIZE: u32 = 256;
 
 // Required for MTLCreateSystemDefaultDevice to link correctly.
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -251,7 +258,11 @@ impl GpuBackend for MetalBackend {
         let nw = self.num_wavelengths as usize;
         let buf_output = create_empty_buffer(&self.device, nw)?;
 
-        self.dispatch_kernel(
+        // Hybrid v2: dispatch nw threadgroups of HYBRID_THREADGROUP_SIZE threads.
+        // Each threadgroup handles one wavelength; threads within a threadgroup
+        // each handle one LOS step with secondary chain tracing, then reduce
+        // via simd_sum() + threadgroup shared memory.
+        self.dispatch_hybrid(
             &self.pso_hybrid,
             &[buf_atm, &buf_params, &buf_output],
             nw as u32,
@@ -315,12 +326,233 @@ impl GpuBackend for MetalBackend {
         let total: f64 = results.iter().map(|&v| v as f64).sum();
         Ok(total)
     }
+
+    fn scan_batch(&self, requests: &[BatchRequest]) -> Result<Vec<GpuSpectralResult>, GpuError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let buf_atm = self
+            .buf_atm
+            .as_ref()
+            .ok_or_else(|| GpuError::Dispatch("atmosphere not uploaded".into()))?;
+
+        let nw = self.num_wavelengths as usize;
+        let n = requests.len();
+
+        // ── Unified memory optimization ─────────────────────────────────
+        //
+        // Apple Silicon has unified memory: CPU and GPU share the same
+        // physical DRAM. Creating many small Metal buffers wastes time on
+        // per-buffer bookkeeping (the Metal runtime tracks each buffer for
+        // residency, reference counting, and hazard tracking). Instead we
+        // pack ALL N params into one contiguous shared buffer and ALL N
+        // outputs into one contiguous shared buffer, then use byte offsets
+        // at bind time via setBuffer:offset:atIndex:. This gives:
+        //
+        //   - 2 buffer allocations total instead of 2N
+        //   - Zero CPU->GPU copies (StorageModeShared, unified memory)
+        //   - Better cache locality for sequential GPU access
+        //   - Single readback pointer cast (no DMA, no copy)
+
+        // PackedDispatchParams is 16 f32 = 64 bytes, already 16-byte aligned.
+        const PARAMS_STRIDE: usize = 16; // f32 count per dispatch
+
+        // Pack all N params contiguously into one flat f32 array.
+        let mut all_params = Vec::with_capacity(n * PARAMS_STRIDE);
+        for req in requests {
+            let (ppw, sec, seed) = match req.kernel {
+                BatchKernel::SingleScatter => (0u32, 0u32, 0u64),
+                BatchKernel::McrtTrace {
+                    photons_per_wavelength,
+                    seed,
+                } => (photons_per_wavelength, 0, seed),
+                BatchKernel::Hybrid {
+                    secondary_rays,
+                    seed,
+                } => (0, secondary_rays, seed),
+            };
+            let p = PackedDispatchParams::new(
+                req.observer_pos,
+                req.view_dir,
+                req.sun_dir,
+                ppw,
+                sec,
+                seed,
+            );
+            all_params.extend_from_slice(&p.data);
+        }
+        let buf_all_params = create_buffer_from_f32(&self.device, &all_params)?;
+
+        // Compute output layout: each dispatch's f32 count, padded to
+        // 16-byte (4 f32) alignment so Metal buffer offsets stay valid.
+        const ALIGN_F32: usize = 4; // 16 bytes / sizeof(f32)
+
+        struct SliceInfo {
+            offset_f32: usize,
+            raw_len: usize,
+            kernel: BatchKernel,
+        }
+
+        let mut slices = Vec::with_capacity(n);
+        let mut cursor: usize = 0;
+
+        for req in requests {
+            let raw_len = match req.kernel {
+                BatchKernel::McrtTrace {
+                    photons_per_wavelength,
+                    ..
+                } => nw * photons_per_wavelength as usize,
+                _ => nw,
+            };
+            slices.push(SliceInfo {
+                offset_f32: cursor,
+                raw_len,
+                kernel: req.kernel,
+            });
+            // Advance cursor, padded to 16-byte alignment.
+            let padded = (raw_len + ALIGN_F32 - 1) & !(ALIGN_F32 - 1);
+            cursor += padded;
+        }
+
+        let total_output_f32 = cursor.max(1); // avoid zero-length buffer
+        let buf_all_output = create_empty_buffer(&self.device, total_output_f32)?;
+
+        // ── Encode all N dispatches into ONE command buffer ─────────────
+
+        let cmd_buf = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| GpuError::Dispatch("failed to create command buffer".into()))?;
+
+        let wg_size = self.config.workgroup_size;
+
+        for (i, s) in slices.iter().enumerate() {
+            let pipeline = match s.kernel {
+                BatchKernel::SingleScatter => &self.pso_single_scatter,
+                BatchKernel::McrtTrace { .. } => &self.pso_mcrt_trace,
+                BatchKernel::Hybrid { .. } => &self.pso_hybrid,
+            };
+
+            let is_hybrid = matches!(s.kernel, BatchKernel::Hybrid { .. });
+
+            // For non-hybrid kernels: total_threads = raw_len (1 thread/output).
+            // For hybrid: dispatch nw threadgroups of HYBRID_THREADGROUP_SIZE threads.
+            // The hybrid kernel indexes by threadgroup_position_in_grid (wl_idx)
+            // and thread_position_in_threadgroup (step_idx).
+            if !is_hybrid && s.raw_len == 0 {
+                continue;
+            }
+
+            let encoder = cmd_buf
+                .computeCommandEncoder()
+                .ok_or_else(|| GpuError::Dispatch("failed to create compute encoder".into()))?;
+
+            encoder.setComputePipelineState(pipeline);
+
+            // Bind shared atmosphere at offset 0, then per-dispatch params
+            // and output regions via byte offsets into the mega-buffers.
+            let params_byte_offset = i * PARAMS_STRIDE * std::mem::size_of::<f32>();
+            let output_byte_offset = s.offset_f32 * std::mem::size_of::<f32>();
+
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(buf_atm), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(&buf_all_params), params_byte_offset, 1);
+                encoder.setBuffer_offset_atIndex(Some(&buf_all_output), output_byte_offset, 2);
+            }
+
+            let (grid_size, threadgroup_size) = if is_hybrid {
+                // Hybrid: nw threadgroups, each with HYBRID_THREADGROUP_SIZE threads
+                let num_tg = nw as u32;
+                (
+                    MTLSize {
+                        width: num_tg as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: HYBRID_THREADGROUP_SIZE as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                )
+            } else {
+                // Non-hybrid: flat dispatch
+                let total_threads = s.raw_len as u32;
+                let num_groups = dispatch_groups(total_threads, wg_size);
+                (
+                    MTLSize {
+                        width: num_groups as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: wg_size as usize,
+                        height: 1,
+                        depth: 1,
+                    },
+                )
+            };
+
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+            encoder.endEncoding();
+        }
+
+        // ONE commit, ONE wait -- the whole point of batching.
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        // ── Readback from unified memory ────────────────────────────────
+        //
+        // StorageModeShared on Apple Silicon means buf_all_output.contents()
+        // points directly into unified DRAM -- this is a pointer cast, not
+        // a DMA transfer. We read once into a Vec then slice per-dispatch.
+        let all_output = read_f32_buffer(&buf_all_output, total_output_f32);
+
+        let mut results = Vec::with_capacity(n);
+
+        for s in &slices {
+            match s.kernel {
+                BatchKernel::McrtTrace {
+                    photons_per_wavelength,
+                    ..
+                } => {
+                    let ppw = photons_per_wavelength as usize;
+                    let base = s.offset_f32;
+                    let mut radiance = Vec::with_capacity(nw);
+                    for w in 0..nw {
+                        let start = base + w * ppw;
+                        let end = start + ppw;
+                        let sum: f32 = all_output[start..end].iter().sum();
+                        radiance.push((sum / ppw as f32) as f64);
+                    }
+                    results.push(GpuSpectralResult {
+                        radiance,
+                        num_wavelengths: nw,
+                    });
+                }
+                _ => {
+                    let base = s.offset_f32;
+                    let raw = &all_output[base..base + nw];
+                    results.push(GpuSpectralResult {
+                        radiance: raw.iter().map(|&v| v as f64).collect(),
+                        num_wavelengths: nw,
+                    });
+                }
+            }
+        }
+
+        Ok(results)
+    }
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────
 
 impl MetalBackend {
     /// Encode and dispatch a compute kernel with the given buffers.
+    ///
+    /// Used for single_scatter, mcrt_trace, and garstang kernels where each
+    /// thread is independent and the workgroup size is configurable.
     fn dispatch_kernel(
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -358,6 +590,59 @@ impl MetalBackend {
         };
         let grid_size = MTLSize {
             width: num_groups as usize,
+            height: 1,
+            depth: 1,
+        };
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        encoder.endEncoding();
+
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        Ok(())
+    }
+
+    /// Dispatch the hybrid kernel with fixed threadgroup size.
+    ///
+    /// The hybrid kernel uses exactly `num_threadgroups` threadgroups of
+    /// HYBRID_THREADGROUP_SIZE threads each. Each threadgroup handles one
+    /// wavelength; threads within the group each handle one LOS step and
+    /// reduce via simd_sum() + threadgroup shared memory.
+    fn dispatch_hybrid(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        buffers: &[&ProtocolObject<dyn MTLBuffer>],
+        num_threadgroups: u32,
+    ) -> Result<(), GpuError> {
+        if num_threadgroups == 0 {
+            return Ok(());
+        }
+
+        let cmd_buf = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| GpuError::Dispatch("failed to create command buffer".into()))?;
+
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| GpuError::Dispatch("failed to create compute encoder".into()))?;
+
+        encoder.setComputePipelineState(pipeline);
+
+        for (i, buf) in buffers.iter().enumerate() {
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(*buf), 0, i as usize);
+            }
+        }
+
+        let threadgroup_size = MTLSize {
+            width: HYBRID_THREADGROUP_SIZE as usize,
+            height: 1,
+            depth: 1,
+        };
+        let grid_size = MTLSize {
+            width: num_threadgroups as usize,
             height: 1,
             depth: 1,
         };

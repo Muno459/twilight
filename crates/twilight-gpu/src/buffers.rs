@@ -21,7 +21,8 @@ use twilight_core::atmosphere::{AtmosphereModel, MAX_SHELLS, MAX_WAVELENGTHS};
 pub const BUFFER_MAGIC: u32 = 0x544C_5754;
 
 /// Current buffer layout version. Increment when the packing format changes.
-pub const BUFFER_VERSION: u32 = 1;
+/// v2: added refractive_index[MAX_SHELLS] after surface_albedo.
+pub const BUFFER_VERSION: u32 = 2;
 
 /// Maximum number of light pollution sources in a single dispatch.
 pub const MAX_LIGHT_SOURCES: usize = 2048;
@@ -74,9 +75,12 @@ impl BufferHeader {
 ///
 /// --- Surface albedo: padded to vec4 alignment ---
 /// [16708 .. 16708+64]  surface_albedo[w]
+///
+/// --- Refractive index per shell (v2) ---
+/// [16772 .. 16772+64]  refractive_index[s]
 /// ```
 ///
-/// Total: ~16,772 f32 values = ~67 KB.
+/// Total: 16,836 f32 values = ~67.3 KB.
 #[derive(Debug, Clone)]
 pub struct PackedAtmosphere {
     /// Flat f32 buffer ready for GPU upload.
@@ -110,8 +114,10 @@ pub mod atm_offsets {
         OPTICS_START + OPTICS_STRIDE * super::MAX_SHELLS * super::MAX_WAVELENGTHS; // 260 + 16384 = 16644
     /// Start of surface albedo array
     pub const ALBEDO_START: usize = WAVELENGTHS_START + super::MAX_WAVELENGTHS; // 16644 + 64 = 16708
+    /// Start of refractive index array (1 f32 per shell, padded to vec4)
+    pub const REFRACTIVE_INDEX_START: usize = ALBEDO_START + super::MAX_WAVELENGTHS; // 16708 + 64 = 16772
     /// Total buffer size in f32 elements
-    pub const TOTAL_SIZE: usize = ALBEDO_START + super::MAX_WAVELENGTHS; // 16708 + 64 = 16772
+    pub const TOTAL_SIZE: usize = REFRACTIVE_INDEX_START + super::MAX_SHELLS; // 16772 + 64 = 16836
 }
 
 impl PackedAtmosphere {
@@ -159,6 +165,11 @@ impl PackedAtmosphere {
         // Surface albedo
         for w in 0..atm.num_wavelengths {
             data[atm_offsets::ALBEDO_START + w] = atm.surface_albedo[w] as f32;
+        }
+
+        // Refractive index per shell (v2)
+        for s in 0..atm.num_shells {
+            data[atm_offsets::REFRACTIVE_INDEX_START + s] = atm.refractive_index[s] as f32;
         }
 
         PackedAtmosphere {
@@ -211,6 +222,11 @@ impl PackedAtmosphere {
         // Restore albedo
         for w in 0..nw {
             atm.surface_albedo[w] = self.data[atm_offsets::ALBEDO_START + w] as f64;
+        }
+
+        // Restore refractive indices (v2)
+        for s in 0..ns {
+            atm.refractive_index[s] = self.data[atm_offsets::REFRACTIVE_INDEX_START + s] as f64;
         }
 
         atm
@@ -903,14 +919,83 @@ mod tests {
     }
 
     #[test]
-    fn atm_offset_total_size() {
+    fn atm_offset_refractive_index_start() {
         // 16708 + 64 = 16772
-        assert_eq!(atm_offsets::TOTAL_SIZE, 16772);
+        assert_eq!(atm_offsets::REFRACTIVE_INDEX_START, 16772);
+    }
+
+    #[test]
+    fn atm_offset_total_size() {
+        // 16772 + 64 = 16836
+        assert_eq!(atm_offsets::TOTAL_SIZE, 16836);
     }
 
     #[test]
     fn atm_total_size_in_bytes() {
-        // 16772 * 4 = 67088 bytes ≈ 65.5 KB
-        assert_eq!(atm_offsets::TOTAL_SIZE * 4, 67088);
+        // 16836 * 4 = 67344 bytes ≈ 65.8 KB
+        assert_eq!(atm_offsets::TOTAL_SIZE * 4, 67344);
+    }
+
+    #[test]
+    fn packed_atm_refractive_index_default_roundtrip() {
+        let atm = make_test_atm(); // default n=1.0 everywhere
+        let packed = PackedAtmosphere::pack(&atm);
+        for s in 0..atm.num_shells {
+            let n = packed.data[atm_offsets::REFRACTIVE_INDEX_START + s] as f64;
+            assert!(
+                (n - 1.0).abs() < 1e-5,
+                "default refractive_index[{}] should be 1.0, got {}",
+                s,
+                n,
+            );
+        }
+    }
+
+    #[test]
+    fn packed_atm_refractive_index_computed_roundtrip() {
+        let mut atm = make_test_atm();
+        // Set Rayleigh extinction so compute_refractive_indices works
+        atm.optics[0][0].extinction = 1.3e-5;
+        atm.optics[0][0].rayleigh_fraction = 1.0;
+        atm.optics[1][0].extinction = 1.3e-6;
+        atm.optics[1][0].rayleigh_fraction = 1.0;
+        atm.optics[2][0].extinction = 1.3e-8;
+        atm.optics[2][0].rayleigh_fraction = 1.0;
+        atm.compute_refractive_indices();
+
+        let packed = PackedAtmosphere::pack(&atm);
+        let unpacked = packed.unpack();
+
+        for s in 0..atm.num_shells {
+            let rel_err = (unpacked.refractive_index[s] - atm.refractive_index[s]).abs();
+            assert!(
+                rel_err < 1e-5,
+                "refractive_index[{}] roundtrip: packed={}, original={}, err={}",
+                s,
+                unpacked.refractive_index[s],
+                atm.refractive_index[s],
+                rel_err,
+            );
+        }
+    }
+
+    #[test]
+    fn packed_atm_refractive_index_decreases_with_altitude() {
+        let mut atm = make_test_atm();
+        atm.compute_refractive_indices_from_altitude();
+
+        let packed = PackedAtmosphere::pack(&atm);
+        for s in 0..(atm.num_shells - 1) {
+            let n_low = packed.data[atm_offsets::REFRACTIVE_INDEX_START + s];
+            let n_high = packed.data[atm_offsets::REFRACTIVE_INDEX_START + s + 1];
+            assert!(
+                n_low > n_high,
+                "n[{}]={} should be > n[{}]={} (denser air below)",
+                s,
+                n_low,
+                s + 1,
+                n_high,
+            );
+        }
     }
 }

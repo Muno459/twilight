@@ -35,7 +35,15 @@ use crate::buffers::{
     dispatch_groups, PackedAtmosphere, PackedDispatchParams, PackedLightSource,
     PackedSolarSpectrum, PackedVisionLuts,
 };
-use crate::{BackendKind, GpuBackend, GpuConfig, GpuDeviceInfo, GpuError, GpuSpectralResult};
+use crate::{
+    BackendKind, BatchKernel, BatchRequest, GpuBackend, GpuConfig, GpuDeviceInfo, GpuError,
+    GpuSpectralResult,
+};
+
+/// Workgroup size for the hybrid kernel. Must match HYBRID_THREADGROUP_SIZE
+/// in twilight.comp (256 threads per workgroup).
+#[allow(dead_code)]
+const HYBRID_WORKGROUP_SIZE: u32 = 256;
 
 // ── Embedded SPIR-V shaders ────────────────────────────────────────────
 
@@ -126,7 +134,7 @@ pub fn probe() -> bool {
     };
 
     let app_info = vk::ApplicationInfo::default()
-        .api_version(vk::make_api_version(0, 1, 0, 0));
+        .api_version(vk::make_api_version(0, 1, 1, 0));
 
     // macOS needs VK_KHR_portability_enumeration for MoltenVK
     let mut create_flags = vk::InstanceCreateFlags::empty();
@@ -178,7 +186,7 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
         .application_version(vk::make_api_version(0, 0, 1, 0))
         .engine_name(c"twilight-gpu")
         .engine_version(vk::make_api_version(0, 0, 1, 0))
-        .api_version(vk::make_api_version(0, 1, 0, 0));
+        .api_version(vk::make_api_version(0, 1, 1, 0));
 
     let mut create_flags = vk::InstanceCreateFlags::empty();
     let mut instance_extensions: Vec<*const i8> = Vec::new();
@@ -518,7 +526,11 @@ impl GpuBackend for VulkanBackend {
         let nw = self.num_wavelengths as usize;
         let buf_output = create_empty_buffer(&self.device, self.allocator_mut(), nw, "output")?;
 
-        self.dispatch_kernel(
+        // Hybrid v2: dispatch nw workgroups of HYBRID_WORKGROUP_SIZE threads.
+        // Each workgroup handles one wavelength; threads within the group each
+        // handle one LOS step with secondary chain tracing, then reduce via
+        // subgroupAdd() + shared memory.
+        self.dispatch_hybrid(
             self.pipeline_hybrid,
             &[buf_atm, &buf_params, &buf_output],
             nw as u32,
@@ -589,6 +601,292 @@ impl GpuBackend for VulkanBackend {
         self.free_transient_buffers(vec![buf_sources, buf_config, buf_output]);
 
         Ok(total)
+    }
+
+    fn scan_batch(&self, requests: &[BatchRequest]) -> Result<Vec<GpuSpectralResult>, GpuError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let buf_atm = self
+            .buf_atm
+            .as_ref()
+            .ok_or_else(|| GpuError::Dispatch("atmosphere not uploaded".into()))?;
+
+        let nw = self.num_wavelengths as usize;
+        let n = requests.len();
+        let wg_size = self.config.workgroup_size;
+
+        // ── Pre-allocate all per-dispatch buffers ───────────────────────
+        //
+        // Vulkan descriptor sets reference (buffer, offset, range) tuples.
+        // We create per-dispatch params and output buffers, then record ALL
+        // dispatches into a single command buffer with a single fence wait.
+        // This eliminates the per-SZA submit+wait round trip that was the
+        // bottleneck (50 round trips -> 1).
+
+        struct DispatchSlice {
+            params_buf: VkBuffer,
+            output_buf: VkBuffer,
+            output_len: usize,
+            desc_set: vk::DescriptorSet,
+            kernel: BatchKernel,
+        }
+
+        let mut slices = Vec::with_capacity(n);
+
+        // Allocate N descriptor sets in one call.
+        let layouts: Vec<vk::DescriptorSetLayout> = vec![self.desc_set_layout; n];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.desc_pool)
+            .set_layouts(&layouts);
+        let desc_sets = unsafe { self.device.allocate_descriptor_sets(&alloc_info) }
+            .map_err(|e| GpuError::Dispatch(format!("batch descriptor set allocation: {:?}", e)))?;
+
+        for (i, req) in requests.iter().enumerate() {
+            let (ppw, sec, seed) = match req.kernel {
+                BatchKernel::SingleScatter => (0u32, 0u32, 0u64),
+                BatchKernel::McrtTrace {
+                    photons_per_wavelength,
+                    seed,
+                } => (photons_per_wavelength, 0, seed),
+                BatchKernel::Hybrid {
+                    secondary_rays,
+                    seed,
+                } => (0, secondary_rays, seed),
+            };
+
+            let params = PackedDispatchParams::new(
+                req.observer_pos,
+                req.view_dir,
+                req.sun_dir,
+                ppw,
+                sec,
+                seed,
+            );
+            let params_buf = create_buffer_from_f32(
+                &self.device,
+                self.allocator_mut(),
+                &params.data,
+                "batch_params",
+            )?;
+
+            let output_len = match req.kernel {
+                BatchKernel::McrtTrace {
+                    photons_per_wavelength,
+                    ..
+                } => nw * photons_per_wavelength as usize,
+                _ => nw,
+            };
+            let output_buf = create_empty_buffer(
+                &self.device,
+                self.allocator_mut(),
+                output_len,
+                "batch_output",
+            )?;
+
+            // Write descriptor set bindings for this dispatch.
+            let buffer_infos = [
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buf_atm.buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default()
+                    .buffer(params_buf.buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE),
+                vk::DescriptorBufferInfo::default()
+                    .buffer(output_buf.buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE),
+            ];
+
+            let writes: Vec<vk::WriteDescriptorSet> = buffer_infos
+                .iter()
+                .enumerate()
+                .map(|(j, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(desc_sets[i])
+                        .dst_binding(j as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect();
+
+            unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+            slices.push(DispatchSlice {
+                params_buf,
+                output_buf,
+                output_len,
+                desc_set: desc_sets[i],
+                kernel: req.kernel,
+            });
+        }
+
+        // ── Record all N dispatches into ONE command buffer ─────────────
+
+        let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.cmd_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd_bufs = unsafe { self.device.allocate_command_buffers(&cmd_alloc_info) }
+            .map_err(|e| GpuError::Dispatch(format!("batch command buffer: {:?}", e)))?;
+        let cmd = cmd_bufs[0];
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { self.device.begin_command_buffer(cmd, &begin_info) }
+            .map_err(|e| GpuError::Dispatch(format!("begin batch command buffer: {:?}", e)))?;
+
+        for s in &slices {
+            let pipeline = match s.kernel {
+                BatchKernel::SingleScatter => self.pipeline_single_scatter,
+                BatchKernel::McrtTrace { .. } => self.pipeline_mcrt_trace,
+                BatchKernel::Hybrid { .. } => self.pipeline_hybrid,
+            };
+
+            let is_hybrid = matches!(s.kernel, BatchKernel::Hybrid { .. });
+
+            if !is_hybrid && s.output_len == 0 {
+                continue;
+            }
+
+            // Hybrid: dispatch nw workgroups of HYBRID_WORKGROUP_SIZE threads.
+            // Non-hybrid: flat dispatch with configurable workgroup size.
+            let num_groups = if is_hybrid {
+                nw as u32
+            } else {
+                let total_threads = s.output_len as u32;
+                if total_threads == 0 {
+                    continue;
+                }
+                dispatch_groups(total_threads, wg_size)
+            };
+
+            unsafe {
+                self.device
+                    .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                self.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.pipeline_layout,
+                    0,
+                    &[s.desc_set],
+                    &[],
+                );
+                self.device.cmd_dispatch(cmd, num_groups, 1, 1);
+            }
+
+            // Memory barrier between dispatches: ensure writes from this
+            // dispatch are visible to the next (they share the atm buffer
+            // read-only, but the barrier ensures correct ordering).
+            let barrier = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+
+            unsafe {
+                self.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[barrier],
+                    &[],
+                    &[],
+                );
+            }
+        }
+
+        // Final barrier: make all compute writes visible to host reads.
+        let host_barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[host_barrier],
+                &[],
+                &[],
+            );
+        }
+
+        unsafe { self.device.end_command_buffer(cmd) }
+            .map_err(|e| GpuError::Dispatch(format!("end batch command buffer: {:?}", e)))?;
+
+        // ONE submit, ONE fence wait.
+        let cmd_bufs_submit = [cmd];
+        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_bufs_submit);
+
+        unsafe { self.device.reset_fences(&[self.fence]) }
+            .map_err(|e| GpuError::Dispatch(format!("reset fence: {:?}", e)))?;
+
+        unsafe {
+            self.device
+                .queue_submit(self.queue, &[submit_info], self.fence)
+        }
+        .map_err(|e| GpuError::Dispatch(format!("batch queue submit: {:?}", e)))?;
+
+        unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX) }
+            .map_err(|e| GpuError::Dispatch(format!("batch wait for fence: {:?}", e)))?;
+
+        // ── Readback and reduce ─────────────────────────────────────────
+
+        let mut results = Vec::with_capacity(n);
+
+        for s in &slices {
+            match s.kernel {
+                BatchKernel::McrtTrace {
+                    photons_per_wavelength,
+                    ..
+                } => {
+                    let ppw = photons_per_wavelength as usize;
+                    let raw = read_f32_buffer(&s.output_buf, s.output_len);
+                    let mut radiance = Vec::with_capacity(nw);
+                    for w in 0..nw {
+                        let start = w * ppw;
+                        let end = start + ppw;
+                        let sum: f32 = raw[start..end].iter().sum();
+                        radiance.push((sum / ppw as f32) as f64);
+                    }
+                    results.push(GpuSpectralResult {
+                        radiance,
+                        num_wavelengths: nw,
+                    });
+                }
+                _ => {
+                    let raw = read_f32_buffer(&s.output_buf, nw);
+                    results.push(GpuSpectralResult {
+                        radiance: raw.iter().map(|&v| v as f64).collect(),
+                        num_wavelengths: nw,
+                    });
+                }
+            }
+        }
+
+        // Clean up: free transient buffers, descriptor sets, command buffer.
+        let mut transient_bufs = Vec::with_capacity(2 * n);
+        let mut desc_set_list = Vec::with_capacity(n);
+        for s in slices {
+            desc_set_list.push(s.desc_set);
+            transient_bufs.push(s.params_buf);
+            transient_bufs.push(s.output_buf);
+        }
+
+        unsafe {
+            self.device.free_command_buffers(self.cmd_pool, &[cmd]);
+            let _ = self
+                .device
+                .free_descriptor_sets(self.desc_pool, &desc_set_list);
+        }
+
+        self.free_transient_buffers(transient_bufs);
+
+        Ok(results)
     }
 }
 
@@ -681,6 +979,130 @@ impl VulkanBackend {
                 &[],
             );
             self.device.cmd_dispatch(cmd, num_groups, 1, 1);
+        }
+
+        // Memory barrier: ensure compute writes are visible to host reads
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::HOST_READ);
+
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+
+        unsafe { self.device.end_command_buffer(cmd) }
+            .map_err(|e| GpuError::Dispatch(format!("end command buffer: {:?}", e)))?;
+
+        // Submit and wait
+        let cmd_bufs_submit = [cmd];
+        let submit_info = vk::SubmitInfo::default().command_buffers(&cmd_bufs_submit);
+
+        unsafe { self.device.reset_fences(&[self.fence]) }
+            .map_err(|e| GpuError::Dispatch(format!("reset fence: {:?}", e)))?;
+
+        unsafe { self.device.queue_submit(self.queue, &[submit_info], self.fence) }
+            .map_err(|e| GpuError::Dispatch(format!("queue submit: {:?}", e)))?;
+
+        unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX) }
+            .map_err(|e| GpuError::Dispatch(format!("wait for fence: {:?}", e)))?;
+
+        // Free command buffer and descriptor set
+        unsafe {
+            self.device.free_command_buffers(self.cmd_pool, &[cmd]);
+            self.device
+                .free_descriptor_sets(self.desc_pool, &[desc_set])
+                .ok();
+        }
+
+        Ok(())
+    }
+
+    /// Dispatch the hybrid kernel with fixed workgroup size.
+    ///
+    /// The hybrid kernel uses exactly `num_workgroups` workgroups of
+    /// HYBRID_WORKGROUP_SIZE threads each. Each workgroup handles one
+    /// wavelength; threads within the group each handle one LOS step and
+    /// reduce via subgroupAdd() + shared memory.
+    fn dispatch_hybrid(
+        &self,
+        pipeline: vk::Pipeline,
+        buffers: &[&VkBuffer],
+        num_workgroups: u32,
+    ) -> Result<(), GpuError> {
+        if num_workgroups == 0 {
+            return Ok(());
+        }
+
+        // Allocate a descriptor set for this dispatch
+        let layouts = [self.desc_set_layout];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.desc_pool)
+            .set_layouts(&layouts);
+        let desc_sets = unsafe { self.device.allocate_descriptor_sets(&alloc_info) }
+            .map_err(|e| GpuError::Dispatch(format!("descriptor set allocation: {:?}", e)))?;
+        let desc_set = desc_sets[0];
+
+        // Update descriptor set with buffer bindings
+        let buffer_infos: Vec<vk::DescriptorBufferInfo> = buffers
+            .iter()
+            .map(|b| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(b.buffer)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)
+            })
+            .collect();
+
+        let writes: Vec<vk::WriteDescriptorSet> = buffer_infos
+            .iter()
+            .enumerate()
+            .map(|(i, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(desc_set)
+                    .dst_binding(i as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+
+        unsafe { self.device.update_descriptor_sets(&writes, &[]) };
+
+        // Allocate and record command buffer
+        let cmd_alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(self.cmd_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let cmd_bufs = unsafe { self.device.allocate_command_buffers(&cmd_alloc_info) }
+            .map_err(|e| GpuError::Dispatch(format!("command buffer allocation: {:?}", e)))?;
+        let cmd = cmd_bufs[0];
+
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe { self.device.begin_command_buffer(cmd, &begin_info) }
+            .map_err(|e| GpuError::Dispatch(format!("begin command buffer: {:?}", e)))?;
+
+        unsafe {
+            self.device
+                .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            self.device.cmd_bind_descriptor_sets(
+                cmd,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                0,
+                &[desc_set],
+                &[],
+            );
+            // Dispatch num_workgroups workgroups -- the shader's local_size_x
+            // is HYBRID_WORKGROUP_SIZE (256), so each workgroup gets 256 threads.
+            self.device.cmd_dispatch(cmd, num_workgroups, 1, 1);
         }
 
         // Memory barrier: ensure compute writes are visible to host reads

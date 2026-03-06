@@ -1,15 +1,24 @@
-// Twilight MCRT - Metal Shading Language compute kernels
+// Twilight MCRT - Metal Shading Language compute kernels (v2)
 //
 // Four compute kernels for GPU-accelerated twilight radiative transfer:
 //   1. single_scatter_spectrum   - Deterministic LOS integration
 //   2. mcrt_trace_photon         - Backward MC with next-event estimation
-//   3. hybrid_scatter            - LOS + secondary MC chains
+//   3. hybrid_scatter            - LOS + secondary MC chains (reparallelized)
 //   4. garstang_zenith           - Light pollution skyglow
 //
-// Buffer layout matches crates/twilight-gpu/src/buffers.rs exactly.
+// Buffer layout matches crates/twilight-gpu/src/buffers.rs (v2) exactly.
 // All physics ported from twilight-core (f64) to f32 GPU precision.
+//
+// Key changes from v1:
+//   - Binary search O(log N) shell lookup (was O(N) linear scan)
+//   - Shell-by-shell shadow ray with Snell's law refraction at boundaries
+//   - Radial boundary nudge (2m along Earth normal, not along ray)
+//   - Kahan compensated summation for optical depth and radiance
+//   - Hybrid kernel: 1 threadgroup per wavelength with SIMD reduction
+//     (was 1 thread per wavelength -- 23x slower than CPU)
 
 #include <metal_stdlib>
+#include <metal_simdgroup>
 using namespace metal;
 
 // ============================================================================
@@ -25,24 +34,29 @@ constant uint MAX_LOS_STEPS = 200;
 constant uint MAX_SCATTERS = 100;
 constant uint HYBRID_LOS_STEPS = 200;
 constant uint HYBRID_MAX_BOUNCES = 50;
-
-constant float RUSSIAN_ROULETTE_WEIGHT = 0.01f;
-constant float RUSSIAN_ROULETTE_SURVIVE = 0.1f;
+constant uint HYBRID_THREADGROUP_SIZE = 256;
+constant uint SIMD_WIDTH = 32;
+constant uint NUM_SIMD_GROUPS = HYBRID_THREADGROUP_SIZE / SIMD_WIDTH; // 8
 
 // Buffer header magic
-// Atmosphere buffer offsets (must match buffers.rs atm_offsets)
-constant uint ATM_NUM_SHELLS      = 2;
-constant uint ATM_NUM_WAVELENGTHS = 3;
-constant uint ATM_SHELLS_START    = 4;
-constant uint ATM_SHELL_STRIDE    = 4;
-constant uint ATM_OPTICS_START    = 260;  // 4 + 4*64
-constant uint ATM_OPTICS_STRIDE   = 4;
-constant uint ATM_ALBEDO_START    = 16708;   // 16644 + 64
+// Atmosphere buffer offsets (must match buffers.rs atm_offsets exactly)
+constant uint ATM_NUM_SHELLS            = 2;
+constant uint ATM_NUM_WAVELENGTHS       = 3;
+constant uint ATM_SHELLS_START          = 4;
+constant uint ATM_SHELL_STRIDE          = 4;
+constant uint ATM_OPTICS_START          = 260;   // 4 + 4*64
+constant uint ATM_OPTICS_STRIDE         = 4;
+constant uint ATM_ALBEDO_START          = 16708;  // 16644 + 64
+constant uint ATM_REFRACTIVE_INDEX_START = 16772; // 16708 + 64 (v2)
 
 // Garstang constants
 constant float H_RAYLEIGH = 8500.0f;
 constant float H_AEROSOL  = 1500.0f;
 constant float TAU_RAYLEIGH_550 = 0.0962f;
+
+// Boundary nudge distance (meters). Must exceed f32 ULP at Earth radius
+// (~0.5m) to guarantee shell crossing after radial nudge.
+constant float BOUNDARY_NUDGE_M = 2.0f;
 
 // ============================================================================
 // Buffer accessor helpers
@@ -61,12 +75,6 @@ struct ShellOptics {
     float asymmetry;
     float rayleigh_fraction;
 };
-
-inline uint read_num_shells(device const float* atm) {
-    return as_type<uint>(atm[ATM_NUM_SHELLS]) > 0
-        ? uint(atm[ATM_NUM_SHELLS])
-        : as_type<uint>(atm[ATM_NUM_SHELLS]);
-}
 
 inline uint atm_num_shells(device const float* atm) {
     return uint(atm[ATM_NUM_SHELLS]);
@@ -101,6 +109,10 @@ inline float read_albedo(device const float* atm, uint wl_idx) {
     return atm[ATM_ALBEDO_START + wl_idx];
 }
 
+inline float read_refractive_index(device const float* atm, uint shell_idx) {
+    return atm[ATM_REFRACTIVE_INDEX_START + shell_idx];
+}
+
 // Dispatch params: 4 x vec4
 // vec4(obs_x, obs_y, obs_z, pad)
 // vec4(view_x, view_y, view_z, pad)
@@ -128,11 +140,25 @@ inline ulong read_rng_seed(device const float* params) {
 }
 
 // ============================================================================
-// Math utilities
+// Kahan compensated summation
 // ============================================================================
 
-inline float len3(float3 v) { return length(v); }
-inline float dot3(float3 a, float3 b) { return dot(a, b); }
+struct KahanAccum {
+    float sum;
+    float comp; // compensation term
+
+    KahanAccum() : sum(0.0f), comp(0.0f) {}
+    KahanAccum(float s) : sum(s), comp(0.0f) {}
+
+    void add(float value) {
+        float y = value - comp;
+        float t = sum + y;
+        comp = (t - sum) - y;
+        sum = t;
+    }
+
+    float result() const { return sum + comp; }
+};
 
 // ============================================================================
 // xorshift64 RNG (Metal supports ulong natively on Apple Silicon)
@@ -159,10 +185,16 @@ struct RaySphereHit {
 };
 
 inline RaySphereHit ray_sphere_intersect(float3 origin, float3 dir, float radius) {
-    float a = dot3(dir, dir);
-    float b = 2.0f * dot3(origin, dir);
-    float c = dot3(origin, origin) - radius * radius;
-    float disc = b * b - 4.0f * a * c;
+    // Half-b formulation with factored difference-of-squares to avoid
+    // catastrophic cancellation at Earth scale. Standard formula
+    // c = dot(o,o) - r*r loses all significant digits when |origin| ~ r
+    // (both terms ~ 4.06e13 in f32, difference ~ 1e6 = 0 sig figs).
+    // Factoring: c = (|o| - r)(|o| + r) preserves precision.
+    float a = dot(dir, dir);
+    float b_half = dot(origin, dir);
+    float r_pos = length(origin);
+    float c = (r_pos - radius) * (r_pos + radius);
+    float disc = b_half * b_half - a * c;
 
     RaySphereHit result;
     if (disc < 0.0f) {
@@ -173,33 +205,43 @@ inline RaySphereHit ray_sphere_intersect(float3 origin, float3 dir, float radius
     }
 
     float sqrt_disc = sqrt(disc);
-    float inv_2a = 0.5f / a;
-    result.t_near = (-b - sqrt_disc) * inv_2a;
-    result.t_far  = (-b + sqrt_disc) * inv_2a;
+    float inv_a = 1.0f / a;
+    result.t_near = (-b_half - sqrt_disc) * inv_a;
+    result.t_far  = (-b_half + sqrt_disc) * inv_a;
     result.hit = true;
     return result;
 }
 
 // ============================================================================
-// Shell index lookup
+// Shell index lookup -- O(log N) binary search
+//
+// Replaces the old O(N) linear scan. The binary search finds the largest
+// shell index s such that r_inner[s] <= radius. Since shells are contiguous
+// (r_outer[s] == r_inner[s+1]), this guarantees the radius is in shell s.
 // ============================================================================
 
-inline int shell_index(device const float* atm, float r) {
+inline int shell_index_binary(device const float* atm, float r) {
     uint ns = atm_num_shells(atm);
-    for (uint s = 0; s < ns; s++) {
-        ShellGeom sh = read_shell(atm, s);
-        if (r >= sh.r_inner && r < sh.r_outer) {
-            return int(s);
+    if (ns == 0) return -1;
+
+    // Bounds check
+    float r_inner_first = atm[ATM_SHELLS_START];
+    float r_outer_last = atm[ATM_SHELLS_START + (ns - 1) * ATM_SHELL_STRIDE + 1];
+    if (r < r_inner_first || r >= r_outer_last) return -1;
+
+    // Binary search: find largest s with r_inner[s] <= r
+    uint lo = 0;
+    uint hi = ns;
+    while (lo < hi) {
+        uint mid = lo + (hi - lo) / 2;
+        float r_inner_mid = atm[ATM_SHELLS_START + mid * ATM_SHELL_STRIDE];
+        if (r_inner_mid <= r) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
         }
     }
-    // Check if r is exactly at the outer boundary of the last shell
-    if (ns > 0) {
-        ShellGeom last = read_shell(atm, ns - 1);
-        if (r >= last.r_inner && r <= last.r_outer + 1.0f) {
-            return int(ns - 1);
-        }
-    }
-    return -1;
+    return (lo == 0) ? -1 : int(lo - 1);
 }
 
 // ============================================================================
@@ -225,76 +267,191 @@ inline float mixed_phase(float cos_theta, ShellOptics op) {
 }
 
 // ============================================================================
-// Ray path through shell (analytical)
+// Next shell boundary
 // ============================================================================
 
-float ray_path_through_shell(float3 origin, float3 dir,
-                             float r_inner, float r_outer, float t_max) {
-    // Outer sphere intersection
-    RaySphereHit outer = ray_sphere_intersect(origin, dir, r_outer);
-    if (!outer.hit) return 0.0f;
+struct ShellBoundary {
+    float dist;
+    bool is_outward;
+    bool found;
+};
 
-    float t0_outer = max(outer.t_near, 0.0f);
-    float t1_outer = min(outer.t_far, t_max);
-    if (t1_outer <= t0_outer + 1e-6f) return 0.0f;
+ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r_outer) {
+    ShellBoundary result;
+    result.found = false;
+    result.dist = 1e30f;
+    result.is_outward = true;
 
-    // Inner sphere intersection (to subtract)
-    RaySphereHit inner = ray_sphere_intersect(origin, dir, r_inner);
-    if (!inner.hit) {
-        return t1_outer - t0_outer;
+    // Minimum distance threshold: must exceed f32 noise at Earth scale.
+    // At r ~ 6.4e6, ULP is ~0.5m. We nudge by 2m, so any valid hit
+    // should be at least ~shell_thickness away (hundreds of meters).
+    // Using 1e-5 (10 um) safely filters self-intersections.
+    const float EPS = 1e-5f;
+
+    RaySphereHit outer = ray_sphere_intersect(pos, dir, r_outer);
+    if (outer.hit) {
+        if (outer.t_near > EPS) {
+            RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
+            if (inner.hit && inner.t_near > EPS && inner.t_near < outer.t_near) {
+                result.dist = inner.t_near;
+                result.is_outward = false;
+                result.found = true;
+                return result;
+            }
+            result.dist = outer.t_near;
+            result.is_outward = true;
+            result.found = true;
+            return result;
+        }
+        if (outer.t_far > EPS) {
+            RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
+            if (inner.hit && inner.t_near > EPS && inner.t_near < outer.t_far) {
+                result.dist = inner.t_near;
+                result.is_outward = false;
+                result.found = true;
+                return result;
+            }
+            result.dist = outer.t_far;
+            result.is_outward = true;
+            result.found = true;
+            return result;
+        }
     }
 
-    float t0_inner = max(inner.t_near, 0.0f);
-    float t1_inner = min(inner.t_far, t_max);
-    if (t1_inner <= t0_inner + 1e-6f) {
-        return t1_outer - t0_outer;
+    // Fallback: inner sphere only
+    RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
+    if (inner.hit && inner.t_near > EPS) {
+        result.dist = inner.t_near;
+        result.is_outward = false;
+        result.found = true;
     }
-
-    // Shell = outer - inner
-    float total = 0.0f;
-    // Segment before inner
-    float seg1_end = min(t1_outer, t0_inner);
-    if (seg1_end > t0_outer) total += seg1_end - t0_outer;
-    // Segment after inner
-    float seg2_start = max(t0_outer, t1_inner);
-    if (t1_outer > seg2_start) total += t1_outer - seg2_start;
-
-    return total;
+    return result;
 }
 
 // ============================================================================
-// Shadow ray transmittance (analytical, shell-by-shell)
+// Snell's law refraction at a spherical shell boundary
+//
+// Returns the new ray direction after refraction. For total internal
+// reflection (TIR), returns the reflected direction. When n_from == n_to,
+// returns the original direction (fast path).
+// ============================================================================
+
+float3 refract_at_boundary(float3 dir, float3 boundary_pos, float n_from, float n_to) {
+    // Fast path: no refraction when indices match
+    if (abs(n_from - n_to) < 1e-7f) return dir;
+
+    float3 outward = normalize(boundary_pos);
+
+    // Orient normal to face the incoming ray
+    float cos_dir_normal = dot(dir, outward);
+    float3 normal = (cos_dir_normal < 0.0f) ? outward : -outward;
+
+    float cos_i = -dot(dir, normal);
+    float eta = n_from / n_to;
+    float k = 1.0f - eta * eta * (1.0f - cos_i * cos_i);
+
+    if (k < 0.0f) {
+        // Total internal reflection
+        return normalize(dir + normal * (2.0f * cos_i));
+    }
+
+    float cos_t = sqrt(k);
+    float factor = eta * cos_i - cos_t;
+    return normalize(dir * eta + normal * factor);
+}
+
+// ============================================================================
+// Radial boundary nudge
+//
+// At Earth scale (r ~ 6.4e6 m), f32 ULP is ~0.5m. For tangential rays at
+// shell boundaries, nudging along the ray direction by 1m produces ZERO
+// radial movement in f32 (the tangential component dominates, and the radial
+// delta rounds to zero). The position stays at exactly the boundary radius,
+// causing the ray to get stuck in an infinite loop.
+//
+// Fix: nudge RADIALLY (along the outward normal from Earth center) by 2m.
+// This guarantees the position crosses into the next shell regardless of
+// ray direction.
+// ============================================================================
+
+inline float3 radial_nudge(float3 boundary_pos, bool is_outward) {
+    float bp_r = length(boundary_pos);
+    float3 radial_dir = (bp_r > 1e-10f) ? boundary_pos / bp_r : float3(1.0f, 0.0f, 0.0f);
+    float nudge_sign = is_outward ? 1.0f : -1.0f;
+    return boundary_pos + radial_dir * (nudge_sign * BOUNDARY_NUDGE_M);
+}
+
+// ============================================================================
+// Shadow ray transmittance -- shell-by-shell with refraction
+//
+// Traces a ray from scatter_pos toward the sun through the atmosphere,
+// accumulating optical depth with Kahan summation. At each shell boundary,
+// applies Snell's law refraction and radial nudge.
+//
+// This replaces the old analytical ray_path_through_shell approach, which
+// assumed straight rays (no refraction). The CPU ground truth is in
+// twilight-core/src/single_scatter.rs:shadow_ray_transmittance.
 // ============================================================================
 
 float shadow_ray_transmittance(device const float* atm, float3 start_pos,
                                 float3 sun_dir, uint wl_idx) {
     uint ns = atm_num_shells(atm);
-    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
-    float surface_radius = EARTH_RADIUS_M;
+    float surface_radius = atm[ATM_SHELLS_START]; // r_inner of shell 0
 
-    // Find where shadow ray exits atmosphere
-    RaySphereHit toa_hit = ray_sphere_intersect(start_pos, sun_dir, toa_radius);
-    if (!toa_hit.hit || toa_hit.t_far <= 0.0f) return 0.0f;
-    float ray_max = toa_hit.t_far;
+    float3 pos = start_pos;
+    float3 dir = sun_dir;
 
-    // Check if shadow ray hits the ground
-    RaySphereHit ground_hit = ray_sphere_intersect(start_pos, sun_dir, surface_radius);
-    if (ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < ray_max) {
-        return 0.0f;
-    }
+    KahanAccum tau;
 
-    // Analytical integration: exact path length through each shell
-    float tau = 0.0f;
-    for (uint s = 0; s < ns; s++) {
-        ShellGeom sh = read_shell(atm, s);
-        float path = ray_path_through_shell(start_pos, sun_dir, sh.r_inner, sh.r_outer, ray_max);
-        if (path > 0.0f) {
-            ShellOptics op = read_optics(atm, s, wl_idx);
-            tau += op.extinction * path;
-            if (tau > 50.0f) return 0.0f;
+    for (uint iter = 0; iter < 200; iter++) {
+        float r = length(pos);
+
+        int sidx = shell_index_binary(atm, r);
+        if (sidx < 0) break; // exited atmosphere
+
+        uint us = uint(sidx);
+        float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
+        float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
+
+        // Read extinction for this shell and wavelength
+        uint optics_idx = us * MAX_WAVELENGTHS + wl_idx;
+        float extinction = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE];
+
+        ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
+        if (!bnd.found) break;
+
+        // Accumulate optical depth with Kahan summation
+        tau.add(extinction * bnd.dist);
+
+        // Refract at boundary
+        float3 boundary_pos = pos + dir * bnd.dist;
+        // Snap to exact boundary radius to prevent cumulative f32 position drift.
+        // At Earth scale (r ~ 6.4e6), pos + dir * t accumulates ULP errors
+        // across 50+ shell crossings. Snapping ensures the radial nudge starts
+        // from the exact boundary, not an approximation.
+        float target_r = bnd.is_outward ? r_outer : r_inner;
+        float bp_len = length(boundary_pos);
+        if (bp_len > 0.0f) {
+            boundary_pos *= (target_r / bp_len);
         }
+        float n_from = read_refractive_index(atm, us);
+        uint next_shell = bnd.is_outward ? us + 1 : us - 1;
+        float n_to = (next_shell < ns) ? read_refractive_index(atm, next_shell) : 1.0f;
+
+        dir = refract_at_boundary(dir, boundary_pos, n_from, n_to);
+
+        // Radial nudge past boundary
+        pos = radial_nudge(boundary_pos, bnd.is_outward);
+
+        // Ground hit: fully opaque
+        if (!bnd.is_outward && length(pos) <= surface_radius + 1.0f) {
+            return 0.0f;
+        }
+
+        if (tau.result() > 50.0f) return 0.0f;
     }
-    return exp(-tau);
+
+    return exp(-tau.result());
 }
 
 // ============================================================================
@@ -302,11 +459,9 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
 // ============================================================================
 
 inline float sample_rayleigh_analytic(float xi) {
-    // Cardano's formula for depressed cubic: mu^3 + 3*mu - q = 0
     float q = 8.0f * xi - 4.0f;
     float disc = q * q * 0.25f + 1.0f;
     float sqrt_disc = sqrt(disc);
-    // cbrt is available in MSL via precise::cbrt or just pow with sign handling
     float a_val = -q * 0.5f + sqrt_disc;
     float b_val = -q * 0.5f - sqrt_disc;
     float u = (a_val >= 0.0f) ? pow(a_val, 1.0f/3.0f) : -pow(-a_val, 1.0f/3.0f);
@@ -350,66 +505,10 @@ float3 sample_hemisphere(float3 normal, thread ulong &rng) {
 }
 
 // ============================================================================
-// Next shell boundary
-// ============================================================================
-
-struct ShellBoundary {
-    float dist;
-    bool is_outward;
-    bool found;
-};
-
-ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r_outer) {
-    ShellBoundary result;
-    result.found = false;
-    result.dist = 1e30f;
-    result.is_outward = true;
-
-    RaySphereHit outer = ray_sphere_intersect(pos, dir, r_outer);
-    if (outer.hit) {
-        if (outer.t_near > 1e-10f) {
-            // Check inner first
-            RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
-            if (inner.hit && inner.t_near > 1e-10f && inner.t_near < outer.t_near) {
-                result.dist = inner.t_near;
-                result.is_outward = false;
-                result.found = true;
-                return result;
-            }
-            result.dist = outer.t_near;
-            result.is_outward = true;
-            result.found = true;
-            return result;
-        }
-        if (outer.t_far > 1e-10f) {
-            RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
-            if (inner.hit && inner.t_near > 1e-10f && inner.t_near < outer.t_far) {
-                result.dist = inner.t_near;
-                result.is_outward = false;
-                result.found = true;
-                return result;
-            }
-            result.dist = outer.t_far;
-            result.is_outward = true;
-            result.found = true;
-            return result;
-        }
-    }
-
-    // Fallback: inner only
-    RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
-    if (inner.hit && inner.t_near > 1e-10f) {
-        result.dist = inner.t_near;
-        result.is_outward = false;
-        result.found = true;
-    }
-    return result;
-}
-
-// ============================================================================
 // Kernel 1: single_scatter_spectrum
 //
-// One thread per wavelength. Full LOS integration with analytical shadow rays.
+// One thread per wavelength. Full LOS integration with refracted shadow rays.
+// Kahan summation for optical depth and radiance accumulation.
 // Output: radiance[wl_idx] (f32)
 // ============================================================================
 
@@ -450,46 +549,47 @@ kernel void single_scatter_spectrum(
     uint num_steps = min(MAX_LOS_STEPS, uint(los_end / 500.0f) + 20u);
     float ds = los_end / float(num_steps);
 
-    float radiance = 0.0f;
-    float tau_obs = 0.0f;
+    KahanAccum radiance;
+    KahanAccum tau_obs;
 
-    float cos_theta = dot3(sun_dir, -view_dir);
+    float cos_theta = dot(sun_dir, -view_dir);
 
     for (uint step = 0; step < num_steps; step++) {
         float s = (float(step) + 0.5f) * ds;
         float3 scatter_pos = observer_pos + view_dir * s;
-        float r = len3(scatter_pos);
+        float r = length(scatter_pos);
 
         if (r > toa_radius || r < surface_radius) continue;
 
-        int sidx = shell_index(atm, r);
+        int sidx = shell_index_binary(atm, r);
         if (sidx < 0) continue;
 
         ShellOptics op = read_optics(atm, uint(sidx), wl_idx);
         float beta_scat = op.extinction * op.ssa;
 
         if (beta_scat < 1e-30f) {
-            tau_obs += op.extinction * ds;
+            tau_obs.add(op.extinction * ds);
             continue;
         }
 
-        float tau_obs_mid = tau_obs + op.extinction * ds * 0.5f;
-        float t_obs = exp(-tau_obs_mid);
+        // exp(-(A+B)) = exp(-A)*exp(-B) avoids f32 precision loss when
+        // adding a small half-step to a large accumulated tau.
+        float t_obs = exp(-tau_obs.result()) * exp(-op.extinction * ds * 0.5f);
 
         if (t_obs < 1e-30f) break;
 
         float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
 
         if (t_sun < 1e-30f) {
-            tau_obs += op.extinction * ds;
+            tau_obs.add(op.extinction * ds);
             continue;
         }
 
         float phase = mixed_phase(cos_theta, op);
         float di = beta_scat * phase / (4.0f * PI) * t_sun * t_obs * ds;
-        radiance += di;
+        radiance.add(di);
 
-        tau_obs += op.extinction * ds;
+        tau_obs.add(op.extinction * ds);
     }
 
     // Ground reflection (Lambertian BRDF = albedo / pi)
@@ -498,17 +598,17 @@ kernel void single_scatter_spectrum(
         if (albedo > 1e-10f) {
             float3 ground_pos = observer_pos + view_dir * los_end;
             float3 ground_normal = normalize(ground_pos);
-            float cos_sun_incidence = dot3(sun_dir, ground_normal);
+            float cos_sun_incidence = dot(sun_dir, ground_normal);
 
             if (cos_sun_incidence > 0.0f) {
                 float t_sun_ground = shadow_ray_transmittance(atm, ground_pos, sun_dir, wl_idx);
-                float t_obs_ground = exp(-tau_obs);
-                radiance += albedo / PI * cos_sun_incidence * t_sun_ground * t_obs_ground;
+                float t_obs_ground = exp(-tau_obs.result());
+                radiance.add(albedo / PI * cos_sun_incidence * t_sun_ground * t_obs_ground);
             }
         }
     }
 
-    output[tid] = radiance;
+    output[tid] = radiance.result();
 }
 
 // ============================================================================
@@ -550,20 +650,21 @@ kernel void mcrt_trace_photon(
     float3 pos = observer_pos;
     float3 dir = view_dir;
     float weight = 1.0f;
-    float result_weight = 0.0f;
+    KahanAccum result_weight;
 
     for (uint bounce = 0; bounce < MAX_SCATTERS; bounce++) {
-        float r = len3(pos);
-        int sidx = shell_index(atm, r);
+        float r = length(pos);
+        int sidx = shell_index_binary(atm, r);
         if (sidx < 0) break;
 
-        ShellGeom sh = read_shell(atm, uint(sidx));
-        ShellOptics op = read_optics(atm, uint(sidx), wl_idx);
+        uint us = uint(sidx);
+        ShellGeom sh = read_shell(atm, us);
+        ShellOptics op = read_optics(atm, us, wl_idx);
 
         if (op.extinction < 1e-20f) {
             ShellBoundary bnd = next_shell_boundary(pos, dir, sh.r_inner, sh.r_outer);
             if (!bnd.found) break;
-            pos = pos + dir * (bnd.dist + 1e-3f);
+            pos = radial_nudge(pos + dir * bnd.dist, bnd.is_outward);
             continue;
         }
 
@@ -576,15 +677,21 @@ kernel void mcrt_trace_photon(
 
         if (free_path >= bnd.dist) {
             // Exit shell without scattering
-            pos = pos + dir * (bnd.dist + 1e-3f);
+            float3 boundary_pos = pos + dir * bnd.dist;
 
-            // Ground reflection
-            if (!bnd.is_outward && len3(pos) <= surface_radius + 1.0f) {
+            // Ground reflection check
+            if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
                 float albedo = read_albedo(atm, wl_idx);
                 weight *= albedo;
-                float3 normal = normalize(pos);
+                float3 normal = normalize(boundary_pos);
                 dir = sample_hemisphere(normal, rng);
+                // Nudge outward from ground
+                pos = radial_nudge(boundary_pos, true);
+                continue;
             }
+
+            // Radial nudge past boundary
+            pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }
 
@@ -594,19 +701,19 @@ kernel void mcrt_trace_photon(
         // NEE: direct solar contribution
         float t_sun = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
-            float cos_angle = dot3(sun_dir, -dir);
+            float cos_angle = dot(sun_dir, -dir);
             float phase = mixed_phase(cos_angle, op);
-            result_weight += weight * t_sun * phase / (4.0f * PI);
+            result_weight.add(weight * t_sun * phase / (4.0f * PI));
         }
 
         // Apply SSA
         weight *= op.ssa;
 
         // Russian roulette
-        if (weight < RUSSIAN_ROULETTE_WEIGHT) {
+        if (weight < 0.01f) {
             float xi_rr = xorshift_f32(rng);
-            if (xi_rr > RUSSIAN_ROULETTE_SURVIVE) break;
-            weight /= RUSSIAN_ROULETTE_SURVIVE;
+            if (xi_rr > 0.1f) break;
+            weight /= 0.1f;
         }
 
         // Sample new direction
@@ -620,7 +727,7 @@ kernel void mcrt_trace_photon(
         dir = scatter_direction(dir, cos_theta, phi);
     }
 
-    output[tid] = result_weight;
+    output[tid] = result_weight.result();
 }
 
 // ============================================================================
@@ -652,20 +759,21 @@ float trace_secondary_chain(device const float* atm, float3 start_pos,
     float3 pos = start_pos;
     float3 current_dir = dir;
     float weight = start_optics.ssa;
-    float total_contribution = 0.0f;
+    KahanAccum total_contribution;
 
     for (uint bounce = 0; bounce < HYBRID_MAX_BOUNCES; bounce++) {
-        float r = len3(pos);
-        int sidx = shell_index(atm, r);
+        float r = length(pos);
+        int sidx = shell_index_binary(atm, r);
         if (sidx < 0) break;
 
-        ShellGeom sh = read_shell(atm, uint(sidx));
-        ShellOptics op = read_optics(atm, uint(sidx), wl_idx);
+        uint us = uint(sidx);
+        ShellGeom sh = read_shell(atm, us);
+        ShellOptics op = read_optics(atm, us, wl_idx);
 
         if (op.extinction < 1e-20f) {
             ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
             if (!bnd.found) break;
-            pos = pos + current_dir * (bnd.dist + 1e-3f);
+            pos = radial_nudge(pos + current_dir * bnd.dist, bnd.is_outward);
             continue;
         }
 
@@ -676,14 +784,20 @@ float trace_secondary_chain(device const float* atm, float3 start_pos,
         if (!bnd.found) break;
 
         if (free_path >= bnd.dist) {
-            pos = pos + current_dir * (bnd.dist + 1e-3f);
-            if (!bnd.is_outward && len3(pos) <= surface_radius + 1.0f) {
+            float3 boundary_pos = pos + current_dir * bnd.dist;
+
+            // Ground reflection
+            if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
                 float albedo = read_albedo(atm, wl_idx);
                 weight *= albedo;
                 if (weight < 1e-30f) break;
-                float3 normal = normalize(pos);
+                float3 normal = normalize(boundary_pos);
                 current_dir = sample_hemisphere(normal, rng);
+                pos = radial_nudge(boundary_pos, true);
+                continue;
             }
+
+            pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }
 
@@ -693,18 +807,18 @@ float trace_secondary_chain(device const float* atm, float3 start_pos,
         // NEE
         float t_sun_sec = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
         if (t_sun_sec > 1e-30f) {
-            float cos_angle = dot3(sun_dir, -current_dir);
+            float cos_angle = dot(sun_dir, -current_dir);
             float phase = mixed_phase(cos_angle, op);
-            total_contribution += weight * t_sun_sec * phase / (4.0f * PI);
+            total_contribution.add(weight * t_sun_sec * phase / (4.0f * PI));
         }
 
         weight *= op.ssa;
 
         // Russian roulette
-        if (weight < RUSSIAN_ROULETTE_WEIGHT) {
+        if (weight < 0.01f) {
             float xi_rr = xorshift_f32(rng);
-            if (xi_rr > RUSSIAN_ROULETTE_SURVIVE) break;
-            weight /= RUSSIAN_ROULETTE_SURVIVE;
+            if (xi_rr > 0.1f) break;
+            weight /= 0.1f;
         }
 
         // Sample new direction
@@ -718,105 +832,159 @@ float trace_secondary_chain(device const float* atm, float3 start_pos,
         current_dir = scatter_direction(current_dir, cos_theta, phi);
     }
 
-    return total_contribution;
+    return total_contribution.result();
 }
 
 // ============================================================================
-// Kernel 3: hybrid_scatter
+// Kernel 3: hybrid_scatter (REPARALLELIZED)
 //
-// One thread per wavelength. LOS integration + secondary MC chains.
-// Output: radiance[wl_idx]
+// Old design: 1 thread per wavelength (catastrophic GPU underutilization --
+//   only 21 of thousands of cores active, 23x slower than CPU).
+//
+// New design: 1 THREADGROUP per wavelength, 256 threads per threadgroup.
+//   Each thread handles one LOS step with its own secondary ray loop.
+//   Per-wavelength reduction via simd_sum() + threadgroup shared memory.
+//
+// Dispatch: num_wavelengths threadgroups of 256 threads each.
+//   wl_idx  = threadgroup_position_in_grid  (which wavelength)
+//   step_idx = thread_position_in_threadgroup (which LOS step)
+//
+// Output: radiance[wl_idx] (f32) -- one value per wavelength.
 // ============================================================================
 
 kernel void hybrid_scatter(
     device const float* atm       [[buffer(0)]],
     device const float* params    [[buffer(1)]],
     device float*       output    [[buffer(2)]],
-    uint                tid       [[thread_position_in_grid]]
+    uint wl_idx    [[threadgroup_position_in_grid]],
+    uint step_idx  [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id   [[simdgroup_index_in_threadgroup]]
 ) {
     uint num_wl = atm_num_wavelengths(atm);
-    if (tid >= num_wl) return;
+    if (wl_idx >= num_wl) return;
 
-    uint wl_idx = tid;
     float3 observer_pos = read_observer(params);
     float3 view_dir     = read_view_dir(params);
     float3 sun_dir      = read_sun_dir(params);
     uint secondary_rays = read_secondary_rays(params);
 
-    // Per-wavelength RNG
-    ulong rng = read_rng_seed(params) + ulong(wl_idx);
-    rng *= 6364136223846793005ul;
-    rng += 1ul;
-
     float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
     float surface_radius = EARTH_RADIUS_M;
 
+    // ── LOS geometry (all threads compute same values) ──────────────────
     RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
-    if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
-        output[tid] = 0.0f;
-        return;
-    }
-    float los_max = toa_hit.t_far;
+    bool valid_los = toa_hit.hit && toa_hit.t_far > 0.0f;
 
-    RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
-    bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
-    float los_end = hits_ground ? ground_hit.t_near : los_max;
+    uint num_steps = 0;
+    float ds = 0.0f;
 
-    if (los_end <= 0.0f) {
-        output[tid] = 0.0f;
-        return;
-    }
-
-    uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
-    float ds = los_end / float(num_steps);
-
-    float radiance = 0.0f;
-    float tau_obs = 0.0f;
-
-    for (uint step = 0; step < num_steps; step++) {
-        float s = (float(step) + 0.5f) * ds;
-        float3 scatter_pos = observer_pos + view_dir * s;
-        float r = len3(scatter_pos);
-
-        if (r > toa_radius || r < surface_radius) continue;
-
-        int sidx = shell_index(atm, r);
-        if (sidx < 0) continue;
-
-        ShellOptics op = read_optics(atm, uint(sidx), wl_idx);
-        float beta_scat = op.extinction * op.ssa;
-
-        if (beta_scat < 1e-30f) {
-            tau_obs += op.extinction * ds;
-            continue;
+    if (valid_los) {
+        float los_max = toa_hit.t_far;
+        RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+        bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
+        float los_end = hits_ground ? ground_hit.t_near : los_max;
+        if (los_end > 0.0f) {
+            num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
+            ds = los_end / float(num_steps);
         }
+    }
 
-        float tau_obs_mid = tau_obs + op.extinction * ds * 0.5f;
-        float t_obs = exp(-tau_obs_mid);
-        if (t_obs < 1e-30f) break;
+    // ── Phase 1: Each thread computes extinction*ds for its LOS step ────
+    // Store in shared memory for the optical depth prefix computation.
 
-        // Order 1: deterministic NEE
+    threadgroup float shared_ext_ds[HYBRID_THREADGROUP_SIZE];
+
+    float my_ext_ds = 0.0f;
+    float my_beta_scat = 0.0f;
+    float3 scatter_pos = float3(0.0f);
+    int my_sidx = -1;
+    ShellOptics my_op = {};
+
+    if (valid_los && step_idx < num_steps) {
+        float s = (float(step_idx) + 0.5f) * ds;
+        scatter_pos = observer_pos + view_dir * s;
+        float r = length(scatter_pos);
+
+        if (r <= toa_radius && r >= surface_radius) {
+            my_sidx = shell_index_binary(atm, r);
+            if (my_sidx >= 0) {
+                my_op = read_optics(atm, uint(my_sidx), wl_idx);
+                my_ext_ds = my_op.extinction * ds;
+                my_beta_scat = my_op.extinction * my_op.ssa;
+            }
+        }
+    }
+
+    shared_ext_ds[step_idx] = my_ext_ds;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ── Phase 2: Compute tau_obs at this step via sequential scan ────────
+    // Each thread sums shared_ext_ds[0..step_idx-1]. This is O(N) per thread,
+    // O(N^2) total, but N=200 and the cost is negligible compared to the
+    // secondary chain tracing (thousands of operations per step).
+
+    float tau_obs = 0.0f;
+    for (uint i = 0; i < step_idx && i < num_steps; i++) {
+        tau_obs += shared_ext_ds[i];
+    }
+    // exp(-(A+B)) = exp(-A)*exp(-B) avoids f32 precision loss
+    float t_obs = exp(-tau_obs) * exp(-my_ext_ds * 0.5f);
+
+    // ── Phase 3: Compute per-step contribution ──────────────────────────
+    float contribution = 0.0f;
+
+    if (valid_los && step_idx < num_steps && my_sidx >= 0
+        && my_beta_scat > 1e-30f && t_obs > 1e-30f)
+    {
+        // Per-thread RNG: unique seed for (wavelength, step) pair
+        ulong rng = read_rng_seed(params) + ulong(wl_idx);
+        rng *= 6364136223846793005ul;
+        rng += ulong(step_idx);
+        rng *= 2862933555777941757ul;
+        rng += 1ul;
+
+        // Order 1: deterministic single-scatter NEE
         float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
-        float cos_theta_1 = dot3(sun_dir, -view_dir);
-        float phase_1 = mixed_phase(cos_theta_1, op);
-        float di_single = beta_scat * phase_1 / (4.0f * PI) * t_sun * t_obs * ds;
-        radiance += di_single;
+        float cos_theta_1 = dot(sun_dir, -view_dir);
+        float phase_1 = mixed_phase(cos_theta_1, my_op);
+        float di_single = my_beta_scat * phase_1 / (4.0f * PI) * t_sun * t_obs * ds;
+        contribution += di_single;
 
         // Orders 2+: MC secondary chains
         if (secondary_rays > 0) {
-            float mc_sum = 0.0f;
+            KahanAccum mc_sum;
             for (uint ray = 0; ray < secondary_rays; ray++) {
-                mc_sum += trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx, op, rng);
+                mc_sum.add(trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx, my_op, rng));
             }
-            float mc_avg = mc_sum / float(secondary_rays);
-            float di_multi = beta_scat * t_obs * ds * mc_avg;
-            radiance += di_multi;
+            float mc_avg = mc_sum.result() / float(secondary_rays);
+            float di_multi = my_beta_scat * t_obs * ds * mc_avg;
+            contribution += di_multi;
         }
-
-        tau_obs += op.extinction * ds;
     }
 
-    output[tid] = radiance;
+    // ── Phase 4: Two-level reduction ────────────────────────────────────
+    //
+    // Level 1: SIMD reduction (hardware-accelerated, 32 threads -> 1 sum)
+    // Level 2: Threadgroup reduction (8 SIMD sums -> 1 final sum)
+
+    float simd_total = simd_sum(contribution);
+
+    threadgroup float shared_sums[NUM_SIMD_GROUPS];
+
+    if (simd_lane == 0) {
+        shared_sums[simd_id] = simd_total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Thread 0 writes the final reduced result
+    if (step_idx == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < NUM_SIMD_GROUPS; i++) {
+            total += shared_sums[i];
+        }
+        output[wl_idx] = total;
+    }
 }
 
 // ============================================================================
@@ -856,10 +1024,7 @@ kernel void garstang_zenith(
     // Read this source (8 f32 per source)
     uint base = tid * 8;
     float distance_m   = sources[base + 0];
-    // sources[base + 1] = zenith_angle_rad (unused for zenith calc)
     float source_rad   = sources[base + 2];
-    // sources[base + 3] = spectrum_type (unused)
-    // sources[base + 4] = height_m (unused for zenith calc)
 
     if (distance_m < 1.0f) {
         output[tid] = 0.0f;
@@ -877,8 +1042,9 @@ kernel void garstang_zenith(
     float source_intensity = source_rad * effective_up;
 
     float dh = max_altitude / float(altitude_steps);
-    float integral = 0.0f;
     float d = distance_m;
+
+    KahanAccum integral;
 
     for (uint step = 0; step < altitude_steps; step++) {
         float h = (float(step) + 0.5f) * dh;
@@ -892,7 +1058,7 @@ kernel void garstang_zenith(
         float n_aerosol  = aerosol_tau  / H_AEROSOL  * exp(-h / H_AEROSOL);
         float sigma_total = n_rayleigh + n_aerosol;
 
-        // Phase functions (Garstang uses angle-based, not cos-based)
+        // Phase functions
         float cos_scatter = cos(theta_scatter);
         float p_rayleigh = 3.0f / (16.0f * PI) * (1.0f + cos_scatter * cos_scatter);
         float p_mie = 0.0f;
@@ -926,8 +1092,8 @@ kernel void garstang_zenith(
         float r2 = r_src_to_scat * r_src_to_scat;
 
         float di = source_intensity / (4.0f * PI * r2) * sigma_total * p_avg * extinction * dh;
-        integral += di;
+        integral.add(di);
     }
 
-    output[tid] = integral;
+    output[tid] = integral.result();
 }

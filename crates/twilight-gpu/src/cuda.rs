@@ -17,6 +17,10 @@ use crate::buffers::{
 };
 use crate::{BackendKind, GpuBackend, GpuConfig, GpuDeviceInfo, GpuError, GpuSpectralResult};
 
+/// Block size for the hybrid kernel. Must match HYBRID_BLOCK_SIZE in
+/// twilight.cu (256 threads = 8 warps of 32).
+const HYBRID_BLOCK_SIZE: u32 = 256;
+
 /// Embedded CUDA C shader source.
 const CUDA_SOURCE: &str = include_str!("../shaders/twilight.cu");
 
@@ -325,8 +329,16 @@ impl GpuBackend for CudaBackend {
             .alloc_zeros(nw)
             .map_err(|e| GpuError::BufferAllocation(format!("output: {}", e)))?;
 
+        // Hybrid v2: dispatch nw blocks of HYBRID_BLOCK_SIZE threads.
+        // Each block handles one wavelength; threads within the block each
+        // handle one LOS step with secondary chain tracing, then reduce via
+        // __shfl_down_sync + __shared__ memory.
         let num_threads = nw as u32;
-        let cfg = launch_config(num_threads, self.config.workgroup_size);
+        let cfg = LaunchConfig {
+            grid_dim: (nw as u32, 1, 1),
+            block_dim: (HYBRID_BLOCK_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        };
 
         unsafe {
             self.stream

@@ -16,7 +16,7 @@
 
 use twilight_core::atmosphere::AtmosphereModel;
 use twilight_data::solar_spectrum::SOLAR_IRRADIANCE;
-use twilight_gpu::{GpuBackend, GpuError, GpuSpectralResult};
+use twilight_gpu::{BatchKernel, BatchRequest, GpuBackend, GpuError, GpuSpectralResult};
 
 use crate::simulation::{compute_geometry, ScatteringMode, SimulationConfig, SpectralResult};
 
@@ -60,9 +60,12 @@ pub fn simulate_at_sza_gpu(
 
 /// Scan a range of SZA values using GPU.
 ///
-/// Equivalent to [`simulation::simulate_twilight_scan`] but dispatches
-/// each SZA step to the GPU backend. The atmosphere must already be
-/// uploaded via `gpu.upload_atmosphere()` before calling this.
+/// Pre-computes geometry for all SZA points, then dispatches them as a
+/// single batch via [`GpuBackend::scan_batch`]. This encodes all N SZA
+/// dispatches into one GPU command submission (one commit, one wait)
+/// instead of N serial round trips, which is ~25x faster on Metal.
+///
+/// The atmosphere must already be uploaded via `gpu.upload_atmosphere()`.
 pub fn simulate_twilight_scan_gpu(
     gpu: &dyn GpuBackend,
     atm: &AtmosphereModel,
@@ -71,13 +74,54 @@ pub fn simulate_twilight_scan_gpu(
     sza_end: f64,
     sza_step: f64,
 ) -> Result<Vec<SpectralResult>, GpuError> {
-    let mut results = Vec::new();
+    // Collect all SZA values upfront.
+    let mut sza_values = Vec::new();
     let mut sza = sza_start;
-
     while sza <= sza_end + 1e-6 {
-        results.push(simulate_at_sza_gpu(gpu, atm, config, sza)?);
+        sza_values.push(sza);
         sza += sza_step;
     }
+
+    if sza_values.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build one BatchRequest per SZA with pre-computed geometry.
+    let requests: Vec<BatchRequest> = sza_values
+        .iter()
+        .map(|&sza_deg| {
+            let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
+            let kernel = match config.scattering_mode {
+                ScatteringMode::Single => BatchKernel::SingleScatter,
+                ScatteringMode::Multiple => BatchKernel::McrtTrace {
+                    photons_per_wavelength: config.photons_per_wavelength as u32,
+                    seed: sza_deg.to_bits(),
+                },
+                ScatteringMode::Hybrid => BatchKernel::Hybrid {
+                    secondary_rays: config.photons_per_wavelength as u32,
+                    seed: sza_deg.to_bits(),
+                },
+            };
+            BatchRequest {
+                observer_pos: [observer_pos.x, observer_pos.y, observer_pos.z],
+                view_dir: [view_dir.x, view_dir.y, view_dir.z],
+                sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z],
+                kernel,
+            }
+        })
+        .collect();
+
+    // Single batched GPU submission.
+    let gpu_results = gpu.scan_batch(&requests)?;
+
+    // Convert GPU results to SpectralResult with solar irradiance weighting.
+    let results: Vec<SpectralResult> = gpu_results
+        .iter()
+        .zip(sza_values.iter())
+        .map(|(gr, &sza_deg)| {
+            gpu_result_to_spectral(atm, gr, sza_deg, config.apply_solar_irradiance)
+        })
+        .collect();
 
     Ok(results)
 }
