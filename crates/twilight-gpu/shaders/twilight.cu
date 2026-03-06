@@ -513,6 +513,16 @@ __device__ float3 refract_at_boundary(float3 dir, float3 boundary_pos, float n_f
 }
 
 // ============================================================================
+// Snap position to exact target radius to prevent cumulative f32 drift
+// ============================================================================
+
+// Snap position to exact target radius to prevent cumulative f32 drift.
+__device__ float3 snap_to_radius(float3 p, float target_r) {
+    float r = len3(p);
+    return (r > 0.0f) ? make_float3(p.x * (target_r / r), p.y * (target_r / r), p.z * (target_r / r)) : p;
+}
+
+// ============================================================================
 // Radial boundary nudge
 // ============================================================================
 
@@ -812,6 +822,7 @@ void mcrt_trace_photon(const float* atm, const float* params, float* output,
             ShellBoundary bnd = next_shell_boundary(pos, dir, sh.r_inner, sh.r_outer);
             if (!bnd.found) break;
             float3 boundary_pos = pos + dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
             float n_from = read_refractive_index(atm, us);
             unsigned int next_s = bnd.is_outward ? us + 1 : us - 1;
             float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
@@ -828,6 +839,7 @@ void mcrt_trace_photon(const float* atm, const float* params, float* output,
 
         if (free_path >= bnd.dist) {
             float3 boundary_pos = pos + dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
 
             // Ground reflection: depolarizes
             if (!bnd.is_outward && len3(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
@@ -956,6 +968,7 @@ __device__ float4 trace_secondary_chain(const float* atm, float3 start_pos,
             ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
             if (!bnd.found) break;
             float3 boundary_pos = pos + current_dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
             float n_from = read_refractive_index(atm, us);
             unsigned int next_s = bnd.is_outward ? us + 1 : us - 1;
             float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
@@ -972,6 +985,7 @@ __device__ float4 trace_secondary_chain(const float* atm, float3 start_pos,
 
         if (free_path >= bnd.dist) {
             float3 boundary_pos = pos + current_dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
 
             if (!bnd.is_outward && len3(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
                 float albedo = read_albedo(atm, wl_idx);

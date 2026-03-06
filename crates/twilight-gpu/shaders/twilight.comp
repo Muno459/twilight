@@ -479,6 +479,16 @@ vec3 refract_at_boundary(vec3 dir, vec3 boundary_pos, float n_from, float n_to) 
 }
 
 // ============================================================================
+// Snap position to exact shell radius (prevents cumulative f32 drift)
+// ============================================================================
+
+// Snap position to exact target radius to prevent cumulative f32 drift.
+vec3 snap_to_radius(vec3 p, float target_r) {
+    float r = length(p);
+    return (r > 0.0) ? p * (target_r / r) : p;
+}
+
+// ============================================================================
 // Radial boundary nudge
 // ============================================================================
 
@@ -754,6 +764,7 @@ void main() {
             ShellBoundary bnd = next_shell_boundary(pos, dir, sh.r_inner, sh.r_outer);
             if (!bnd.found) break;
             vec3 boundary_pos = pos + dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
             float n_from = read_refractive_index(us);
             uint next_s = bnd.is_outward ? us + 1u : us - 1u;
             float n_to = (next_s < atm_num_shells()) ? read_refractive_index(next_s) : 1.0;
@@ -770,6 +781,7 @@ void main() {
 
         if (free_path >= bnd.dist) {
             vec3 boundary_pos = pos + dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
 
             // Ground reflection: depolarizes
             if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
@@ -905,6 +917,7 @@ vec4 trace_secondary_chain(vec3 start_pos, vec3 sun_dir, uint wl_idx,
             ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
             if (!bnd.found) break;
             vec3 boundary_pos = pos + current_dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
             float n_from = read_refractive_index(us);
             uint next_s = bnd.is_outward ? us + 1u : us - 1u;
             float n_to = (next_s < atm_num_shells()) ? read_refractive_index(next_s) : 1.0;
@@ -921,6 +934,7 @@ vec4 trace_secondary_chain(vec3 start_pos, vec3 sun_dir, uint wl_idx,
 
         if (free_path >= bnd.dist) {
             vec3 boundary_pos = pos + current_dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
 
             if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
                 float albedo = read_albedo(wl_idx);

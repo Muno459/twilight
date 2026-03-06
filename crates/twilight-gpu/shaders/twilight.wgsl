@@ -465,6 +465,19 @@ fn refract_at_boundary(dir: vec3f, boundary_pos: vec3f, n_from: f32, n_to: f32) 
 }
 
 // ============================================================================
+// Snap position to exact boundary radius
+// ============================================================================
+
+// Snap position to exact target radius to prevent cumulative f32 drift.
+fn snap_to_radius(p: vec3f, target_r: f32) -> vec3f {
+    let r = length(p);
+    if (r > 0.0) {
+        return p * (target_r / r);
+    }
+    return p;
+}
+
+// ============================================================================
 // Radial boundary nudge
 // ============================================================================
 
@@ -740,7 +753,8 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
         if op.extinction < 1e-20 {
             let bnd = next_shell_boundary(pos, dir, sh.r_inner, sh.r_outer);
             if !bnd.found { break; }
-            let boundary_pos = pos + dir * bnd.dist;
+            var boundary_pos = pos + dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, select(sh.r_inner, sh.r_outer, bnd.is_outward));
             let n_from = read_refractive_index(us);
             var next_s = us + 1u;
             if !bnd.is_outward { next_s = us - 1u; }
@@ -758,7 +772,8 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
         if !bnd.found { break; }
 
         if free_path >= bnd.dist {
-            let boundary_pos = pos + dir * bnd.dist;
+            var boundary_pos = pos + dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, select(sh.r_inner, sh.r_outer, bnd.is_outward));
 
             // Ground reflection: depolarizes
             if !bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M {
@@ -884,7 +899,8 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
         if op.extinction < 1e-20 {
             let bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
             if !bnd.found { break; }
-            let boundary_pos = pos + current_dir * bnd.dist;
+            var boundary_pos = pos + current_dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, select(sh.r_inner, sh.r_outer, bnd.is_outward));
             let n_from = read_refractive_index(us);
             var next_s = us + 1u;
             if !bnd.is_outward { next_s = us - 1u; }
@@ -902,7 +918,8 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
         if !bnd.found { break; }
 
         if free_path >= bnd.dist {
-            let boundary_pos = pos + current_dir * bnd.dist;
+            var boundary_pos = pos + current_dir * bnd.dist;
+            boundary_pos = snap_to_radius(boundary_pos, select(sh.r_inner, sh.r_outer, bnd.is_outward));
 
             if !bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M {
                 let albedo = read_albedo(wl_idx);
