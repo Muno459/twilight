@@ -3096,6 +3096,7 @@ fn diagnostic_hybrid_gpu_vs_cpu_deep_twilight() {
                 w,
                 secondary_rays,
                 &mut rng,
+                true,
             );
         }
 

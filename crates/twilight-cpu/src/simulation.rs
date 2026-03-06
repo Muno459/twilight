@@ -279,6 +279,7 @@ fn simulate_at_sza_hybrid(
                 w,
                 secondary_rays,
                 &mut rng,
+                config.polarized,
             )
         })
         .collect();

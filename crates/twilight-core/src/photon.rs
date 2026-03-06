@@ -622,6 +622,7 @@ pub fn hybrid_scatter_radiance(
     wavelength_idx: usize,
     secondary_rays: usize,
     rng_state: &mut u64,
+    polarized: bool,
 ) -> f64 {
     use crate::geometry::ray_sphere_intersect;
     use crate::scattering::{hg_mueller, rayleigh_mueller, MuellerMatrix, StokesVector};
@@ -649,8 +650,9 @@ pub fn hybrid_scatter_radiance(
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
 
-    // Accumulate full Stokes [I,Q,U,V]
+    // Dual path: full Stokes [I,Q,U,V] when polarized, scalar when not.
     let mut stokes_total = StokesVector::unpolarized(0.0);
+    let mut scalar_total = 0.0_f64;
     let mut tau_obs = 0.0; // optical depth from observer
 
     for step in 0..num_steps {
@@ -682,62 +684,91 @@ pub fn hybrid_scatter_radiance(
             break;
         }
 
-        // --- Order 1: deterministic single-scatter Stokes NEE ---
+        // --- Order 1: deterministic single-scatter NEE ---
         let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
         if t_sun > 1e-30 {
             let cos_theta_1 = sun_dir.dot(-view_dir);
-
-            // Compute mixed Mueller matrix for single-scatter from unpolarized sunlight
-            let mueller_1 = if optics.rayleigh_fraction > 0.99 {
-                rayleigh_mueller(cos_theta_1)
-            } else if optics.rayleigh_fraction < 0.01 {
-                hg_mueller(cos_theta_1, optics.asymmetry)
-            } else {
-                let mr = rayleigh_mueller(cos_theta_1).scale(optics.rayleigh_fraction);
-                let mh =
-                    hg_mueller(cos_theta_1, optics.asymmetry).scale(1.0 - optics.rayleigh_fraction);
-                let mut m = MuellerMatrix::zero();
-                for i in 0..4 {
-                    for j in 0..4 {
-                        m.m[i][j] = mr.m[i][j] + mh.m[i][j];
-                    }
-                }
-                m
-            };
-
-            // Apply to unpolarized sunlight [1,0,0,0]
-            // Result: [P11, P12, 0, 0] (no rotation needed for single-scatter from sun)
-            let ss_stokes = mueller_1.apply(&StokesVector::unpolarized(1.0));
             let scale_1 = beta_scat / (4.0 * core::f64::consts::PI) * t_sun * t_obs * ds;
-            stokes_total = stokes_total.add(&ss_stokes.scale(scale_1));
+
+            if polarized {
+                // Full Mueller matrix for polarized order-1
+                let mueller_1 = if optics.rayleigh_fraction > 0.99 {
+                    rayleigh_mueller(cos_theta_1)
+                } else if optics.rayleigh_fraction < 0.01 {
+                    hg_mueller(cos_theta_1, optics.asymmetry)
+                } else {
+                    let mr = rayleigh_mueller(cos_theta_1).scale(optics.rayleigh_fraction);
+                    let mh = hg_mueller(cos_theta_1, optics.asymmetry)
+                        .scale(1.0 - optics.rayleigh_fraction);
+                    let mut m = MuellerMatrix::zero();
+                    for i in 0..4 {
+                        for j in 0..4 {
+                            m.m[i][j] = mr.m[i][j] + mh.m[i][j];
+                        }
+                    }
+                    m
+                };
+                let ss_stokes = mueller_1.apply(&StokesVector::unpolarized(1.0));
+                stokes_total = stokes_total.add(&ss_stokes.scale(scale_1));
+            } else {
+                // Scalar phase function (no Mueller, no Stokes)
+                let phase = if optics.rayleigh_fraction > 0.99 {
+                    rayleigh_phase(cos_theta_1)
+                } else {
+                    optics.rayleigh_fraction * rayleigh_phase(cos_theta_1)
+                        + (1.0 - optics.rayleigh_fraction)
+                            * henyey_greenstein_phase(cos_theta_1, optics.asymmetry)
+                };
+                scalar_total += phase * scale_1;
+            }
         }
 
-        // --- Orders 2+: MC secondary chains (full Stokes) ---
+        // --- Orders 2+: MC secondary chains ---
         if secondary_rays > 0 {
-            let mut mc_stokes = StokesVector::unpolarized(0.0);
-            for _ray in 0..secondary_rays {
-                let chain_stokes = trace_secondary_chain(
-                    atm,
-                    scatter_pos,
-                    view_dir,
-                    sun_dir,
-                    wavelength_idx,
-                    optics,
-                    rng_state,
-                );
-                mc_stokes = mc_stokes.add(&chain_stokes);
+            if polarized {
+                let mut mc_stokes = StokesVector::unpolarized(0.0);
+                for _ray in 0..secondary_rays {
+                    let chain_stokes = trace_secondary_chain(
+                        atm,
+                        scatter_pos,
+                        view_dir,
+                        sun_dir,
+                        wavelength_idx,
+                        optics,
+                        rng_state,
+                    );
+                    mc_stokes = mc_stokes.add(&chain_stokes);
+                }
+                let inv_rays = 1.0 / secondary_rays as f64;
+                let mc_avg = mc_stokes.scale(inv_rays);
+                let scale_m = beta_scat * t_obs * ds;
+                stokes_total = stokes_total.add(&mc_avg.scale(scale_m));
+            } else {
+                let mut mc_scalar = 0.0_f64;
+                for _ray in 0..secondary_rays {
+                    mc_scalar += trace_secondary_chain_scalar(
+                        atm,
+                        scatter_pos,
+                        sun_dir,
+                        wavelength_idx,
+                        optics,
+                        rng_state,
+                    );
+                }
+                let inv_rays = 1.0 / secondary_rays as f64;
+                let scale_m = beta_scat * t_obs * ds;
+                scalar_total += mc_scalar * inv_rays * scale_m;
             }
-            let inv_rays = 1.0 / secondary_rays as f64;
-            let mc_avg = mc_stokes.scale(inv_rays);
-            let scale_m = beta_scat * t_obs * ds;
-            stokes_total = stokes_total.add(&mc_avg.scale(scale_m));
         }
 
         tau_obs += optics.extinction * ds;
     }
 
-    // Return Stokes I (total intensity)
-    stokes_total.intensity()
+    if polarized {
+        stokes_total.intensity()
+    } else {
+        scalar_total
+    }
 }
 
 /// Trace a secondary MC chain from a scatter point on the LOS.
@@ -920,6 +951,140 @@ fn trace_secondary_chain(
     total_stokes
 }
 
+/// Scalar-mode secondary MC chain (no Stokes, no Mueller matrices).
+///
+/// Identical physics to `trace_secondary_chain` but tracks only scalar
+/// radiance weight. All RNG consumption is identical so direction sampling
+/// produces the same trajectories -- the only difference is that we evaluate
+/// scalar phase functions instead of Mueller/Stokes operations at each
+/// scatter event and NEE.
+///
+/// This saves 3x `scatter_stokes_fast`, 3x `scattering_plane_cos_sin`,
+/// and multiple 4-component Stokes operations per bounce.
+fn trace_secondary_chain_scalar(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    sun_dir: Vec3,
+    wavelength_idx: usize,
+    start_optics: &crate::atmosphere::ShellOptics,
+    rng_state: &mut u64,
+) -> f64 {
+    use crate::single_scatter::shadow_ray_transmittance;
+
+    let local_up = start_pos.normalize();
+
+    // --- Initial direction sampling (RNG consumption matches Stokes version) ---
+    let xi_mix = xorshift_f64(rng_state);
+    let dir = if xi_mix < 0.5 {
+        let _cos_theta_init = if xorshift_f64(rng_state) < start_optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        } else {
+            sample_henyey_greenstein(xorshift_f64(rng_state), start_optics.asymmetry)
+        };
+        let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        scatter_direction(sun_dir, _cos_theta_init, phi_init)
+    } else {
+        sample_hemisphere(local_up, rng_state)
+    };
+
+    let mut pos = start_pos;
+    let mut current_dir = dir;
+    let mut weight = start_optics.ssa;
+    let mut total = 0.0_f64;
+
+    for _bounce in 0..HYBRID_MAX_BOUNCES {
+        let r = pos.length();
+
+        let shell_idx = match atm.shell_index(r) {
+            Some(idx) => idx,
+            None => break,
+        };
+
+        let shell = &atm.shells[shell_idx];
+        let optics = &atm.optics[shell_idx][wavelength_idx];
+
+        if optics.extinction < 1e-20 {
+            match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                Some((dist, is_outward)) => {
+                    let (new_pos, new_dir) =
+                        cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
+                    pos = new_pos;
+                    current_dir = new_dir;
+                    continue;
+                }
+                None => break,
+            }
+        }
+
+        let xi = xorshift_f64(rng_state);
+        let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+
+        match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+            Some((boundary_dist, is_outward)) => {
+                if free_path >= boundary_dist {
+                    let (new_pos, new_dir) =
+                        cross_boundary(pos, current_dir, boundary_dist, is_outward, shell_idx, atm);
+                    pos = new_pos;
+                    current_dir = new_dir;
+
+                    // Ground reflection
+                    if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
+                        let albedo = atm.surface_albedo[wavelength_idx];
+                        weight *= albedo;
+                        if weight < 1e-30 {
+                            break;
+                        }
+                        let normal = pos.normalize();
+                        current_dir = sample_hemisphere(normal, rng_state);
+                        continue;
+                    }
+                    continue;
+                }
+            }
+            None => break,
+        }
+
+        // Scatter event
+        pos = pos + current_dir * free_path;
+
+        // NEE: scalar phase function (no Mueller matrix)
+        let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
+
+        if t_sun_secondary > 1e-30 {
+            let cos_angle_nee = sun_dir.dot(-current_dir);
+            let phase = if optics.rayleigh_fraction > 0.99 {
+                rayleigh_phase(cos_angle_nee)
+            } else {
+                optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
+                    + (1.0 - optics.rayleigh_fraction)
+                        * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
+            };
+
+            let scale = weight * t_sun_secondary / (4.0 * core::f64::consts::PI);
+            total += phase * scale;
+        }
+
+        // Apply SSA
+        weight *= optics.ssa;
+        if weight < 1e-30 {
+            break;
+        }
+
+        // Sample new direction (RNG consumption matches Stokes version)
+        let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        } else {
+            sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
+        };
+        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let new_dir = scatter_direction(current_dir, cos_theta, phi);
+
+        current_dir = new_dir;
+    }
+
+    total
+}
+
 /// Compute hybrid multi-scatter spectral radiance for all wavelengths.
 ///
 /// This is the primary function for physically-accurate twilight computation.
@@ -944,6 +1109,7 @@ pub fn hybrid_scatter_spectrum(
     sun_dir: Vec3,
     secondary_rays: usize,
     base_seed: u64,
+    polarized: bool,
 ) -> [f64; 64] {
     let mut radiance = [0.0f64; 64];
     let num_wl = atm.num_wavelengths;
@@ -962,6 +1128,7 @@ pub fn hybrid_scatter_spectrum(
             w,
             secondary_rays,
             &mut rng,
+            polarized,
         );
     }
 
@@ -1362,7 +1529,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 10, 42);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 10, 42, true);
         assert_eq!(spectrum.len(), 64);
     }
 
@@ -1373,7 +1540,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(96.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
         for w in 0..atm.num_wavelengths {
             assert!(
                 spectrum[w] >= 0.0,
@@ -1391,7 +1558,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -1410,7 +1577,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
         assert!(
             spectrum[0].abs() < 1e-20,
             "Empty atmosphere should give zero hybrid contribution, got {}",
@@ -1425,8 +1592,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42);
-        let s2 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42);
+        let s1 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let s2 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
         for w in 0..atm.num_wavelengths {
             assert!(
                 (s1[w] - s2[w]).abs() < 1e-15,
@@ -1554,7 +1721,7 @@ mod tests {
 
         for sza in &[92.0, 96.0, 102.0] {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
-            let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42);
+            let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true);
             for w in 0..atm.num_wavelengths {
                 assert!(
                     spectrum[w] >= 0.0,
@@ -1576,7 +1743,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
