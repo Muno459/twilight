@@ -10,8 +10,6 @@
 //! The reference plane for Q/U is the scattering plane (containing the
 //! incident and scattered ray directions).
 
-use libm::cos;
-
 /// Rayleigh scattering phase function.
 ///
 /// P(cos_theta) = (3/4) * (1 + cos^2(theta))
@@ -132,11 +130,10 @@ pub fn scatter_direction(
     phi: f64,
 ) -> crate::geometry::Vec3 {
     use crate::geometry::Vec3;
-    use libm::{fabs, sin, sqrt};
+    use libm::{fabs, sincos, sqrt};
 
     let sin_theta = sqrt((1.0 - cos_theta * cos_theta).max(0.0));
-    let cos_phi = cos(phi);
-    let sin_phi = sin(phi);
+    let (sin_phi, cos_phi) = sincos(phi);
 
     // Build local coordinate system around incoming direction
     let w = dir;
@@ -151,13 +148,17 @@ pub fn scatter_direction(
     let u = w.cross(up).normalize();
     let v = w.cross(u);
 
-    // New direction in local coordinates
+    // (u, v, w) is orthonormal by construction: u is normalized,
+    // v = w x u with both unit and orthogonal, w is unit input.
+    // The linear combination has magnitude sqrt(sin_theta^2 + cos_theta^2) = 1,
+    // so the result is already unit length -- no final normalize needed.
+    let sc = sin_theta * cos_phi;
+    let ss = sin_theta * sin_phi;
     Vec3::new(
-        sin_theta * cos_phi * u.x + sin_theta * sin_phi * v.x + cos_theta * w.x,
-        sin_theta * cos_phi * u.y + sin_theta * sin_phi * v.y + cos_theta * w.y,
-        sin_theta * cos_phi * u.z + sin_theta * sin_phi * v.z + cos_theta * w.z,
+        sc * u.x + ss * v.x + cos_theta * w.x,
+        sc * u.y + ss * v.y + cos_theta * w.y,
+        sc * u.z + ss * v.z + cos_theta * w.z,
     )
-    .normalize()
 }
 
 // ── Stokes vector polarized radiative transfer ─────────────────────────
