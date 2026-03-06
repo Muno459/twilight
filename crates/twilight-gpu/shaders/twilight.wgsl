@@ -454,12 +454,14 @@ fn refract_at_boundary(dir: vec3f, boundary_pos: vec3f, n_from: f32, n_to: f32) 
     let k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
 
     if k < 0.0 {
-        return normalize(dir + normal * (2.0 * cos_i));
+        // Total internal reflection: result is unit by reflection identity.
+        return dir + normal * (2.0 * cos_i);
     }
 
     let cos_t = sqrt(k);
     let factor = eta * cos_i - cos_t;
-    return normalize(dir * eta + normal * factor);
+    // Snell refraction: result is unit by Snell's law identity.
+    return dir * eta + normal * factor;
 }
 
 // ============================================================================
@@ -497,13 +499,12 @@ fn shadow_ray_transmittance(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32) -> f3
     var dir = sun_dir;
     var tau = kahan_init();
 
+    // Find initial shell once (O(log N)), then track directly (O(1) per step).
+    let sidx_init = shell_index_binary(length(pos));
+    if sidx_init < 0 { return 1.0; }
+    var us = u32(sidx_init);
+
     for (var iter = 0u; iter < 200u; iter++) {
-        let r = length(pos);
-
-        let sidx = shell_index_binary(r);
-        if sidx < 0 { break; }
-
-        let us = u32(sidx);
         let r_inner = input_buf[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
         let r_outer = input_buf[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1u];
 
@@ -536,6 +537,10 @@ fn shadow_ray_transmittance(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32) -> f3
         if !bnd.is_outward && length(pos) <= surface_radius + 1.0 {
             return 0.0;
         }
+
+        // Exited atmosphere
+        if next_shell_idx >= ns { break; }
+        us = next_shell_idx;
 
         if kahan_result(tau) > 50.0 { return 0.0; }
     }
@@ -579,10 +584,10 @@ fn scatter_direction(dir: vec3f, cos_theta: f32, phi: f32) -> vec3f {
     let u_vec = normalize(cross(w, up));
     let v_vec = cross(w, u_vec);
 
-    let new_dir = sin_theta * cos_phi * u_vec
-                + sin_theta * sin_phi * v_vec
-                + cos_theta * w;
-    return normalize(new_dir);
+    // (u_vec, v_vec, w) is orthonormal: result is unit length, no normalize needed.
+    let sc = sin_theta * cos_phi;
+    let ss = sin_theta * sin_phi;
+    return sc * u_vec + ss * v_vec + cos_theta * w;
 }
 
 fn sample_hemisphere(normal: vec3f, rng: ptr<function, u32>) -> vec3f {

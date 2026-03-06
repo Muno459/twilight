@@ -502,12 +502,14 @@ __device__ float3 refract_at_boundary(float3 dir, float3 boundary_pos, float n_f
     float k = 1.0f - eta * eta * (1.0f - cos_i * cos_i);
 
     if (k < 0.0f) {
-        return normalize3(dir + normal * (2.0f * cos_i));
+        // Total internal reflection: result is unit by reflection identity.
+        return dir + normal * (2.0f * cos_i);
     }
 
     float cos_t = sqrtf(k);
     float factor = eta * cos_i - cos_t;
-    return normalize3(dir * eta + normal * factor);
+    // Snell refraction: result is unit by Snell's law identity.
+    return dir * eta + normal * factor;
 }
 
 // ============================================================================
@@ -547,13 +549,12 @@ __device__ float shadow_ray_transmittance(const float* atm, float3 start_pos,
 
     KahanAccum tau;
 
+    // Find initial shell once (O(log N)), then track directly (O(1) per step).
+    int sidx = shell_index_binary(atm, len3(pos));
+    if (sidx < 0) return 1.0f;
+    unsigned int us = (unsigned int)sidx;
+
     for (unsigned int iter = 0; iter < 200; iter++) {
-        float r = len3(pos);
-
-        int sidx = shell_index_binary(atm, r);
-        if (sidx < 0) break;
-
-        unsigned int us = (unsigned int)sidx;
         float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
         float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
 
@@ -582,6 +583,10 @@ __device__ float shadow_ray_transmittance(const float* atm, float3 start_pos,
         if (!bnd.is_outward && len3(pos) <= surface_radius + 1.0f) {
             return 0.0f;
         }
+
+        // Exited atmosphere
+        if (next_shell >= ns) break;
+        us = next_shell;
 
         if (tau.result() > 50.0f) return 0.0f;
     }
@@ -617,18 +622,18 @@ __device__ float sample_henyey_greenstein(float xi, float g) {
 
 __device__ float3 scatter_direction(float3 dir, float cos_theta, float phi) {
     float sin_theta = sqrtf(fmaxf(1.0f - cos_theta * cos_theta, 0.0f));
-    float cos_phi = cosf(phi);
-    float sin_phi = sinf(phi);
+    float cos_phi, sin_phi;
+    sincosf(phi, &sin_phi, &cos_phi);
 
     float3 w = dir;
     float3 up = (fabsf(w.z) < 0.9f) ? make_float3(0.0f, 0.0f, 1.0f) : make_float3(1.0f, 0.0f, 0.0f);
     float3 u_vec = normalize3(cross3(w, up));
     float3 v_vec = cross3(w, u_vec);
 
-    float3 new_dir = sin_theta * cos_phi * u_vec
-                   + sin_theta * sin_phi * v_vec
-                   + cos_theta * w;
-    return normalize3(new_dir);
+    // (u_vec, v_vec, w) is orthonormal: result is unit length, no normalize needed.
+    float sc = sin_theta * cos_phi;
+    float ss = sin_theta * sin_phi;
+    return sc * u_vec + ss * v_vec + cos_theta * w;
 }
 
 __device__ float3 sample_hemisphere(float3 normal, unsigned long long &rng) {

@@ -468,12 +468,14 @@ vec3 refract_at_boundary(vec3 dir, vec3 boundary_pos, float n_from, float n_to) 
     float k = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
 
     if (k < 0.0) {
-        return normalize(dir + normal * (2.0 * cos_i));
+        // Total internal reflection: result is unit by reflection identity.
+        return dir + normal * (2.0 * cos_i);
     }
 
     float cos_t = sqrt(k);
     float factor = eta * cos_i - cos_t;
-    return normalize(dir * eta + normal * factor);
+    // Snell refraction: result is unit by Snell's law identity.
+    return dir * eta + normal * factor;
 }
 
 // ============================================================================
@@ -510,13 +512,12 @@ float shadow_ray_transmittance(vec3 start_pos, vec3 sun_dir, uint wl_idx) {
 
     vec2 tau = kahan_init();
 
+    // Find initial shell once (O(log N)), then track directly (O(1) per step).
+    int sidx = shell_index_binary(length(pos));
+    if (sidx < 0) return 1.0;
+    uint us = uint(sidx);
+
     for (uint iter = 0u; iter < 200u; iter++) {
-        float r = length(pos);
-
-        int sidx = shell_index_binary(r);
-        if (sidx < 0) break;
-
-        uint us = uint(sidx);
         float r_inner = input_buf.data[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
         float r_outer = input_buf.data[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1u];
 
@@ -545,6 +546,10 @@ float shadow_ray_transmittance(vec3 start_pos, vec3 sun_dir, uint wl_idx) {
         if (!bnd.is_outward && length(pos) <= surface_radius + 1.0) {
             return 0.0;
         }
+
+        // Exited atmosphere
+        if (next_shell >= ns) break;
+        us = next_shell;
 
         if (kahan_result(tau) > 50.0) return 0.0;
     }
@@ -588,10 +593,10 @@ vec3 scatter_direction(vec3 dir, float cos_theta, float phi) {
     vec3 u_vec = normalize(cross(w, up));
     vec3 v_vec = cross(w, u_vec);
 
-    vec3 new_dir = sin_theta * cos_phi * u_vec
-                 + sin_theta * sin_phi * v_vec
-                 + cos_theta * w;
-    return normalize(new_dir);
+    // (u_vec, v_vec, w) is orthonormal: result is unit length, no normalize needed.
+    float sc = sin_theta * cos_phi;
+    float ss = sin_theta * sin_phi;
+    return sc * u_vec + ss * v_vec + cos_theta * w;
 }
 
 vec3 sample_hemisphere(vec3 normal, inout uint rng) {

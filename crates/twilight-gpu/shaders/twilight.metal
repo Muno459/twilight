@@ -528,13 +528,14 @@ float3 refract_at_boundary(float3 dir, float3 boundary_pos, float n_from, float 
     float k = 1.0f - eta * eta * (1.0f - cos_i * cos_i);
 
     if (k < 0.0f) {
-        // Total internal reflection
-        return normalize(dir + normal * (2.0f * cos_i));
+        // Total internal reflection: result is unit by reflection identity.
+        return dir + normal * (2.0f * cos_i);
     }
 
     float cos_t = sqrt(k);
     float factor = eta * cos_i - cos_t;
-    return normalize(dir * eta + normal * factor);
+    // Snell refraction: result is unit by Snell's law identity.
+    return dir * eta + normal * factor;
 }
 
 // ============================================================================
@@ -595,13 +596,12 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
 
     KahanAccum tau;
 
+    // Find initial shell once (O(log N)), then track directly (O(1) per step).
+    int sidx = shell_index_binary(atm, length(pos));
+    if (sidx < 0) return 1.0f;
+    uint us = uint(sidx);
+
     for (uint iter = 0; iter < 200; iter++) {
-        float r = length(pos);
-
-        int sidx = shell_index_binary(atm, r);
-        if (sidx < 0) break; // exited atmosphere
-
-        uint us = uint(sidx);
         float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
         float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
 
@@ -618,9 +618,6 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
         // Refract at boundary
         float3 boundary_pos = pos + dir * bnd.dist;
         // Snap to exact boundary radius to prevent cumulative f32 position drift.
-        // At Earth scale (r ~ 6.4e6), pos + dir * t accumulates ULP errors
-        // across 50+ shell crossings. Snapping ensures the radial nudge starts
-        // from the exact boundary, not an approximation.
         float target_r = bnd.is_outward ? r_outer : r_inner;
         float bp_len = length(boundary_pos);
         if (bp_len > 0.0f) {
@@ -639,6 +636,10 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
         if (!bnd.is_outward && length(pos) <= surface_radius + 1.0f) {
             return 0.0f;
         }
+
+        // Exited atmosphere
+        if (next_shell >= ns) break;
+        us = next_shell;
 
         if (tau.result() > 50.0f) return 0.0f;
     }
@@ -674,18 +675,18 @@ inline float sample_henyey_greenstein(float xi, float g) {
 
 float3 scatter_direction(float3 dir, float cos_theta, float phi) {
     float sin_theta = sqrt(max(1.0f - cos_theta * cos_theta, 0.0f));
-    float cos_phi = cos(phi);
-    float sin_phi = sin(phi);
+    float cos_phi;
+    float sin_phi = sincos(phi, cos_phi);
 
     float3 w = dir;
     float3 up = (abs(w.z) < 0.9f) ? float3(0.0f, 0.0f, 1.0f) : float3(1.0f, 0.0f, 0.0f);
     float3 u_vec = normalize(cross(w, up));
     float3 v_vec = cross(w, u_vec);
 
-    float3 new_dir = sin_theta * cos_phi * u_vec
-                   + sin_theta * sin_phi * v_vec
-                   + cos_theta * w;
-    return normalize(new_dir);
+    // (u_vec, v_vec, w) is orthonormal: result is unit length, no normalize needed.
+    float sc = sin_theta * cos_phi;
+    float ss = sin_theta * sin_phi;
+    return sc * u_vec + ss * v_vec + cos_theta * w;
 }
 
 float3 sample_hemisphere(float3 normal, thread ulong &rng) {
