@@ -740,7 +740,14 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
         if op.extinction < 1e-20 {
             let bnd = next_shell_boundary(pos, dir, sh.r_inner, sh.r_outer);
             if !bnd.found { break; }
-            pos = radial_nudge(pos + dir * bnd.dist, bnd.is_outward);
+            let boundary_pos = pos + dir * bnd.dist;
+            let n_from = read_refractive_index(us);
+            var next_s = us + 1u;
+            if !bnd.is_outward { next_s = us - 1u; }
+            var n_to = 1.0f;
+            if next_s < atm_num_shells_val() { n_to = read_refractive_index(next_s); }
+            dir = refract_at_boundary(dir, boundary_pos, n_from, n_to);
+            pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }
 
@@ -765,6 +772,15 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
                 continue;
             }
 
+            // Refract and nudge past boundary
+            {
+                let n_from = read_refractive_index(us);
+                var next_s2 = us + 1u;
+                if !bnd.is_outward { next_s2 = us - 1u; }
+                var n_to2 = 1.0f;
+                if next_s2 < atm_num_shells_val() { n_to2 = read_refractive_index(next_s2); }
+                dir = refract_at_boundary(dir, boundary_pos, n_from, n_to2);
+            }
             pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }
@@ -868,7 +884,14 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
         if op.extinction < 1e-20 {
             let bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
             if !bnd.found { break; }
-            pos = radial_nudge(pos + current_dir * bnd.dist, bnd.is_outward);
+            let boundary_pos = pos + current_dir * bnd.dist;
+            let n_from = read_refractive_index(us);
+            var next_s = us + 1u;
+            if !bnd.is_outward { next_s = us - 1u; }
+            var n_to = 1.0f;
+            if next_s < atm_num_shells_val() { n_to = read_refractive_index(next_s); }
+            current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
+            pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }
 
@@ -893,6 +916,15 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
                 continue;
             }
 
+            // Refract and nudge past boundary
+            {
+                let n_from = read_refractive_index(us);
+                var next_s2 = us + 1u;
+                if !bnd.is_outward { next_s2 = us - 1u; }
+                var n_to2 = 1.0f;
+                if next_s2 < atm_num_shells_val() { n_to2 = read_refractive_index(next_s2); }
+                current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to2);
+            }
             pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }

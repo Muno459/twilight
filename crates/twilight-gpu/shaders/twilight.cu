@@ -811,7 +811,12 @@ void mcrt_trace_photon(const float* atm, const float* params, float* output,
         if (op.extinction < 1e-20f) {
             ShellBoundary bnd = next_shell_boundary(pos, dir, sh.r_inner, sh.r_outer);
             if (!bnd.found) break;
-            pos = radial_nudge(pos + dir * bnd.dist, bnd.is_outward);
+            float3 boundary_pos = pos + dir * bnd.dist;
+            float n_from = read_refractive_index(atm, us);
+            unsigned int next_s = bnd.is_outward ? us + 1 : us - 1;
+            float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
+            dir = refract_at_boundary(dir, boundary_pos, n_from, n_to);
+            pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }
 
@@ -836,6 +841,13 @@ void mcrt_trace_photon(const float* atm, const float* params, float* output,
                 continue;
             }
 
+            // Refract and nudge past boundary
+            {
+                float n_from = read_refractive_index(atm, us);
+                unsigned int next_s = bnd.is_outward ? us + 1 : us - 1;
+                float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
+                dir = refract_at_boundary(dir, boundary_pos, n_from, n_to);
+            }
             pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }
@@ -943,7 +955,12 @@ __device__ float4 trace_secondary_chain(const float* atm, float3 start_pos,
         if (op.extinction < 1e-20f) {
             ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
             if (!bnd.found) break;
-            pos = radial_nudge(pos + current_dir * bnd.dist, bnd.is_outward);
+            float3 boundary_pos = pos + current_dir * bnd.dist;
+            float n_from = read_refractive_index(atm, us);
+            unsigned int next_s = bnd.is_outward ? us + 1 : us - 1;
+            float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
+            current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
+            pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }
 
@@ -968,6 +985,13 @@ __device__ float4 trace_secondary_chain(const float* atm, float3 start_pos,
                 continue;
             }
 
+            // Refract and nudge past boundary
+            {
+                float n_from = read_refractive_index(atm, us);
+                unsigned int next_s = bnd.is_outward ? us + 1 : us - 1;
+                float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
+                current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
+            }
             pos = radial_nudge(boundary_pos, bnd.is_outward);
             continue;
         }

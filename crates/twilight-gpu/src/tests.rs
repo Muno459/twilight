@@ -3041,11 +3041,286 @@ fn test_parity_coverage_report() {
     );
 }
 
+/// CPU-only convergence diagnostic: establish true mean and variance at deep
+/// twilight by running many independent seeds.
+///
+/// This test runs ONLY on CPU (no GPU needed) and answers the question:
+/// "How many MC samples does it take for the hybrid scatter mean to converge
+/// at SZA 104-106?" If the coefficient of variation (CV) is still >100% at
+/// 50 seeds x 100 rays, the GPU-high bias seen in the statistical test
+/// (5 seeds x 100 rays) is likely just noise, not a real code difference.
+///
+/// Output is purely diagnostic (eprintln), no assertions.
+#[test]
+fn cpu_convergence_at_deep_twilight() {
+    let atm = twilight_data::builder::build_clear_sky(
+        twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+        0.15,
+    );
+
+    let lat = 21.4225;
+    let lon = 39.8262;
+    let solar_azimuth = 270.0;
+    let view_zenith = 85.0;
+
+    let obs_pos = twilight_core::geometry::geographic_to_ecef(lat, lon, 0.0);
+    let view = twilight_core::geometry::solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+
+    let num_seeds = 50usize;
+
+    for &sza_deg in &[96.0, 100.0, 104.0, 106.0] {
+        let sun = twilight_core::geometry::solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+
+        for &rays in &[100usize] {
+            let mut seed_totals = Vec::with_capacity(num_seeds);
+
+            for seed_idx in 0..num_seeds {
+                let mut total = 0.0f64;
+                for w in 0..atm.num_wavelengths {
+                    let mut rng = (seed_idx as u64)
+                        .wrapping_mul(2862933555777941757)
+                        .wrapping_add(sza_deg.to_bits())
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(w as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1);
+                    total += twilight_core::photon::hybrid_scatter_radiance(
+                        &atm, obs_pos, view, sun, w, rays, &mut rng, true,
+                    );
+                }
+                seed_totals.push(total);
+            }
+
+            let mean = seed_totals.iter().sum::<f64>() / num_seeds as f64;
+            let std = (seed_totals.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                / (num_seeds - 1) as f64)
+                .sqrt();
+            let cv = if mean.abs() > 1e-30 { std / mean } else { 0.0 };
+            let se = std / (num_seeds as f64).sqrt();
+
+            // Running mean: show how the mean evolves as we add seeds
+            let mut running = Vec::new();
+            let mut run_sum = 0.0f64;
+            for (i, &v) in seed_totals.iter().enumerate() {
+                run_sum += v;
+                if (i + 1) % 10 == 0 {
+                    running.push(run_sum / (i + 1) as f64);
+                }
+            }
+
+            eprintln!(
+                "\nCONV SZA={:.1} rays={}: mean={:.4e} std={:.4e} CV={:.2} SE={:.4e} \
+                 95%CI=[{:.4e}, {:.4e}]",
+                sza_deg,
+                rays,
+                mean,
+                std,
+                cv,
+                se,
+                mean - 1.96 * se,
+                mean + 1.96 * se,
+            );
+            eprintln!(
+                "  running means (every 10 seeds): {:?}",
+                running
+                    .iter()
+                    .map(|x| format!("{:.4e}", x))
+                    .collect::<Vec<_>>(),
+            );
+
+            // Sort seed totals to show distribution shape
+            let mut sorted = seed_totals.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let median = sorted[num_seeds / 2];
+            let p10 = sorted[num_seeds / 10];
+            let p90 = sorted[num_seeds * 9 / 10];
+            eprintln!(
+                "  median={:.4e} p10={:.4e} p90={:.4e} min={:.4e} max={:.4e}",
+                median,
+                p10,
+                p90,
+                sorted[0],
+                sorted[num_seeds - 1],
+            );
+        }
+    }
+}
+
+/// Statistical parity test: GPU hybrid vs CPU hybrid at deep twilight.
+///
+/// At deep twilight (SZA 102-108), MC variance is extreme because the signal
+/// is dominated by rare high-contribution secondary chains that find a path
+/// to the sun through Earth's shadow.
+///
+/// CPU convergence analysis (50 seeds x 100 rays, `cpu_convergence_at_deep_twilight`):
+///
+///   SZA 96:  CV=0.01, distribution Gaussian, mean stable to 0.3%
+///   SZA 100: CV=0.03, distribution Gaussian, mean stable to 0.8%
+///   SZA 104: CV=0.38, right-skewed (max=3.3x median), mean stable to 21%
+///   SZA 106: CV=1.91, extremely right-skewed (max=23x median), 95% CI spans 3.2x
+///
+/// With 10 seeds at 100 rays, the GPU/CPU ratio is expected to scatter in
+/// a wide band due to independent RNG streams. These are NOT precision bugs.
+/// The deterministic single-scatter and shadow-ray parity tests confirm
+/// GPU correctness to <0.1% at all SZA.
+///
+/// Pass/fail criteria: GPU broadband mean / CPU broadband mean is within
+/// an SZA-dependent tolerance band derived from the convergence analysis.
+/// Catching gross GPU bugs (broken shadow ray = ratio ~0, missing kernel
+/// output, sign error) while tolerating MC noise.
+#[test]
+fn statistical_hybrid_gpu_vs_cpu_deep_twilight() {
+    let mut backends = init_all_backends();
+    if backends.is_empty() {
+        eprintln!("STAT: No GPU backends available, skipping");
+        return;
+    }
+
+    let atm = twilight_data::builder::build_clear_sky(
+        twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+        0.15,
+    );
+    for (_, gpu) in backends.iter_mut() {
+        gpu.upload_atmosphere(&atm).unwrap();
+    }
+
+    let lat = 21.4225;
+    let lon = 39.8262;
+    let solar_azimuth = 270.0;
+    let view_zenith = 85.0;
+
+    let obs_pos = twilight_core::geometry::geographic_to_ecef(lat, lon, 0.0);
+    let view = twilight_core::geometry::solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+    let obs_arr = [obs_pos.x, obs_pos.y, obs_pos.z];
+    let view_arr = [view.x, view.y, view.z];
+
+    let secondary_rays: usize = 100;
+    let num_seeds: usize = 10;
+    let num_wl = atm.num_wavelengths;
+
+    // SZA -> (min_ratio, max_ratio) for broadband total.
+    //
+    // Tolerances derived from CPU convergence analysis:
+    //   SZA 96:  CV=0.01. With 10 seeds, SE ~ 0.3%. Band: [0.90, 1.10] catches
+    //            any >10% systematic error while passing normal noise.
+    //   SZA 100: CV=0.03. SE ~ 1%. Band: [0.80, 1.30].
+    //   SZA 102: CV~0.15. SE ~ 5%. Band: [0.50, 2.00].
+    //   SZA 104: CV=0.38. SE ~ 12%. Fat tails: max/median ~ 3x.
+    //            Band: [0.15, 8.0] catches gross errors (ratio ~0 or ~100).
+    //   SZA 106: CV=1.91. SE ~ 60%. max/median ~ 23x.
+    //            Band: [0.02, 50.0] -- only catches complete failure.
+    let test_cases: &[(f64, f64, f64)] = &[
+        // (sza, min_ratio, max_ratio)
+        (96.0, 0.90, 1.10),  // CV=0.01, tight band catches >10% systematic error
+        (100.0, 0.80, 1.30), // CV=0.03, catches >20% error
+        (102.0, 0.50, 2.00), // CV~0.15, catches gross errors
+        (104.0, 0.15, 8.0),  // CV=0.38, fat tails, wide band
+        (106.0, 0.02, 50.0), // CV=1.91, only catches complete failure
+    ];
+
+    for &(sza_deg, min_ratio, max_ratio) in test_cases {
+        let sun = twilight_core::geometry::solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+        let sun_arr = [sun.x, sun.y, sun.z];
+
+        // ---- CPU: average broadband total over num_seeds independent runs ----
+        let mut cpu_seed_totals = Vec::with_capacity(num_seeds);
+        for seed_idx in 0..num_seeds {
+            let mut cpu_total = 0.0f64;
+            for w in 0..num_wl {
+                let mut rng = (seed_idx as u64)
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(sza_deg.to_bits())
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(w as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1);
+                let rad = twilight_core::photon::hybrid_scatter_radiance(
+                    &atm,
+                    obs_pos,
+                    view,
+                    sun,
+                    w,
+                    secondary_rays,
+                    &mut rng,
+                    true,
+                );
+                cpu_total += rad;
+            }
+            cpu_seed_totals.push(cpu_total);
+        }
+        let cpu_mean = cpu_seed_totals.iter().sum::<f64>() / num_seeds as f64;
+
+        // ---- GPU: average broadband total over num_seeds independent runs ----
+        for (kind, gpu) in backends.iter() {
+            let mut gpu_seed_totals = Vec::with_capacity(num_seeds);
+            for seed_idx in 0..num_seeds {
+                let seed = (seed_idx as u64)
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(sza_deg.to_bits());
+                let gpu_result = gpu
+                    .hybrid_scatter(obs_arr, view_arr, sun_arr, secondary_rays as u32, seed)
+                    .unwrap();
+                let gpu_total: f64 = gpu_result.radiance[..num_wl].iter().sum();
+                gpu_seed_totals.push(gpu_total);
+            }
+            let gpu_mean = gpu_seed_totals.iter().sum::<f64>() / num_seeds as f64;
+
+            // Compute coefficient of variation for diagnostic
+            let cpu_std = (cpu_seed_totals
+                .iter()
+                .map(|x| (x - cpu_mean).powi(2))
+                .sum::<f64>()
+                / (num_seeds - 1) as f64)
+                .sqrt();
+            let gpu_std = (gpu_seed_totals
+                .iter()
+                .map(|x| (x - gpu_mean).powi(2))
+                .sum::<f64>()
+                / (num_seeds - 1) as f64)
+                .sqrt();
+
+            let ratio = if cpu_mean.abs() > 1e-30 {
+                gpu_mean / cpu_mean
+            } else if gpu_mean.abs() > 1e-30 {
+                f64::INFINITY
+            } else {
+                1.0
+            };
+
+            eprintln!(
+                "STAT [{:?}] SZA={:.1}: CPU_mean={:.4e} (std={:.4e}), GPU_mean={:.4e} (std={:.4e}), ratio={:.4}",
+                kind, sza_deg, cpu_mean, cpu_std, gpu_mean, gpu_std, ratio,
+            );
+
+            // Skip assertion if both means are effectively zero (deep night)
+            if cpu_mean.abs() < 1e-30 && gpu_mean.abs() < 1e-30 {
+                continue;
+            }
+
+            assert!(
+                ratio >= min_ratio && ratio <= max_ratio,
+                "[{:?}] SZA={}: GPU/CPU broadband ratio {:.4} outside [{}, {}]\n\
+                 CPU seeds: {:?}\n\
+                 GPU seeds: {:?}",
+                kind,
+                sza_deg,
+                ratio,
+                min_ratio,
+                max_ratio,
+                cpu_seed_totals,
+                gpu_seed_totals,
+            );
+        }
+    }
+}
+
 /// Diagnostic: Compare GPU hybrid radiance vs CPU hybrid radiance at deep
 /// twilight using the SAME geometry as the prayer pipeline (Mecca,
-/// view_zenith=85°, solar_azimuth=270°).
+/// view_zenith=85, solar_azimuth=270).
 ///
 /// Not a pass/fail test -- purely diagnostic output via eprintln.
+/// For the proper statistical parity test, see
+/// `statistical_hybrid_gpu_vs_cpu_deep_twilight` above.
 #[test]
 fn diagnostic_hybrid_gpu_vs_cpu_deep_twilight() {
     let mut backends = init_all_backends();
