@@ -167,13 +167,7 @@ pub fn no2_cross_section(wl_nm: f64, temp_k: f64) -> f64 {
     let xs_220 = lerp(NO2_XS_220K[wi], NO2_XS_220K[wi + 1], wt);
 
     // Clamp to [220, 294] range for interpolation.
-    let t_clamped = if temp_k > 294.0 {
-        294.0
-    } else if temp_k < 220.0 {
-        220.0
-    } else {
-        temp_k
-    };
+    let t_clamped = temp_k.clamp(220.0, 294.0);
     let frac = (294.0 - t_clamped) / (294.0 - 220.0); // 0 at 294K, 1 at 220K
     lerp(xs_294, xs_220, frac)
 }
@@ -524,7 +518,7 @@ fn doppler_halfwidth(nu0: f64, temp_k: f64, mass_amu: f64) -> f64 {
 
     const C_CGS: f64 = 2.99792458e10; // cm/s
     const R: f64 = 8.314462618; // J/(mol*K)
-    const LN2: f64 = 0.6931471805599453;
+    const LN2: f64 = core::f64::consts::LN_2;
 
     let m_kg_per_mol = mass_amu * 1e-3;
     let factor = libm::sqrt(2.0 * R * LN2 / m_kg_per_mol);
@@ -543,13 +537,13 @@ fn doppler_halfwidth(nu0: f64, temp_k: f64, mass_amu: f64) -> f64 {
 ///
 /// Returns cross-section in cm^2/molecule.
 pub fn o2_cross_section_lbl(wl_nm: f64, pressure_hpa: f64, temperature_k: f64) -> f64 {
-    if wl_nm < 380.0 || wl_nm > 780.0 {
+    if !(380.0..=780.0).contains(&wl_nm) {
         return 0.0;
     }
 
     let nu = 1e7 / wl_nm; // target wavenumber in cm^-1
     const O2_MASS_AMU: f64 = 31.9988; // O2 molecular mass
-    const LN2: f64 = 0.6931471805599453;
+    const LN2: f64 = core::f64::consts::LN_2;
 
     let gamma_d_factor = doppler_halfwidth(1.0, temperature_k, O2_MASS_AMU);
 
@@ -607,13 +601,13 @@ pub fn o2_cross_section_lbl(wl_nm: f64, pressure_hpa: f64, temperature_k: f64) -
 ///
 /// Returns cross-section in cm^2/molecule.
 pub fn h2o_cross_section_lbl(wl_nm: f64, pressure_hpa: f64, temperature_k: f64) -> f64 {
-    if wl_nm < 380.0 || wl_nm > 780.0 {
+    if !(380.0..=780.0).contains(&wl_nm) {
         return 0.0;
     }
 
     let nu = 1e7 / wl_nm;
     const H2O_MASS_AMU: f64 = 18.0106; // H2O molecular mass
-    const LN2: f64 = 0.6931471805599453;
+    const LN2: f64 = core::f64::consts::LN_2;
 
     let gamma_d_factor = doppler_halfwidth(1.0, temperature_k, H2O_MASS_AMU);
 

@@ -35,13 +35,10 @@ pub fn rayleigh_cross_section(wavelength_nm: f64) -> f64 {
     let n2_plus_2 = n2_minus_1 + 3.0; // n² + 2
     let lorentz_lorenz = n2_minus_1 / n2_plus_2; // (n²-1)/(n²+2)
 
-    let cross_section =
-        (24.0 * core::f64::consts::PI * core::f64::consts::PI * core::f64::consts::PI)
-            / (n_s * n_s * pow(lambda_cm, 4.0))
-            * (lorentz_lorenz * lorentz_lorenz)
-            * f_king;
-
-    cross_section
+    (24.0 * core::f64::consts::PI * core::f64::consts::PI * core::f64::consts::PI)
+        / (n_s * n_s * pow(lambda_cm, 4.0))
+        * (lorentz_lorenz * lorentz_lorenz)
+        * f_king
 }
 
 /// Compute Rayleigh scattering coefficient (extinction per meter) at given

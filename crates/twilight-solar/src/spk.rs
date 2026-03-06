@@ -27,7 +27,7 @@ const SPK_ND: usize = 2;
 const SPK_NI: usize = 6;
 
 /// Summary size in doubles for SPK: ND + ceil((NI+1)/2) = 2 + 3 = 5.
-const SPK_SS: usize = SPK_ND + (SPK_NI + 1) / 2; // 5
+const SPK_SS: usize = SPK_ND + SPK_NI.div_ceil(2); // 5
 
 /// Maximum summaries per summary record: (128 - 3) / SS = 25.
 #[allow(dead_code)]

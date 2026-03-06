@@ -46,8 +46,7 @@ pub const O3_NUM_ENTRIES: usize = 41;
 /// Returns cross-section in cm²/molecule.
 /// Returns 0 for wavelengths outside the table range.
 pub fn o3_cross_section_at(wavelength_nm: f64) -> f64 {
-    if wavelength_nm < O3_WAVELENGTHS_NM[0] || wavelength_nm > O3_WAVELENGTHS_NM[O3_NUM_ENTRIES - 1]
-    {
+    if !(O3_WAVELENGTHS_NM[0]..=O3_WAVELENGTHS_NM[O3_NUM_ENTRIES - 1]).contains(&wavelength_nm) {
         return 0.0;
     }
 

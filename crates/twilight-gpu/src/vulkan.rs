@@ -55,7 +55,7 @@ const SPV_GARSTANG: &[u8] = include_bytes!("../shaders/garstang_zenith.spv");
 // ── Helper: bytes to u32 words for SPIR-V ──────────────────────────────
 
 fn spv_to_words(bytes: &[u8]) -> Vec<u32> {
-    assert!(bytes.len() % 4 == 0, "SPIR-V must be 4-byte aligned");
+    assert!(bytes.len().is_multiple_of(4), "SPIR-V must be 4-byte aligned");
     bytes
         .chunks_exact(4)
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -144,7 +144,7 @@ pub fn probe() -> bool {
     {
         create_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
         extensions.push(
-            b"VK_KHR_portability_enumeration\0".as_ptr() as *const i8,
+            c"VK_KHR_portability_enumeration".as_ptr(),
         );
     }
 
@@ -195,7 +195,7 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     {
         create_flags |= vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR;
         instance_extensions.push(
-            b"VK_KHR_portability_enumeration\0".as_ptr() as *const i8,
+            c"VK_KHR_portability_enumeration".as_ptr(),
         );
     }
 
@@ -262,7 +262,7 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
         });
         if has_portability {
             device_extensions.push(
-                b"VK_KHR_portability_subset\0".as_ptr() as *const i8,
+                c"VK_KHR_portability_subset".as_ptr(),
             );
         }
     }
@@ -901,8 +901,9 @@ impl VulkanBackend {
     /// 1. We never have concurrent allocations (dispatch_kernel is synchronous)
     /// 2. VulkanBackend is not Sync (only Send), so no concurrent &self access
     /// 3. The allocator is only accessed through this method
+    #[allow(clippy::mut_from_ref)] // Interior mutability via UnsafeCell is intentional
     fn allocator_mut(&self) -> &mut Allocator {
-        unsafe { &mut **self.allocator.get() }
+        unsafe { &mut *self.allocator.get() }
     }
 
     /// Dispatch a compute kernel with the given storage buffers.
@@ -1261,7 +1262,7 @@ fn create_buffer_from_f32(
     data: &[f32],
     name: &str,
 ) -> Result<VkBuffer, GpuError> {
-    let byte_len = data.len() * std::mem::size_of::<f32>();
+    let byte_len = std::mem::size_of_val(data);
     if byte_len == 0 {
         return Err(GpuError::BufferAllocation("zero-length buffer".into()));
     }

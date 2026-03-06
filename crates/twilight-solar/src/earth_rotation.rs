@@ -30,6 +30,7 @@ const JULIAN_CENTURY_DAYS: f64 = 36525.0;
 const EARTH_A: f64 = 6378.137;
 
 /// Earth polar radius (WGS84) in km.
+#[allow(clippy::inconsistent_digit_grouping)] // IERS reference value, grouped to match source
 const EARTH_B: f64 = 6356.752_314_245;
 
 /// Earth flattening (unused currently but kept for reference).
@@ -103,12 +104,13 @@ pub fn calendar_utc_to_tdb(
 ///
 /// Uses the IAU 2006 expression (Capitaine et al. 2003).
 /// Input: Julian UT1 date.
+#[allow(clippy::inconsistent_digit_grouping)] // Capitaine et al. 2003 reference coefficients, grouped to match source
 pub fn gmst_radians(jd_ut1: f64) -> f64 {
     let t = (jd_ut1 - J2000_JD) / JULIAN_CENTURY_DAYS;
     let du = jd_ut1 - J2000_JD;
 
     // ERA (Earth Rotation Angle) - IERS 2003
-    let theta = TWO_PI * (0.779_057_273_264_0 + 1.002_737_811_911_354_48 * du);
+    let theta = TWO_PI * (0.779_057_273_264_0 + 1.002_737_811_911_354_6 * du);
 
     // GMST = ERA + precession polynomial
     // Capitaine et al. 2003 (arcseconds -> radians)
@@ -131,6 +133,7 @@ pub fn gmst_radians(jd_ut1: f64) -> f64 {
 ///
 /// Uses the dominant terms of the IAU 1980 nutation series.
 /// Returns (delta_psi, delta_epsilon) in radians.
+#[allow(clippy::inconsistent_digit_grouping)] // IAU 1980 nutation series reference coefficients
 pub fn nutation_simple(t_centuries: f64) -> (f64, f64) {
     let t = t_centuries;
 
@@ -188,7 +191,7 @@ pub fn gast_radians(jd_ut1: f64, jd_tdb: f64) -> f64 {
     let eq_eq = delta_psi * cos(epsilon);
 
     let mut gast = gmst + eq_eq;
-    gast = gast % TWO_PI;
+    gast %= TWO_PI;
     if gast < 0.0 {
         gast += TWO_PI;
     }

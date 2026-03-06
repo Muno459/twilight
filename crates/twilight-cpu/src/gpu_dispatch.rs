@@ -142,10 +142,10 @@ fn gpu_result_to_spectral(
     let mut wavelengths = Vec::with_capacity(nw);
     let mut radiance = Vec::with_capacity(nw);
 
-    for w in 0..nw {
+    for (w, solar_irr) in SOLAR_IRRADIANCE.iter().enumerate().take(nw) {
         wavelengths.push(atm.wavelengths_nm[w]);
-        let r = if apply_solar_irradiance && w < SOLAR_IRRADIANCE.len() {
-            gpu_result.radiance[w] * SOLAR_IRRADIANCE[w]
+        let r = if apply_solar_irradiance {
+            gpu_result.radiance[w] * solar_irr
         } else {
             gpu_result.radiance[w]
         };

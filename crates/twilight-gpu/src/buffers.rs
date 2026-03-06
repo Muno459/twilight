@@ -201,8 +201,8 @@ impl PackedAtmosphere {
         }
 
         let mut wavelengths_nm = vec![0.0f64; nw];
-        for w in 0..nw {
-            wavelengths_nm[w] = self.data[atm_offsets::WAVELENGTHS_START + w] as f64;
+        for (w, wl) in wavelengths_nm.iter_mut().enumerate().take(nw) {
+            *wl = self.data[atm_offsets::WAVELENGTHS_START + w] as f64;
         }
 
         let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths_nm);
@@ -431,7 +431,7 @@ impl PackedDispatchParams {
 /// Compute the number of workgroups needed for `total_threads` with
 /// `workgroup_size` threads per group.
 pub fn dispatch_groups(total_threads: u32, workgroup_size: u32) -> u32 {
-    (total_threads + workgroup_size - 1) / workgroup_size
+    total_threads.div_ceil(workgroup_size)
 }
 
 #[cfg(test)]

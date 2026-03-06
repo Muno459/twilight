@@ -17,7 +17,7 @@ const KM_SCOTOPIC: f64 = 1700.06;
 ///
 /// The table covers 380-780nm at 5nm intervals (81 values).
 fn interpolate_vision_function(wavelength_nm: f64, values: &[f64; 81]) -> f64 {
-    if wavelength_nm < 380.0 || wavelength_nm > 780.0 {
+    if !(380.0..=780.0).contains(&wavelength_nm) {
         return 0.0;
     }
     let idx_f = (wavelength_nm - 380.0) / 5.0;

@@ -33,8 +33,8 @@ pub const SOLAR_NUM_ENTRIES: usize = 41;
 ///
 /// Returns irradiance in W/m²/nm.
 pub fn solar_irradiance_at(wavelength_nm: f64) -> f64 {
-    if wavelength_nm < SOLAR_WAVELENGTHS_NM[0]
-        || wavelength_nm > SOLAR_WAVELENGTHS_NM[SOLAR_NUM_ENTRIES - 1]
+    if !(SOLAR_WAVELENGTHS_NM[0]..=SOLAR_WAVELENGTHS_NM[SOLAR_NUM_ENTRIES - 1])
+        .contains(&wavelength_nm)
     {
         return 0.0;
     }

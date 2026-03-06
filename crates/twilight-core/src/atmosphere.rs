@@ -121,9 +121,7 @@ impl AtmosphereModel {
         model.num_shells = n_shells;
 
         let n_wl = wavelengths_nm.len().min(MAX_WAVELENGTHS);
-        for i in 0..n_wl {
-            model.wavelengths_nm[i] = wavelengths_nm[i];
-        }
+        model.wavelengths_nm[..n_wl].copy_from_slice(&wavelengths_nm[..n_wl]);
         model.num_wavelengths = n_wl;
 
         model
@@ -176,12 +174,8 @@ impl AtmosphereModel {
     /// Get shell index for a given radius from Earth center.
     /// Returns None if outside the atmosphere.
     pub fn shell_index(&self, radius: f64) -> Option<usize> {
-        for i in 0..self.num_shells {
-            if radius >= self.shells[i].r_inner && radius < self.shells[i].r_outer {
-                return Some(i);
-            }
-        }
-        None
+        (0..self.num_shells)
+            .find(|&i| radius >= self.shells[i].r_inner && radius < self.shells[i].r_outer)
     }
 
     /// Get the optical depth through a shell along a path of given length.

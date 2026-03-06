@@ -577,7 +577,7 @@ impl MetalBackend {
 
         for (i, buf) in buffers.iter().enumerate() {
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(*buf), 0, i as usize);
+                encoder.setBuffer_offset_atIndex(Some(*buf), 0, i);
             }
         }
 
@@ -633,7 +633,7 @@ impl MetalBackend {
 
         for (i, buf) in buffers.iter().enumerate() {
             unsafe {
-                encoder.setBuffer_offset_atIndex(Some(*buf), 0, i as usize);
+                encoder.setBuffer_offset_atIndex(Some(*buf), 0, i);
             }
         }
 
@@ -692,7 +692,7 @@ fn create_buffer_from_f32(
     device: &ProtocolObject<dyn MTLDevice>,
     data: &[f32],
 ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, GpuError> {
-    let byte_len = data.len() * std::mem::size_of::<f32>();
+    let byte_len = std::mem::size_of_val(data);
     if byte_len == 0 {
         return Err(GpuError::BufferAllocation("zero-length buffer".into()));
     }

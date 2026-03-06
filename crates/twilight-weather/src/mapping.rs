@@ -83,9 +83,9 @@ pub fn map_aerosol(conditions: &WeatherConditions) -> Option<AerosolProperties> 
 /// optical depth (cloud edges contribute, and horizontal transport of
 /// light through gaps matters).
 pub fn map_cloud(conditions: &WeatherConditions) -> Option<CloudProperties> {
-    let low = conditions.cloud_cover_low.min(100.0).max(0.0);
-    let mid = conditions.cloud_cover_mid.min(100.0).max(0.0);
-    let high = conditions.cloud_cover_high.min(100.0).max(0.0);
+    let low = conditions.cloud_cover_low.clamp(0.0, 100.0);
+    let mid = conditions.cloud_cover_mid.clamp(0.0, 100.0);
+    let high = conditions.cloud_cover_high.clamp(0.0, 100.0);
 
     // Check for fog (WMO codes 45, 48)
     let is_fog = conditions.weather_code == 45 || conditions.weather_code == 48;
@@ -193,7 +193,7 @@ fn estimate_o3_column_du(surface_o3_ug_m3: f64) -> f64 {
     let du = baseline_du + (surface_o3_ug_m3 - baseline_surface) * sensitivity;
 
     // Clamp to physically reasonable range
-    du.max(220.0).min(450.0)
+    du.clamp(220.0, 450.0)
 }
 
 /// Convert surface NO2 in ug/m3 to number density in molecules/m3.

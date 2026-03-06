@@ -320,7 +320,7 @@ pub fn mc_scatter_spectrum(
         return radiance;
     }
 
-    for w in 0..num_wl {
+    for (w, rad_w) in radiance.iter_mut().enumerate().take(num_wl) {
         let mut total_weight = 0.0;
         for p in 0..photons_per_wavelength {
             // Unique seed per (wavelength, photon) pair to avoid correlation
@@ -334,7 +334,7 @@ pub fn mc_scatter_spectrum(
             let result = trace_photon(atm, observer_pos, view_dir, sun_dir, w, &mut rng);
             total_weight += result.weight;
         }
-        radiance[w] = total_weight / photons_per_wavelength as f64;
+        *rad_w = total_weight / photons_per_wavelength as f64;
     }
 
     radiance
@@ -488,6 +488,7 @@ pub fn trace_photon_polarized(
 
 /// Polarized NEE: compute the Stokes vector contribution from the sun
 /// at a scatter point, using the full Mueller matrix framework.
+#[allow(clippy::too_many_arguments)] // Physics function: all 8 params are independent physical quantities
 fn compute_nee_polarized(
     atm: &AtmosphereModel,
     scatter_pos: Vec3,
@@ -549,7 +550,7 @@ pub fn mc_scatter_spectrum_polarized(
         return radiance;
     }
 
-    for w in 0..num_wl {
+    for (w, rad_w) in radiance.iter_mut().enumerate().take(num_wl) {
         let mut total_stokes = StokesVector::unpolarized(0.0);
         for p in 0..photons_per_wavelength {
             let mut rng = base_seed
@@ -563,7 +564,7 @@ pub fn mc_scatter_spectrum_polarized(
             total_stokes = total_stokes.add(&result.stokes);
         }
         let inv_n = 1.0 / photons_per_wavelength as f64;
-        radiance[w] = total_stokes.scale(inv_n);
+        *rad_w = total_stokes.scale(inv_n);
     }
 
     radiance
@@ -585,11 +586,11 @@ const HYBRID_MAX_BOUNCES: usize = 50;
 /// 1. Step along the line of sight (LOS) from the observer.
 /// 2. At each LOS step point, compute:
 ///    a. The single-scatter contribution (deterministic NEE toward sun)
-///       using the exact analytical shadow ray from `single_scatter.rs`.
+///    using the exact analytical shadow ray from `single_scatter.rs`.
 ///    b. Launch `secondary_rays` MC chains from this scatter point.
-///       Chains are importance-sampled toward the upper atmosphere (upward
-///       bias) so that at deep twilight, photons have a chance of reaching
-///       sunlit altitudes (>40km) where they can connect to the sun via NEE.
+///    Chains are importance-sampled toward the upper atmosphere (upward
+///    bias) so that at deep twilight, photons have a chance of reaching
+///    sunlit altitudes (>40km) where they can connect to the sun via NEE.
 /// 3. Sum both contributions, weighted by transmittance and scattering
 ///    probability along the LOS.
 ///
@@ -614,6 +615,7 @@ const HYBRID_MAX_BOUNCES: usize = 50;
 /// # Returns
 /// Total spectral radiance (single-scatter + multi-scatter contribution)
 /// in the same units as `single_scatter_radiance`.
+#[allow(clippy::too_many_arguments)] // Physics function: observer, view, sun, wavelength, rays, rng, polarized are all independent
 pub fn hybrid_scatter_radiance(
     atm: &AtmosphereModel,
     observer_pos: Vec3,
@@ -1114,13 +1116,13 @@ pub fn hybrid_scatter_spectrum(
     let mut radiance = [0.0f64; 64];
     let num_wl = atm.num_wavelengths;
 
-    for w in 0..num_wl {
+    for (w, rad_w) in radiance.iter_mut().enumerate().take(num_wl) {
         let mut rng = base_seed
             .wrapping_add(w as u64)
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1);
 
-        radiance[w] = hybrid_scatter_radiance(
+        *rad_w = hybrid_scatter_radiance(
             atm,
             observer_pos,
             view_dir,

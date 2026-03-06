@@ -5,14 +5,10 @@ use twilight_data::aerosol::AerosolType;
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
 use twilight_data::cloud::CloudType;
-use twilight_skyglow;
 use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
 use twilight_terrain::horizon;
 use twilight_threshold::threshold::TwilightColor;
-
-#[cfg(feature = "gpu")]
-use twilight_gpu;
 
 /// Twilight — Monte Carlo Radiative Transfer engine for Fajr/Isha prayer times.
 #[derive(Parser)]
@@ -387,7 +383,7 @@ const TWILIGHT_ANGLES: &[TwilightAngle] = &[
 ];
 
 fn format_fractional_hour(h: f64) -> String {
-    if h < 0.0 || h > 24.0 {
+    if !(0.0..=24.0).contains(&h) {
         return "N/A".to_string();
     }
     let hours = h as u32;
@@ -530,10 +526,10 @@ fn cmd_solar(
         let evening = spa::find_zenith_crossing(&base_input, angle.zenith, 12.0, 24.0, 0.0001);
 
         let morning_str = morning
-            .map(|h| format_fractional_hour(h))
+            .map(format_fractional_hour)
             .unwrap_or("N/A".to_string());
         let evening_str = evening
-            .map(|h| format_fractional_hour(h))
+            .map(format_fractional_hour)
             .unwrap_or("N/A".to_string());
 
         println!(
@@ -550,6 +546,7 @@ fn cmd_solar(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // CLI dispatch: all params come from parsed command-line args
 fn cmd_mcrt(
     lat: f64,
     lon: f64,
@@ -621,8 +618,8 @@ fn cmd_mcrt(
         } else {
             let aerosol_type = aerosol.to_aerosol_type();
             let cloud_type = cloud.to_cloud_type();
-            let ap = aerosol_type.map(|at| twilight_data::aerosol::default_properties(at));
-            let cp = cloud_type.map(|ct| twilight_data::cloud::default_properties(ct));
+            let ap = aerosol_type.map(twilight_data::aerosol::default_properties);
+            let cp = cloud_type.map(twilight_data::cloud::default_properties);
             let desc = format_atm_desc(aerosol_type, cloud_type);
             (ap, cp, None, desc)
         };
@@ -826,6 +823,7 @@ fn cmd_mcrt(
     );
 }
 
+#[allow(clippy::too_many_arguments)] // CLI dispatch: all params come from parsed command-line args
 fn cmd_pray(
     lat: f64,
     lon: f64,
@@ -918,8 +916,8 @@ fn cmd_pray(
     } else {
         let aerosol_type = aerosol.to_aerosol_type();
         let cloud_type = cloud.to_cloud_type();
-        let ap = aerosol_type.map(|at| twilight_data::aerosol::default_properties(at));
-        let cp = cloud_type.map(|ct| twilight_data::cloud::default_properties(ct));
+        let ap = aerosol_type.map(twilight_data::aerosol::default_properties);
+        let cp = cloud_type.map(twilight_data::cloud::default_properties);
         let desc = format_atm_desc(aerosol_type, cloud_type);
         (ap, cp, None, desc)
     };
@@ -1128,14 +1126,14 @@ fn cmd_pray(
         "  Sunrise:              {}",
         output
             .sunrise_time
-            .map(|h| format_fractional_hour(h))
+            .map(format_fractional_hour)
             .unwrap_or("N/A".to_string())
     );
     println!(
         "  Sunset:               {}",
         output
             .sunset_time
-            .map(|h| format_fractional_hour(h))
+            .map(format_fractional_hour)
             .unwrap_or("N/A".to_string())
     );
 
@@ -1294,7 +1292,7 @@ fn cmd_pray(
         };
 
         let time_str = time
-            .map(|h| format_fractional_hour(h))
+            .map(format_fractional_hour)
             .unwrap_or("N/A".to_string());
 
         let diff_str = match (time, mcrt_time) {

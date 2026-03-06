@@ -34,7 +34,7 @@ const TILE_SIZE_M: f64 = 10_000.0;
 
 /// Check whether a WGS84 coordinate falls within Denmark's bounding box.
 pub fn covers(lat: f64, lon: f64) -> bool {
-    lat >= DK_LAT_MIN && lat <= DK_LAT_MAX && lon >= DK_LON_MIN && lon <= DK_LON_MAX
+    (DK_LAT_MIN..=DK_LAT_MAX).contains(&lat) && (DK_LON_MIN..=DK_LON_MAX).contains(&lon)
 }
 
 /// Danish DHM (Digital Height Model) elevation source.

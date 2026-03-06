@@ -114,6 +114,7 @@ impl De440 {
     ///
     /// # Returns
     /// [`TopocentricPosition`] with zenith, azimuth, elevation, distance.
+    #[allow(clippy::too_many_arguments)] // Calendar components (y/m/d/h/m/s) + delta_t + observer (lat/lon/elev) are all independent
     pub fn solar_position(
         &mut self,
         year: i32,
@@ -147,6 +148,7 @@ impl De440 {
     /// Compute solar zenith angle (degrees) at a given UTC fractional hour.
     ///
     /// Convenience method matching the SPA pipeline interface.
+    #[allow(clippy::too_many_arguments)] // Calendar components + observer location are all independent
     pub fn zenith_at_hour(
         &mut self,
         year: i32,
@@ -178,6 +180,7 @@ impl De440 {
     /// `target_zenith`: target zenith angle in degrees
     /// `start_hour`, `end_hour`: search range (fractional hours, local UTC)
     /// `tolerance`: convergence tolerance in fractional hours
+    #[allow(clippy::too_many_arguments)] // Calendar components + observer location + search params are all independent
     pub fn find_zenith_crossing(
         &mut self,
         year: i32,

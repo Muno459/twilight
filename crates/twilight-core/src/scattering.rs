@@ -77,13 +77,7 @@ pub fn sample_rayleigh_analytic(xi: f64) -> f64 {
     let v = cbrt(-q / 2.0 - sqrt_disc);
     let mu = u + v;
     // Clamp to [-1, 1]
-    if mu < -1.0 {
-        -1.0
-    } else if mu > 1.0 {
-        1.0
-    } else {
-        mu
-    }
+    mu.clamp(-1.0, 1.0)
 }
 
 /// Sample a scattering angle from the Henyey-Greenstein phase function.
@@ -105,13 +99,7 @@ pub fn sample_henyey_greenstein(xi: f64, g: f64) -> f64 {
     let mu = (1.0 + g2 - s * s) / (2.0 * g);
 
     // Clamp to [-1, 1]
-    if mu < -1.0 {
-        -1.0
-    } else if mu > 1.0 {
-        1.0
-    } else {
-        mu
-    }
+    mu.clamp(-1.0, 1.0)
 }
 
 /// Generate a new direction vector after scattering.
@@ -280,8 +268,8 @@ impl MuellerMatrix {
     #[inline]
     pub fn apply(&self, s: &StokesVector) -> StokesVector {
         let mut out = [0.0f64; 4];
-        for i in 0..4 {
-            out[i] = self.m[i][0] * s.s[0]
+        for (i, out_i) in out.iter_mut().enumerate() {
+            *out_i = self.m[i][0] * s.s[0]
                 + self.m[i][1] * s.s[1]
                 + self.m[i][2] * s.s[2]
                 + self.m[i][3] * s.s[3];
@@ -293,9 +281,9 @@ impl MuellerMatrix {
     #[inline]
     pub fn mul(&self, other: &Self) -> Self {
         let mut out = [[0.0f64; 4]; 4];
-        for i in 0..4 {
-            for j in 0..4 {
-                out[i][j] = self.m[i][0] * other.m[0][j]
+        for (i, out_row) in out.iter_mut().enumerate() {
+            for (j, out_ij) in out_row.iter_mut().enumerate() {
+                *out_ij = self.m[i][0] * other.m[0][j]
                     + self.m[i][1] * other.m[1][j]
                     + self.m[i][2] * other.m[2][j]
                     + self.m[i][3] * other.m[3][j];

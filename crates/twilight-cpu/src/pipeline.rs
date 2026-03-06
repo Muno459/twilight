@@ -354,12 +354,10 @@ impl SolarEngine {
 fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::AtmosphereModel {
     let aerosol_props = input
         .custom_aerosol
-        .clone()
-        .or_else(|| input.aerosol_type.map(|at| aerosol::default_properties(at)));
+        .or_else(|| input.aerosol_type.map(aerosol::default_properties));
     let cloud_props = input
         .custom_cloud
-        .clone()
-        .or_else(|| input.cloud_type.map(|ct| cloud::default_properties(ct)));
+        .or_else(|| input.cloud_type.map(cloud::default_properties));
 
     if input.o3_column_du.is_some() || input.no2_surface_density.is_some() {
         builder::build_full_with_gas(
@@ -737,7 +735,7 @@ fn set_time_from_fractional_hour(input: &mut SpaInput, fractional_hour: f64) {
 /// Converts to total integer seconds (with rounding) first, then decomposes
 /// with integer arithmetic to avoid floating-point truncation errors.
 pub fn format_time(h: f64) -> String {
-    if h < 0.0 || h > 24.0 {
+    if !(0.0..=24.0).contains(&h) {
         return "N/A".to_string();
     }
     let total_seconds = (h * 3600.0).round() as u32;

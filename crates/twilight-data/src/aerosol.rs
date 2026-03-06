@@ -182,13 +182,7 @@ pub fn aerosol_extinction(props: &AerosolProperties, wavelength_nm: f64, altitud
 pub fn aerosol_ssa(props: &AerosolProperties, wavelength_nm: f64) -> f64 {
     let ssa = props.ssa_550 + props.ssa_slope * (wavelength_nm - 550.0);
     // Clamp to physical bounds
-    if ssa < 0.0 {
-        0.0
-    } else if ssa > 1.0 {
-        1.0
-    } else {
-        ssa
-    }
+    ssa.clamp(0.0, 1.0)
 }
 
 /// Compute the aerosol scattering asymmetry parameter at a given wavelength.
@@ -201,13 +195,7 @@ pub fn aerosol_ssa(props: &AerosolProperties, wavelength_nm: f64) -> f64 {
 /// * `wavelength_nm` - Wavelength in nanometers
 pub fn aerosol_asymmetry(props: &AerosolProperties, wavelength_nm: f64) -> f64 {
     let g = props.asymmetry_550 + props.g_slope * (wavelength_nm - 550.0);
-    if g < -1.0 {
-        -1.0
-    } else if g > 1.0 {
-        1.0
-    } else {
-        g
-    }
+    g.clamp(-1.0, 1.0)
 }
 
 /// Compute the total column AOD at a given wavelength.

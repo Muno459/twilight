@@ -488,7 +488,7 @@ fn topocentric_zenith(
     ) * RAD_TO_DEG;
 
     // Atmospheric refraction correction (Meeus approximation)
-    let delta_e = if e0 >= -1.0 * (0.26667 + 0.5667) {
+    let delta_e = if e0 >= -(0.26667 + 0.5667) {
         (pressure / 1010.0) * (283.0 / (273.0 + temperature)) * 1.02
             / (60.0 * tan((e0 + 10.3 / (e0 + 5.11)) * DEG_TO_RAD))
     } else {

@@ -33,10 +33,11 @@ pub struct SpectralResult {
 }
 
 /// Scattering mode for the simulation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScatteringMode {
     /// Deterministic single-scattering line-of-sight integration.
     /// Fast, no noise. Accurate for clear sky up to ~15° depression.
+    #[default]
     Single,
     /// Backward Monte Carlo with next-event estimation.
     /// Handles all scattering orders. Required for deep twilight (>15°),
@@ -46,12 +47,6 @@ pub enum ScatteringMode {
     /// chains (orders 2+). Best convergence for deep twilight.
     /// Uses `photons_per_wavelength` as number of secondary rays per LOS step.
     Hybrid,
-}
-
-impl Default for ScatteringMode {
-    fn default() -> Self {
-        ScatteringMode::Single
-    }
 }
 
 /// Configuration for a twilight simulation.

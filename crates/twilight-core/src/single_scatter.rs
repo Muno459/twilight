@@ -492,8 +492,8 @@ fn shadow_ray_transmittance_spectrum(
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
-                for w in 0..num_wl {
-                    tau[w] += atm.optics[shell_idx][w].extinction * dist;
+                for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
+                    *tau_w += atm.optics[shell_idx][w].extinction * dist;
                 }
 
                 // Refract at boundary
@@ -530,20 +530,15 @@ fn shadow_ray_transmittance_spectrum(
         }
 
         // Early out if ALL wavelengths are opaque
-        let mut min_tau = f64::MAX;
-        for w in 0..num_wl {
-            if tau[w] < min_tau {
-                min_tau = tau[w];
-            }
-        }
+        let min_tau = tau.iter().take(num_wl).copied().fold(f64::MAX, f64::min);
         if min_tau > 50.0 {
             return [0.0f64; 64];
         }
     }
 
     let mut result = [0.0f64; 64];
-    for w in 0..num_wl {
-        result[w] = if tau[w] > 50.0 {
+    for (w, res_w) in result.iter_mut().enumerate().take(num_wl) {
+        *res_w = if tau[w] > 50.0 {
             0.0
         } else {
             libm::exp(-tau[w])

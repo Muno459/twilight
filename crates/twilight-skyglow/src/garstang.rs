@@ -414,7 +414,7 @@ pub fn bin_sources(
         let mut dist = start;
         while dist < actual_end {
             // More azimuth bins at larger distances (covers more area)
-            let n_az = (n_azimuths_base as f64 * (dist / 5.0).max(1.0).min(4.0)) as usize;
+            let n_az = (n_azimuths_base as f64 * (dist / 5.0).clamp(1.0, 4.0)) as usize;
             let az_step = 360.0 / n_az as f64;
 
             for az_idx in 0..n_az {

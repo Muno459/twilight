@@ -46,7 +46,7 @@ pub fn compute_horizon(
     let radius_m = radius_km * 1000.0;
     let mut angles = [0.0_f64; 360];
 
-    for az in 0..360 {
+    for (az, angle) in angles.iter_mut().enumerate() {
         let azimuth_deg = az as f64;
         let mut max_angle = f64::NEG_INFINITY;
         let mut dist = step_m;
@@ -77,7 +77,7 @@ pub fn compute_horizon(
         }
 
         // If no terrain was found at all (ocean everywhere), horizon is at 0 degrees
-        angles[az] = if max_angle == f64::NEG_INFINITY {
+        *angle = if max_angle == f64::NEG_INFINITY {
             0.0
         } else {
             max_angle
@@ -120,7 +120,7 @@ pub fn horizon_time_shift(
     horizon_angle_deg: f64,
     lat_deg: f64,
     declination_deg: f64,
-    sunrise: bool,
+    _sunrise: bool,
 ) -> f64 {
     if horizon_angle_deg <= 0.0 {
         return 0.0; // No obstruction
@@ -185,15 +185,10 @@ pub fn horizon_time_shift(
     }
 
     let shift_hours = horizon_angle_deg / rate;
-    let shift_minutes = shift_hours * 60.0;
 
-    // For sunrise: positive shift means later sunrise
-    // For sunset: positive shift means earlier sunset
-    if sunrise {
-        shift_minutes
-    } else {
-        shift_minutes
-    }
+    // Horizon shift is the same sign for both sunrise and sunset:
+    // positive terrain angle means later sunrise / earlier sunset.
+    shift_hours * 60.0
 }
 
 /// Compute the effective solar zenith angle for sunrise/sunset accounting for terrain.
