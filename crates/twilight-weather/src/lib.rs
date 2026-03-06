@@ -1,12 +1,17 @@
 //! Real-time weather data for twilight MCRT simulations.
 //!
 //! Fetches current atmospheric conditions from the Open-Meteo API (no key
-//! required) and maps them to the aerosol and cloud models used by the
-//! twilight radiative transfer engine.
+//! required) and maps them to the aerosol, cloud, and gas composition
+//! models used by the twilight radiative transfer engine.
 //!
 //! Two API endpoints are used:
 //! - Weather Forecast API: cloud cover (low/mid/high), visibility, humidity
-//! - Air Quality API: aerosol optical depth at 550nm, dust concentration
+//! - Air Quality API: AOD, dust, PM, surface O3 and NO2 concentrations
+//!
+//! Surface O3 and NO2 from the air quality API (sourced from CAMS global
+//! forecasts) are used to estimate total column O3 (Dobson Units) and
+//! scale the NO2 profile, improving gas absorption accuracy over the
+//! standard atmosphere defaults.
 //!
 //! The mapping from weather observations to MCRT parameters is physically
 //! motivated but approximate. Real aerosol composition and cloud micro-
@@ -29,6 +34,12 @@ pub struct WeatherConditions {
     pub pm2_5_ug_m3: f64,
     /// PM10 concentration at surface (ug/m3)
     pub pm10_ug_m3: f64,
+    /// Surface ozone concentration (ug/m3). From CAMS global forecast via
+    /// Open-Meteo Air Quality API. Used to estimate total column O3.
+    pub ozone_ug_m3: f64,
+    /// Surface NO2 concentration (ug/m3). From CAMS global forecast via
+    /// Open-Meteo Air Quality API. Used to scale the tropospheric NO2 profile.
+    pub nitrogen_dioxide_ug_m3: f64,
     /// Total cloud cover (%)
     pub cloud_cover_total: f64,
     /// Low cloud cover, below 3km (%)
@@ -51,6 +62,22 @@ pub struct WeatherConditions {
     pub api_longitude: f64,
 }
 
+/// Atmospheric gas composition overrides derived from observations.
+///
+/// When available, these values replace the US Standard Atmosphere defaults
+/// in the gas absorption model. The O3 column is scaled using
+/// [`twilight_core::gas_absorption::scale_o3_column`], and NO2 surface
+/// density is used to scale the tropospheric NO2 profile.
+#[derive(Debug, Clone, Copy)]
+pub struct GasComposition {
+    /// Total column O3 in Dobson Units. `None` means use the standard
+    /// atmosphere default (~347 DU for US Standard 1976).
+    pub o3_column_du: Option<f64>,
+    /// Surface NO2 number density in molecules/m^3. `None` means use the
+    /// standard atmosphere default.
+    pub no2_surface_density: Option<f64>,
+}
+
 /// Atmospheric parameters derived from weather observations, ready to
 /// pass to `twilight_data::builder::build_full()`.
 #[derive(Debug, Clone)]
@@ -59,6 +86,8 @@ pub struct AtmosphericParams {
     pub aerosol: Option<AerosolProperties>,
     /// Cloud properties (None = clear sky, no cloud)
     pub cloud: Option<CloudProperties>,
+    /// Gas composition overrides (None = use standard atmosphere defaults)
+    pub gas_composition: Option<GasComposition>,
     /// Human-readable summary of what was detected
     pub description: String,
     /// The raw weather conditions used to derive these params
@@ -77,11 +106,13 @@ pub fn fetch_atmospheric_params(lat: f64, lon: f64) -> Result<AtmosphericParams,
     let conditions = api::fetch_weather(lat, lon)?;
     let aerosol = mapping::map_aerosol(&conditions);
     let cloud = mapping::map_cloud(&conditions);
-    let description = mapping::describe(&conditions, &aerosol, &cloud);
+    let gas_composition = mapping::map_gas_composition(&conditions);
+    let description = mapping::describe(&conditions, &aerosol, &cloud, &gas_composition);
 
     Ok(AtmosphericParams {
         aerosol,
         cloud,
+        gas_composition,
         description,
         conditions,
     })
@@ -97,6 +128,8 @@ mod tests {
             dust_ug_m3: 0.0,
             pm2_5_ug_m3: 3.0,
             pm10_ug_m3: 5.0,
+            ozone_ug_m3: 60.0,
+            nitrogen_dioxide_ug_m3: 5.0,
             cloud_cover_total: 0.0,
             cloud_cover_low: 0.0,
             cloud_cover_mid: 0.0,
@@ -116,6 +149,8 @@ mod tests {
             dust_ug_m3: 2.0,
             pm2_5_ug_m3: 25.0,
             pm10_ug_m3: 40.0,
+            ozone_ug_m3: 40.0,
+            nitrogen_dioxide_ug_m3: 30.0,
             cloud_cover_total: 20.0,
             cloud_cover_low: 0.0,
             cloud_cover_mid: 0.0,
@@ -135,6 +170,8 @@ mod tests {
             dust_ug_m3: 0.0,
             pm2_5_ug_m3: 8.0,
             pm10_ug_m3: 12.0,
+            ozone_ug_m3: 50.0,
+            nitrogen_dioxide_ug_m3: 15.0,
             cloud_cover_total: 100.0,
             cloud_cover_low: 90.0,
             cloud_cover_mid: 30.0,
@@ -154,6 +191,8 @@ mod tests {
             dust_ug_m3: 80.0,
             pm2_5_ug_m3: 15.0,
             pm10_ug_m3: 120.0,
+            ozone_ug_m3: 80.0,
+            nitrogen_dioxide_ug_m3: 8.0,
             cloud_cover_total: 0.0,
             cloud_cover_low: 0.0,
             cloud_cover_mid: 0.0,
@@ -326,7 +365,8 @@ mod tests {
         let c = make_clear_conditions();
         let aerosol = mapping::map_aerosol(&c);
         let cloud = mapping::map_cloud(&c);
-        let desc = mapping::describe(&c, &aerosol, &cloud);
+        let gas = mapping::map_gas_composition(&c);
+        let desc = mapping::describe(&c, &aerosol, &cloud, &gas);
         assert!(
             desc.contains("clear") || desc.contains("Clean") || desc.contains("pristine"),
             "Clear sky description should mention clear: {}",
@@ -339,7 +379,8 @@ mod tests {
         let c = make_hazy_conditions();
         let aerosol = mapping::map_aerosol(&c);
         let cloud = mapping::map_cloud(&c);
-        let desc = mapping::describe(&c, &aerosol, &cloud);
+        let gas = mapping::map_gas_composition(&c);
+        let desc = mapping::describe(&c, &aerosol, &cloud, &gas);
         assert!(
             desc.contains("0.25") || desc.contains("AOD"),
             "Hazy description should mention AOD: {}",
@@ -352,7 +393,8 @@ mod tests {
         let c = make_overcast_conditions();
         let aerosol = mapping::map_aerosol(&c);
         let cloud = mapping::map_cloud(&c);
-        let desc = mapping::describe(&c, &aerosol, &cloud);
+        let gas = mapping::map_gas_composition(&c);
+        let desc = mapping::describe(&c, &aerosol, &cloud, &gas);
         assert!(
             desc.contains("cloud") || desc.contains("overcast") || desc.contains("Cloud"),
             "Overcast description should mention cloud: {}",

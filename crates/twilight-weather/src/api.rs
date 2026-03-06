@@ -5,7 +5,7 @@
 //!
 //! Two endpoints:
 //! - `api.open-meteo.com/v1/forecast`: cloud cover, visibility, humidity
-//! - `air-quality-api.open-meteo.com/v1/air-quality`: AOD, dust, PM
+//! - `air-quality-api.open-meteo.com/v1/air-quality`: AOD, dust, PM, O3, NO2
 
 use serde::Deserialize;
 
@@ -51,6 +51,8 @@ struct AirQualityCurrent {
     dust: Option<f64>,
     pm2_5: Option<f64>,
     pm10: Option<f64>,
+    ozone: Option<f64>,
+    nitrogen_dioxide: Option<f64>,
 }
 
 /// Fetch current weather conditions from Open-Meteo.
@@ -67,7 +69,7 @@ pub fn fetch_weather(lat: f64, lon: f64) -> Result<WeatherConditions, String> {
     );
 
     let aq_url = format!(
-        "{}?latitude={}&longitude={}&current=aerosol_optical_depth,dust,pm2_5,pm10",
+        "{}?latitude={}&longitude={}&current=aerosol_optical_depth,dust,pm2_5,pm10,ozone,nitrogen_dioxide",
         AIR_QUALITY_BASE_URL, lat, lon
     );
 
@@ -95,6 +97,8 @@ pub fn fetch_weather(lat: f64, lon: f64) -> Result<WeatherConditions, String> {
         dust: None,
         pm2_5: None,
         pm10: None,
+        ozone: None,
+        nitrogen_dioxide: None,
     });
 
     Ok(WeatherConditions {
@@ -102,6 +106,8 @@ pub fn fetch_weather(lat: f64, lon: f64) -> Result<WeatherConditions, String> {
         dust_ug_m3: aqc.dust.unwrap_or(0.0),
         pm2_5_ug_m3: aqc.pm2_5.unwrap_or(0.0),
         pm10_ug_m3: aqc.pm10.unwrap_or(0.0),
+        ozone_ug_m3: aqc.ozone.unwrap_or(0.0),
+        nitrogen_dioxide_ug_m3: aqc.nitrogen_dioxide.unwrap_or(0.0),
         cloud_cover_total: wc.cloud_cover.unwrap_or(0.0),
         cloud_cover_low: wc.cloud_cover_low.unwrap_or(0.0),
         cloud_cover_mid: wc.cloud_cover_mid.unwrap_or(0.0),

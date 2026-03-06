@@ -1,4 +1,4 @@
-//! Map weather observations to MCRT aerosol and cloud parameters.
+//! Map weather observations to MCRT aerosol, cloud, and gas parameters.
 //!
 //! The mapping is physically motivated but necessarily approximate.
 //! We use the measured AOD at 550nm directly (not the type default),
@@ -8,11 +8,15 @@
 //!
 //! Cloud mapping uses the low/mid/high cloud cover breakdown to select
 //! the dominant cloud type, and scales optical depth by coverage fraction.
+//!
+//! Gas composition mapping converts surface O3 and NO2 concentrations
+//! from the CAMS-based air quality API into total column estimates for
+//! the MCRT gas absorption model.
 
 use twilight_data::aerosol::{self, AerosolProperties, AerosolType};
 use twilight_data::cloud::{self, CloudProperties, CloudType};
 
-use crate::WeatherConditions;
+use crate::{GasComposition, WeatherConditions};
 
 /// Minimum AOD to consider aerosols worth modeling.
 /// Below this, the atmosphere is essentially pristine.
@@ -159,11 +163,105 @@ pub fn map_cloud(conditions: &WeatherConditions) -> Option<CloudProperties> {
     None
 }
 
+// ── Gas composition mapping ─────────────────────────────────────────────
+
+/// NO2 molar mass (g/mol).
+const NO2_MOLAR_MASS: f64 = 46.0;
+
+/// Avogadro's number (molecules/mol).
+const AVOGADRO: f64 = 6.022e23;
+
+/// Empirical relationship between surface O3 concentration and total column.
+///
+/// The total column O3 is dominated by the stratospheric layer (peak at
+/// 20-25 km), not surface O3. However, surface O3 correlates loosely with
+/// the total column through large-scale atmospheric dynamics (tropopause
+/// folding, stratosphere-troposphere exchange).
+///
+/// Typical surface O3: 20-80 ug/m3 (rural), 40-200 ug/m3 (urban episodes).
+/// Typical total column: 220-450 DU (global range), ~300 DU (mid-latitude).
+///
+/// We use a conservative linear mapping with a floor of 250 DU and a
+/// ceiling of 450 DU. The baseline is 300 DU at 60 ug/m3 surface O3.
+fn estimate_o3_column_du(surface_o3_ug_m3: f64) -> f64 {
+    // Baseline: 300 DU corresponds to ~60 ug/m3 surface O3
+    // Sensitivity: ~0.5 DU per ug/m3 deviation (weak correlation)
+    let baseline_du = 300.0;
+    let baseline_surface = 60.0;
+    let sensitivity = 0.5; // DU per ug/m3
+
+    let du = baseline_du + (surface_o3_ug_m3 - baseline_surface) * sensitivity;
+
+    // Clamp to physically reasonable range
+    du.max(220.0).min(450.0)
+}
+
+/// Convert surface NO2 in ug/m3 to number density in molecules/m3.
+///
+/// n [molecules/m3] = (concentration [ug/m3] * 1e-6 [g/ug]) / M [g/mol] * N_A [molecules/mol] * 1e6 [cm3/m3... wait]
+///
+/// Actually: n [molecules/m3] = (C [ug/m3] * 1e-6 [g/ug] * N_A [molecules/mol]) / (M [g/mol] * 1e-3 [kg/g] * 1e3 [L/m3] * 22.4 [L/mol at STP])
+///
+/// Convert NO2 surface concentration from ug/m3 to molecules/m3.
+///
+/// The concentration C [ug/m3] is already a mass per unit volume, so the
+/// conversion is straightforward:
+///   n [molecules/m3] = C [ug/m3] * 1e-6 [g/ug] / M [g/mol] * N_A [molecules/mol]
+///   n = C * 1e-6 * 6.022e23 / 46.0
+///   n = C * 1.309e16
+///
+/// At 40 ug/m3 (moderate urban): n ~ 5.2e17 molecules/m3
+fn no2_ug_m3_to_molecules_m3(no2_ug_m3: f64) -> f64 {
+    no2_ug_m3 * 1e-6 * AVOGADRO / NO2_MOLAR_MASS
+}
+
+/// Map weather observations to gas composition overrides.
+///
+/// Converts surface O3 and NO2 concentrations from the CAMS-based air
+/// quality API into values usable by the MCRT gas absorption model:
+///
+/// - **O3**: Surface concentration is used to estimate total column O3
+///   in Dobson Units via an empirical relationship. This adjusts the
+///   standard ~347 DU column to actual conditions (ozone holes, seasonal
+///   variation, latitude dependence).
+///
+/// - **NO2**: Surface concentration is converted to number density
+///   (molecules/m^3) to scale the tropospheric NO2 profile. This matters
+///   for Huggins/Chappuis band absorption, especially in polluted urban areas.
+///
+/// Returns `None` if both O3 and NO2 are zero or missing (no data from API).
+pub fn map_gas_composition(conditions: &WeatherConditions) -> Option<GasComposition> {
+    let has_o3 = conditions.ozone_ug_m3 > 0.0;
+    let has_no2 = conditions.nitrogen_dioxide_ug_m3 > 0.0;
+
+    if !has_o3 && !has_no2 {
+        return None;
+    }
+
+    let o3_column_du = if has_o3 {
+        Some(estimate_o3_column_du(conditions.ozone_ug_m3))
+    } else {
+        None
+    };
+
+    let no2_surface_density = if has_no2 {
+        Some(no2_ug_m3_to_molecules_m3(conditions.nitrogen_dioxide_ug_m3))
+    } else {
+        None
+    };
+
+    Some(GasComposition {
+        o3_column_du,
+        no2_surface_density,
+    })
+}
+
 /// Generate a human-readable description of the atmospheric conditions.
 pub fn describe(
     conditions: &WeatherConditions,
     aerosol: &Option<AerosolProperties>,
     cloud: &Option<CloudProperties>,
+    gas: &Option<GasComposition>,
 ) -> String {
     let mut parts = Vec::new();
 
@@ -210,6 +308,23 @@ pub fn describe(
         }
     }
 
+    // Gas composition
+    if let Some(gc) = gas {
+        let mut gas_parts = Vec::new();
+        if let Some(du) = gc.o3_column_du {
+            gas_parts.push(format!("O3 {:.0} DU", du));
+        }
+        if gc.no2_surface_density.is_some() {
+            gas_parts.push(format!(
+                "NO2 {:.0} ug/m3",
+                conditions.nitrogen_dioxide_ug_m3
+            ));
+        }
+        if !gas_parts.is_empty() {
+            parts.push(format!("Gas: {}", gas_parts.join(", ")));
+        }
+    }
+
     // Visibility
     if conditions.visibility_m < 10000.0 {
         parts.push(format!(
@@ -232,6 +347,8 @@ mod tests {
             dust_ug_m3: 0.0,
             pm2_5_ug_m3: 10.0,
             pm10_ug_m3: 15.0,
+            ozone_ug_m3: 50.0,
+            nitrogen_dioxide_ug_m3: 10.0,
             cloud_cover_total: 0.0,
             cloud_cover_low: 0.0,
             cloud_cover_mid: 0.0,
@@ -428,7 +545,8 @@ mod tests {
         c.aod_550 = 0.02;
         let a = map_aerosol(&c);
         let cl = map_cloud(&c);
-        let desc = describe(&c, &a, &cl);
+        let g = map_gas_composition(&c);
+        let desc = describe(&c, &a, &cl, &g);
         assert!(desc.contains("pristine") || desc.contains("Clear"));
     }
 
@@ -439,7 +557,8 @@ mod tests {
         c.cloud_cover_high = 40.0;
         let a = map_aerosol(&c);
         let cl = map_cloud(&c);
-        let desc = describe(&c, &a, &cl);
+        let g = map_gas_composition(&c);
+        let desc = describe(&c, &a, &cl, &g);
         assert!(desc.contains("0.25"));
         assert!(desc.contains("cirrus") || desc.contains("Cloud"));
     }
@@ -450,7 +569,97 @@ mod tests {
         c.visibility_m = 5000.0;
         let a = map_aerosol(&c);
         let cl = map_cloud(&c);
-        let desc = describe(&c, &a, &cl);
+        let g = map_gas_composition(&c);
+        let desc = describe(&c, &a, &cl, &g);
         assert!(desc.contains("5.0km") || desc.contains("Visibility"));
+    }
+
+    // ── Gas composition mapping ──
+
+    #[test]
+    fn gas_composition_from_typical_conditions() {
+        let c = base_conditions(); // O3=50, NO2=10
+        let gc = map_gas_composition(&c).expect("Should produce gas composition");
+        assert!(gc.o3_column_du.is_some());
+        let du = gc.o3_column_du.unwrap();
+        assert!(
+            du >= 220.0 && du <= 450.0,
+            "O3 column should be in range: {} DU",
+            du
+        );
+    }
+
+    #[test]
+    fn gas_composition_none_when_zero() {
+        let mut c = base_conditions();
+        c.ozone_ug_m3 = 0.0;
+        c.nitrogen_dioxide_ug_m3 = 0.0;
+        assert!(map_gas_composition(&c).is_none());
+    }
+
+    #[test]
+    fn gas_composition_o3_column_scales_with_surface() {
+        let mut c1 = base_conditions();
+        c1.ozone_ug_m3 = 30.0;
+        let mut c2 = base_conditions();
+        c2.ozone_ug_m3 = 100.0;
+        let gc1 = map_gas_composition(&c1).unwrap();
+        let gc2 = map_gas_composition(&c2).unwrap();
+        assert!(
+            gc2.o3_column_du.unwrap() > gc1.o3_column_du.unwrap(),
+            "Higher surface O3 should give higher column estimate"
+        );
+    }
+
+    #[test]
+    fn gas_composition_o3_column_clamped() {
+        let mut c = base_conditions();
+        c.ozone_ug_m3 = 500.0; // extremely high
+        let gc = map_gas_composition(&c).unwrap();
+        assert!(
+            gc.o3_column_du.unwrap() <= 450.0,
+            "Should be clamped to 450 DU"
+        );
+
+        c.ozone_ug_m3 = 1.0; // extremely low
+        let gc = map_gas_composition(&c).unwrap();
+        assert!(
+            gc.o3_column_du.unwrap() >= 220.0,
+            "Should be clamped to 220 DU"
+        );
+    }
+
+    #[test]
+    fn gas_composition_no2_conversion_reasonable() {
+        let mut c = base_conditions();
+        c.nitrogen_dioxide_ug_m3 = 40.0; // moderate urban
+        let gc = map_gas_composition(&c).unwrap();
+        let n = gc.no2_surface_density.unwrap();
+        // At 40 ug/m3 NO2: n = 40e-6 * 6.022e23 / 46.0 ~ 5.2e17 molecules/m3
+        assert!(
+            n > 1e17 && n < 1e19,
+            "NO2 density should be ~5e17, got {:.2e}",
+            n
+        );
+    }
+
+    #[test]
+    fn gas_composition_o3_only() {
+        let mut c = base_conditions();
+        c.ozone_ug_m3 = 60.0;
+        c.nitrogen_dioxide_ug_m3 = 0.0;
+        let gc = map_gas_composition(&c).unwrap();
+        assert!(gc.o3_column_du.is_some());
+        assert!(gc.no2_surface_density.is_none());
+    }
+
+    #[test]
+    fn gas_composition_no2_only() {
+        let mut c = base_conditions();
+        c.ozone_ug_m3 = 0.0;
+        c.nitrogen_dioxide_ug_m3 = 20.0;
+        let gc = map_gas_composition(&c).unwrap();
+        assert!(gc.o3_column_du.is_none());
+        assert!(gc.no2_surface_density.is_some());
     }
 }

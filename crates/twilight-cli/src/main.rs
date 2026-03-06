@@ -568,7 +568,7 @@ fn cmd_mcrt(
     println!("Wavelengths:  380-780 nm (41 bands, 10nm steps)");
 
     // Resolve atmosphere: weather API or manual flags
-    let (aerosol_props, cloud_props, atm_desc) =
+    let (aerosol_props, cloud_props, gas_composition, atm_desc) =
         if use_weather {
             match twilight_weather::fetch_atmospheric_params(lat, lon) {
                 Ok(params) => {
@@ -579,9 +579,16 @@ fn cmd_mcrt(
                     c.aod_550, c.cloud_cover_total, c.cloud_cover_low,
                     c.cloud_cover_mid, c.cloud_cover_high, c.visibility_m
                 );
+                    if c.ozone_ug_m3 > 0.0 || c.nitrogen_dioxide_ug_m3 > 0.0 {
+                        println!(
+                            "  Gas data:   O3={:.0} ug/m3, NO2={:.0} ug/m3",
+                            c.ozone_ug_m3, c.nitrogen_dioxide_ug_m3
+                        );
+                    }
                     (
                         params.aerosol,
                         params.cloud,
+                        params.gas_composition,
                         format!("Live weather: {}", params.description),
                     )
                 }
@@ -589,6 +596,7 @@ fn cmd_mcrt(
                     eprintln!("Warning: failed to fetch weather: {}", e);
                     eprintln!("Falling back to clear sky.");
                     (
+                        None,
                         None,
                         None,
                         "US Standard 1976 (clear sky, weather fetch failed)".to_string(),
@@ -601,7 +609,7 @@ fn cmd_mcrt(
             let ap = aerosol_type.map(|at| twilight_data::aerosol::default_properties(at));
             let cp = cloud_type.map(|ct| twilight_data::cloud::default_properties(ct));
             let desc = format_atm_desc(aerosol_type, cloud_type);
-            (ap, cp, desc)
+            (ap, cp, None, desc)
         };
 
     println!("Atmosphere:   {}", atm_desc);
@@ -620,12 +628,23 @@ fn cmd_mcrt(
     println!();
 
     // Build atmosphere
-    let atm = builder::build_full(
-        AtmosphereType::UsStandard,
-        albedo,
-        aerosol_props.as_ref(),
-        cloud_props.as_ref(),
-    );
+    let atm = if let Some(ref gc) = gas_composition {
+        builder::build_full_with_gas(
+            AtmosphereType::UsStandard,
+            albedo,
+            aerosol_props.as_ref(),
+            cloud_props.as_ref(),
+            gc.o3_column_du,
+            gc.no2_surface_density,
+        )
+    } else {
+        builder::build_full(
+            AtmosphereType::UsStandard,
+            albedo,
+            aerosol_props.as_ref(),
+            cloud_props.as_ref(),
+        )
+    };
 
     let config = SimulationConfig {
         latitude: lat,
@@ -836,7 +855,7 @@ fn cmd_pray(
     println!("SZA step:   {:.2}°", sza_step);
 
     // Resolve atmosphere: weather API or manual flags
-    let (weather_aerosol, weather_cloud, atm_desc) = if use_weather {
+    let (weather_aerosol, weather_cloud, weather_gas, atm_desc) = if use_weather {
         match twilight_weather::fetch_atmospheric_params(lat, lon) {
             Ok(params) => {
                 let c = &params.conditions;
@@ -849,13 +868,25 @@ fn cmd_pray(
                     c.cloud_cover_high,
                     c.visibility_m
                 );
+                if c.ozone_ug_m3 > 0.0 || c.nitrogen_dioxide_ug_m3 > 0.0 {
+                    println!(
+                        "Gas:        O3={:.0} ug/m3, NO2={:.0} ug/m3",
+                        c.ozone_ug_m3, c.nitrogen_dioxide_ug_m3
+                    );
+                    if let Some(ref gc) = params.gas_composition {
+                        if let Some(du) = gc.o3_column_du {
+                            println!("            O3 column estimate: {:.0} DU", du);
+                        }
+                    }
+                }
                 let desc = format!("Live weather: {}", params.description);
-                (params.aerosol, params.cloud, desc)
+                (params.aerosol, params.cloud, params.gas_composition, desc)
             }
             Err(e) => {
                 eprintln!("Warning: failed to fetch weather: {}", e);
                 eprintln!("Falling back to clear sky.");
                 (
+                    None,
                     None,
                     None,
                     "US Standard 1976 (clear sky, weather fetch failed)".to_string(),
@@ -868,7 +899,7 @@ fn cmd_pray(
         let ap = aerosol_type.map(|at| twilight_data::aerosol::default_properties(at));
         let cp = cloud_type.map(|ct| twilight_data::cloud::default_properties(ct));
         let desc = format_atm_desc(aerosol_type, cloud_type);
-        (ap, cp, desc)
+        (ap, cp, None, desc)
     };
 
     println!("Atmosphere: {}", atm_desc);
@@ -970,13 +1001,17 @@ fn cmd_pray(
 
     // When using weather API, pass custom properties directly.
     // When using manual flags, use the type-based approach.
-    let (aerosol_type, cloud_type, custom_aerosol, custom_cloud) = if use_weather {
-        (None, None, weather_aerosol, weather_cloud)
-    } else {
-        let at = aerosol.to_aerosol_type();
-        let ct = cloud.to_cloud_type();
-        (at, ct, None, None)
-    };
+    let (aerosol_type, cloud_type, custom_aerosol, custom_cloud, o3_du, no2_density) =
+        if use_weather {
+            let (o3, no2) = weather_gas
+                .map(|gc| (gc.o3_column_du, gc.no2_surface_density))
+                .unwrap_or((None, None));
+            (None, None, weather_aerosol, weather_cloud, o3, no2)
+        } else {
+            let at = aerosol.to_aerosol_type();
+            let ct = cloud.to_cloud_type();
+            (at, ct, None, None, None, None)
+        };
 
     let input = PrayerTimeInput {
         latitude: lat,
@@ -998,6 +1033,8 @@ fn cmd_pray(
         photons_per_wavelength: photons,
         horizon_profile,
         skyglow: skyglow_result,
+        o3_column_du: o3_du,
+        no2_surface_density: no2_density,
         ..Default::default()
     };
 
@@ -1307,6 +1344,9 @@ fn cmd_pray(
         }
         if has_cloud {
             println!("  - Cloud layer derived from observed cloud cover.");
+        }
+        if o3_du.is_some() || no2_density.is_some() {
+            println!("  - Gas absorption scaled from live O3/NO2 measurements.");
         }
     } else if has_aerosol || has_cloud {
         if has_aerosol {

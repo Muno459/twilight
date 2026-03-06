@@ -13,7 +13,7 @@ use crate::aerosol::{self, AerosolProperties, AerosolType};
 use crate::atmosphere_profiles::{self, AtmosphereType};
 use crate::cloud::{self, CloudProperties, CloudType};
 use twilight_core::atmosphere::{AtmosphereModel, ShellOptics};
-use twilight_core::gas_absorption::{apply_gas_absorption, standard_gas_profile};
+use twilight_core::gas_absorption::{apply_gas_absorption, scale_o3_column, standard_gas_profile};
 use twilight_core::spectrum::rayleigh_scattering_coeff;
 
 /// Default wavelength grid for twilight simulations: 380-780nm at 10nm steps.
@@ -405,13 +405,82 @@ pub fn build_full(
     }
 
     // Apply molecular gas absorption as the final step.
-    // This adds O3, NO2, O2, H2O, and O4 CIA absorption to each shell,
-    // increasing extinction and decreasing SSA while preserving the
-    // scattering coefficient.
-    let gas_profile = standard_gas_profile(&atm);
-    apply_gas_absorption(&mut atm, &gas_profile);
+    apply_gas_absorption_standard(&mut atm, None, None);
 
     atm
+}
+
+/// Build an atmosphere with gas composition overrides from observations.
+///
+/// Like [`build_full`] but allows overriding the O3 total column (in Dobson
+/// Units) and surface NO2 density (molecules/m^3) using real-time data
+/// from the weather/air quality API.
+///
+/// # Arguments
+/// * `o3_column_du` - Target O3 total column in DU. `None` uses the standard
+///   atmosphere default (~347 DU).
+/// * `no2_surface_density` - Surface NO2 in molecules/m^3. `None` uses the
+///   standard atmosphere default.
+pub fn build_full_with_gas(
+    profile: AtmosphereType,
+    surface_albedo: f64,
+    aerosol_props: Option<&AerosolProperties>,
+    cloud_props: Option<&CloudProperties>,
+    o3_column_du: Option<f64>,
+    no2_surface_density: Option<f64>,
+) -> AtmosphereModel {
+    let mut atm = match aerosol_props {
+        Some(props) => build_with_aerosol_properties(profile, surface_albedo, props),
+        None => build_clear_sky(profile, surface_albedo),
+    };
+
+    if let Some(cloud_props) = cloud_props {
+        if cloud_props.optical_depth > 0.0 {
+            let cloud_thickness_m = (cloud_props.top_km - cloud_props.base_km) * 1000.0;
+            if cloud_thickness_m > 0.0 {
+                let cloud_ext = cloud_props.optical_depth / cloud_thickness_m;
+                add_cloud_layer(&mut atm, cloud_props, cloud_ext);
+            }
+        }
+    }
+
+    apply_gas_absorption_standard(&mut atm, o3_column_du, no2_surface_density);
+
+    atm
+}
+
+/// Apply standard gas absorption with optional column overrides.
+///
+/// Builds a standard gas profile, optionally scales O3 to a target column
+/// and/or replaces the NO2 surface density, then applies gas absorption.
+fn apply_gas_absorption_standard(
+    atm: &mut AtmosphereModel,
+    o3_column_du: Option<f64>,
+    no2_surface_density: Option<f64>,
+) {
+    let mut gas_profile = standard_gas_profile(atm);
+
+    // Scale O3 column to target DU if provided
+    if let Some(target_du) = o3_column_du {
+        scale_o3_column(&mut gas_profile, atm, target_du);
+    }
+
+    // Scale NO2 profile if surface density override provided.
+    // We scale all shells proportionally so the shape is preserved
+    // but the surface value matches the observation.
+    if let Some(target_surface) = no2_surface_density {
+        if gas_profile.num_shells > 0 {
+            let current_surface = gas_profile.shells[0].no2_density;
+            if current_surface > 1e-30 {
+                let factor = target_surface / current_surface;
+                for s in 0..gas_profile.num_shells {
+                    gas_profile.shells[s].no2_density *= factor;
+                }
+            }
+        }
+    }
+
+    apply_gas_absorption(atm, &gas_profile);
 }
 
 /// Add a cloud layer to an existing atmosphere model.
@@ -1526,6 +1595,208 @@ mod tests {
                     rel_err < 1e-10,
                     "Scattering coefficient not preserved at shell {}, wl {}: before={:.6e} after={:.6e}",
                     s, w, scat_before, scat_after,
+                );
+            }
+        }
+    }
+
+    // ── build_full_with_gas tests ───────────────────────────────────────
+
+    #[test]
+    fn build_full_with_gas_none_overrides_matches_build_full() {
+        // When both overrides are None, build_full_with_gas should produce
+        // identical results to build_full (same standard gas profile).
+        let full = build_full(AtmosphereType::UsStandard, 0.15, None, None);
+        let full_gas =
+            build_full_with_gas(AtmosphereType::UsStandard, 0.15, None, None, None, None);
+        for s in 0..full.num_shells {
+            for w in 0..full.num_wavelengths {
+                let ext_a = full.optics[s][w].extinction;
+                let ext_b = full_gas.optics[s][w].extinction;
+                let rel = if ext_a > 1e-30 {
+                    (ext_b - ext_a).abs() / ext_a
+                } else {
+                    0.0
+                };
+                assert!(
+                    rel < 1e-10,
+                    "Shell {} wl {}: build_full={:.6e} vs build_full_with_gas={:.6e}",
+                    s,
+                    w,
+                    ext_a,
+                    ext_b,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_full_with_gas_o3_override_changes_extinction() {
+        // Doubling O3 column (standard is ~347 DU) should increase extinction
+        // in the Chappuis band (~600 nm) in the ozone layer (20-25 km).
+        let standard =
+            build_full_with_gas(AtmosphereType::UsStandard, 0.15, None, None, None, None);
+        let high_o3 = build_full_with_gas(
+            AtmosphereType::UsStandard,
+            0.15,
+            None,
+            None,
+            Some(600.0),
+            None,
+        );
+        // Find Chappuis wavelength index (~600 nm)
+        let mut chappuis_idx = 0;
+        for w in 0..standard.num_wavelengths {
+            if (standard.wavelengths_nm[w] - 600.0).abs() < 15.0 {
+                chappuis_idx = w;
+                break;
+            }
+        }
+        // Check ozone layer shells (~15-35 km). O3 absorption adds to
+        // Rayleigh extinction, so the relative increase in total extinction
+        // is modest (~5-10% going from 347 to 600 DU). We only require >1%.
+        let mut found_increase = false;
+        for s in 0..standard.num_shells {
+            let alt = standard.shells[s].altitude_mid;
+            if alt > 15_000.0 && alt < 35_000.0 {
+                let ext_std = standard.optics[s][chappuis_idx].extinction;
+                let ext_high = high_o3.optics[s][chappuis_idx].extinction;
+                if ext_std > 1e-30 && ext_high > ext_std * 1.01 {
+                    found_increase = true;
+                }
+            }
+        }
+        assert!(
+            found_increase,
+            "600 DU O3 column should increase Chappuis extinction over default ~347 DU"
+        );
+    }
+
+    #[test]
+    fn build_full_with_gas_low_o3_reduces_extinction() {
+        // A low O3 column (220 DU, ozone hole) should reduce extinction
+        // relative to the default ~347 DU.
+        let standard =
+            build_full_with_gas(AtmosphereType::UsStandard, 0.15, None, None, None, None);
+        let low_o3 = build_full_with_gas(
+            AtmosphereType::UsStandard,
+            0.15,
+            None,
+            None,
+            Some(220.0),
+            None,
+        );
+        let mut chappuis_idx = 0;
+        for w in 0..standard.num_wavelengths {
+            if (standard.wavelengths_nm[w] - 600.0).abs() < 15.0 {
+                chappuis_idx = w;
+                break;
+            }
+        }
+        let mut found_decrease = false;
+        for s in 0..standard.num_shells {
+            let alt = standard.shells[s].altitude_mid;
+            if alt > 15_000.0 && alt < 35_000.0 {
+                let ext_std = standard.optics[s][chappuis_idx].extinction;
+                let ext_low = low_o3.optics[s][chappuis_idx].extinction;
+                if ext_std > 1e-30 && ext_low < ext_std * 0.95 {
+                    found_decrease = true;
+                }
+            }
+        }
+        assert!(
+            found_decrease,
+            "220 DU O3 column should reduce Chappuis extinction below default ~347 DU"
+        );
+    }
+
+    #[test]
+    fn build_full_with_gas_no2_override_changes_extinction() {
+        // High NO2 (urban, ~5e17 molecules/m3) should increase extinction
+        // at short wavelengths (400 nm, Huggins region) near the surface.
+        let standard =
+            build_full_with_gas(AtmosphereType::UsStandard, 0.15, None, None, None, None);
+        let high_no2 = build_full_with_gas(
+            AtmosphereType::UsStandard,
+            0.15,
+            None,
+            None,
+            None,
+            Some(5.0e17),
+        );
+        // Find 400nm index
+        let mut uv_idx = 0;
+        for w in 0..standard.num_wavelengths {
+            if (standard.wavelengths_nm[w] - 400.0).abs() < 15.0 {
+                uv_idx = w;
+                break;
+            }
+        }
+        // Surface shell should show increased extinction
+        let ext_std = standard.optics[0][uv_idx].extinction;
+        let ext_high = high_no2.optics[0][uv_idx].extinction;
+        assert!(
+            ext_high > ext_std,
+            "High NO2 should increase surface extinction at 400nm: std={:.6e} high={:.6e}",
+            ext_std,
+            ext_high,
+        );
+    }
+
+    #[test]
+    fn build_full_with_gas_preserves_scattering_coefficient() {
+        // Gas absorption is purely absorptive: scattering coefficient must
+        // be preserved regardless of O3/NO2 overrides.
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let with_gas = build_full_with_gas(
+            AtmosphereType::UsStandard,
+            0.15,
+            None,
+            None,
+            Some(400.0),
+            Some(1.0e18),
+        );
+        for s in 0..clear.num_shells {
+            for w in 0..clear.num_wavelengths {
+                let scat_before = clear.optics[s][w].extinction * clear.optics[s][w].ssa;
+                let scat_after = with_gas.optics[s][w].extinction * with_gas.optics[s][w].ssa;
+                let rel_err = if scat_before > 1e-30 {
+                    (scat_after - scat_before).abs() / scat_before
+                } else {
+                    0.0
+                };
+                assert!(
+                    rel_err < 1e-10,
+                    "Scattering coefficient changed at shell {} wl {}: before={:.6e} after={:.6e}",
+                    s,
+                    w,
+                    scat_before,
+                    scat_after,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_full_with_gas_ssa_bounded() {
+        // SSA must stay in [0, 1] even with extreme overrides.
+        let atm = build_full_with_gas(
+            AtmosphereType::UsStandard,
+            0.15,
+            None,
+            None,
+            Some(600.0),
+            Some(1.0e18),
+        );
+        for s in 0..atm.num_shells {
+            for w in 0..atm.num_wavelengths {
+                let ssa = atm.optics[s][w].ssa;
+                assert!(
+                    ssa >= 0.0 && ssa <= 1.0,
+                    "SSA out of bounds at shell {} wl {}: {}",
+                    s,
+                    w,
+                    ssa,
                 );
             }
         }

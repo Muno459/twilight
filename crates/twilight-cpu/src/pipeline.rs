@@ -21,13 +21,13 @@ use twilight_data::aerosol::{self, AerosolProperties, AerosolType};
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
 use twilight_data::cloud::{self, CloudProperties, CloudType};
-use twilight_solar::de440::De440;
-use twilight_solar::spa::{self, SpaInput};
-use twilight_threshold::threshold::{self, ThresholdConfig, TwilightAnalysis};
 
 use twilight_skyglow::SkyglowResult;
+use twilight_solar::de440::De440;
+use twilight_solar::spa::{self, SpaInput};
 use twilight_terrain::horizon;
 use twilight_terrain::HorizonProfile;
+use twilight_threshold::threshold::{self, ThresholdConfig, TwilightAnalysis};
 
 use crate::simulation::{self, ScatteringMode, SimulationConfig, SpectralResult};
 
@@ -81,6 +81,13 @@ pub struct PrayerTimeInput {
     /// radiance is added to the MCRT-computed natural twilight radiance before
     /// threshold analysis, shifting Fajr/Isha times.
     pub skyglow: Option<SkyglowResult>,
+    /// Override total column O3 (Dobson Units). When set, the standard
+    /// atmosphere O3 profile is scaled to match this total column.
+    /// Typical range: 220-450 DU.
+    pub o3_column_du: Option<f64>,
+    /// Override surface NO2 density (molecules/m^3). When set, the standard
+    /// atmosphere NO2 profile is scaled so the surface value matches.
+    pub no2_surface_density: Option<f64>,
 }
 
 impl Default for PrayerTimeInput {
@@ -106,6 +113,8 @@ impl Default for PrayerTimeInput {
             photons_per_wavelength: 10_000,
             horizon_profile: None,
             skyglow: None,
+            o3_column_du: None,
+            no2_surface_density: None,
         }
     }
 }
@@ -337,6 +346,7 @@ impl SolarEngine {
 /// Build the atmosphere model from pipeline input.
 ///
 /// Custom properties (from weather API) take priority over type-based defaults.
+/// Gas composition overrides (O3 column, NO2 density) are applied when present.
 fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::AtmosphereModel {
     let aerosol_props = input
         .custom_aerosol
@@ -346,12 +356,24 @@ fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::Atmos
         .custom_cloud
         .clone()
         .or_else(|| input.cloud_type.map(|ct| cloud::default_properties(ct)));
-    builder::build_full(
-        AtmosphereType::UsStandard,
-        input.surface_albedo,
-        aerosol_props.as_ref(),
-        cloud_props.as_ref(),
-    )
+
+    if input.o3_column_du.is_some() || input.no2_surface_density.is_some() {
+        builder::build_full_with_gas(
+            AtmosphereType::UsStandard,
+            input.surface_albedo,
+            aerosol_props.as_ref(),
+            cloud_props.as_ref(),
+            input.o3_column_du,
+            input.no2_surface_density,
+        )
+    } else {
+        builder::build_full(
+            AtmosphereType::UsStandard,
+            input.surface_albedo,
+            aerosol_props.as_ref(),
+            cloud_props.as_ref(),
+        )
+    }
 }
 
 // ── Main pipeline ──────────────────────────────────────────────────
