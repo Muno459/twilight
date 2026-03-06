@@ -618,7 +618,18 @@ pub fn shadow_ray_transmittance_f32(
                 tau = t;
 
                 // Refract at boundary
-                let boundary_pos = add3(pos, scale3(dir, dist));
+                let mut boundary_pos = add3(pos, scale3(dir, dist));
+                // Snap to exact shell radius (matches GPU shader snap_to_radius)
+                let target_r = if is_outward { r_outer } else { r_inner };
+                let bp_r = len3(boundary_pos);
+                if bp_r > 0.0 {
+                    let s = target_r / bp_r;
+                    boundary_pos = [
+                        boundary_pos[0] * s,
+                        boundary_pos[1] * s,
+                        boundary_pos[2] * s,
+                    ];
+                }
                 let n_from = data[atm_offsets::REFRACTIVE_INDEX_START + shell_idx];
                 let next_shell = if is_outward {
                     shell_idx + 1
