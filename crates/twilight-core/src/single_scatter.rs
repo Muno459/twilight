@@ -290,18 +290,18 @@ pub fn shadow_ray_transmittance(
     wavelength_idx: usize,
 ) -> f64 {
     let surface_radius = atm.surface_radius();
+    let num_shells = atm.num_shells;
     let mut pos = start_pos;
     let mut dir = sun_dir;
     let mut tau = 0.0;
 
+    // Find initial shell once (O(n)), then track directly (O(1) per step).
+    let mut shell_idx = match atm.shell_index(pos.length()) {
+        Some(idx) => idx,
+        None => return 1.0,
+    };
+
     for _ in 0..200 {
-        let r = pos.length();
-
-        let shell_idx = match atm.shell_index(r) {
-            Some(idx) => idx,
-            None => break, // exited atmosphere
-        };
-
         let shell = &atm.shells[shell_idx];
         let optics = &atm.optics[shell_idx][wavelength_idx];
 
@@ -317,7 +317,7 @@ pub fn shadow_ray_transmittance(
                 } else {
                     shell_idx.wrapping_sub(1)
                 };
-                let n_to = if next_shell < atm.num_shells {
+                let n_to = if next_shell < num_shells {
                     atm.refractive_index[next_shell]
                 } else {
                     1.0
@@ -331,6 +331,13 @@ pub fn shadow_ray_transmittance(
                 if !is_outward && pos.length() <= surface_radius + 1.0 {
                     return 0.0;
                 }
+
+                // Exited atmosphere
+                if next_shell >= num_shells {
+                    break;
+                }
+
+                shell_idx = next_shell;
             }
             None => break,
         }
@@ -470,18 +477,17 @@ fn shadow_ray_transmittance_spectrum(
     num_wl: usize,
 ) -> [f64; 64] {
     let surface_radius = atm.surface_radius();
+    let num_shells = atm.num_shells;
     let mut pos = start_pos;
     let mut dir = sun_dir;
     let mut tau = [0.0f64; 64];
 
+    let mut shell_idx = match atm.shell_index(pos.length()) {
+        Some(idx) => idx,
+        None => return [1.0f64; 64],
+    };
+
     for _ in 0..200 {
-        let r = pos.length();
-
-        let shell_idx = match atm.shell_index(r) {
-            Some(idx) => idx,
-            None => break,
-        };
-
         let shell = &atm.shells[shell_idx];
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
@@ -498,7 +504,7 @@ fn shadow_ray_transmittance_spectrum(
                 } else {
                     shell_idx.wrapping_sub(1)
                 };
-                let n_to = if next_shell < atm.num_shells {
+                let n_to = if next_shell < num_shells {
                     atm.refractive_index[next_shell]
                 } else {
                     1.0
@@ -512,6 +518,13 @@ fn shadow_ray_transmittance_spectrum(
                 if !is_outward && pos.length() <= surface_radius + 1.0 {
                     return [0.0f64; 64];
                 }
+
+                // Exited atmosphere
+                if next_shell >= num_shells {
+                    break;
+                }
+
+                shell_idx = next_shell;
             }
             None => break,
         }
