@@ -95,7 +95,7 @@ __device__ float3 operator*(float s, float3 v) {
 }
 
 // ============================================================================
-// Kahan compensated summation
+// KBN (Kahan-Babuska-Neumaier) compensated summation
 // ============================================================================
 
 struct KahanAccum {
@@ -105,9 +105,12 @@ struct KahanAccum {
     __device__ KahanAccum() : sum(0.0f), comp(0.0f) {}
 
     __device__ void add(float value) {
-        float y = value - comp;
-        float t = sum + y;
-        comp = (t - sum) - y;
+        float t = sum + value;
+        if (fabsf(sum) >= fabsf(value)) {
+            comp += (sum - t) + value;
+        } else {
+            comp += (value - t) + sum;
+        }
         sum = t;
     }
 
@@ -205,7 +208,49 @@ __device__ float xorshift_f32(unsigned long long &state) {
 }
 
 // ============================================================================
-// Ray-sphere intersection
+// Error-free transformations (DS arithmetic via FMA)
+// ============================================================================
+
+struct DS {
+    float hi;
+    float lo;
+};
+
+__device__ DS two_product(float a, float b) {
+    float p = a * b;
+    float e = __fmaf_rn(a, b, -p);
+    DS result;
+    result.hi = p;
+    result.lo = e;
+    return result;
+}
+
+__device__ DS two_sum(float a, float b) {
+    float s = a + b;
+    float v = s - a;
+    float e = (a - (s - v)) + (b - v);
+    DS result;
+    result.hi = s;
+    result.lo = e;
+    return result;
+}
+
+__device__ DS ds_add(DS x, DS y) {
+    DS s = two_sum(x.hi, y.hi);
+    s.lo += x.lo + y.lo;
+    DS r = two_sum(s.hi, s.lo);
+    return r;
+}
+
+__device__ DS ds_sub(DS x, DS y) {
+    DS neg_y;
+    neg_y.hi = -y.hi;
+    neg_y.lo = -y.lo;
+    return ds_add(x, neg_y);
+}
+
+// ============================================================================
+// Ray-sphere intersection (DS discriminant + stable quadratic)
 // ============================================================================
 
 struct RaySphereHit {
@@ -219,7 +264,12 @@ __device__ RaySphereHit ray_sphere_intersect(float3 origin, float3 dir, float ra
     float b_half = dot3(origin, dir);
     float r_pos = len3(origin);
     float c = (r_pos - radius) * (r_pos + radius);
-    float disc = b_half * b_half - a * c;
+
+    // DS discriminant: b_half^2 - a*c with ~14-digit precision
+    DS b2 = two_product(b_half, b_half);
+    DS ac = two_product(a, c);
+    DS disc_ds = ds_sub(b2, ac);
+    float disc = disc_ds.hi + disc_ds.lo;
 
     RaySphereHit result;
     if (disc < 0.0f) {
@@ -229,10 +279,23 @@ __device__ RaySphereHit ray_sphere_intersect(float3 origin, float3 dir, float ra
         return result;
     }
 
-    float sqrt_disc = sqrtf(disc);
-    float inv_a = 1.0f / a;
-    result.t_near = (-b_half - sqrt_disc) * inv_a;
-    result.t_far  = (-b_half + sqrt_disc) * inv_a;
+    float sqrt_disc = sqrtf(fmaxf(disc, 0.0f));
+
+    // Stable quadratic using copysignf
+    float q = -(b_half + copysignf(sqrt_disc, b_half));
+
+    float t1, t2;
+    if (fabsf(q) > 1e-30f) {
+        t1 = q / a;
+        t2 = c / q;
+    } else {
+        float inv_a = 1.0f / a;
+        t1 = (-b_half - sqrt_disc) * inv_a;
+        t2 = (-b_half + sqrt_disc) * inv_a;
+    }
+
+    result.t_near = fminf(t1, t2);
+    result.t_far  = fmaxf(t1, t2);
     result.hit = true;
     return result;
 }
@@ -283,6 +346,87 @@ __device__ float mixed_phase(float cos_theta, ShellOptics op) {
     }
     return op.rayleigh_fraction * rayleigh_phase(cos_theta)
          + (1.0f - op.rayleigh_fraction) * henyey_greenstein_phase(cos_theta, op.asymmetry);
+}
+
+// ============================================================================
+// float4 helpers
+// ============================================================================
+
+__device__ float4 make_f4(float x, float y, float z, float w) {
+    return make_float4(x, y, z, w);
+}
+
+__device__ float4 operator+(float4 a, float4 b) {
+    return make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+}
+
+__device__ float4 operator*(float4 v, float s) {
+    return make_float4(v.x * s, v.y * s, v.z * s, v.w * s);
+}
+
+__device__ float4 operator*(float s, float4 v) {
+    return make_float4(v.x * s, v.y * s, v.z * s, v.w * s);
+}
+
+// ============================================================================
+// Stokes [I,Q,U,V] polarized RT helpers
+// ============================================================================
+
+__device__ float rayleigh_P12(float cos_theta) {
+    float sin2 = 1.0f - cos_theta * cos_theta;
+    return -0.75f * sin2;
+}
+
+__device__ float rayleigh_P33(float cos_theta) {
+    return 1.5f * cos_theta;
+}
+
+__device__ void scattering_plane_rotation(float3 dir_in, float3 dir_out, float3 dir_next,
+                                           float &cos2phi, float &sin2phi) {
+    float3 n1 = cross3(dir_in, dir_out);
+    float3 n2 = cross3(dir_out, dir_next);
+
+    float n1_sq = dot3(n1, n1);
+    float n2_sq = dot3(n2, n2);
+
+    if (n1_sq < 1e-20f || n2_sq < 1e-20f) {
+        cos2phi = 1.0f;
+        sin2phi = 0.0f;
+        return;
+    }
+
+    float inv_norm = rsqrtf(n1_sq * n2_sq);
+    float cos_phi = dot3(n1, n2) * inv_norm;
+    float sin_phi = dot3(dir_out, cross3(n1, n2)) * inv_norm;
+
+    cos_phi = fminf(fmaxf(cos_phi, -1.0f), 1.0f);
+
+    cos2phi = 2.0f * cos_phi * cos_phi - 1.0f;
+    sin2phi = 2.0f * sin_phi * cos_phi;
+}
+
+__device__ void stokes_ABC(float cos_theta, ShellOptics op,
+                           float &A, float &B, float &C) {
+    float alpha = op.rayleigh_fraction;
+    float p11_r = rayleigh_phase(cos_theta);
+    float p12_r = rayleigh_P12(cos_theta);
+    float p33_r = rayleigh_P33(cos_theta);
+    float p11_hg = henyey_greenstein_phase(cos_theta, op.asymmetry);
+
+    A = alpha * p11_r + (1.0f - alpha) * p11_hg;
+    B = alpha * p12_r;
+    C = alpha * p33_r + (1.0f - alpha) * p11_hg;
+}
+
+__device__ float4 scatter_stokes(float A, float B, float C,
+                                  float cos2phi, float sin2phi, float4 s_in) {
+    float rotQU = cos2phi * s_in.y + sin2phi * s_in.z;
+    float4 s_out;
+    s_out.x = A * s_in.x + B * rotQU;
+    s_out.y = B * s_in.x + A * rotQU;
+    s_out.z = C * (cos2phi * s_in.z - sin2phi * s_in.y);
+    s_out.w = C * s_in.w;
+    return s_out;
 }
 
 // ============================================================================
@@ -388,6 +532,16 @@ __device__ float shadow_ray_transmittance(const float* atm, float3 start_pos,
     unsigned int ns = atm_num_shells(atm);
     float surface_radius = atm[ATM_SHELLS_START]; // r_inner of shell 0
 
+    // Umbra cylinder culling (O(1) pre-check)
+    float p_proj = dot3(start_pos, sun_dir);
+    if (p_proj < 0.0f) {
+        float3 cross_ps = cross3(start_pos, sun_dir);
+        float perp_dist_sq = dot3(cross_ps, cross_ps);
+        if (perp_dist_sq < surface_radius * surface_radius) {
+            return 0.0f;
+        }
+    }
+
     float3 pos = start_pos;
     float3 dir = sun_dir;
 
@@ -492,6 +646,16 @@ __device__ float3 sample_hemisphere(float3 normal, unsigned long long &rng) {
 __device__ float warp_reduce_sum(float val) {
     for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
         val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__device__ float4 warp_reduce_sum4(float4 val) {
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+        val.x += __shfl_down_sync(0xffffffff, val.x, offset);
+        val.y += __shfl_down_sync(0xffffffff, val.y, offset);
+        val.z += __shfl_down_sync(0xffffffff, val.z, offset);
+        val.w += __shfl_down_sync(0xffffffff, val.w, offset);
     }
     return val;
 }
@@ -691,19 +855,20 @@ void mcrt_trace_photon(const float* atm, const float* params, float* output,
 }
 
 // ============================================================================
-// Secondary chain tracer (used by hybrid_scatter)
+// Secondary chain tracer (full Stokes [I,Q,U,V])
 // ============================================================================
 
-__device__ float trace_secondary_chain(const float* atm, float3 start_pos,
-                                       float3 sun_dir, unsigned int wl_idx,
-                                       ShellOptics start_optics, unsigned long long &rng) {
+__device__ float4 trace_secondary_chain(const float* atm, float3 start_pos,
+                                        float3 sun_dir, unsigned int wl_idx,
+                                        ShellOptics start_optics, float3 prev_dir_in,
+                                        unsigned long long &rng) {
     float3 local_up = normalize3(start_pos);
     float surface_radius = EARTH_RADIUS_M;
 
     float xi_mix = xorshift_f32(rng);
     float3 dir;
+    float cos_theta_init;
     if (xi_mix < 0.5f) {
-        float cos_theta_init;
         if (xorshift_f32(rng) < start_optics.rayleigh_fraction) {
             cos_theta_init = sample_rayleigh_analytic(xorshift_f32(rng));
         } else {
@@ -713,12 +878,28 @@ __device__ float trace_secondary_chain(const float* atm, float3 start_pos,
         dir = scatter_direction(sun_dir, cos_theta_init, phi_init);
     } else {
         dir = sample_hemisphere(local_up, rng);
+        cos_theta_init = dot3(sun_dir, dir);
+    }
+
+    // Initialize Stokes state with first scatter Mueller
+    float4 stokes = make_f4(1.0f, 0.0f, 0.0f, 0.0f);
+    {
+        float A0, B0, C0;
+        stokes_ABC(cos_theta_init, start_optics, A0, B0, C0);
+        float cos2phi0, sin2phi0;
+        scattering_plane_rotation(prev_dir_in, sun_dir, dir, cos2phi0, sin2phi0);
+        stokes = scatter_stokes(A0, B0, C0, cos2phi0, sin2phi0, stokes);
+        if (stokes.x > 1e-30f) {
+            stokes = stokes * (1.0f / stokes.x);
+        }
     }
 
     float3 pos = start_pos;
     float3 current_dir = dir;
+    float3 prev_dir = sun_dir;
     float weight = start_optics.ssa;
-    KahanAccum total_contribution;
+
+    KahanAccum total_I, total_Q, total_U, total_V;
 
     for (unsigned int bounce = 0; bounce < HYBRID_MAX_BOUNCES; bounce++) {
         float r = len3(pos);
@@ -750,8 +931,10 @@ __device__ float trace_secondary_chain(const float* atm, float3 start_pos,
                 weight *= albedo;
                 if (weight < 1e-30f) break;
                 float3 normal = normalize3(boundary_pos);
+                prev_dir = current_dir;
                 current_dir = sample_hemisphere(normal, rng);
                 pos = radial_nudge(boundary_pos, true);
+                stokes = make_f4(1.0f, 0.0f, 0.0f, 0.0f);
                 continue;
             }
 
@@ -761,14 +944,27 @@ __device__ float trace_secondary_chain(const float* atm, float3 start_pos,
 
         pos = pos + current_dir * free_path;
 
+        // NEE with full Stokes
         float t_sun_sec = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
         if (t_sun_sec > 1e-30f) {
-            float cos_angle = dot3(sun_dir, -current_dir);
-            float phase = mixed_phase(cos_angle, op);
-            total_contribution.add(weight * t_sun_sec * phase / (4.0f * PI));
+            float cos_angle_nee = dot3(sun_dir, -current_dir);
+            float A_nee, B_nee, C_nee;
+            stokes_ABC(cos_angle_nee, op, A_nee, B_nee, C_nee);
+
+            float cos2phi_nee, sin2phi_nee;
+            scattering_plane_rotation(prev_dir, current_dir, -sun_dir, cos2phi_nee, sin2phi_nee);
+
+            float4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
+
+            float scale = weight * t_sun_sec / (4.0f * PI);
+            total_I.add(scale * nee_stokes.x);
+            total_Q.add(scale * nee_stokes.y);
+            total_U.add(scale * nee_stokes.z);
+            total_V.add(scale * nee_stokes.w);
         }
 
         weight *= op.ssa;
+        if (weight < 1e-30f) break;
 
         float cos_theta_s;
         if (xorshift_f32(rng) < op.rayleigh_fraction) {
@@ -777,10 +973,25 @@ __device__ float trace_secondary_chain(const float* atm, float3 start_pos,
             cos_theta_s = sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry);
         }
         float phi = 2.0f * PI * xorshift_f32(rng);
-        current_dir = scatter_direction(current_dir, cos_theta_s, phi);
+        float3 new_dir = scatter_direction(current_dir, cos_theta_s, phi);
+
+        float A_s, B_s, C_s;
+        stokes_ABC(cos_theta_s, op, A_s, B_s, C_s);
+        float cos2phi_s, sin2phi_s;
+        scattering_plane_rotation(prev_dir, current_dir, new_dir, cos2phi_s, sin2phi_s);
+        stokes = scatter_stokes(A_s, B_s, C_s, cos2phi_s, sin2phi_s, stokes);
+
+        if (stokes.x > 1e-30f) {
+            stokes = stokes * (1.0f / stokes.x);
+        } else {
+            stokes = make_f4(1.0f, 0.0f, 0.0f, 0.0f);
+        }
+
+        prev_dir = current_dir;
+        current_dir = new_dir;
     }
 
-    return total_contribution.result();
+    return make_f4(total_I.result(), total_Q.result(), total_U.result(), total_V.result());
 }
 
 // ============================================================================
@@ -868,8 +1079,8 @@ void hybrid_scatter(const float* atm, const float* params, float* output,
     // exp(-(A+B)) = exp(-A)*exp(-B) avoids f32 precision loss
     float t_obs = expf(-tau_obs) * expf(-my_ext_ds * 0.5f);
 
-    // Phase 3: per-step contribution
-    float contribution = 0.0f;
+    // Phase 3: per-step Stokes contribution
+    float4 contribution = make_f4(0.0f, 0.0f, 0.0f, 0.0f);
 
     if (valid_los && step_idx < num_steps && my_sidx >= 0
         && my_beta_scat > 1e-30f && t_obs > 1e-30f)
@@ -880,30 +1091,40 @@ void hybrid_scatter(const float* atm, const float* params, float* output,
         rng *= 2862933555777941757ull;
         rng += 1ull;
 
+        // Order 1: single-scatter NEE (Stokes)
         float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
-        float cos_theta_1 = dot3(sun_dir, -view_dir);
-        float phase_1 = mixed_phase(cos_theta_1, my_op);
-        float di_single = my_beta_scat * phase_1 / (4.0f * PI) * t_sun * t_obs * ds;
-        contribution += di_single;
+        if (t_sun > 1e-30f) {
+            float cos_theta_1 = dot3(sun_dir, -view_dir);
+            float A_1, B_1, C_1;
+            stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
+            float4 ss_stokes = make_f4(A_1, B_1, 0.0f, 0.0f);
+            float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;
+            contribution = contribution + ss_stokes * scale_1;
+        }
 
-        // Skip MC chains when direct solar transmittance is negligible --
-        // f32 shadow rays inside MC chains produce spurious nonzero values
-        // at deep twilight due to accumulated rounding over many shells.
-        if (secondary_rays_count > 0 && t_sun > 1e-20f) {
-            KahanAccum mc_sum;
+        // Orders 2+: MC secondary chains (full Stokes, noise gate REMOVED)
+        if (secondary_rays_count > 0) {
+            KahanAccum mc_I, mc_Q, mc_U, mc_V;
             for (unsigned int ray = 0; ray < secondary_rays_count; ray++) {
-                mc_sum.add(trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx, my_op, rng));
+                float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
+                                                      my_op, view_dir, rng);
+                mc_I.add(chain.x);
+                mc_Q.add(chain.y);
+                mc_U.add(chain.z);
+                mc_V.add(chain.w);
             }
-            float mc_avg = mc_sum.result() / (float)secondary_rays_count;
-            float di_multi = my_beta_scat * t_obs * ds * mc_avg;
-            contribution += di_multi;
+            float inv_rays = 1.0f / (float)secondary_rays_count;
+            float4 mc_avg = make_f4(mc_I.result(), mc_Q.result(),
+                                     mc_U.result(), mc_V.result()) * inv_rays;
+            float scale_m = my_beta_scat * t_obs * ds;
+            contribution = contribution + mc_avg * scale_m;
         }
     }
 
-    // Phase 4: two-level reduction
-    float warp_total = warp_reduce_sum(contribution);
+    // Phase 4: two-level Stokes reduction
+    float4 warp_total = warp_reduce_sum4(contribution);
 
-    __shared__ float shared_sums[NUM_WARPS];
+    __shared__ float4 shared_sums[NUM_WARPS];
     unsigned int warp_id = threadIdx.x / WARP_SIZE;
     unsigned int lane_id = threadIdx.x % WARP_SIZE;
 
@@ -913,11 +1134,11 @@ void hybrid_scatter(const float* atm, const float* params, float* output,
     __syncthreads();
 
     if (step_idx == 0) {
-        float total = 0.0f;
+        float4 total = make_f4(0.0f, 0.0f, 0.0f, 0.0f);
         for (unsigned int i = 0; i < NUM_WARPS; i++) {
-            total += shared_sums[i];
+            total = total + shared_sums[i];
         }
-        output[wl_idx] = total;
+        output[wl_idx] = total.x;  // Stokes I = total intensity
     }
 }
 

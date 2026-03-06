@@ -625,7 +625,7 @@ pub fn hybrid_scatter_radiance(
     rng_state: &mut u64,
 ) -> f64 {
     use crate::geometry::ray_sphere_intersect;
-    use crate::scattering::{henyey_greenstein_phase, rayleigh_phase};
+    use crate::scattering::{hg_mueller, rayleigh_mueller, MuellerMatrix, StokesVector};
     use crate::single_scatter::shadow_ray_transmittance;
 
     let toa_radius = atm.toa_radius();
@@ -650,7 +650,8 @@ pub fn hybrid_scatter_radiance(
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
 
-    let mut radiance = 0.0;
+    // Accumulate full Stokes [I,Q,U,V]
+    let mut stokes_total = StokesVector::unpolarized(0.0);
     let mut tau_obs = 0.0; // optical depth from observer
 
     for step in 0..num_steps {
@@ -682,130 +683,132 @@ pub fn hybrid_scatter_radiance(
             break;
         }
 
-        // --- Order 1: deterministic single-scatter NEE ---
-        // Use the exact analytical shadow ray (not step-by-step trace_transmittance)
+        // --- Order 1: deterministic single-scatter Stokes NEE ---
         let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
-        let cos_theta_1 = sun_dir.dot(-view_dir);
+        if t_sun > 1e-30 {
+            let cos_theta_1 = sun_dir.dot(-view_dir);
 
-        let phase_1 = if optics.rayleigh_fraction > 0.99 {
-            rayleigh_phase(cos_theta_1)
-        } else {
-            optics.rayleigh_fraction * rayleigh_phase(cos_theta_1)
-                + (1.0 - optics.rayleigh_fraction)
-                    * henyey_greenstein_phase(cos_theta_1, optics.asymmetry)
-        };
+            // Compute mixed Mueller matrix for single-scatter from unpolarized sunlight
+            let mueller_1 = if optics.rayleigh_fraction > 0.99 {
+                rayleigh_mueller(cos_theta_1)
+            } else if optics.rayleigh_fraction < 0.01 {
+                hg_mueller(cos_theta_1, optics.asymmetry)
+            } else {
+                let mr = rayleigh_mueller(cos_theta_1).scale(optics.rayleigh_fraction);
+                let mh =
+                    hg_mueller(cos_theta_1, optics.asymmetry).scale(1.0 - optics.rayleigh_fraction);
+                let mut m = MuellerMatrix::zero();
+                for i in 0..4 {
+                    for j in 0..4 {
+                        m.m[i][j] = mr.m[i][j] + mh.m[i][j];
+                    }
+                }
+                m
+            };
 
-        let di_single = beta_scat * phase_1 / (4.0 * core::f64::consts::PI) * t_sun * t_obs * ds;
-        radiance += di_single;
+            // Apply to unpolarized sunlight [1,0,0,0]
+            // Result: [P11, P12, 0, 0] (no rotation needed for single-scatter from sun)
+            let ss_stokes = mueller_1.apply(&StokesVector::unpolarized(1.0));
+            let scale_1 = beta_scat / (4.0 * core::f64::consts::PI) * t_sun * t_obs * ds;
+            stokes_total = stokes_total.add(&ss_stokes.scale(scale_1));
+        }
 
-        // --- Orders 2+: MC secondary chains ---
-        // CRITICAL: Launch secondary rays even when this LOS point is in shadow
-        // (t_sun ≈ 0). The secondary chain can scatter UPWARD to sunlit altitudes
-        // and redirect light back down. This is the whole point of multiple
-        // scattering at deep twilight.
+        // --- Orders 2+: MC secondary chains (full Stokes) ---
         if secondary_rays > 0 {
-            let mut mc_sum = 0.0;
+            let mut mc_stokes = StokesVector::unpolarized(0.0);
             for _ray in 0..secondary_rays {
-                let contribution = trace_secondary_chain(
+                let chain_stokes = trace_secondary_chain(
                     atm,
                     scatter_pos,
+                    view_dir,
                     sun_dir,
                     wavelength_idx,
                     optics,
                     rng_state,
                 );
-                mc_sum += contribution;
+                mc_stokes = mc_stokes.add(&chain_stokes);
             }
-            let mc_avg = mc_sum / secondary_rays as f64;
-
-            // The secondary chain contribution is weighted by:
-            // - beta_scat: scattering coefficient at LOS point (probability of
-            //   scattering here)
-            // - T_obs: transmittance from this point to observer
-            // - ds: LOS step length
-            // The chain itself returns radiance per unit scattering event,
-            // already including phase function weighting at each bounce via NEE.
-            let di_multi = beta_scat * t_obs * ds * mc_avg;
-            radiance += di_multi;
+            let inv_rays = 1.0 / secondary_rays as f64;
+            let mc_avg = mc_stokes.scale(inv_rays);
+            let scale_m = beta_scat * t_obs * ds;
+            stokes_total = stokes_total.add(&mc_avg.scale(scale_m));
         }
 
         tau_obs += optics.extinction * ds;
     }
 
-    radiance
+    // Return Stokes I (total intensity)
+    stokes_total.intensity()
 }
 
 /// Trace a secondary MC chain from a scatter point on the LOS.
 ///
-/// This chain represents orders 2+ of scattering. A photon starts at
-/// `start_pos`, is scattered into a direction biased toward the upper
-/// atmosphere (importance sampling for deep twilight), and then propagates
-/// through the atmosphere undergoing further scattering with NEE at each
-/// bounce. Uses the exact analytical shadow ray for transmittance.
+/// Full Stokes [I,Q,U,V] propagation through the chain. Tracks the photon's
+/// polarization state (normalized, I=1) through each scatter event. At each
+/// NEE, applies the Mueller matrix to the photon's actual Stokes state.
 ///
-/// **Importance sampling strategy:**
-/// At deep twilight, the only sunlit regions are at high altitudes (>40km).
-/// We bias the initial scatter direction upward (toward the local zenith)
-/// with a cosine-weighted distribution. The importance weight corrects for
-/// this bias so the estimator remains unbiased.
-///
-/// Returns the multi-scatter contribution (weight) that should be
-/// multiplied by the LOS-step weighting factor.
+/// Returns the multi-scatter Stokes contribution that should be multiplied
+/// by the LOS-step weighting factor.
 fn trace_secondary_chain(
     atm: &AtmosphereModel,
     start_pos: Vec3,
+    prev_dir_in: Vec3,
     sun_dir: Vec3,
     wavelength_idx: usize,
     start_optics: &crate::atmosphere::ShellOptics,
     rng_state: &mut u64,
-) -> f64 {
+) -> crate::scattering::StokesVector {
+    use crate::scattering::{scatter_mueller, scattering_plane_rotation, StokesVector};
     use crate::single_scatter::shadow_ray_transmittance;
 
-    // Importance sampling: bias initial direction toward upper atmosphere.
-    // The local "up" direction at the scatter point.
     let local_up = start_pos.normalize();
 
-    // Sample initial direction with upward bias.
-    // We use a mixture: 50% phase-function sampling (unbiased), 50% upward-
-    // biased cosine hemisphere. This ensures we explore both the natural
-    // scattering directions AND the sunlit upper atmosphere.
     let xi_mix = xorshift_f64(rng_state);
-    let (dir, importance_weight) = if xi_mix < 0.5 {
-        // Phase-function sampling (unbiased)
+    let (dir, cos_theta_init) = if xi_mix < 0.5 {
         let cos_theta_init = if xorshift_f64(rng_state) < start_optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(rng_state))
         } else {
             sample_henyey_greenstein(xorshift_f64(rng_state), start_optics.asymmetry)
         };
         let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-        // Scatter relative to the sun direction (dominant incoming light)
         let d = scatter_direction(sun_dir, cos_theta_init, phi_init);
-        // Weight = 1/(mixture weight) = 1/0.5 = 2, but we divide by 2
-        // to account for the mixture PDF. Actually: the contribution from
-        // this sample to the mixture is proportional to 1/p_mixture where
-        // p_mixture = 0.5 * p_phase + 0.5 * p_cosine. For simplicity,
-        // use the standard mixture weight of 2.0 (for the 0.5 probability
-        // of choosing this branch).
-        (d, 1.0) // weight handled by averaging over both branches
+        (d, cos_theta_init)
     } else {
-        // Upward-biased cosine hemisphere sampling
-        // This samples directions in the upper hemisphere defined by local_up
-        // with PDF proportional to cos(theta) / pi.
         let d = sample_hemisphere(local_up, rng_state);
-        (d, 1.0) // weight handled by averaging over both branches
+        let cos_theta_init = sun_dir.dot(d);
+        (d, cos_theta_init)
     };
+
+    // Initialize Stokes state: apply first scatter's Mueller to [1,0,0,0]
+    let mut stokes = StokesVector::unpolarized(1.0);
+    {
+        let rot0 = scattering_plane_rotation(prev_dir_in, sun_dir, dir);
+        let mueller0 = scatter_mueller(
+            cos_theta_init,
+            start_optics.rayleigh_fraction,
+            start_optics.asymmetry,
+            rot0,
+        );
+        stokes = mueller0.apply(&stokes);
+        // Normalize by I (importance weighting)
+        let i_val = stokes.intensity();
+        if i_val > 1e-30 {
+            stokes = stokes.scale(1.0 / i_val);
+        }
+    }
 
     let mut pos = start_pos;
     let mut current_dir = dir;
-    let mut weight = start_optics.ssa * importance_weight;
-    let mut total_contribution = 0.0;
+    let mut prev_dir = sun_dir;
+    let mut weight = start_optics.ssa;
+    let mut total_stokes = StokesVector::unpolarized(0.0);
 
     for _bounce in 0..HYBRID_MAX_BOUNCES {
         let r = pos.length();
 
         let shell_idx = match atm.shell_index(r) {
             Some(idx) => idx,
-            None => break, // escaped atmosphere
+            None => break,
         };
 
         let shell = &atm.shells[shell_idx];
@@ -824,7 +827,6 @@ fn trace_secondary_chain(
             }
         }
 
-        // Sample free path
         let xi = xorshift_f64(rng_state);
         let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
 
@@ -836,7 +838,7 @@ fn trace_secondary_chain(
                     pos = new_pos;
                     current_dir = new_dir;
 
-                    // Ground reflection
+                    // Ground reflection: depolarizes
                     if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
                         let albedo = atm.surface_albedo[wavelength_idx];
                         weight *= albedo;
@@ -844,7 +846,9 @@ fn trace_secondary_chain(
                             break;
                         }
                         let normal = pos.normalize();
+                        prev_dir = current_dir;
                         current_dir = sample_hemisphere(normal, rng_state);
+                        stokes = StokesVector::unpolarized(1.0);
                         continue;
                     }
                     continue;
@@ -856,39 +860,58 @@ fn trace_secondary_chain(
         // Scatter event
         pos = pos + current_dir * free_path;
 
-        // NEE: direct solar contribution from this secondary scatter point.
-        // Use the exact analytical shadow ray for accuracy at deep twilight.
+        // NEE: apply Mueller to photon's actual Stokes state
         let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
 
         if t_sun_secondary > 1e-30 {
-            // Phase function for scattering from sun_dir to -current_dir
-            let cos_angle = sun_dir.dot(-current_dir);
+            let cos_angle_nee = sun_dir.dot(-current_dir);
+            let rot_nee = scattering_plane_rotation(prev_dir, current_dir, -sun_dir);
+            let mueller_nee = scatter_mueller(
+                cos_angle_nee,
+                optics.rayleigh_fraction,
+                optics.asymmetry,
+                rot_nee,
+            );
+            let nee_stokes = mueller_nee.apply(&stokes);
 
-            let phase = if optics.rayleigh_fraction > 0.99 {
-                rayleigh_phase(cos_angle)
-            } else {
-                optics.rayleigh_fraction * rayleigh_phase(cos_angle)
-                    + (1.0 - optics.rayleigh_fraction)
-                        * henyey_greenstein_phase(cos_angle, optics.asymmetry)
-            };
-
-            total_contribution += weight * t_sun_secondary * phase / (4.0 * core::f64::consts::PI);
+            let scale = weight * t_sun_secondary / (4.0 * core::f64::consts::PI);
+            total_stokes = total_stokes.add(&nee_stokes.scale(scale));
         }
 
         // Apply SSA
         weight *= optics.ssa;
+        if weight < 1e-30 {
+            break;
+        }
 
-        // Sample new direction
+        // Sample new direction and update Stokes state
         let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(rng_state))
         } else {
             sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
         };
         let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-        current_dir = scatter_direction(current_dir, cos_theta, phi);
+        let new_dir = scatter_direction(current_dir, cos_theta, phi);
+
+        // Update Stokes through this scatter
+        let rot_s = scattering_plane_rotation(prev_dir, current_dir, new_dir);
+        let mueller_s =
+            scatter_mueller(cos_theta, optics.rayleigh_fraction, optics.asymmetry, rot_s);
+        stokes = mueller_s.apply(&stokes);
+
+        // Normalize by I (importance weighting -- keeps stokes I = 1)
+        let i_val = stokes.intensity();
+        if i_val > 1e-30 {
+            stokes = stokes.scale(1.0 / i_val);
+        } else {
+            stokes = StokesVector::unpolarized(1.0);
+        }
+
+        prev_dir = current_dir;
+        current_dir = new_dir;
     }
 
-    total_contribution
+    total_stokes
 }
 
 /// Compute hybrid multi-scatter spectral radiance for all wavelengths.

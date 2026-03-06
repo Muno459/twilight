@@ -98,15 +98,20 @@ struct KahanAccum {
 };
 
 // ============================================================================
-// Kahan summation
+// KBN (Kahan-Babuska-Neumaier) compensated summation
 // ============================================================================
 
 fn kahan_init() -> KahanAccum { return KahanAccum(0.0, 0.0); }
 
 fn kahan_add(accum: KahanAccum, value: f32) -> KahanAccum {
-    let y = value - accum.comp;
-    let t = accum.sum + y;
-    return KahanAccum(t, (t - accum.sum) - y);
+    let t = accum.sum + value;
+    var comp: f32;
+    if abs(accum.sum) >= abs(value) {
+        comp = accum.comp + (accum.sum - t) + value;
+    } else {
+        comp = accum.comp + (value - t) + accum.sum;
+    }
+    return KahanAccum(t, comp);
 }
 
 fn kahan_result(accum: KahanAccum) -> f32 { return accum.sum + accum.comp; }
@@ -195,7 +200,41 @@ fn xorshift_f32(state: ptr<function, u32>) -> f32 {
 }
 
 // ============================================================================
-// Ray-sphere intersection
+// Error-free transformations (DS arithmetic via FMA)
+// ============================================================================
+
+struct DS {
+    hi: f32,
+    lo: f32,
+};
+
+fn two_product(a: f32, b: f32) -> DS {
+    let p = a * b;
+    let e = fma(a, b, -p);
+    return DS(p, e);
+}
+
+fn two_sum_ds(a: f32, b: f32) -> DS {
+    let s = a + b;
+    let v = s - a;
+    let e = (a - (s - v)) + (b - v);
+    return DS(s, e);
+}
+
+fn ds_add(x: DS, y: DS) -> DS {
+    var s = two_sum_ds(x.hi, y.hi);
+    s.lo += x.lo + y.lo;
+    let r = two_sum_ds(s.hi, s.lo);
+    return r;
+}
+
+fn ds_sub(x: DS, y: DS) -> DS {
+    let neg_y = DS(-y.hi, -y.lo);
+    return ds_add(x, neg_y);
+}
+
+// ============================================================================
+// Ray-sphere intersection (DS discriminant + stable quadratic)
 // ============================================================================
 
 fn ray_sphere_intersect(origin: vec3f, dir: vec3f, radius: f32) -> RaySphereHit {
@@ -203,17 +242,34 @@ fn ray_sphere_intersect(origin: vec3f, dir: vec3f, radius: f32) -> RaySphereHit 
     let b_half = dot(origin, dir);
     let r_pos = length(origin);
     let c = (r_pos - radius) * (r_pos + radius);
-    let disc = b_half * b_half - a * c;
+
+    // DS discriminant: b_half^2 - a*c with ~14-digit precision
+    let b2 = two_product(b_half, b_half);
+    let ac = two_product(a, c);
+    let disc_ds = ds_sub(b2, ac);
+    let disc = disc_ds.hi + disc_ds.lo;
 
     if disc < 0.0 {
         return RaySphereHit(0.0, 0.0, false);
     }
 
-    let sqrt_disc = sqrt(disc);
-    let inv_a = 1.0 / a;
-    let t_near = (-b_half - sqrt_disc) * inv_a;
-    let t_far = (-b_half + sqrt_disc) * inv_a;
-    return RaySphereHit(t_near, t_far, true);
+    let sqrt_disc = sqrt(max(disc, 0.0));
+
+    // Stable quadratic: no copysign in WGSL, use select
+    let q = -(b_half + select(-sqrt_disc, sqrt_disc, b_half >= 0.0));
+
+    var t1: f32;
+    var t2: f32;
+    if abs(q) > 1e-30 {
+        t1 = q / a;
+        t2 = c / q;
+    } else {
+        let inv_a = 1.0 / a;
+        t1 = (-b_half - sqrt_disc) * inv_a;
+        t2 = (-b_half + sqrt_disc) * inv_a;
+    }
+
+    return RaySphereHit(min(t1, t2), max(t1, t2), true);
 }
 
 // ============================================================================
@@ -263,6 +319,75 @@ fn mixed_phase(cos_theta: f32, op: ShellOptics) -> f32 {
     }
     return op.rayleigh_fraction * rayleigh_phase(cos_theta)
          + (1.0 - op.rayleigh_fraction) * henyey_greenstein_phase(cos_theta, op.asymmetry);
+}
+
+// ============================================================================
+// Stokes [I,Q,U,V] polarized RT helpers
+// ============================================================================
+
+struct StokesRot {
+    cos2phi: f32,
+    sin2phi: f32,
+};
+
+struct StokesABC {
+    A: f32,
+    B: f32,
+    C: f32,
+};
+
+fn rayleigh_P12(cos_theta: f32) -> f32 {
+    let sin2 = 1.0 - cos_theta * cos_theta;
+    return -0.75 * sin2;
+}
+
+fn rayleigh_P33(cos_theta: f32) -> f32 {
+    return 1.5 * cos_theta;
+}
+
+fn scattering_plane_rotation(dir_in: vec3f, dir_out: vec3f, dir_next: vec3f) -> StokesRot {
+    let n1 = cross(dir_in, dir_out);
+    let n2 = cross(dir_out, dir_next);
+
+    let n1_sq = dot(n1, n1);
+    let n2_sq = dot(n2, n2);
+
+    if n1_sq < 1e-20 || n2_sq < 1e-20 {
+        return StokesRot(1.0, 0.0);
+    }
+
+    let inv_norm = inverseSqrt(n1_sq * n2_sq);
+    var cos_phi = dot(n1, n2) * inv_norm;
+    let sin_phi = dot(dir_out, cross(n1, n2)) * inv_norm;
+
+    cos_phi = clamp(cos_phi, -1.0, 1.0);
+
+    let cos2phi = 2.0 * cos_phi * cos_phi - 1.0;
+    let sin2phi = 2.0 * sin_phi * cos_phi;
+    return StokesRot(cos2phi, sin2phi);
+}
+
+fn compute_stokes_ABC(cos_theta: f32, op: ShellOptics) -> StokesABC {
+    let alpha = op.rayleigh_fraction;
+    let p11_r = rayleigh_phase(cos_theta);
+    let p12_r = rayleigh_P12(cos_theta);
+    let p33_r = rayleigh_P33(cos_theta);
+    let p11_hg = henyey_greenstein_phase(cos_theta, op.asymmetry);
+
+    let A = alpha * p11_r + (1.0 - alpha) * p11_hg;
+    let B = alpha * p12_r;
+    let C = alpha * p33_r + (1.0 - alpha) * p11_hg;
+    return StokesABC(A, B, C);
+}
+
+fn scatter_stokes_vec(abc: StokesABC, rot: StokesRot, s_in: vec4f) -> vec4f {
+    let rotQU = rot.cos2phi * s_in.y + rot.sin2phi * s_in.z;
+    var s_out: vec4f;
+    s_out.x = abc.A * s_in.x + abc.B * rotQU;
+    s_out.y = abc.B * s_in.x + abc.A * rotQU;
+    s_out.z = abc.C * (rot.cos2phi * s_in.z - rot.sin2phi * s_in.y);
+    s_out.w = abc.C * s_in.w;
+    return s_out;
 }
 
 // ============================================================================
@@ -357,6 +482,16 @@ fn radial_nudge(boundary_pos: vec3f, is_outward: bool) -> vec3f {
 fn shadow_ray_transmittance(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32) -> f32 {
     let ns = atm_num_shells_val();
     let surface_radius = input_buf[ATM_SHELLS_START]; // r_inner of shell 0
+
+    // Umbra cylinder culling (O(1) pre-check)
+    let p_proj = dot(start_pos, sun_dir);
+    if p_proj < 0.0 {
+        let cross_ps = cross(start_pos, sun_dir);
+        let perp_dist_sq = dot(cross_ps, cross_ps);
+        if perp_dist_sq < surface_radius * surface_radius {
+            return 0.0;
+        }
+    }
 
     var pos = start_pos;
     var dir = sun_dir;
@@ -649,18 +784,19 @@ fn mcrt_trace_photon(@builtin(global_invocation_id) gid: vec3u) {
 }
 
 // ============================================================================
-// Secondary chain tracer (used by hybrid_scatter)
+// Secondary chain tracer (full Stokes [I,Q,U,V])
 // ============================================================================
 
 fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
-                         start_optics: ShellOptics, rng: ptr<function, u32>) -> f32 {
+                         start_optics: ShellOptics, prev_dir_in: vec3f,
+                         rng: ptr<function, u32>) -> vec4f {
     let local_up = normalize(start_pos);
     let surface_radius = EARTH_RADIUS_M;
 
     let xi_mix = xorshift_f32(rng);
     var dir: vec3f;
+    var cos_theta_init: f32;
     if xi_mix < 0.5 {
-        var cos_theta_init: f32;
         if xorshift_f32(rng) < start_optics.rayleigh_fraction {
             cos_theta_init = sample_rayleigh_analytic(xorshift_f32(rng));
         } else {
@@ -670,12 +806,29 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
         dir = scatter_direction(sun_dir, cos_theta_init, phi_init);
     } else {
         dir = sample_hemisphere(local_up, rng);
+        cos_theta_init = dot(sun_dir, dir);
+    }
+
+    // Initialize Stokes state with first scatter Mueller
+    var stokes = vec4f(1.0, 0.0, 0.0, 0.0);
+    {
+        let abc0 = compute_stokes_ABC(cos_theta_init, start_optics);
+        let rot0 = scattering_plane_rotation(prev_dir_in, sun_dir, dir);
+        stokes = scatter_stokes_vec(abc0, rot0, stokes);
+        if stokes.x > 1e-30 {
+            stokes = stokes / stokes.x;
+        }
     }
 
     var pos = start_pos;
     var current_dir = dir;
+    var prev_dir = sun_dir;
     var weight = start_optics.ssa;
-    var total_contribution = kahan_init();
+
+    var total_I = kahan_init();
+    var total_Q = kahan_init();
+    var total_U = kahan_init();
+    var total_V = kahan_init();
 
     for (var bounce = 0u; bounce < HYBRID_MAX_BOUNCES; bounce++) {
         let r = length(pos);
@@ -707,8 +860,10 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
                 weight *= albedo;
                 if weight < 1e-30 { break; }
                 let normal = normalize(boundary_pos);
+                prev_dir = current_dir;
                 current_dir = sample_hemisphere(normal, rng);
                 pos = radial_nudge(boundary_pos, true);
+                stokes = vec4f(1.0, 0.0, 0.0, 0.0);
                 continue;
             }
 
@@ -718,16 +873,25 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
 
         pos = pos + current_dir * free_path;
 
+        // NEE with full Stokes
         let t_sun_sec = shadow_ray_transmittance(pos, sun_dir, wl_idx);
         if t_sun_sec > 1e-30 {
-            let cos_angle = dot(sun_dir, -current_dir);
-            let phase = mixed_phase(cos_angle, op);
-            total_contribution = kahan_add(total_contribution,
-                weight * t_sun_sec * phase / (4.0 * PI));
+            let cos_angle_nee = dot(sun_dir, -current_dir);
+            let abc_nee = compute_stokes_ABC(cos_angle_nee, op);
+            let rot_nee = scattering_plane_rotation(prev_dir, current_dir, -sun_dir);
+            let nee_stokes = scatter_stokes_vec(abc_nee, rot_nee, stokes);
+
+            let scale = weight * t_sun_sec / (4.0 * PI);
+            total_I = kahan_add(total_I, scale * nee_stokes.x);
+            total_Q = kahan_add(total_Q, scale * nee_stokes.y);
+            total_U = kahan_add(total_U, scale * nee_stokes.z);
+            total_V = kahan_add(total_V, scale * nee_stokes.w);
         }
 
         weight *= op.ssa;
+        if weight < 1e-30 { break; }
 
+        // Sample new direction and update Stokes
         var cos_theta_s: f32;
         if xorshift_f32(rng) < op.rayleigh_fraction {
             cos_theta_s = sample_rayleigh_analytic(xorshift_f32(rng));
@@ -735,10 +899,24 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
             cos_theta_s = sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry);
         }
         let phi = 2.0 * PI * xorshift_f32(rng);
-        current_dir = scatter_direction(current_dir, cos_theta_s, phi);
+        let new_dir = scatter_direction(current_dir, cos_theta_s, phi);
+
+        let abc_s = compute_stokes_ABC(cos_theta_s, op);
+        let rot_s = scattering_plane_rotation(prev_dir, current_dir, new_dir);
+        stokes = scatter_stokes_vec(abc_s, rot_s, stokes);
+
+        if stokes.x > 1e-30 {
+            stokes = stokes / stokes.x;
+        } else {
+            stokes = vec4f(1.0, 0.0, 0.0, 0.0);
+        }
+
+        prev_dir = current_dir;
+        current_dir = new_dir;
     }
 
-    return kahan_result(total_contribution);
+    return vec4f(kahan_result(total_I), kahan_result(total_Q),
+                 kahan_result(total_U), kahan_result(total_V));
 }
 
 // ============================================================================
@@ -750,7 +928,7 @@ fn trace_secondary_chain(start_pos: vec3f, sun_dir: vec3f, wl_idx: u32,
 // ============================================================================
 
 var<workgroup> shared_ext_ds: array<f32, 256>;
-var<workgroup> shared_sums: array<f32, 8>; // 256/32 = 8 subgroups max
+var<workgroup> shared_sums: array<vec4f, 8>; // 256/32 = 8 subgroups max
 
 @compute @workgroup_size(256)
 fn hybrid_scatter(
@@ -821,11 +999,10 @@ fn hybrid_scatter(
     for (var i = 0u; i < step_idx && i < num_steps; i++) {
         tau_obs += shared_ext_ds[i];
     }
-    // exp(-(A+B)) = exp(-A)*exp(-B) avoids f32 precision loss
     let t_obs = exp(-tau_obs) * exp(-my_ext_ds * 0.5);
 
-    // Phase 3: per-step contribution
-    var contribution = 0.0f;
+    // Phase 3: per-step Stokes contribution
+    var contribution = vec4f(0.0, 0.0, 0.0, 0.0);
 
     if valid_los && step_idx < num_steps && my_sidx >= 0
         && my_beta_scat > 1e-30 && t_obs > 1e-30
@@ -834,28 +1011,40 @@ fn hybrid_scatter(
         var rng = seed_lo ^ (wl_idx * 2654435761u) ^ (step_idx * 2246822519u);
         xorshift_f32(&rng);
 
+        // Order 1: single-scatter NEE (Stokes)
         let t_sun = shadow_ray_transmittance(scatter_pos, sun_dir, wl_idx);
-        let cos_theta_1 = dot(sun_dir, -view_dir);
-        let phase_1 = mixed_phase(cos_theta_1, my_op);
-        let di_single = my_beta_scat * phase_1 / (4.0 * PI) * t_sun * t_obs * ds;
-        contribution += di_single;
+        if t_sun > 1e-30 {
+            let cos_theta_1 = dot(sun_dir, -view_dir);
+            let abc_1 = compute_stokes_ABC(cos_theta_1, my_op);
+            let ss_stokes = vec4f(abc_1.A, abc_1.B, 0.0, 0.0);
+            let scale_1 = my_beta_scat / (4.0 * PI) * t_sun * t_obs * ds;
+            contribution += ss_stokes * scale_1;
+        }
 
-        // Skip MC chains when direct solar transmittance is negligible --
-        // f32 shadow rays inside MC chains produce spurious nonzero values
-        // at deep twilight due to accumulated rounding over many shells.
-        if secondary_rays_count > 0u && t_sun > 1e-20 {
-            var mc_sum = kahan_init();
+        // Orders 2+: MC secondary chains (full Stokes, noise gate REMOVED)
+        if secondary_rays_count > 0u {
+            var mc_I = kahan_init();
+            var mc_Q = kahan_init();
+            var mc_U = kahan_init();
+            var mc_V = kahan_init();
             for (var ray = 0u; ray < secondary_rays_count; ray++) {
-                mc_sum = kahan_add(mc_sum,
-                    trace_secondary_chain(scatter_pos, sun_dir, wl_idx, my_op, &rng));
+                let chain = trace_secondary_chain(scatter_pos, sun_dir, wl_idx,
+                                                   my_op, view_dir, &rng);
+                mc_I = kahan_add(mc_I, chain.x);
+                mc_Q = kahan_add(mc_Q, chain.y);
+                mc_U = kahan_add(mc_U, chain.z);
+                mc_V = kahan_add(mc_V, chain.w);
             }
-            let mc_avg = kahan_result(mc_sum) / f32(secondary_rays_count);
-            let di_multi = my_beta_scat * t_obs * ds * mc_avg;
-            contribution += di_multi;
+            let inv_rays = 1.0 / f32(secondary_rays_count);
+            let mc_avg = vec4f(kahan_result(mc_I), kahan_result(mc_Q),
+                               kahan_result(mc_U), kahan_result(mc_V)) * inv_rays;
+            let scale_m = my_beta_scat * t_obs * ds;
+            contribution += mc_avg * scale_m;
         }
     }
 
-    // Phase 4: two-level reduction
+    // Phase 4: two-level Stokes reduction
+    // subgroupAdd on vec4f operates component-wise
     let simd_total = subgroupAdd(contribution);
 
     if simd_lane == 0u {
@@ -864,12 +1053,11 @@ fn hybrid_scatter(
     workgroupBarrier();
 
     if step_idx == 0u {
-        var total = 0.0f;
-        // Sum up to 8 subgroup partial sums
+        var total = vec4f(0.0, 0.0, 0.0, 0.0);
         for (var i = 0u; i < 8u; i++) {
             total += shared_sums[i];
         }
-        output_buf[wl_idx] = total;
+        output_buf[wl_idx] = total.x;  // Stokes I = total intensity
     }
 }
 
