@@ -81,6 +81,17 @@ constant float ZENITH_BIAS_N = 5.0f;
 // Maximum fraction of rays using zenith-biased sampling at deep twilight.
 constant float ZENITH_MAX_FRACTION = 0.95f;
 
+// Maximum fraction of zenith-allocated rays redirected to terminator lobe.
+// At SZA >= 106: phase 5%, zenith 47.5%, terminator 47.5%.
+constant float TERMINATOR_MAX_SHARE = 0.5f;
+
+// Power-cosine exponent for the terminator lobe at maximum SZA.
+constant float TERMINATOR_N_MAX = 8.0f;
+
+// Tilt angle (degrees) of terminator axis from zenith at SZA_START / SZA_FULL.
+constant float TERMINATOR_TILT_MIN_DEG = 20.0f;
+constant float TERMINATOR_TILT_MAX_DEG = 50.0f;
+
 // ============================================================================
 // Buffer accessor helpers
 // ============================================================================
@@ -754,13 +765,51 @@ inline float zenith_importance_weight(float cos_theta, float n) {
     return 2.0f / ((n + 1.0f) * cos_nm1);
 }
 
-// SZA-adaptive zenith bias parameters.
-// Returns (zenith_frac, n) via out parameters.
-inline void zenith_params_for_sza(float sza_deg, thread float &zenith_frac, thread float &n_out) {
+// 3-branch direction sampling parameters, SZA-adaptive.
+struct BranchParams {
+    float zenith_frac;  // total non-phase fraction
+    float n_zenith;     // power-cosine exponent for zenith lobe
+    float term_share;   // fraction of zenith-allocated rays -> terminator
+    float m_term;       // power-cosine exponent for terminator lobe
+    float tilt_rad;     // tilt angle of terminator axis from zenith
+};
+
+inline BranchParams branch_params_for_sza(float sza_deg) {
     float sza_t = clamp((sza_deg - ZENITH_SZA_START_DEG)
                         / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
-    zenith_frac = 0.5f + (ZENITH_MAX_FRACTION - 0.5f) * sza_t;
-    n_out = 1.0f + (ZENITH_BIAS_N - 1.0f) * sza_t;
+    BranchParams bp;
+    bp.zenith_frac = 0.5f + (ZENITH_MAX_FRACTION - 0.5f) * sza_t;
+    bp.n_zenith = 1.0f + (ZENITH_BIAS_N - 1.0f) * sza_t;
+    bp.term_share = TERMINATOR_MAX_SHARE * sza_t;
+    bp.m_term = 1.0f + (TERMINATOR_N_MAX - 1.0f) * sza_t;
+    float tilt_deg = TERMINATOR_TILT_MIN_DEG
+        + (TERMINATOR_TILT_MAX_DEG - TERMINATOR_TILT_MIN_DEG) * sza_t;
+    bp.tilt_rad = tilt_deg * PI / 180.0f;
+    return bp;
+}
+
+// Compute terminator axis: unit vector tilted from up toward sub-solar horizon.
+inline float3 terminator_axis(float3 up, float3 sun_dir, float tilt_rad) {
+    float dot_us = dot(sun_dir, up);
+    float3 horiz = sun_dir - dot_us * up;
+    float h_len = length(horiz);
+    if (h_len < 1e-6f) {
+        return up;
+    }
+    float3 sun_horiz = horiz / h_len;
+    float sin_t = sin(tilt_rad);
+    float cos_t = cos(tilt_rad);
+    return normalize(cos_t * up + sin_t * sun_horiz);
+}
+
+// Shape weight for terminator lobe: corrects cos^m(theta_t) PDF back to
+// cosine-hemisphere reference.
+// w = 2 * cos(theta_z) / ((m+1) * cos^m(theta_t))
+inline float terminator_shape_weight(float cos_z, float cos_t, float m) {
+    if (cos_z <= 0.0f || cos_t <= 0.0f) return 0.0f;
+    float cos_t_m = pow(cos_t, m);
+    if (cos_t_m < 1e-30f) return 0.0f;
+    return 2.0f * cos_z / ((m + 1.0f) * cos_t_m);
 }
 
 // ============================================================================
@@ -1170,20 +1219,24 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     float3 local_up = normalize(start_pos);
     float surface_radius = EARTH_RADIUS_M;
 
-    // SZA-adaptive zenith bias parameters
+    // SZA-adaptive 3-branch parameters
     float cos_sza = dot(sun_dir, local_up);
     float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
-    float zenith_frac, zenith_n;
-    zenith_params_for_sza(sza_deg, zenith_frac, zenith_n);
+    BranchParams bp = branch_params_for_sza(sza_deg);
 
-    // Stratified two-branch importance sampling with branch probability weights.
-    // xi_mix is stratified across rays for even coverage of both branches.
+    float alpha_p = 1.0f - bp.zenith_frac;
+    float alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
+    float alpha_t = bp.zenith_frac * bp.term_share;
+
+    float3 term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
+
+    // Stratified 3-branch importance sampling with branch probability weights.
     float xi_jitter = xorshift_f32(rng);
     float xi_mix = (float(ray_idx) + xi_jitter) / float(total_rays);
     float3 dir;
     float cos_theta_init;
     float initial_weight;
-    if (xi_mix < (1.0f - zenith_frac)) {
+    if (xi_mix < alpha_p) {
         // Phase function branch
         if (xorshift_f32(rng) < start_optics.rayleigh_fraction) {
             cos_theta_init = sample_rayleigh_analytic(xorshift_f32(rng));
@@ -1192,14 +1245,23 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         }
         float phi_init = 2.0f * PI * xorshift_f32(rng);
         dir = scatter_direction(sun_dir, cos_theta_init, phi_init);
-        initial_weight = 0.5f / (1.0f - zenith_frac);
-    } else {
+        initial_weight = 0.5f / alpha_p;
+    } else if (xi_mix < alpha_p + alpha_z || alpha_t < 1e-6f) {
         // Zenith-biased branch with shape + branch weight correction
-        ZenithSample zs = sample_zenith_biased(local_up, zenith_n, rng);
+        ZenithSample zs = sample_zenith_biased(local_up, bp.n_zenith, rng);
         dir = zs.dir;
         cos_theta_init = dot(sun_dir, dir);
-        float shape_w = zenith_importance_weight(zs.cos_theta, zenith_n);
-        float branch_w = 0.5f / zenith_frac;
+        float shape_w = zenith_importance_weight(zs.cos_theta, bp.n_zenith);
+        float branch_w = 0.5f / (alpha_z + alpha_t);
+        initial_weight = shape_w * branch_w;
+    } else {
+        // Terminator lobe branch
+        ZenithSample zs = sample_zenith_biased(term_axis_dir, bp.m_term, rng);
+        dir = zs.dir;
+        cos_theta_init = dot(sun_dir, dir);
+        float cos_z = dot(dir, local_up);
+        float shape_w = terminator_shape_weight(cos_z, zs.cos_theta, bp.m_term);
+        float branch_w = 0.5f / alpha_t;
         initial_weight = shape_w * branch_w;
     }
 

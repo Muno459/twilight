@@ -809,6 +809,40 @@ const ZENITH_SZA_FULL: f64 = 106.0;
 /// sampling to maintain some coverage of non-vertical scattering paths.
 const ZENITH_MAX_FRACTION: f64 = 0.95;
 
+/// Maximum fraction of the zenith-allocated rays redirected to the
+/// terminator lobe at deep twilight.
+///
+/// At SZA >= ZENITH_SZA_FULL:
+///   phase branch:      (1 - ZENITH_MAX_FRACTION) = 5%
+///   zenith branch:     ZENITH_MAX_FRACTION * (1 - TERMINATOR_MAX_SHARE) = 47.5%
+///   terminator branch: ZENITH_MAX_FRACTION * TERMINATOR_MAX_SHARE      = 47.5%
+///
+/// At SZA <= ZENITH_SZA_START: term_share = 0, no terminator rays.
+const TERMINATOR_MAX_SHARE: f64 = 0.5;
+
+/// Power-cosine exponent for the terminator lobe at maximum SZA.
+///
+/// The terminator lobe samples from cos^m(theta_t) centered on the
+/// terminator axis. Higher m concentrates rays more tightly around
+/// the axis. At m=8, ~70% of rays fall within 30 deg of the axis.
+///
+/// Ramps from 1.0 (SZA <= 96, inactive -- equivalent to cosine hemisphere)
+/// to TERMINATOR_N_MAX (SZA >= 106).
+const TERMINATOR_N_MAX: f64 = 8.0;
+
+/// Tilt angle (degrees) of the terminator axis from zenith at SZA = ZENITH_SZA_START.
+///
+/// The terminator axis is: normalize(cos(tilt) * up + sin(tilt) * sun_horiz).
+/// At civil twilight, a small tilt gently biases toward the sun's azimuth.
+const TERMINATOR_TILT_MIN_DEG: f64 = 20.0;
+
+/// Tilt angle (degrees) of the terminator axis from zenith at SZA = ZENITH_SZA_FULL.
+///
+/// At deep twilight (SZA 106), the terminator axis points 50 deg from
+/// zenith toward the sub-solar horizon, directing rays into the region
+/// where shadow rays can first reach sunlit atmosphere.
+const TERMINATOR_TILT_MAX_DEG: f64 = 50.0;
+
 /// Compute multi-scatter spectral radiance using a hybrid approach.
 ///
 /// This combines the deterministic single-scatter integrator (order 1, exact)
@@ -1045,29 +1079,39 @@ fn trace_secondary_chain(
 
     let local_up = start_pos.normalize();
 
-    // --- SZA-adaptive zenith parameters ---
+    // --- SZA-adaptive 3-branch parameters ---
     let cos_sza = sun_dir.dot(local_up);
-    let (zenith_frac, n) = zenith_params_for_sza(cos_sza);
+    let bp = branch_params_for_sza(cos_sza);
+
+    // Branch probabilities:
+    //   alpha_p = 1 - zenith_frac           (phase function)
+    //   alpha_z = zenith_frac * (1 - term_share)  (zenith lobe)
+    //   alpha_t = zenith_frac * term_share         (terminator lobe)
+    let alpha_p = 1.0 - bp.zenith_frac;
+    let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
+    let alpha_t = bp.zenith_frac * bp.term_share;
+
+    // Terminator axis (only used if term_share > 0, but cheap to compute)
+    let term_axis = terminator_axis(local_up, sun_dir, bp.tilt_rad);
 
     // --- Stratified initial direction sampling ---
     let xi_jitter = xorshift_f64(rng_state);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
-    // Two-branch importance sampling with correct branch probability weights.
+    // 3-branch importance sampling with correct branch probability weights.
     //
-    // The baseline estimator (no bias) is:
+    // The baseline estimator is:
     //   E = 0.5 * E_phase + 0.5 * E_hemi
     //
-    // We sample phase branch with probability (1 - zenith_frac) and zenith
-    // branch with probability zenith_frac. To keep E unchanged, each branch
-    // carries a branch probability weight of (baseline_prob / actual_prob):
-    //   phase:  0.5 / (1.0 - zenith_frac)
-    //   zenith: 0.5 / zenith_frac
+    // We sample with probabilities (alpha_p, alpha_z, alpha_t). Each branch
+    // carries weight (baseline_prob / actual_prob) * shape_correction:
+    //   phase:      0.5 / alpha_p
+    //   zenith:     0.5 / alpha_z * zenith_shape_weight
+    //   terminator: 0.5 / alpha_t * terminator_shape_weight
     //
-    // The zenith branch also carries a shape weight correcting cos^n -> cos^1.
-    //
-    // At SZA <= 96: n=1, zenith_frac=0.5. Both weights = 1.0 exactly.
-    let (dir, cos_theta_init, initial_weight) = if xi_mix < (1.0 - zenith_frac) {
+    // At SZA <= 96: alpha_p=0.5, alpha_z=0.5, alpha_t=0. Both active
+    // branch weights = 1.0 exactly (n=1 makes zenith_importance_weight=1).
+    let (dir, cos_theta_init, initial_weight) = if xi_mix < alpha_p {
         // Phase function branch
         let cos_theta_init = if xorshift_f64(rng_state) < start_optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(rng_state))
@@ -1076,14 +1120,22 @@ fn trace_secondary_chain(
         };
         let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
         let d = scatter_direction(sun_dir, cos_theta_init, phi_init);
-        let branch_w = 0.5 / (1.0 - zenith_frac);
+        let branch_w = 0.5 / alpha_p;
         (d, cos_theta_init, branch_w)
-    } else {
+    } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
         // Zenith-biased branch with shape + branch weight correction
-        let (d, cos_z) = sample_zenith_biased(local_up, n, rng_state);
+        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, rng_state);
         let cos_theta_init = sun_dir.dot(d);
-        let shape_w = zenith_importance_weight(cos_z, n);
-        let branch_w = 0.5 / zenith_frac;
+        let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
+        let branch_w = 0.5 / (alpha_z + alpha_t); // fallback if alpha_t ~ 0
+        (d, cos_theta_init, shape_w * branch_w)
+    } else {
+        // Terminator lobe branch
+        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, rng_state);
+        let cos_z = d.dot(local_up);
+        let cos_theta_init = sun_dir.dot(d);
+        let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
+        let branch_w = 0.5 / alpha_t;
         (d, cos_theta_init, shape_w * branch_w)
     };
 
@@ -1370,19 +1422,23 @@ fn trace_secondary_chain_scalar(
 
     let local_up = start_pos.normalize();
 
-    // --- SZA-adaptive zenith parameters ---
+    // --- SZA-adaptive 3-branch parameters ---
     let cos_sza = sun_dir.dot(local_up);
-    let (zenith_frac, n) = zenith_params_for_sza(cos_sza);
+    let bp = branch_params_for_sza(cos_sza);
+
+    let alpha_p = 1.0 - bp.zenith_frac;
+    let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
+    let alpha_t = bp.zenith_frac * bp.term_share;
+
+    let term_axis = terminator_axis(local_up, sun_dir, bp.tilt_rad);
 
     // --- Stratified initial direction sampling ---
-    // Stratify across rays: the first (1-zenith_frac) fraction of rays use
-    // phase function, the rest use zenith-biased hemisphere.
     let xi_jitter = xorshift_f64(rng_state);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
-    // Two-branch importance sampling with correct branch probability weights.
-    // See trace_secondary_chain for derivation. At SZA <= 96: both weights = 1.0.
-    let (dir, initial_weight) = if xi_mix < (1.0 - zenith_frac) {
+    // 3-branch importance sampling. See trace_secondary_chain for derivation.
+    // At SZA <= 96: alpha_p=0.5, alpha_z=0.5, alpha_t=0. Both weights = 1.0.
+    let (dir, initial_weight) = if xi_mix < alpha_p {
         // Phase function branch (toward sun_dir -- effective at civil twilight)
         let _cos_theta_init = if xorshift_f64(rng_state) < start_optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(rng_state))
@@ -1390,16 +1446,23 @@ fn trace_secondary_chain_scalar(
             sample_henyey_greenstein(xorshift_f64(rng_state), start_optics.asymmetry)
         };
         let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-        let branch_w = 0.5 / (1.0 - zenith_frac);
+        let branch_w = 0.5 / alpha_p;
         (
             scatter_direction(sun_dir, _cos_theta_init, phi_init),
             branch_w,
         )
-    } else {
+    } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
         // Zenith-biased branch with shape + branch weight correction
-        let (d, cos_z) = sample_zenith_biased(local_up, n, rng_state);
-        let shape_w = zenith_importance_weight(cos_z, n);
-        let branch_w = 0.5 / zenith_frac;
+        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, rng_state);
+        let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
+        let branch_w = 0.5 / (alpha_z + alpha_t);
+        (d, shape_w * branch_w)
+    } else {
+        // Terminator lobe branch
+        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, rng_state);
+        let cos_z = d.dot(local_up);
+        let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
+        let branch_w = 0.5 / alpha_t;
         (d, shape_w * branch_w)
     };
 
@@ -1779,18 +1842,25 @@ fn trace_secondary_chain_alis(
     let local_up = start_pos.normalize();
     let hero_optics = &atm.optics[start_shell][hero_wl];
 
-    // --- SZA-adaptive zenith parameters ---
+    // --- SZA-adaptive 3-branch parameters ---
     let cos_sza = sun_dir.dot(local_up);
-    let (zenith_frac, n) = zenith_params_for_sza(cos_sza);
+    let bp = branch_params_for_sza(cos_sza);
+
+    let alpha_p = 1.0 - bp.zenith_frac;
+    let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
+    let alpha_t = bp.zenith_frac * bp.term_share;
+
+    let term_axis = terminator_axis(local_up, sun_dir, bp.tilt_rad);
 
     // --- Stratified initial direction sampling ---
     let xi_jitter = xorshift_f64(rng_state);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
-    // Sample initial direction from hero's phase function (phase branch) or
-    // zenith-biased distribution (zenith branch). Track cos_theta_init for
-    // phase function ratio correction on non-hero wavelengths.
-    let (dir, initial_weight, cos_theta_init, is_phase_branch) = if xi_mix < (1.0 - zenith_frac) {
+    // Sample initial direction from hero's phase function (phase branch),
+    // zenith-biased distribution (zenith branch), or terminator lobe
+    // (terminator branch). Track cos_theta_init for phase function ratio
+    // correction on non-hero wavelengths.
+    let (dir, initial_weight, cos_theta_init, is_phase_branch) = if xi_mix < alpha_p {
         // Phase function branch
         let ct = if xorshift_f64(rng_state) < hero_optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(rng_state))
@@ -1798,13 +1868,20 @@ fn trace_secondary_chain_alis(
             sample_henyey_greenstein(xorshift_f64(rng_state), hero_optics.asymmetry)
         };
         let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-        let branch_w = 0.5 / (1.0 - zenith_frac);
+        let branch_w = 0.5 / alpha_p;
         (scatter_direction(sun_dir, ct, phi_init), branch_w, ct, true)
-    } else {
+    } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
         // Zenith-biased branch (wavelength-independent)
-        let (d, cos_z) = sample_zenith_biased(local_up, n, rng_state);
-        let shape_w = zenith_importance_weight(cos_z, n);
-        let branch_w = 0.5 / zenith_frac;
+        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, rng_state);
+        let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
+        let branch_w = 0.5 / (alpha_z + alpha_t);
+        (d, shape_w * branch_w, 0.0, false)
+    } else {
+        // Terminator lobe branch (wavelength-independent)
+        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, rng_state);
+        let cos_z = d.dot(local_up);
+        let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
+        let branch_w = 0.5 / alpha_t;
         (d, shape_w * branch_w, 0.0, false)
     };
 
@@ -2348,32 +2425,120 @@ fn zenith_importance_weight(cos_theta: f64, n: f64) -> f64 {
     2.0 / ((n + 1.0) * cos_nm1)
 }
 
-/// Compute the SZA-adaptive zenith bias parameters.
+/// SZA-adaptive parameters for the 3-branch initial direction sampling.
 ///
-/// Returns `(zenith_frac, n)` where:
-/// - `zenith_frac` is the fraction of rays using zenith-biased sampling
-///   (in [0.5, ZENITH_MAX_FRACTION])
-/// - `n` is the power-cosine exponent (in [1.0, ZENITH_BIAS_N])
+/// All six parameters ramp linearly from SZA_START (96 deg) to SZA_FULL (106 deg).
+#[derive(Clone, Copy)]
+struct BranchParams {
+    /// Total fraction of rays using non-phase-function sampling (zenith + terminator).
+    /// Phase branch gets `1 - zenith_frac`.
+    zenith_frac: f64,
+    /// Power-cosine exponent for the zenith lobe.
+    n_zenith: f64,
+    /// Fraction of zenith-allocated rays redirected to terminator lobe.
+    /// The actual probabilities are:
+    ///   alpha_p = 1 - zenith_frac
+    ///   alpha_z = zenith_frac * (1 - term_share)
+    ///   alpha_t = zenith_frac * term_share
+    term_share: f64,
+    /// Power-cosine exponent for the terminator lobe.
+    m_term: f64,
+    /// Tilt angle (radians) of the terminator axis from zenith toward the sun.
+    tilt_rad: f64,
+}
+
+/// Compute the SZA-adaptive branch parameters.
 ///
-/// Both parameters vary linearly with SZA:
+/// At SZA <= 96:
+///   zenith_frac = 0.5, n = 1.0, term_share = 0.0
+///   -> standard 50/50 mix, no terminator lobe
+///   -> all branch weights evaluate to exactly 1.0 (zero overhead)
 ///
-///   SZA <= 96:  (0.5, 1.0) -- standard 50/50 mix, cosine-weighted (baseline)
-///   SZA >= 106: (0.95, 5.0) -- aggressive zenith bias
-///   In between: linear interpolation
+/// At SZA >= 106:
+///   zenith_frac = 0.95, n = 5.0, term_share = 0.5, m = 8.0, tilt = 50 deg
+///   -> phase: 5%, zenith: 47.5%, terminator: 47.5%
 ///
-/// At the baseline point (sza_t=0, n=1, frac=0.5), branch weights evaluate
-/// to exactly 1.0 for both branches -- no if/else bypass needed.
+/// In between: linear interpolation of all parameters.
 #[inline]
-fn zenith_params_for_sza(cos_sza: f64) -> (f64, f64) {
+fn branch_params_for_sza(cos_sza: f64) -> BranchParams {
     let sza_deg = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
 
     let sza_t =
         ((sza_deg - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
 
-    let zenith_frac = 0.5 + (ZENITH_MAX_FRACTION - 0.5) * sza_t; // 0.5 -> 0.95
-    let n = 1.0 + (ZENITH_BIAS_N - 1.0) * sza_t; // 1.0 -> 5.0
+    let zenith_frac = 0.5 + (ZENITH_MAX_FRACTION - 0.5) * sza_t;
+    let n_zenith = 1.0 + (ZENITH_BIAS_N - 1.0) * sza_t;
+    let term_share = TERMINATOR_MAX_SHARE * sza_t;
+    let m_term = 1.0 + (TERMINATOR_N_MAX - 1.0) * sza_t;
+    let tilt_deg =
+        TERMINATOR_TILT_MIN_DEG + (TERMINATOR_TILT_MAX_DEG - TERMINATOR_TILT_MIN_DEG) * sza_t;
+    let tilt_rad = tilt_deg * core::f64::consts::PI / 180.0;
 
-    (zenith_frac, n)
+    BranchParams {
+        zenith_frac,
+        n_zenith,
+        term_share,
+        m_term,
+        tilt_rad,
+    }
+}
+
+/// Compute the terminator axis: a unit vector tilted from `up` toward the
+/// sub-solar point on the local horizon.
+///
+/// The axis is: `cos(tilt) * up + sin(tilt) * sun_horiz` where `sun_horiz`
+/// is the projection of `sun_dir` onto the horizontal plane, normalized.
+///
+/// If the sun is directly at zenith/nadir (no horizontal component), the
+/// axis falls back to `up` (pure zenith, no tilt).
+#[inline]
+fn terminator_axis(up: Vec3, sun_dir: Vec3, tilt_rad: f64) -> Vec3 {
+    // Project sun_dir onto the local horizontal plane
+    let dot_us = sun_dir.dot(up);
+    let horiz = Vec3::new(
+        sun_dir.x - dot_us * up.x,
+        sun_dir.y - dot_us * up.y,
+        sun_dir.z - dot_us * up.z,
+    );
+    let h_len = horiz.length();
+    if h_len < 1e-12 {
+        // Sun at zenith/nadir: no preferred horizontal direction
+        return up;
+    }
+    let sun_horiz = horiz.scale(1.0 / h_len);
+
+    let (sin_t, cos_t) = libm::sincos(tilt_rad);
+    let axis = Vec3::new(
+        cos_t * up.x + sin_t * sun_horiz.x,
+        cos_t * up.y + sin_t * sun_horiz.y,
+        cos_t * up.z + sin_t * sun_horiz.z,
+    );
+    axis.normalize()
+}
+
+/// Shape weight for the terminator lobe: corrects the power-cosine PDF
+/// centered on the terminator axis back to the cosine-hemisphere reference.
+///
+/// `cos_z` = cos(angle from zenith), `cos_t` = cos(angle from terminator axis).
+///
+/// Weight = p_cosine(d) / p_term(d)
+///        = [cos(theta_z) / pi] / [(m+1) / (2*pi) * cos^m(theta_t)]
+///        = 2 * cos(theta_z) / ((m+1) * cos^m(theta_t))
+///
+/// If `cos_z <= 0` (below horizon), returns 0 -- the direction has zero
+/// probability in the cosine-hemisphere reference. Samples are not wasted
+/// in practice because the terminator axis tilt (max 50 deg) combined with
+/// the concentration (m=8) keeps 95%+ of samples above the horizon.
+#[inline]
+fn terminator_shape_weight(cos_z: f64, cos_t: f64, m: f64) -> f64 {
+    if cos_z <= 0.0 || cos_t <= 0.0 {
+        return 0.0;
+    }
+    let cos_t_m = libm::pow(cos_t, m);
+    if cos_t_m < 1e-30 {
+        return 0.0;
+    }
+    2.0 * cos_z / ((m + 1.0) * cos_t_m)
 }
 
 /// Simple xorshift64 PRNG suitable for no_std Monte Carlo.
@@ -3739,6 +3904,209 @@ mod tests {
                 tau_single,
                 tau_multi[hero],
                 rel_err
+            );
+        }
+    }
+
+    // ── Terminator lobe + 3-branch direction sampling ──
+
+    #[test]
+    fn branch_params_baseline_at_civil_twilight() {
+        // SZA = 90 deg (cos_sza = 0): well below threshold
+        let bp = branch_params_for_sza(0.0);
+        assert!(
+            (bp.zenith_frac - 0.5).abs() < 1e-10,
+            "zenith_frac should be 0.5 at SZA 90"
+        );
+        assert!(
+            (bp.n_zenith - 1.0).abs() < 1e-10,
+            "n_zenith should be 1.0 at SZA 90"
+        );
+        assert!(
+            bp.term_share.abs() < 1e-10,
+            "term_share should be 0 at SZA 90"
+        );
+        assert!(
+            (bp.m_term - 1.0).abs() < 1e-10,
+            "m_term should be 1.0 at SZA 90"
+        );
+    }
+
+    #[test]
+    fn branch_params_full_at_deep_twilight() {
+        // SZA = 108 deg (cos = cos(108 deg))
+        let cos_108 = libm::cos(108.0 * core::f64::consts::PI / 180.0);
+        let bp = branch_params_for_sza(cos_108);
+        assert!(
+            (bp.zenith_frac - ZENITH_MAX_FRACTION).abs() < 1e-10,
+            "zenith_frac should be {} at SZA 108, got {}",
+            ZENITH_MAX_FRACTION,
+            bp.zenith_frac
+        );
+        assert!(
+            (bp.n_zenith - ZENITH_BIAS_N).abs() < 1e-10,
+            "n_zenith should be {} at SZA 108, got {}",
+            ZENITH_BIAS_N,
+            bp.n_zenith
+        );
+        assert!(
+            (bp.term_share - TERMINATOR_MAX_SHARE).abs() < 1e-10,
+            "term_share should be {} at SZA 108, got {}",
+            TERMINATOR_MAX_SHARE,
+            bp.term_share
+        );
+        assert!(
+            (bp.m_term - TERMINATOR_N_MAX).abs() < 1e-10,
+            "m_term should be {} at SZA 108, got {}",
+            TERMINATOR_N_MAX,
+            bp.m_term
+        );
+    }
+
+    #[test]
+    fn branch_probabilities_sum_to_one() {
+        // Test at several SZAs that alpha_p + alpha_z + alpha_t = 1
+        for sza_deg in [85.0, 96.0, 100.0, 104.0, 106.0, 108.0, 115.0] {
+            let cos_sza = libm::cos(sza_deg * core::f64::consts::PI / 180.0);
+            let bp = branch_params_for_sza(cos_sza);
+            let alpha_p = 1.0 - bp.zenith_frac;
+            let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
+            let alpha_t = bp.zenith_frac * bp.term_share;
+            let sum = alpha_p + alpha_z + alpha_t;
+            assert!(
+                (sum - 1.0).abs() < 1e-14,
+                "branch probs sum to {} at SZA {}, expected 1.0",
+                sum,
+                sza_deg
+            );
+        }
+    }
+
+    #[test]
+    fn terminator_axis_is_unit_vector() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let sun = Vec3::new(0.3, 0.0, -0.2).normalize(); // below horizon, with horizontal component
+        for tilt_deg in [0.0, 20.0, 45.0, 50.0, 80.0] {
+            let tilt = tilt_deg * core::f64::consts::PI / 180.0;
+            let axis = terminator_axis(up, sun, tilt);
+            let len = axis.length();
+            assert!(
+                (len - 1.0).abs() < 1e-10,
+                "terminator axis length = {} at tilt {} deg",
+                len,
+                tilt_deg
+            );
+        }
+    }
+
+    #[test]
+    fn terminator_axis_tilt_angle_correct() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let sun = Vec3::new(1.0, 0.0, -0.3).normalize(); // sun below horizon in +x direction
+        let tilt = 30.0 * core::f64::consts::PI / 180.0;
+        let axis = terminator_axis(up, sun, tilt);
+
+        // The axis should be tilted 30 degrees from up
+        let cos_angle = axis.dot(up);
+        let angle_deg = libm::acos(cos_angle.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
+        assert!(
+            (angle_deg - 30.0).abs() < 0.01,
+            "terminator axis angle from zenith = {} deg, expected 30",
+            angle_deg
+        );
+
+        // The axis should tilt toward the sun's horizontal projection (+x)
+        assert!(
+            axis.x > 0.0,
+            "terminator axis should tilt toward sun (+x), got x={}",
+            axis.x
+        );
+    }
+
+    #[test]
+    fn terminator_axis_sun_at_nadir_fallback() {
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let sun = Vec3::new(0.0, 0.0, -1.0); // directly below -- no horizontal component
+        let tilt = 45.0 * core::f64::consts::PI / 180.0;
+        let axis = terminator_axis(up, sun, tilt);
+
+        // Should fall back to up
+        assert!(
+            (axis.dot(up) - 1.0).abs() < 1e-10,
+            "terminator axis should fall back to up when sun is at nadir"
+        );
+    }
+
+    #[test]
+    fn terminator_shape_weight_at_axis() {
+        // When direction is exactly on the terminator axis AND that axis is at zenith,
+        // cos_z = cos_t = 1, weight = 2 / (m+1)
+        let w = terminator_shape_weight(1.0, 1.0, 8.0);
+        let expected = 2.0 / 9.0;
+        assert!(
+            (w - expected).abs() < 1e-12,
+            "terminator_shape_weight(1,1,8) = {}, expected {}",
+            w,
+            expected
+        );
+    }
+
+    #[test]
+    fn terminator_shape_weight_below_horizon_zero() {
+        // cos_z <= 0 should return 0
+        let w = terminator_shape_weight(-0.1, 0.9, 5.0);
+        assert!(
+            w == 0.0,
+            "terminator_shape_weight should be 0 for below-horizon, got {}",
+            w
+        );
+    }
+
+    #[test]
+    fn terminator_shape_weight_behind_axis_zero() {
+        // cos_t <= 0 should return 0 (direction is behind the terminator axis hemisphere)
+        let w = terminator_shape_weight(0.5, -0.1, 5.0);
+        assert!(
+            w == 0.0,
+            "terminator_shape_weight should be 0 for behind-axis, got {}",
+            w
+        );
+    }
+
+    #[test]
+    fn terminator_shape_weight_positive_in_overlap() {
+        // Both cos_z and cos_t positive: weight should be positive
+        let w = terminator_shape_weight(0.7, 0.8, 5.0);
+        assert!(
+            w > 0.0,
+            "terminator_shape_weight should be positive in overlap region, got {}",
+            w
+        );
+    }
+
+    #[test]
+    fn three_branch_backward_compatible_at_civil() {
+        // At SZA = 90, the 3-branch system should behave identically to the
+        // old 2-branch system: alpha_p = 0.5, alpha_z = 0.5, alpha_t = 0.
+        // Phase branch weight = 0.5/0.5 = 1.0.
+        // Zenith branch with n=1: zenith_importance_weight(cos, 1.0) = 1.0 for all cos.
+        let bp = branch_params_for_sza(0.0);
+        let alpha_p = 1.0 - bp.zenith_frac;
+        let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
+        let alpha_t = bp.zenith_frac * bp.term_share;
+
+        assert!((alpha_p - 0.5).abs() < 1e-14);
+        assert!((alpha_z - 0.5).abs() < 1e-14);
+        assert!(alpha_t < 1e-14);
+
+        // Zenith shape weight at n=1 should be 1.0 for any cos_theta
+        for cos_z in [0.1, 0.3, 0.5, 0.7, 0.9, 1.0] {
+            let w = zenith_importance_weight(cos_z, 1.0);
+            assert!(
+                (w - 1.0).abs() < 1e-10,
+                "zenith weight at n=1, cos={}: got {} expected 1.0",
+                cos_z,
+                w
             );
         }
     }
