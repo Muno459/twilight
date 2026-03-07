@@ -18,5 +18,5 @@ twilight-threshold = { workspace = true }
 twilight-weather = { workspace = true }
 twilight-terrain = { workspace = true }
 twilight-skyglow = { workspace = true }
-twilight-gpu = { workspace = true, optional = true, features = ["metal", "vulkan"] }
+twilight-gpu = { workspace = true, optional = true, features = ["metal"] }
 clap = { version = "4", features = ["derive", "env"] }

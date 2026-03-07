@@ -46,6 +46,176 @@ fn cross_boundary(
     (boundary_pos + new_dir * 1e-3, new_dir)
 }
 
+/// Compute total optical depth from `pos` along `dir` to atmosphere exit.
+///
+/// Marches shell-by-shell with refraction, identical path geometry to
+/// `shadow_ray_transmittance` but in an arbitrary direction and returning
+/// the raw optical depth rather than exp(-tau).
+///
+/// All loop variables are local to this function -- only the returned `f64`
+/// (tau_max) survives into the caller, keeping thread register pressure at
+/// 88 bytes (one extra f64).
+///
+/// Used by tests to verify optical depth consistency with
+/// `shadow_ray_transmittance`, and available for future use by
+/// full-path forced scattering variants.
+#[cfg(test)]
+fn scout_tau_to_exit(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    start_dir: Vec3,
+    wavelength_idx: usize,
+) -> f64 {
+    let surface_radius = atm.surface_radius();
+    let num_shells = atm.num_shells;
+    let mut pos = start_pos;
+    let mut dir = start_dir;
+    let mut tau = 0.0;
+
+    let mut shell_idx = match atm.shell_index(pos.length()) {
+        Some(idx) => idx,
+        None => return 0.0,
+    };
+
+    for _ in 0..200 {
+        let shell = &atm.shells[shell_idx];
+        let optics = &atm.optics[shell_idx][wavelength_idx];
+
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
+            Some((dist, is_outward)) => {
+                tau += optics.extinction * dist;
+
+                // Refract at boundary (same logic as shadow_ray_transmittance)
+                let boundary_pos = pos + dir * dist;
+                let n_from = atm.refractive_index[shell_idx];
+                let next_shell = if is_outward {
+                    shell_idx + 1
+                } else {
+                    shell_idx.wrapping_sub(1)
+                };
+                let n_to = if next_shell < num_shells {
+                    atm.refractive_index[next_shell]
+                } else {
+                    1.0
+                };
+                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                };
+                pos = boundary_pos + dir * 1e-3;
+
+                // Hit ground -- path terminates here
+                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                    return tau;
+                }
+
+                // Exited atmosphere
+                if next_shell >= num_shells {
+                    return tau;
+                }
+
+                shell_idx = next_shell;
+            }
+            None => return tau,
+        }
+
+        // At tau > 100, (1-exp(-100)) = 1.0 to f64 precision.
+        // The forced-scattering weight is indistinguishable from 1.0
+        // and the truncated exponential becomes regular exponential.
+        // No bias -- just avoids pointless shell marching.
+        if tau > 100.0 {
+            return tau;
+        }
+    }
+
+    tau
+}
+
+/// Advance a photon along its ray until `tau_target` optical depth is consumed.
+///
+/// Marches shell-by-shell with refraction, following the same path geometry
+/// as `scout_tau_to_exit`. Returns `(scatter_pos, dir_at_scatter, shell_idx)`
+/// where the photon scatters.
+///
+/// The caller must ensure `tau_target <= tau_max` from a prior scout call,
+/// guaranteeing the scatter point lies within the atmosphere.
+fn advance_to_optical_depth(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    start_dir: Vec3,
+    tau_target: f64,
+    wavelength_idx: usize,
+) -> (Vec3, Vec3, usize) {
+    let surface_radius = atm.surface_radius();
+    let num_shells = atm.num_shells;
+    let mut pos = start_pos;
+    let mut dir = start_dir;
+    let mut tau_accumulated = 0.0;
+
+    let mut shell_idx = match atm.shell_index(pos.length()) {
+        Some(idx) => idx,
+        None => return (pos, dir, 0),
+    };
+
+    for _ in 0..200 {
+        let shell = &atm.shells[shell_idx];
+        let optics = &atm.optics[shell_idx][wavelength_idx];
+
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
+            Some((boundary_dist, is_outward)) => {
+                let tau_shell = optics.extinction * boundary_dist;
+
+                if tau_accumulated + tau_shell >= tau_target {
+                    // Scatter point is within this shell.
+                    let tau_remaining = tau_target - tau_accumulated;
+                    let dist = if optics.extinction > 1e-30 {
+                        tau_remaining / optics.extinction
+                    } else {
+                        // Zero extinction: shouldn't reach here if scout
+                        // was consistent, but place at boundary as fallback.
+                        boundary_dist
+                    };
+                    pos = pos + dir * dist;
+                    return (pos, dir, shell_idx);
+                }
+
+                // Cross boundary -- same refraction as scout
+                tau_accumulated += tau_shell;
+                let boundary_pos = pos + dir * boundary_dist;
+                let n_from = atm.refractive_index[shell_idx];
+                let next_shell = if is_outward {
+                    shell_idx + 1
+                } else {
+                    shell_idx.wrapping_sub(1)
+                };
+                let n_to = if next_shell < num_shells {
+                    atm.refractive_index[next_shell]
+                } else {
+                    1.0
+                };
+                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                };
+                pos = boundary_pos + dir * 1e-3;
+
+                // Hit ground -- place scatter here
+                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                    return (pos, dir, shell_idx);
+                }
+
+                // Exited atmosphere -- place scatter at exit
+                if next_shell >= num_shells {
+                    return (pos, dir, shell_idx);
+                }
+
+                shell_idx = next_shell;
+            }
+            None => return (pos, dir, shell_idx),
+        }
+    }
+
+    (pos, dir, shell_idx)
+}
+
 /// Result of tracing a single photon.
 #[derive(Debug, Clone, Copy)]
 pub struct PhotonResult {
@@ -231,7 +401,7 @@ fn compute_nee(
     };
 
     // Contribution = weight × transmittance × phase / (4π)
-    weight * transmittance * phase / (4.0 * core::f64::consts::PI)
+    weight * transmittance * phase * INV_4PI
 }
 
 /// Compute transmittance along a ray through the atmosphere.
@@ -526,7 +696,7 @@ fn compute_nee_polarized(
     );
 
     // Scale by weight, transmittance, and 1/(4pi)
-    let factor = weight * transmittance / (4.0 * core::f64::consts::PI);
+    let factor = weight * transmittance * INV_4PI;
     scattered.scale(factor)
 }
 
@@ -575,6 +745,9 @@ const HYBRID_LOS_STEPS: usize = 200;
 
 /// Maximum bounces for secondary chains in the hybrid integrator.
 const HYBRID_MAX_BOUNCES: usize = 50;
+
+/// Precomputed 1 / (4 * pi), used at every NEE evaluation.
+const INV_4PI: f64 = 1.0 / (4.0 * core::f64::consts::PI);
 
 /// Power exponent for zenith-biased initial direction sampling.
 ///
@@ -717,7 +890,7 @@ pub fn hybrid_scatter_radiance(
         let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
         if t_sun > 1e-30 {
             let cos_theta_1 = sun_dir.dot(-view_dir);
-            let scale_1 = beta_scat / (4.0 * core::f64::consts::PI) * t_sun * t_obs * ds;
+            let scale_1 = beta_scat * INV_4PI * t_sun * t_obs * ds;
 
             if polarized {
                 // Full Mueller matrix for polarized order-1
@@ -906,62 +1079,119 @@ fn trace_secondary_chain(
     let mut weight = start_optics.ssa * initial_weight;
     let mut total_stokes = StokesVector::unpolarized(0.0);
 
-    for _bounce in 0..HYBRID_MAX_BOUNCES {
-        let r = pos.length();
+    // Forced scattering is only beneficial at deep twilight where chains
+    // frequently escape the atmosphere without scattering. At civil twilight
+    // (SZA < 96) chains naturally scatter many times and rarely escape.
+    let local_up = start_pos.normalize();
+    let cos_sza_local = sun_dir.dot(local_up);
+    let sza_deg_local = libm::acos(cos_sza_local.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
+    let use_forced = sza_deg_local >= ZENITH_SZA_START;
 
-        let shell_idx = match atm.shell_index(r) {
-            Some(idx) => idx,
-            None => break,
-        };
+    for _scatter in 0..HYBRID_MAX_BOUNCES {
+        // --- Free-flight phase: walk shell-by-shell to find scatter point ---
+        let flight_start_pos = pos;
+        let flight_start_dir = current_dir;
+        let mut tau_flight = 0.0;
+        let mut scatter_found = false;
+        let mut scatter_shell = 0usize;
 
-        let shell = &atm.shells[shell_idx];
-        let optics = &atm.optics[shell_idx][wavelength_idx];
+        for _ in 0..200 {
+            let r = pos.length();
+            let shell_idx = match atm.shell_index(r) {
+                Some(idx) => idx,
+                None => break, // exited atmosphere
+            };
 
-        if optics.extinction < 1e-20 {
+            let shell = &atm.shells[shell_idx];
+            let optics = &atm.optics[shell_idx][wavelength_idx];
+
+            if optics.extinction < 1e-20 {
+                match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                    Some((dist, is_outward)) => {
+                        let (np, nd) =
+                            cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
+                        pos = np;
+                        current_dir = nd;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let xi = xorshift_f64(rng_state);
+            let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+
             match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                Some((dist, is_outward)) => {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    current_dir = new_dir;
-                    continue;
+                Some((boundary_dist, is_outward)) => {
+                    if free_path >= boundary_dist {
+                        // Accumulate optical depth for potential forced scattering
+                        tau_flight += optics.extinction * boundary_dist;
+
+                        let (np, nd) = cross_boundary(
+                            pos,
+                            current_dir,
+                            boundary_dist,
+                            is_outward,
+                            shell_idx,
+                            atm,
+                        );
+                        pos = np;
+                        current_dir = nd;
+
+                        // Ground reflection: depolarizes
+                        if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
+                            let albedo = atm.surface_albedo[wavelength_idx];
+                            weight *= albedo;
+                            if weight < 1e-30 {
+                                break;
+                            }
+                            let normal = pos.normalize();
+                            prev_dir = current_dir;
+                            current_dir = sample_hemisphere(normal, rng_state);
+                            stokes = StokesVector::unpolarized(1.0);
+                            // Reset flight tracking after ground bounce
+                            tau_flight = 0.0;
+                            continue;
+                        }
+                        continue;
+                    }
                 }
                 None => break,
             }
+
+            // Scatter within this shell (fast path, zero overhead)
+            pos = pos + current_dir * free_path;
+            scatter_shell = shell_idx;
+            scatter_found = true;
+            break;
         }
 
-        let xi = xorshift_f64(rng_state);
-        let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
-
-        match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-            Some((boundary_dist, is_outward)) => {
-                if free_path >= boundary_dist {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, current_dir, boundary_dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    current_dir = new_dir;
-
-                    // Ground reflection: depolarizes
-                    if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
-                        let albedo = atm.surface_albedo[wavelength_idx];
-                        weight *= albedo;
-                        if weight < 1e-30 {
-                            break;
-                        }
-                        let normal = pos.normalize();
-                        prev_dir = current_dir;
-                        current_dir = sample_hemisphere(normal, rng_state);
-                        stokes = StokesVector::unpolarized(1.0);
-                        continue;
-                    }
-                    continue;
-                }
+        if !scatter_found {
+            // Photon would exit the atmosphere.
+            if !use_forced || weight < 1e-30 || tau_flight < 1e-30 {
+                break; // no forced scattering, or nothing to scatter in
             }
-            None => break,
+            // Forced scattering: resample scatter point within traversed path
+            let exp_neg_tau = libm::exp(-tau_flight);
+            weight *= 1.0 - exp_neg_tau;
+            if weight < 1e-30 {
+                break;
+            }
+            let xi_forced = xorshift_f64(rng_state);
+            let tau_s = -libm::log(1.0 - xi_forced * (1.0 - exp_neg_tau) + 1e-30);
+            let (sp, sd, ss) = advance_to_optical_depth(
+                atm,
+                flight_start_pos,
+                flight_start_dir,
+                tau_s,
+                wavelength_idx,
+            );
+            pos = sp;
+            current_dir = sd;
+            scatter_shell = ss;
         }
 
-        // Scatter event
-        pos = pos + current_dir * free_path;
+        let optics = &atm.optics[scatter_shell][wavelength_idx];
 
         // NEE: apply Mueller to photon's actual Stokes state
         let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
@@ -978,7 +1208,7 @@ fn trace_secondary_chain(
                 sn,
             );
 
-            let scale = weight * t_sun_secondary / (4.0 * core::f64::consts::PI);
+            let scale = weight * t_sun_secondary * INV_4PI;
             total_stokes = total_stokes.add(&nee_stokes.scale(scale));
         }
 
@@ -1099,60 +1329,109 @@ fn trace_secondary_chain_scalar(
     let mut weight = start_optics.ssa * initial_weight;
     let mut total = 0.0_f64;
 
-    for _bounce in 0..HYBRID_MAX_BOUNCES {
-        let r = pos.length();
+    // Forced scattering gate: only at deep twilight where escape is common
+    let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
+    let use_forced = sza_deg_local >= ZENITH_SZA_START;
 
-        let shell_idx = match atm.shell_index(r) {
-            Some(idx) => idx,
-            None => break,
-        };
+    for _scatter in 0..HYBRID_MAX_BOUNCES {
+        // --- Free-flight phase: walk shell-by-shell to find scatter point ---
+        let flight_start_pos = pos;
+        let flight_start_dir = current_dir;
+        let mut tau_flight = 0.0;
+        let mut scatter_found = false;
+        let mut scatter_shell = 0usize;
 
-        let shell = &atm.shells[shell_idx];
-        let optics = &atm.optics[shell_idx][wavelength_idx];
+        for _ in 0..200 {
+            let r = pos.length();
+            let shell_idx = match atm.shell_index(r) {
+                Some(idx) => idx,
+                None => break, // exited atmosphere
+            };
 
-        if optics.extinction < 1e-20 {
+            let shell = &atm.shells[shell_idx];
+            let optics = &atm.optics[shell_idx][wavelength_idx];
+
+            if optics.extinction < 1e-20 {
+                match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                    Some((dist, is_outward)) => {
+                        let (np, nd) =
+                            cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
+                        pos = np;
+                        current_dir = nd;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let xi = xorshift_f64(rng_state);
+            let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+
             match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                Some((dist, is_outward)) => {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    current_dir = new_dir;
-                    continue;
+                Some((boundary_dist, is_outward)) => {
+                    if free_path >= boundary_dist {
+                        tau_flight += optics.extinction * boundary_dist;
+
+                        let (np, nd) = cross_boundary(
+                            pos,
+                            current_dir,
+                            boundary_dist,
+                            is_outward,
+                            shell_idx,
+                            atm,
+                        );
+                        pos = np;
+                        current_dir = nd;
+
+                        // Ground reflection
+                        if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
+                            let albedo = atm.surface_albedo[wavelength_idx];
+                            weight *= albedo;
+                            if weight < 1e-30 {
+                                break;
+                            }
+                            let normal = pos.normalize();
+                            current_dir = sample_hemisphere(normal, rng_state);
+                            tau_flight = 0.0;
+                            continue;
+                        }
+                        continue;
+                    }
                 }
                 None => break,
             }
+
+            // Scatter within this shell (fast path)
+            pos = pos + current_dir * free_path;
+            scatter_shell = shell_idx;
+            scatter_found = true;
+            break;
         }
 
-        let xi = xorshift_f64(rng_state);
-        let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
-
-        match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-            Some((boundary_dist, is_outward)) => {
-                if free_path >= boundary_dist {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, current_dir, boundary_dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    current_dir = new_dir;
-
-                    // Ground reflection
-                    if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
-                        let albedo = atm.surface_albedo[wavelength_idx];
-                        weight *= albedo;
-                        if weight < 1e-30 {
-                            break;
-                        }
-                        let normal = pos.normalize();
-                        current_dir = sample_hemisphere(normal, rng_state);
-                        continue;
-                    }
-                    continue;
-                }
+        if !scatter_found {
+            if !use_forced || weight < 1e-30 || tau_flight < 1e-30 {
+                break;
             }
-            None => break,
+            let exp_neg_tau = libm::exp(-tau_flight);
+            weight *= 1.0 - exp_neg_tau;
+            if weight < 1e-30 {
+                break;
+            }
+            let xi_forced = xorshift_f64(rng_state);
+            let tau_s = -libm::log(1.0 - xi_forced * (1.0 - exp_neg_tau) + 1e-30);
+            let (sp, sd, ss) = advance_to_optical_depth(
+                atm,
+                flight_start_pos,
+                flight_start_dir,
+                tau_s,
+                wavelength_idx,
+            );
+            pos = sp;
+            current_dir = sd;
+            scatter_shell = ss;
         }
 
-        // Scatter event
-        pos = pos + current_dir * free_path;
+        let optics = &atm.optics[scatter_shell][wavelength_idx];
 
         // NEE: scalar phase function (no Mueller matrix)
         let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
@@ -1167,7 +1446,7 @@ fn trace_secondary_chain_scalar(
                         * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
             };
 
-            let scale = weight * t_sun_secondary / (4.0 * core::f64::consts::PI);
+            let scale = weight * t_sun_secondary * INV_4PI;
             total += phase * scale;
         }
 
@@ -1447,6 +1726,237 @@ mod tests {
             let val = xorshift_f64(&mut state);
             assert!(val < 1.0, "xorshift_f64 returned 1.0 (should be < 1.0)");
         }
+    }
+
+    // ── scout_tau_to_exit ──
+
+    #[test]
+    fn scout_tau_zero_in_empty_atmosphere() {
+        let atm = crate::atmosphere::AtmosphereModel::new(&[0.0, 50.0, 100.0], &[550.0]);
+        let pos = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0); // radially outward
+
+        let tau = scout_tau_to_exit(&atm, pos, dir, 0);
+        assert!(
+            tau.abs() < 1e-20,
+            "Empty atmosphere should have zero tau, got {}",
+            tau
+        );
+    }
+
+    #[test]
+    fn scout_tau_radial_outward_through_uniform_shell() {
+        // Single shell 0-100km, uniform extinction 1e-5 /m.
+        // Radial outward ray from surface: path = 100km = 1e5 m.
+        // Expected tau = 1e-5 * 1e5 = 1.0
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let mut atm = AtmosphereModel::new(&[0.0, 100.0], &[550.0]);
+        atm.optics[0][0] = ShellOptics {
+            extinction: 1e-5,
+            ssa: 1.0,
+            asymmetry: 0.0,
+            rayleigh_fraction: 1.0,
+        };
+
+        let pos = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
+
+        let tau = scout_tau_to_exit(&atm, pos, dir, 0);
+        // Path ~ 100km, tau ~ 1.0 (within a few percent due to 1m offset)
+        assert!((tau - 1.0).abs() < 0.01, "Expected tau ~ 1.0, got {}", tau);
+    }
+
+    #[test]
+    fn scout_tau_through_multiple_shells() {
+        // Two shells: 0-10km (ext=1e-4), 10-100km (ext=1e-6).
+        // Radial outward: tau = 1e-4*10km + 1e-6*90km = 1.0 + 0.09 = 1.09
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let mut atm = AtmosphereModel::new(&[0.0, 10.0, 100.0], &[550.0]);
+        atm.optics[0][0] = ShellOptics {
+            extinction: 1e-4,
+            ssa: 1.0,
+            asymmetry: 0.0,
+            rayleigh_fraction: 1.0,
+        };
+        atm.optics[1][0] = ShellOptics {
+            extinction: 1e-6,
+            ssa: 1.0,
+            asymmetry: 0.0,
+            rayleigh_fraction: 1.0,
+        };
+
+        let pos = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
+
+        let tau = scout_tau_to_exit(&atm, pos, dir, 0);
+        assert!(
+            (tau - 1.09).abs() < 0.02,
+            "Expected tau ~ 1.09, got {}",
+            tau
+        );
+    }
+
+    #[test]
+    fn scout_tau_downward_hits_ground() {
+        // Radially inward from 50km altitude: hits ground.
+        // Single shell 0-100km, ext=1e-5. Path = 50km. tau = 0.5
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let mut atm = AtmosphereModel::new(&[0.0, 100.0], &[550.0]);
+        atm.optics[0][0] = ShellOptics {
+            extinction: 1e-5,
+            ssa: 1.0,
+            asymmetry: 0.0,
+            rayleigh_fraction: 1.0,
+        };
+
+        let pos = crate::geometry::Vec3::new(EARTH_RADIUS_M + 50_000.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(-1.0, 0.0, 0.0); // radially inward
+
+        let tau = scout_tau_to_exit(&atm, pos, dir, 0);
+        assert!(
+            (tau - 0.5).abs() < 0.01,
+            "Expected tau ~ 0.5 (downward to ground), got {}",
+            tau
+        );
+    }
+
+    #[test]
+    fn scout_tau_outside_atmosphere_returns_zero() {
+        use crate::atmosphere::{AtmosphereModel, EARTH_RADIUS_M};
+
+        let atm = AtmosphereModel::new(&[0.0, 100.0], &[550.0]);
+        let pos = crate::geometry::Vec3::new(EARTH_RADIUS_M + 200_000.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
+
+        let tau = scout_tau_to_exit(&atm, pos, dir, 0);
+        assert!(
+            tau.abs() < 1e-20,
+            "Outside atmosphere should return zero tau, got {}",
+            tau
+        );
+    }
+
+    #[test]
+    fn scout_tau_matches_shadow_ray_transmittance() {
+        // scout_tau_to_exit should give tau such that exp(-tau) matches
+        // shadow_ray_transmittance along the same ray.
+        use crate::single_scatter::shadow_ray_transmittance;
+
+        let atm = make_scattering_atmosphere();
+        let pos = crate::geometry::Vec3::new(crate::atmosphere::EARTH_RADIUS_M + 5_000.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0); // radially outward
+
+        let tau = scout_tau_to_exit(&atm, pos, dir, 1); // wavelength 1 (550nm)
+        let t_shadow = shadow_ray_transmittance(&atm, pos, dir, 1);
+
+        let t_from_scout = libm::exp(-tau);
+        let rel_err = if t_shadow > 1e-30 {
+            (t_from_scout - t_shadow).abs() / t_shadow
+        } else {
+            t_from_scout.abs()
+        };
+
+        assert!(
+            rel_err < 0.01,
+            "scout tau={:.6} -> T={:.6e}, shadow T={:.6e}, rel_err={:.4}",
+            tau,
+            t_from_scout,
+            t_shadow,
+            rel_err
+        );
+    }
+
+    // ── advance_to_optical_depth ──
+
+    #[test]
+    fn advance_lands_at_correct_optical_depth() {
+        // Uniform shell, radial outward. tau_target = 0.5 with ext=1e-5.
+        // Expected distance = 0.5 / 1e-5 = 50km from start.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let mut atm = AtmosphereModel::new(&[0.0, 100.0], &[550.0]);
+        atm.optics[0][0] = ShellOptics {
+            extinction: 1e-5,
+            ssa: 1.0,
+            asymmetry: 0.0,
+            rayleigh_fraction: 1.0,
+        };
+
+        let pos = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
+
+        let (scatter_pos, _dir, shell) = advance_to_optical_depth(&atm, pos, dir, 0.5, 0);
+
+        let altitude = scatter_pos.length() - EARTH_RADIUS_M;
+        assert_eq!(shell, 0, "Should still be in shell 0");
+        assert!(
+            (altitude - 50_001.0).abs() < 100.0,
+            "Expected ~50km altitude, got {:.0}m",
+            altitude
+        );
+    }
+
+    #[test]
+    fn advance_crosses_shell_boundary() {
+        // Two shells: 0-10km (ext=1e-4), 10-100km (ext=1e-6).
+        // tau through shell 0 = 1e-4 * 10km = 1.0.
+        // Requesting tau_target = 1.5 should land in shell 1.
+        // Remaining tau in shell 1 = 0.5, distance = 0.5/1e-6 = 500km.
+        // But shell 1 is only 90km thick, so this would exit -- let's pick
+        // tau_target = 1.05 instead: remaining 0.05 / 1e-6 = 50km into shell 1.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let mut atm = AtmosphereModel::new(&[0.0, 10.0, 100.0], &[550.0]);
+        atm.optics[0][0] = ShellOptics {
+            extinction: 1e-4,
+            ssa: 1.0,
+            asymmetry: 0.0,
+            rayleigh_fraction: 1.0,
+        };
+        atm.optics[1][0] = ShellOptics {
+            extinction: 1e-6,
+            ssa: 1.0,
+            asymmetry: 0.0,
+            rayleigh_fraction: 1.0,
+        };
+
+        let pos = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
+
+        let (scatter_pos, _dir, shell) = advance_to_optical_depth(&atm, pos, dir, 1.05, 0);
+
+        let altitude = scatter_pos.length() - EARTH_RADIUS_M;
+        assert_eq!(shell, 1, "Should have crossed into shell 1");
+        // 10km + 50km = 60km altitude
+        assert!(
+            (altitude - 60_000.0).abs() < 1000.0,
+            "Expected ~60km altitude, got {:.0}m",
+            altitude
+        );
+    }
+
+    #[test]
+    fn advance_at_zero_tau_stays_at_start() {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let mut atm = AtmosphereModel::new(&[0.0, 100.0], &[550.0]);
+        atm.optics[0][0] = ShellOptics {
+            extinction: 1e-5,
+            ssa: 1.0,
+            asymmetry: 0.0,
+            rayleigh_fraction: 1.0,
+        };
+
+        let pos = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1000.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
+
+        let (scatter_pos, _dir, _shell) = advance_to_optical_depth(&atm, pos, dir, 0.0, 0);
+
+        let dist = (scatter_pos.x - pos.x).abs();
+        assert!(dist < 1.0, "tau=0 should stay at start, moved {:.1}m", dist);
     }
 
     // ── PhotonResult ──
