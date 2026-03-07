@@ -1165,6 +1165,7 @@ AdvanceResult advance_to_optical_depth(device const float* atm, float3 start_pos
 float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                              float3 sun_dir, uint wl_idx,
                              ShellOptics start_optics, float3 prev_dir_in,
+                             uint ray_idx, uint total_rays,
                              thread ulong &rng) {
     float3 local_up = normalize(start_pos);
     float surface_radius = EARTH_RADIUS_M;
@@ -1175,11 +1176,10 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     float zenith_frac, zenith_n;
     zenith_params_for_sza(sza_deg, zenith_frac, zenith_n);
 
-    // Two-branch importance sampling with branch probability weights.
-    // Phase branch prob = (1 - zenith_frac), zenith branch prob = zenith_frac.
-    // Branch weights: phase = 0.5/(1-zenith_frac), zenith = 0.5/zenith_frac.
-    // At SZA <= 96: zenith_frac=0.5, n=1, both weights = 1.0 exactly.
-    float xi_mix = xorshift_f32(rng);
+    // Stratified two-branch importance sampling with branch probability weights.
+    // xi_mix is stratified across rays for even coverage of both branches.
+    float xi_jitter = xorshift_f32(rng);
+    float xi_mix = (float(ray_idx) + xi_jitter) / float(total_rays);
     float3 dir;
     float cos_theta_init;
     float initial_weight;
@@ -1544,7 +1544,7 @@ kernel void hybrid_scatter(
             KahanAccum mc_I, mc_Q, mc_U, mc_V;
             for (uint ray = 0; ray < secondary_rays; ray++) {
                 float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
-                                                      my_op, view_dir, rng);
+                                                      my_op, view_dir, ray, secondary_rays, rng);
                 mc_I.add(chain.x);
                 mc_Q.add(chain.y);
                 mc_U.add(chain.z);
