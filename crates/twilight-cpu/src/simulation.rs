@@ -246,17 +246,38 @@ fn simulate_at_sza_mc(
 /// scattering. This produces converged results at deep twilight (15-18°
 /// depression) with far fewer photons than pure backward MC.
 ///
-/// Uses rayon parallelism over wavelengths.
+/// For scalar (non-polarized) mode, uses ALIS (Adjusted Lambda Importance
+/// Sampling) which traces ONE hero wavelength path per chain but evaluates
+/// ALL wavelengths simultaneously via per-wavelength weight ratios. This
+/// gives ~N_wl fewer shadow ray traces for the same expected value.
+///
+/// For polarized mode, uses rayon parallelism over wavelengths with full
+/// Stokes [I,Q,U,V] propagation per chain.
 fn simulate_at_sza_hybrid(
     atm: &AtmosphereModel,
     config: &SimulationConfig,
     sza_deg: f64,
 ) -> SpectralResult {
     let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
-    let num_wl = atm.num_wavelengths;
     let secondary_rays = config.photons_per_wavelength;
 
-    // Parallelize over wavelengths
+    if !config.polarized {
+        // ALIS path: all wavelengths in a single call.
+        let sza_bits = sza_deg.to_bits();
+        let mut rng = sza_bits.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let radiance_array = photon::hybrid_scatter_radiance_alis(
+            atm,
+            observer_pos,
+            view_dir,
+            sun_dir,
+            secondary_rays,
+            &mut rng,
+        );
+        return build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance);
+    }
+
+    // Polarized path: per-wavelength Stokes tracing with rayon parallelism.
+    let num_wl = atm.num_wavelengths;
     let per_wl_radiance: Vec<f64> = (0..num_wl)
         .into_par_iter()
         .map(|w| {
