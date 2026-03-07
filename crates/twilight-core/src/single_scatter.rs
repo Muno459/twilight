@@ -548,6 +548,63 @@ pub fn shadow_ray_transmittance_spectrum(
     result
 }
 
+/// Compute transmittance between two arbitrary points for all wavelengths.
+///
+/// Uses straight-line ray geometry with exact analytical path lengths
+/// through each shell via `ray_path_through_shell`. This is the correct
+/// approach for VPL connection segments: at the altitudes where VPLs
+/// live (50-80 km), refraction bending is < 0.01 degrees and the
+/// straight-line approximation is exact to f64 precision.
+///
+/// Returns `[0.0; 64]` if the ground blocks the line of sight.
+/// Returns `[1.0; 64]` if the points are coincident (dist < 1e-6 m).
+pub fn transmittance_between_points_spectrum(
+    atm: &AtmosphereModel,
+    from: Vec3,
+    to: Vec3,
+    num_wl: usize,
+) -> [f64; 64] {
+    let diff = Vec3::new(to.x - from.x, to.y - from.y, to.z - from.z);
+    let dist_total = diff.length();
+    if dist_total < 1e-6 {
+        return [1.0f64; 64];
+    }
+    let dir = diff.scale(1.0 / dist_total);
+
+    // Check if the ground blocks the line of sight.
+    let surface_radius = atm.surface_radius();
+    if let Some(hit) = ray_sphere_intersect(from, dir, surface_radius) {
+        if hit.t_near > 1e-3 && hit.t_near < dist_total - 1.0 {
+            return [0.0f64; 64];
+        }
+    }
+
+    // Accumulate optical depth through each shell using exact analytical
+    // path lengths. O(num_shells) with two ray-sphere intersections per
+    // shell, giving exact results without stepping artifacts.
+    let mut tau = [0.0f64; 64];
+
+    for s in 0..atm.num_shells {
+        let shell = &atm.shells[s];
+        let path_len = ray_path_through_shell(from, dir, shell.r_inner, shell.r_outer, dist_total);
+        if path_len > 0.0 {
+            for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
+                *tau_w += atm.optics[s][w].extinction * path_len;
+            }
+        }
+    }
+
+    let mut result = [0.0f64; 64];
+    for (w, res_w) in result.iter_mut().enumerate().take(num_wl) {
+        *res_w = if tau[w] > 50.0 {
+            0.0
+        } else {
+            libm::exp(-tau[w])
+        };
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

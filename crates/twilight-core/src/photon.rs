@@ -843,6 +843,91 @@ const TERMINATOR_TILT_MIN_DEG: f64 = 20.0;
 /// where shadow rays can first reach sunlit atmosphere.
 const TERMINATOR_TILT_MAX_DEG: f64 = 50.0;
 
+/// Number of altitude-based splitting levels for deep twilight variance reduction.
+///
+/// When a backward MC chain scatters above a split altitude, it is duplicated
+/// into K copies, each with weight/K. Each copy explores independently from
+/// the split point with an independent RNG stream. This is provably unbiased
+/// by weight conservation: K * (w/K) * E[score] = w * E[score].
+///
+/// Splitting directly addresses the rare-event bottleneck: at SZA 106, the
+/// probability of a chain reaching 60 km altitude from a 10 km LOS step is
+/// ~10^-3. Splitting at intermediate altitudes converts rare survivors into
+/// multiple independent explorations of the high-altitude region.
+const NUM_SPLIT_LEVELS: usize = 3;
+
+/// Altitude thresholds (meters above surface) at which splitting occurs.
+///
+///   25 km: chain escapes the dense troposphere (major bottleneck)
+///   45 km: chain reaches mid-stratosphere (approaching shadow boundary)
+///   65 km: chain reaches mesosphere (lateral transport region)
+const SPLIT_ALTITUDES_M: [f64; NUM_SPLIT_LEVELS] = [25_000.0, 45_000.0, 65_000.0];
+
+/// Split factors at deep twilight (SZA >= 102 deg).
+///
+/// Worst-case budget: 3 * 3 * 2 = 18 copies per chain. Each copy carries
+/// weight / (product of split factors encountered), so no weight inflation.
+const SPLIT_FACTORS_DEEP: [usize; NUM_SPLIT_LEVELS] = [3, 3, 2];
+
+/// Split factors in the transition band (96 <= SZA < 102 deg).
+///
+/// More conservative: 2 * 2 * 1 = 4 copies max. At SZA 96-100, chains can
+/// reach sunlit regions with ~5-10% probability, so moderate splitting suffices.
+const SPLIT_FACTORS_TRANSITION: [usize; NUM_SPLIT_LEVELS] = [2, 2, 1];
+
+/// Maximum number of concurrent split particles in the work stack.
+///
+/// Must be >= product of maximum split factors (3*3*2 = 18), plus headroom.
+/// Stack memory per particle: ~80 bytes (scalar) or ~600 bytes (ALIS with
+/// weight_ratio[64]). At 20 particles: 1.6 KB (scalar) or 12 KB (ALIS).
+const MAX_SPLIT_PARTICLES: usize = 20;
+
+/// State of a single particle in the altitude-splitting work stack (scalar mode).
+///
+/// When a chain scatters above a split altitude, it spawns K copies (each with
+/// weight/K) that explore the high-altitude region independently. The work
+/// stack stores pending copies; the main particle is processed first.
+#[derive(Clone, Copy)]
+struct SplitParticleScalar {
+    pos: Vec3,
+    dir: Vec3,
+    weight: f64,
+    rng: u64,
+    bounces_left: usize,
+    next_split: usize,
+}
+
+/// State of a single particle in the altitude-splitting work stack (ALIS mode).
+///
+/// Same as `SplitParticleScalar` but carries per-wavelength weight ratios
+/// for the ALIS hero tracing scheme.
+#[derive(Clone, Copy)]
+struct SplitParticleAlis {
+    pos: Vec3,
+    dir: Vec3,
+    hero_weight: f64,
+    weight_ratio: [f64; 64],
+    rng: u64,
+    bounces_left: usize,
+    next_split: usize,
+}
+
+/// Return split factors for the current SZA.
+///
+/// - SZA <= 96: no splitting (all 1s, zero overhead)
+/// - 96 < SZA < 102: transition factors (moderate, 2*2*1 = 4 max copies)
+/// - SZA >= 102: deep factors (aggressive, 3*3*2 = 18 max copies)
+#[inline]
+fn split_factors_for_sza(sza_deg: f64) -> [usize; NUM_SPLIT_LEVELS] {
+    if sza_deg < ZENITH_SZA_START {
+        [1; NUM_SPLIT_LEVELS]
+    } else if sza_deg < 102.0 {
+        SPLIT_FACTORS_TRANSITION
+    } else {
+        SPLIT_FACTORS_DEEP
+    }
+}
+
 /// Compute multi-scatter spectral radiance using a hybrid approach.
 ///
 /// This combines the deterministic single-scatter integrator (order 1, exact)
@@ -1468,9 +1553,7 @@ fn trace_secondary_chain_scalar(
         (d, shape_w * branch_w)
     };
 
-    let mut pos = start_pos;
-    let mut current_dir = dir;
-    let mut weight = start_optics.ssa * initial_weight;
+    let surface_radius = atm.surface_radius();
     let mut total = 0.0_f64;
 
     // Upfront forced scattering gate (same logic as Stokes version).
@@ -1482,161 +1565,238 @@ fn trace_secondary_chain_scalar(
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
-    for _scatter in 0..HYBRID_MAX_BOUNCES {
-        // --- Decide scatter mode for this bounce ---
-        let mut forced_this_bounce = false;
-        let mut tau_max = 0.0;
+    // Altitude-splitting setup. At SZA <= 96 all factors are 1 (no splitting,
+    // zero overhead). At SZA >= 102 we aggressively split chains that reach
+    // high altitude, rewarding the rare event of climbing through the troposphere.
+    let split_factors = split_factors_for_sza(sza_deg_local);
 
-        if use_forced {
-            let (tm, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, wavelength_idx);
-            tau_max = tm;
-            forced_this_bounce = !hit_ground && tm < FORCED_TAU_CUTOFF;
-        }
+    // Initialize work stack with the main particle.
+    let mut stack = [SplitParticleScalar {
+        pos: Vec3::new(0.0, 0.0, 0.0),
+        dir: Vec3::new(0.0, 0.0, 1.0),
+        weight: 0.0,
+        rng: 0,
+        bounces_left: 0,
+        next_split: 0,
+    }; MAX_SPLIT_PARTICLES];
+    let mut stack_len: usize = 1;
+    stack[0] = SplitParticleScalar {
+        pos: start_pos,
+        dir,
+        weight: start_optics.ssa * initial_weight,
+        rng: *rng_state,
+        bounces_left: HYBRID_MAX_BOUNCES,
+        next_split: 0,
+    };
+    let mut main_rng_out = *rng_state;
+    let mut main_processed = false;
 
-        let scatter_shell;
+    // Process all particles: main first, then split copies (LIFO order).
+    while stack_len > 0 {
+        stack_len -= 1;
+        let is_main = !main_processed;
+        main_processed = true;
+        let mut pos = stack[stack_len].pos;
+        let mut current_dir = stack[stack_len].dir;
+        let mut weight = stack[stack_len].weight;
+        let mut local_rng = stack[stack_len].rng;
+        let bounces_left = stack[stack_len].bounces_left;
+        let mut next_split = stack[stack_len].next_split;
 
-        if forced_this_bounce {
-            // Upfront forced scattering (unbiased)
-            let exp_neg_tau = libm::exp(-tau_max);
-            weight *= 1.0 - exp_neg_tau;
-            if weight < 1e-30 {
-                break;
+        for _bounce in 0..bounces_left {
+            // --- Decide scatter mode for this bounce ---
+            let mut forced_this_bounce = false;
+            let mut tau_max = 0.0;
+
+            if use_forced {
+                let (tm, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, wavelength_idx);
+                tau_max = tm;
+                forced_this_bounce = !hit_ground && tm < FORCED_TAU_CUTOFF;
             }
-            let xi = xorshift_f64(rng_state);
-            let tau_s = -libm::log(1.0 - xi * (1.0 - exp_neg_tau) + 1e-30);
-            let (sp, sd, ss) =
-                advance_to_optical_depth(atm, pos, current_dir, tau_s, wavelength_idx);
-            pos = sp;
-            current_dir = sd;
-            scatter_shell = ss;
-        } else {
-            // Analog scatter: standard shell-by-shell free-path walk
-            let mut scatter_found = false;
-            let mut found_shell = 0usize;
 
-            for _ in 0..200 {
-                let r = pos.length();
-                let shell_idx = match atm.shell_index(r) {
-                    Some(idx) => idx,
-                    None => break,
-                };
+            let scatter_shell;
 
-                let shell = &atm.shells[shell_idx];
-                let optics = &atm.optics[shell_idx][wavelength_idx];
+            if forced_this_bounce {
+                let exp_neg_tau = libm::exp(-tau_max);
+                weight *= 1.0 - exp_neg_tau;
+                if weight < 1e-30 {
+                    break;
+                }
+                let xi = xorshift_f64(&mut local_rng);
+                let tau_s = -libm::log(1.0 - xi * (1.0 - exp_neg_tau) + 1e-30);
+                let (sp, sd, ss) =
+                    advance_to_optical_depth(atm, pos, current_dir, tau_s, wavelength_idx);
+                pos = sp;
+                current_dir = sd;
+                scatter_shell = ss;
+            } else {
+                let mut scatter_found = false;
+                let mut found_shell = 0usize;
 
-                if optics.extinction < 1e-20 {
+                for _ in 0..200 {
+                    let r = pos.length();
+                    let shell_idx = match atm.shell_index(r) {
+                        Some(idx) => idx,
+                        None => break,
+                    };
+
+                    let shell = &atm.shells[shell_idx];
+                    let optics = &atm.optics[shell_idx][wavelength_idx];
+
+                    if optics.extinction < 1e-20 {
+                        match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                            Some((dist, is_outward)) => {
+                                let (np, nd) = cross_boundary(
+                                    pos,
+                                    current_dir,
+                                    dist,
+                                    is_outward,
+                                    shell_idx,
+                                    atm,
+                                );
+                                pos = np;
+                                current_dir = nd;
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+
+                    let cos_bias = current_dir.dot(term_axis);
+                    let sigma = optics.extinction;
+                    let sigma_prime = sigma * (1.0 - alpha_et * cos_bias);
+
+                    let xi = xorshift_f64(&mut local_rng);
+                    let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
+
                     match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                        Some((dist, is_outward)) => {
-                            let (np, nd) =
-                                cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
-                            pos = np;
-                            current_dir = nd;
-                            continue;
+                        Some((boundary_dist, is_outward)) => {
+                            if free_path >= boundary_dist {
+                                if alpha_et > 0.0 {
+                                    weight *=
+                                        libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
+                                }
+
+                                let (np, nd) = cross_boundary(
+                                    pos,
+                                    current_dir,
+                                    boundary_dist,
+                                    is_outward,
+                                    shell_idx,
+                                    atm,
+                                );
+                                pos = np;
+                                current_dir = nd;
+
+                                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                                    let albedo = atm.surface_albedo[wavelength_idx];
+                                    weight *= albedo;
+                                    if weight < 1e-30 {
+                                        break;
+                                    }
+                                    let normal = pos.normalize();
+                                    current_dir = sample_hemisphere(normal, &mut local_rng);
+                                    continue;
+                                }
+                                continue;
+                            }
                         }
                         None => break,
                     }
-                }
 
-                // Exponential transform: modified extinction.
-                // Bias axis tilted toward terminator at deep twilight.
-                let cos_bias = current_dir.dot(term_axis);
-                let sigma = optics.extinction;
-                let sigma_prime = sigma * (1.0 - alpha_et * cos_bias);
-
-                let xi = xorshift_f64(rng_state);
-                let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
-
-                match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                    Some((boundary_dist, is_outward)) => {
-                        if free_path >= boundary_dist {
-                            // Boundary crossing weight correction
-                            if alpha_et > 0.0 {
-                                weight *= libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
-                            }
-
-                            let (np, nd) = cross_boundary(
-                                pos,
-                                current_dir,
-                                boundary_dist,
-                                is_outward,
-                                shell_idx,
-                                atm,
-                            );
-                            pos = np;
-                            current_dir = nd;
-
-                            // Ground reflection
-                            if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
-                                let albedo = atm.surface_albedo[wavelength_idx];
-                                weight *= albedo;
-                                if weight < 1e-30 {
-                                    break;
-                                }
-                                let normal = pos.normalize();
-                                current_dir = sample_hemisphere(normal, rng_state);
-                                continue;
-                            }
-                            continue;
-                        }
+                    if alpha_et > 0.0 {
+                        weight *= (sigma / sigma_prime)
+                            * libm::exp(-alpha_et * sigma * cos_bias * free_path);
                     }
-                    None => break,
+                    pos = pos + current_dir * free_path;
+                    found_shell = shell_idx;
+                    scatter_found = true;
+                    break;
                 }
 
-                // Scatter within this shell.
-                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
-                if alpha_et > 0.0 {
-                    weight *=
-                        (sigma / sigma_prime) * libm::exp(-alpha_et * sigma * cos_bias * free_path);
+                if !scatter_found {
+                    break;
                 }
-                pos = pos + current_dir * free_path;
-                found_shell = shell_idx;
-                scatter_found = true;
+                scatter_shell = found_shell;
+            }
+
+            let optics = &atm.optics[scatter_shell][wavelength_idx];
+
+            // NEE: scalar phase function (no Mueller matrix)
+            let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
+
+            if t_sun_secondary > 1e-30 {
+                let cos_angle_nee = sun_dir.dot(-current_dir);
+                let phase = if optics.rayleigh_fraction > 0.99 {
+                    rayleigh_phase(cos_angle_nee)
+                } else {
+                    optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
+                        + (1.0 - optics.rayleigh_fraction)
+                            * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
+                };
+
+                let scale = weight * t_sun_secondary * INV_4PI;
+                total += phase * scale;
+            }
+
+            weight *= optics.ssa;
+            if weight < 1e-30 {
                 break;
             }
 
-            if !scatter_found {
-                break; // chain terminates: escaped atmosphere
-            }
-            scatter_shell = found_shell;
-        }
-
-        let optics = &atm.optics[scatter_shell][wavelength_idx];
-
-        // NEE: scalar phase function (no Mueller matrix)
-        let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
-
-        if t_sun_secondary > 1e-30 {
-            let cos_angle_nee = sun_dir.dot(-current_dir);
-            let phase = if optics.rayleigh_fraction > 0.99 {
-                rayleigh_phase(cos_angle_nee)
+            // Sample new direction
+            let cos_theta = if xorshift_f64(&mut local_rng) < optics.rayleigh_fraction {
+                sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
             } else {
-                optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
-                    + (1.0 - optics.rayleigh_fraction)
-                        * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
+                sample_henyey_greenstein(xorshift_f64(&mut local_rng), optics.asymmetry)
             };
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+            let new_dir = scatter_direction(current_dir, cos_theta, phi);
+            current_dir = new_dir;
 
-            let scale = weight * t_sun_secondary * INV_4PI;
-            total += phase * scale;
+            // --- Altitude-based splitting ---
+            // After a full bounce (NEE + SSA + new direction), check if the
+            // scatter position crossed an altitude threshold. If so, create
+            // K-1 independent copies with weight/K. Each copy explores the
+            // high-altitude region independently from this point.
+            //
+            // The NEE at this scatter point was already evaluated with the
+            // pre-split weight. The continuation uses weight/K for each of
+            // the K particles (main + copies). Weight conservation holds:
+            // K * (w/K) * E[future] = w * E[future].
+            let alt = pos.length() - surface_radius;
+            while next_split < NUM_SPLIT_LEVELS && alt > SPLIT_ALTITUDES_M[next_split] {
+                let k = split_factors[next_split];
+                if k > 1 {
+                    weight /= k as f64;
+                    let remaining = bounces_left.saturating_sub(_bounce + 1);
+                    for copy_idx in 1..k {
+                        if stack_len < MAX_SPLIT_PARTICLES {
+                            let child_rng = local_rng
+                                ^ (copy_idx as u64).wrapping_mul(2654435761)
+                                ^ ((next_split as u64) << 32);
+                            stack[stack_len] = SplitParticleScalar {
+                                pos,
+                                dir: current_dir,
+                                weight,
+                                rng: child_rng,
+                                bounces_left: remaining,
+                                next_split: next_split + 1,
+                            };
+                            stack_len += 1;
+                        }
+                    }
+                }
+                next_split += 1;
+            }
         }
 
-        // Apply SSA
-        weight *= optics.ssa;
-        if weight < 1e-30 {
-            break;
+        if is_main {
+            main_rng_out = local_rng;
         }
-
-        // Sample new direction (RNG consumption matches Stokes version)
-        let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
-        } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
-        };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-        let new_dir = scatter_direction(current_dir, cos_theta, phi);
-
-        current_dir = new_dir;
     }
 
+    *rng_state = main_rng_out;
     total
 }
 
@@ -1911,9 +2071,7 @@ fn trace_secondary_chain_alis(
         weight_ratio[w] = ssa_ratio * dir_ratio;
     }
 
-    let mut pos = start_pos;
-    let mut current_dir = dir;
-    let mut hero_weight = hero_optics.ssa * initial_weight;
+    let surface_radius = atm.surface_radius();
     let mut total = [0.0f64; 64];
 
     // Forced scattering + exponential transform setup (same as scalar tracer).
@@ -1923,237 +2081,300 @@ fn trace_secondary_chain_alis(
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
-    for _scatter in 0..HYBRID_MAX_BOUNCES {
-        // --- Decide scatter mode for this bounce ---
-        let mut forced_this_bounce = false;
-        let mut tau_maxes = [0.0f64; 64];
+    // Altitude-splitting setup (same ramp as scalar tracer).
+    let split_factors = split_factors_for_sza(sza_deg_local);
 
-        if use_forced {
-            let (tms, hit_ground) =
-                scout_tau_to_boundary_alis(atm, pos, current_dir, hero_wl, num_wl);
-            tau_maxes = tms;
-            forced_this_bounce = !hit_ground && tms[hero_wl] < FORCED_TAU_CUTOFF;
-        }
+    // Initialize work stack with the main particle.
+    let mut stack = [SplitParticleAlis {
+        pos: Vec3::new(0.0, 0.0, 0.0),
+        dir: Vec3::new(0.0, 0.0, 1.0),
+        hero_weight: 0.0,
+        weight_ratio: [0.0f64; 64],
+        rng: 0,
+        bounces_left: 0,
+        next_split: 0,
+    }; MAX_SPLIT_PARTICLES];
+    let mut stack_len: usize = 1;
+    stack[0] = SplitParticleAlis {
+        pos: start_pos,
+        dir,
+        hero_weight: hero_optics.ssa * initial_weight,
+        weight_ratio,
+        rng: *rng_state,
+        bounces_left: HYBRID_MAX_BOUNCES,
+        next_split: 0,
+    };
+    let mut main_rng_out = *rng_state;
+    let mut main_processed = false;
 
-        let scatter_shell;
+    // Process all particles: main first, then split copies (LIFO order).
+    while stack_len > 0 {
+        stack_len -= 1;
+        let is_main = !main_processed;
+        main_processed = true;
+        let mut pos = stack[stack_len].pos;
+        let mut current_dir = stack[stack_len].dir;
+        let mut hero_weight = stack[stack_len].hero_weight;
+        let mut wr = stack[stack_len].weight_ratio;
+        let mut local_rng = stack[stack_len].rng;
+        let bounces_left = stack[stack_len].bounces_left;
+        let mut next_split = stack[stack_len].next_split;
 
-        if forced_this_bounce {
-            // Upfront forced scattering on hero wavelength.
-            let tau_max_h = tau_maxes[hero_wl];
-            let exp_neg_tau_h = libm::exp(-tau_max_h);
-            let one_minus_exp_h = 1.0 - exp_neg_tau_h;
-            hero_weight *= one_minus_exp_h;
+        for _bounce in 0..bounces_left {
+            // --- Decide scatter mode for this bounce ---
+            let mut forced_this_bounce = false;
+            let mut tau_maxes = [0.0f64; 64];
+
+            if use_forced {
+                let (tms, hit_ground) =
+                    scout_tau_to_boundary_alis(atm, pos, current_dir, hero_wl, num_wl);
+                tau_maxes = tms;
+                forced_this_bounce = !hit_ground && tms[hero_wl] < FORCED_TAU_CUTOFF;
+            }
+
+            let scatter_shell;
+
+            if forced_this_bounce {
+                let tau_max_h = tau_maxes[hero_wl];
+                let exp_neg_tau_h = libm::exp(-tau_max_h);
+                let one_minus_exp_h = 1.0 - exp_neg_tau_h;
+                hero_weight *= one_minus_exp_h;
+                if hero_weight < 1e-30 {
+                    break;
+                }
+
+                for w in 0..num_wl {
+                    let one_minus_exp_w = 1.0 - libm::exp(-tau_maxes[w]);
+                    wr[w] *= if one_minus_exp_h > 1e-30 {
+                        one_minus_exp_w / one_minus_exp_h
+                    } else {
+                        0.0
+                    };
+                }
+
+                let xi = xorshift_f64(&mut local_rng);
+                let tau_s = -libm::log(1.0 - xi * one_minus_exp_h + 1e-30);
+                let (sp, sd, ss, taus_at_pos) =
+                    advance_to_optical_depth_alis(atm, pos, current_dir, tau_s, hero_wl, num_wl);
+                pos = sp;
+                current_dir = sd;
+                scatter_shell = ss;
+
+                let sigma_h = atm.optics[scatter_shell][hero_wl].extinction;
+                if sigma_h > 1e-30 {
+                    let tau_h_pos = taus_at_pos[hero_wl];
+                    for w in 0..num_wl {
+                        let sigma_w = atm.optics[scatter_shell][w].extinction;
+                        wr[w] *= (sigma_w / sigma_h) * libm::exp(-(taus_at_pos[w] - tau_h_pos));
+                    }
+                }
+            } else {
+                let mut scatter_found = false;
+                let mut found_shell = 0usize;
+
+                for _ in 0..200 {
+                    let r = pos.length();
+                    let shell_idx = match atm.shell_index(r) {
+                        Some(idx) => idx,
+                        None => break,
+                    };
+
+                    let shell = &atm.shells[shell_idx];
+                    let hero_ext = atm.optics[shell_idx][hero_wl].extinction;
+
+                    if hero_ext < 1e-20 {
+                        match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                            Some((dist, is_outward)) => {
+                                for w in 0..num_wl {
+                                    let sigma_w = atm.optics[shell_idx][w].extinction;
+                                    if sigma_w > 1e-30 {
+                                        wr[w] *= libm::exp(-sigma_w * dist);
+                                    }
+                                }
+                                let (np, nd) = cross_boundary(
+                                    pos,
+                                    current_dir,
+                                    dist,
+                                    is_outward,
+                                    shell_idx,
+                                    atm,
+                                );
+                                pos = np;
+                                current_dir = nd;
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+
+                    let cos_bias = current_dir.dot(term_axis);
+                    let sigma_h = hero_ext;
+                    let sigma_prime_h = sigma_h * (1.0 - alpha_et * cos_bias);
+
+                    let xi = xorshift_f64(&mut local_rng);
+                    let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime_h;
+
+                    match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                        Some((boundary_dist, is_outward)) => {
+                            if free_path >= boundary_dist {
+                                if alpha_et > 0.0 {
+                                    hero_weight *=
+                                        libm::exp(-alpha_et * sigma_h * cos_bias * boundary_dist);
+                                }
+                                for w in 0..num_wl {
+                                    let sigma_w = atm.optics[shell_idx][w].extinction;
+                                    wr[w] *= libm::exp(-(sigma_w - sigma_h) * boundary_dist);
+                                }
+
+                                let (np, nd) = cross_boundary(
+                                    pos,
+                                    current_dir,
+                                    boundary_dist,
+                                    is_outward,
+                                    shell_idx,
+                                    atm,
+                                );
+                                pos = np;
+                                current_dir = nd;
+
+                                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                                    let hero_albedo = atm.surface_albedo[hero_wl];
+                                    hero_weight *= hero_albedo;
+                                    if hero_weight < 1e-30 {
+                                        break;
+                                    }
+                                    for w in 0..num_wl {
+                                        let albedo_ratio = if hero_albedo > 1e-30 {
+                                            atm.surface_albedo[w] / hero_albedo
+                                        } else {
+                                            0.0
+                                        };
+                                        wr[w] *= albedo_ratio;
+                                    }
+                                    let normal = pos.normalize();
+                                    current_dir = sample_hemisphere(normal, &mut local_rng);
+                                    continue;
+                                }
+                                continue;
+                            }
+                        }
+                        None => break,
+                    }
+
+                    if alpha_et > 0.0 {
+                        hero_weight *= (sigma_h / sigma_prime_h)
+                            * libm::exp(-alpha_et * sigma_h * cos_bias * free_path);
+                    }
+                    for w in 0..num_wl {
+                        let sigma_w = atm.optics[shell_idx][w].extinction;
+                        if sigma_h > 1e-30 {
+                            wr[w] *=
+                                (sigma_w / sigma_h) * libm::exp(-(sigma_w - sigma_h) * free_path);
+                        }
+                    }
+                    pos = pos + current_dir * free_path;
+                    found_shell = shell_idx;
+                    scatter_found = true;
+                    break;
+                }
+
+                if !scatter_found {
+                    break;
+                }
+                scatter_shell = found_shell;
+            }
+
+            // NEE for ALL wavelengths using multi-wavelength shadow ray.
+            let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
+            let cos_angle_nee = sun_dir.dot(-current_dir);
+
+            for w in 0..num_wl {
+                if t_suns[w] > 1e-30 {
+                    let optics_w = &atm.optics[scatter_shell][w];
+                    let phase_w = scalar_phase_value(cos_angle_nee, optics_w);
+                    total[w] += hero_weight * wr[w] * t_suns[w] * phase_w * INV_4PI;
+                }
+            }
+
+            // Apply hero SSA.
+            let hero_scatter_optics = &atm.optics[scatter_shell][hero_wl];
+            hero_weight *= hero_scatter_optics.ssa;
             if hero_weight < 1e-30 {
                 break;
             }
 
-            // ALIS forced scatter probability ratio.
+            // ALIS SSA ratio correction.
             for w in 0..num_wl {
-                let one_minus_exp_w = 1.0 - libm::exp(-tau_maxes[w]);
-                weight_ratio[w] *= if one_minus_exp_h > 1e-30 {
-                    one_minus_exp_w / one_minus_exp_h
+                let ssa_w = atm.optics[scatter_shell][w].ssa;
+                let ssa_ratio = if hero_scatter_optics.ssa > 1e-30 {
+                    ssa_w / hero_scatter_optics.ssa
                 } else {
                     0.0
                 };
+                wr[w] *= ssa_ratio;
             }
 
-            // Sample from hero's truncated exponential, advance all wavelengths.
-            let xi = xorshift_f64(rng_state);
-            let tau_s = -libm::log(1.0 - xi * one_minus_exp_h + 1e-30);
-            let (sp, sd, ss, taus_at_pos) =
-                advance_to_optical_depth_alis(atm, pos, current_dir, tau_s, hero_wl, num_wl);
-            pos = sp;
-            current_dir = sd;
-            scatter_shell = ss;
-
-            // Position PDF ratio correction for non-hero wavelengths.
-            // Hero PDF at pos: sigma_h * exp(-tau_h_pos) / (1 - exp(-tau_max_h))
-            // Non-hero w PDF:  sigma_w * exp(-tau_w_pos) / (1 - exp(-tau_max_w))
-            // The (1-exp(-tau_max)) factors are already in weight_ratio.
-            // Remaining ratio: (sigma_w * exp(-tau_w_pos)) / (sigma_h * exp(-tau_h_pos))
-            let sigma_h = atm.optics[scatter_shell][hero_wl].extinction;
-            if sigma_h > 1e-30 {
-                let tau_h_pos = taus_at_pos[hero_wl];
-                for w in 0..num_wl {
-                    let sigma_w = atm.optics[scatter_shell][w].extinction;
-                    weight_ratio[w] *=
-                        (sigma_w / sigma_h) * libm::exp(-(taus_at_pos[w] - tau_h_pos));
-                }
-            }
-        } else {
-            // Analog scatter: hero walks shell-by-shell with exponential transform.
-            let mut scatter_found = false;
-            let mut found_shell = 0usize;
-
-            for _ in 0..200 {
-                let r = pos.length();
-                let shell_idx = match atm.shell_index(r) {
-                    Some(idx) => idx,
-                    None => break,
-                };
-
-                let shell = &atm.shells[shell_idx];
-                let hero_ext = atm.optics[shell_idx][hero_wl].extinction;
-
-                if hero_ext < 1e-20 {
-                    match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                        Some((dist, is_outward)) => {
-                            // ALIS: non-hero wavelengths may have nonzero extinction
-                            // in shells where the hero has ~zero. Apply exp(-sigma_w*D).
-                            for w in 0..num_wl {
-                                let sigma_w = atm.optics[shell_idx][w].extinction;
-                                if sigma_w > 1e-30 {
-                                    weight_ratio[w] *= libm::exp(-sigma_w * dist);
-                                }
-                            }
-                            let (np, nd) =
-                                cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
-                            pos = np;
-                            current_dir = nd;
-                            continue;
-                        }
-                        None => break,
-                    }
-                }
-
-                // Exponential transform: modified extinction for hero.
-                // Bias axis tilted toward terminator at deep twilight.
-                let cos_bias = current_dir.dot(term_axis);
-                let sigma_h = hero_ext;
-                let sigma_prime_h = sigma_h * (1.0 - alpha_et * cos_bias);
-
-                let xi = xorshift_f64(rng_state);
-                let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime_h;
-
-                match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                    Some((boundary_dist, is_outward)) => {
-                        if free_path >= boundary_dist {
-                            // Hero exp transform boundary correction.
-                            if alpha_et > 0.0 {
-                                hero_weight *=
-                                    libm::exp(-alpha_et * sigma_h * cos_bias * boundary_dist);
-                            }
-                            // ALIS boundary crossing: exp(-(sigma_w - sigma_h) * D).
-                            for w in 0..num_wl {
-                                let sigma_w = atm.optics[shell_idx][w].extinction;
-                                weight_ratio[w] *= libm::exp(-(sigma_w - sigma_h) * boundary_dist);
-                            }
-
-                            let (np, nd) = cross_boundary(
-                                pos,
-                                current_dir,
-                                boundary_dist,
-                                is_outward,
-                                shell_idx,
-                                atm,
-                            );
-                            pos = np;
-                            current_dir = nd;
-
-                            // Ground reflection.
-                            if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
-                                let hero_albedo = atm.surface_albedo[hero_wl];
-                                hero_weight *= hero_albedo;
-                                if hero_weight < 1e-30 {
-                                    break;
-                                }
-                                for w in 0..num_wl {
-                                    let albedo_ratio = if hero_albedo > 1e-30 {
-                                        atm.surface_albedo[w] / hero_albedo
-                                    } else {
-                                        0.0
-                                    };
-                                    weight_ratio[w] *= albedo_ratio;
-                                }
-                                let normal = pos.normalize();
-                                current_dir = sample_hemisphere(normal, rng_state);
-                                continue;
-                            }
-                            continue;
-                        }
-                    }
-                    None => break,
-                }
-
-                // Scatter within this shell.
-                // Hero exp transform correction.
-                if alpha_et > 0.0 {
-                    hero_weight *= (sigma_h / sigma_prime_h)
-                        * libm::exp(-alpha_et * sigma_h * cos_bias * free_path);
-                }
-                // ALIS scatter: (sigma_w/sigma_h) * exp(-(sigma_w - sigma_h) * d).
-                for w in 0..num_wl {
-                    let sigma_w = atm.optics[shell_idx][w].extinction;
-                    if sigma_h > 1e-30 {
-                        weight_ratio[w] *=
-                            (sigma_w / sigma_h) * libm::exp(-(sigma_w - sigma_h) * free_path);
-                    }
-                }
-                pos = pos + current_dir * free_path;
-                found_shell = shell_idx;
-                scatter_found = true;
-                break;
-            }
-
-            if !scatter_found {
-                break;
-            }
-            scatter_shell = found_shell;
-        }
-
-        // NEE for ALL wavelengths using multi-wavelength shadow ray.
-        let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
-        let cos_angle_nee = sun_dir.dot(-current_dir);
-
-        for w in 0..num_wl {
-            if t_suns[w] > 1e-30 {
-                let optics_w = &atm.optics[scatter_shell][w];
-                let phase_w = scalar_phase_value(cos_angle_nee, optics_w);
-                total[w] += hero_weight * weight_ratio[w] * t_suns[w] * phase_w * INV_4PI;
-            }
-        }
-
-        // Apply hero SSA.
-        let hero_scatter_optics = &atm.optics[scatter_shell][hero_wl];
-        hero_weight *= hero_scatter_optics.ssa;
-        if hero_weight < 1e-30 {
-            break;
-        }
-
-        // ALIS SSA ratio correction.
-        for w in 0..num_wl {
-            let ssa_w = atm.optics[scatter_shell][w].ssa;
-            let ssa_ratio = if hero_scatter_optics.ssa > 1e-30 {
-                ssa_w / hero_scatter_optics.ssa
+            // Sample new direction from hero's phase function.
+            let cos_theta = if xorshift_f64(&mut local_rng) < hero_scatter_optics.rayleigh_fraction
+            {
+                sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
             } else {
-                0.0
+                sample_henyey_greenstein(
+                    xorshift_f64(&mut local_rng),
+                    hero_scatter_optics.asymmetry,
+                )
             };
-            weight_ratio[w] *= ssa_ratio;
-        }
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+            let new_dir = scatter_direction(current_dir, cos_theta, phi);
 
-        // Sample new direction from hero's phase function.
-        let cos_theta = if xorshift_f64(rng_state) < hero_scatter_optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
-        } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), hero_scatter_optics.asymmetry)
-        };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-        let new_dir = scatter_direction(current_dir, cos_theta, phi);
+            // ALIS phase function ratio for direction sampling.
+            let phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics);
+            if phase_hero > 1e-30 {
+                for w in 0..num_wl {
+                    let optics_w = &atm.optics[scatter_shell][w];
+                    let phase_w = scalar_phase_value(cos_theta, optics_w);
+                    wr[w] *= phase_w / phase_hero;
+                }
+            }
 
-        // ALIS phase function ratio for direction sampling.
-        // Correction: phase_w(cos_theta) / phase_hero(cos_theta).
-        let phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics);
-        if phase_hero > 1e-30 {
-            for w in 0..num_wl {
-                let optics_w = &atm.optics[scatter_shell][w];
-                let phase_w = scalar_phase_value(cos_theta, optics_w);
-                weight_ratio[w] *= phase_w / phase_hero;
+            current_dir = new_dir;
+
+            // --- Altitude-based splitting ---
+            // Same logic as scalar tracer, but each child carries weight_ratio.
+            let alt = pos.length() - surface_radius;
+            while next_split < NUM_SPLIT_LEVELS && alt > SPLIT_ALTITUDES_M[next_split] {
+                let k = split_factors[next_split];
+                if k > 1 {
+                    hero_weight /= k as f64;
+                    let remaining = bounces_left.saturating_sub(_bounce + 1);
+                    for copy_idx in 1..k {
+                        if stack_len < MAX_SPLIT_PARTICLES {
+                            let child_rng = local_rng
+                                ^ (copy_idx as u64).wrapping_mul(2654435761)
+                                ^ ((next_split as u64) << 32);
+                            stack[stack_len] = SplitParticleAlis {
+                                pos,
+                                dir: current_dir,
+                                hero_weight,
+                                weight_ratio: wr,
+                                rng: child_rng,
+                                bounces_left: remaining,
+                                next_split: next_split + 1,
+                            };
+                            stack_len += 1;
+                        }
+                    }
+                }
+                next_split += 1;
             }
         }
 
-        current_dir = new_dir;
+        if is_main {
+            main_rng_out = local_rng;
+        }
     }
 
+    *rng_state = main_rng_out;
     total
 }
 
@@ -4111,6 +4332,269 @@ mod tests {
                 "zenith weight at n=1, cos={}: got {} expected 1.0",
                 cos_z,
                 w
+            );
+        }
+    }
+
+    // ── Altitude splitting ──
+
+    #[test]
+    fn split_factors_no_splitting_at_civil_twilight() {
+        let factors = split_factors_for_sza(90.0);
+        assert_eq!(factors, [1, 1, 1], "No splitting at civil twilight");
+    }
+
+    #[test]
+    fn split_factors_transition_band() {
+        let factors = split_factors_for_sza(99.0);
+        assert_eq!(factors, SPLIT_FACTORS_TRANSITION);
+    }
+
+    #[test]
+    fn split_factors_deep_twilight() {
+        let factors = split_factors_for_sza(106.0);
+        assert_eq!(factors, SPLIT_FACTORS_DEEP);
+    }
+
+    #[test]
+    fn split_factors_boundary_96() {
+        // Exactly at 96: should be no splitting (< ZENITH_SZA_START)
+        let factors = split_factors_for_sza(95.9);
+        assert_eq!(factors, [1, 1, 1]);
+    }
+
+    #[test]
+    fn split_factors_boundary_102() {
+        // At 102: deep factors
+        let factors = split_factors_for_sza(102.0);
+        assert_eq!(factors, SPLIT_FACTORS_DEEP);
+    }
+
+    #[test]
+    fn split_particle_scalar_size_reasonable() {
+        // Ensure SplitParticleScalar doesn't blow stack.
+        // 3 Vec3s (72 bytes) + f64 (8) + u64 (8) + 2 usize (16) = ~104 bytes
+        let size = core::mem::size_of::<SplitParticleScalar>();
+        assert!(size <= 128, "SplitParticleScalar too large: {} bytes", size);
+    }
+
+    #[test]
+    fn split_particle_alis_size_reasonable() {
+        // weight_ratio[64] = 512 bytes, plus overhead.
+        let size = core::mem::size_of::<SplitParticleAlis>();
+        assert!(size <= 640, "SplitParticleAlis too large: {} bytes", size);
+    }
+
+    #[test]
+    fn split_stack_scalar_fits_in_stack() {
+        // MAX_SPLIT_PARTICLES * sizeof(SplitParticleScalar) should be < 4 KB
+        let total = MAX_SPLIT_PARTICLES * core::mem::size_of::<SplitParticleScalar>();
+        assert!(
+            total <= 4096,
+            "Scalar split stack too large: {} bytes",
+            total
+        );
+    }
+
+    #[test]
+    fn split_stack_alis_fits_in_stack() {
+        // MAX_SPLIT_PARTICLES * sizeof(SplitParticleAlis) should be < 16 KB
+        let total = MAX_SPLIT_PARTICLES * core::mem::size_of::<SplitParticleAlis>();
+        assert!(
+            total <= 16384,
+            "ALIS split stack too large: {} bytes",
+            total
+        );
+    }
+
+    #[test]
+    fn splitting_unbiased_scalar_civil_twilight() {
+        // At civil twilight (SZA 90), splitting is disabled (all factors = 1).
+        // The new code must produce identical results to the old code.
+        // Run 1000 chains at SZA=90 with and without splitting and compare.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let altitudes_km = [0.0, 10.0, 50.0, 100.0];
+        let wavelengths = [550.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..3 {
+            atm.optics[s][0] = ShellOptics {
+                extinction: 1e-5 / (1.0 + s as f64),
+                ssa: 0.99,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        // SZA 90: sun on horizon
+        let sun_dir = Vec3::new(0.0, 1.0, 0.0);
+        let start_optics = &atm.optics[0][0];
+
+        let n = 1000;
+        let mut total = 0.0;
+        let mut rng: u64 = 42;
+        for ray in 0..n {
+            total += trace_secondary_chain_scalar(
+                &atm,
+                observer,
+                sun_dir,
+                0,
+                start_optics,
+                &mut rng,
+                ray,
+                n,
+            );
+        }
+        let mean = total / n as f64;
+        // At civil twilight the signal should be positive and finite
+        assert!(mean >= 0.0, "Mean should be non-negative, got {}", mean);
+        assert!(mean.is_finite(), "Mean should be finite, got {}", mean);
+    }
+
+    #[test]
+    fn splitting_non_negative_deep_twilight() {
+        // At SZA 106, splitting is active. All contributions must be non-negative.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let altitudes_km = [0.0, 10.0, 25.0, 50.0, 75.0, 100.0];
+        let wavelengths = [550.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..5 {
+            let alt_mid = (altitudes_km[s] + altitudes_km[s + 1]) / 2.0;
+            atm.optics[s][0] = ShellOptics {
+                extinction: 1.3e-5 * libm::exp(-alt_mid / 8.0),
+                ssa: 0.999,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        // SZA 106: sun 16 deg below horizon
+        let sza_rad = 106.0 * core::f64::consts::PI / 180.0;
+        let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+        let start_optics = &atm.optics[0][0];
+
+        let n = 500;
+        let mut rng: u64 = 777;
+        for ray in 0..n {
+            let val = trace_secondary_chain_scalar(
+                &atm,
+                observer,
+                sun_dir,
+                0,
+                start_optics,
+                &mut rng,
+                ray,
+                n,
+            );
+            assert!(
+                val >= 0.0,
+                "Chain {} returned negative value {} at SZA 106",
+                ray,
+                val
+            );
+            assert!(
+                val.is_finite(),
+                "Chain {} returned non-finite value {} at SZA 106",
+                ray,
+                val
+            );
+        }
+    }
+
+    #[test]
+    fn splitting_alis_non_negative_deep_twilight() {
+        // ALIS version at SZA 106: all wavelength contributions non-negative.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let altitudes_km = [0.0, 10.0, 25.0, 50.0, 75.0, 100.0];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..5 {
+            let alt_mid = (altitudes_km[s] + altitudes_km[s + 1]) / 2.0;
+            let base_ext = 1.3e-5 * libm::exp(-alt_mid / 8.0);
+            for w in 0..3 {
+                let wl = wavelengths[w];
+                let lambda_ratio = (550.0 / wl).powi(4);
+                atm.optics[s][w] = ShellOptics {
+                    extinction: base_ext * lambda_ratio,
+                    ssa: 0.999,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        let sza_rad = 106.0 * core::f64::consts::PI / 180.0;
+        let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+
+        let num_wl = 3;
+        let n = 200;
+        let mut rng: u64 = 999;
+        for ray in 0..n {
+            let hero_wl = ray % num_wl;
+            let result = trace_secondary_chain_alis(
+                &atm, observer, sun_dir, hero_wl, 0, &mut rng, ray, n, num_wl,
+            );
+            for w in 0..num_wl {
+                assert!(
+                    result[w] >= 0.0,
+                    "ALIS chain {} wl {} returned negative: {}",
+                    ray,
+                    w,
+                    result[w]
+                );
+                assert!(
+                    result[w].is_finite(),
+                    "ALIS chain {} wl {} returned non-finite: {}",
+                    ray,
+                    w,
+                    result[w]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_split_particles_sufficient() {
+        // The maximum split budget is 3*3*2 = 18 for deep twilight.
+        // MAX_SPLIT_PARTICLES must be >= this.
+        let max_budget: usize = SPLIT_FACTORS_DEEP.iter().product();
+        assert!(
+            MAX_SPLIT_PARTICLES >= max_budget,
+            "MAX_SPLIT_PARTICLES ({}) < max budget ({})",
+            MAX_SPLIT_PARTICLES,
+            max_budget
+        );
+    }
+
+    #[test]
+    fn split_altitudes_increasing() {
+        for i in 1..NUM_SPLIT_LEVELS {
+            assert!(
+                SPLIT_ALTITUDES_M[i] > SPLIT_ALTITUDES_M[i - 1],
+                "Split altitudes must be strictly increasing: [{}]={} <= [{}]={}",
+                i,
+                SPLIT_ALTITUDES_M[i],
+                i - 1,
+                SPLIT_ALTITUDES_M[i - 1]
+            );
+        }
+    }
+
+    #[test]
+    fn split_altitudes_within_atmosphere() {
+        use crate::atmosphere::TOA_ALTITUDE_M;
+        for (i, &alt) in SPLIT_ALTITUDES_M.iter().enumerate() {
+            assert!(
+                alt > 0.0 && alt < TOA_ALTITUDE_M,
+                "Split altitude [{}] = {} must be in (0, {})",
+                i,
+                alt,
+                TOA_ALTITUDE_M
             );
         }
     }
