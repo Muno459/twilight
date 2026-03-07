@@ -1353,10 +1353,11 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                     continue;
                 }
 
-                // Exponential transform: modified extinction
-                float cos_z = dot(current_dir, normalize(pos));
+                // Exponential transform: modified extinction.
+                // Bias axis tilted toward terminator at deep twilight.
+                float cos_bias = dot(current_dir, term_axis_dir);
                 float sigma = op.extinction;
-                float sigma_prime = sigma * (1.0f - alpha_et * cos_z);
+                float sigma_prime = sigma * (1.0f - alpha_et * cos_bias);
 
                 float xi = xorshift_f32(rng);
                 float free_path = -log(1.0f - xi + 1e-30f) / sigma_prime;
@@ -1365,10 +1366,9 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                 if (!bnd.found) break;
 
                 if (free_path >= bnd.dist) {
-                    // Boundary crossing weight correction:
-                    // exp(-(sigma - sigma') * D) = exp(-alpha * sigma * cos_z * D)
+                    // Boundary crossing weight correction
                     if (alpha_et > 0.0f) {
-                        weight *= exp(-alpha_et * sigma * cos_z * bnd.dist);
+                        weight *= exp(-alpha_et * sigma * cos_bias * bnd.dist);
                     }
 
                     float3 boundary_pos = pos + current_dir * bnd.dist;
@@ -1399,9 +1399,9 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                 }
 
                 // Scatter within this shell.
-                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_z * d)
+                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
                 if (alpha_et > 0.0f) {
-                    weight *= (sigma / sigma_prime) * exp(-alpha_et * sigma * cos_z * free_path);
+                    weight *= (sigma / sigma_prime) * exp(-alpha_et * sigma * cos_bias * free_path);
                 }
                 pos = pos + current_dir * free_path;
                 scatter_shell = us;

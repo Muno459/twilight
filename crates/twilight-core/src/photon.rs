@@ -1256,11 +1256,13 @@ fn trace_secondary_chain(
                     }
                 }
 
-                // Exponential transform: modified extinction
-                let cos_z = current_dir.dot(pos.normalize());
+                // Exponential transform: modified extinction.
+                // Bias axis is tilted toward the terminator at deep twilight,
+                // drifting the random walk toward sunlit atmosphere.
+                let cos_bias = current_dir.dot(term_axis);
                 let sigma = optics.extinction;
-                let sigma_prime = sigma * (1.0 - alpha_et * cos_z);
-                // sigma_prime > 0 guaranteed: alpha_et <= 0.5, |cos_z| <= 1
+                let sigma_prime = sigma * (1.0 - alpha_et * cos_bias);
+                // sigma_prime > 0 guaranteed: alpha_et <= 0.5, |cos_bias| <= 1
 
                 let xi = xorshift_f64(rng_state);
                 let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
@@ -1269,9 +1271,9 @@ fn trace_secondary_chain(
                     Some((boundary_dist, is_outward)) => {
                         if free_path >= boundary_dist {
                             // Boundary crossing weight correction:
-                            // exp(-(sigma - sigma') * D) = exp(-alpha * sigma * cos_z * D)
+                            // exp(-(sigma - sigma') * D) = exp(-alpha * sigma * cos_bias * D)
                             if alpha_et > 0.0 {
-                                weight *= libm::exp(-alpha_et * sigma * cos_z * boundary_dist);
+                                weight *= libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
                             }
 
                             let (np, nd) = cross_boundary(
@@ -1305,10 +1307,10 @@ fn trace_secondary_chain(
                 }
 
                 // Scatter within this shell.
-                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_z * d)
+                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
                 if alpha_et > 0.0 {
                     weight *=
-                        (sigma / sigma_prime) * libm::exp(-alpha_et * sigma * cos_z * free_path);
+                        (sigma / sigma_prime) * libm::exp(-alpha_et * sigma * cos_bias * free_path);
                 }
                 pos = pos + current_dir * free_path;
                 found_shell = shell_idx;
@@ -1535,10 +1537,11 @@ fn trace_secondary_chain_scalar(
                     }
                 }
 
-                // Exponential transform: modified extinction
-                let cos_z = current_dir.dot(pos.normalize());
+                // Exponential transform: modified extinction.
+                // Bias axis tilted toward terminator at deep twilight.
+                let cos_bias = current_dir.dot(term_axis);
                 let sigma = optics.extinction;
-                let sigma_prime = sigma * (1.0 - alpha_et * cos_z);
+                let sigma_prime = sigma * (1.0 - alpha_et * cos_bias);
 
                 let xi = xorshift_f64(rng_state);
                 let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
@@ -1548,7 +1551,7 @@ fn trace_secondary_chain_scalar(
                         if free_path >= boundary_dist {
                             // Boundary crossing weight correction
                             if alpha_et > 0.0 {
-                                weight *= libm::exp(-alpha_et * sigma * cos_z * boundary_dist);
+                                weight *= libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
                             }
 
                             let (np, nd) = cross_boundary(
@@ -1580,10 +1583,10 @@ fn trace_secondary_chain_scalar(
                 }
 
                 // Scatter within this shell.
-                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_z * d)
+                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
                 if alpha_et > 0.0 {
                     weight *=
-                        (sigma / sigma_prime) * libm::exp(-alpha_et * sigma * cos_z * free_path);
+                        (sigma / sigma_prime) * libm::exp(-alpha_et * sigma * cos_bias * free_path);
                 }
                 pos = pos + current_dir * free_path;
                 found_shell = shell_idx;
@@ -2014,9 +2017,10 @@ fn trace_secondary_chain_alis(
                 }
 
                 // Exponential transform: modified extinction for hero.
-                let cos_z = current_dir.dot(pos.normalize());
+                // Bias axis tilted toward terminator at deep twilight.
+                let cos_bias = current_dir.dot(term_axis);
                 let sigma_h = hero_ext;
-                let sigma_prime_h = sigma_h * (1.0 - alpha_et * cos_z);
+                let sigma_prime_h = sigma_h * (1.0 - alpha_et * cos_bias);
 
                 let xi = xorshift_f64(rng_state);
                 let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime_h;
@@ -2027,7 +2031,7 @@ fn trace_secondary_chain_alis(
                             // Hero exp transform boundary correction.
                             if alpha_et > 0.0 {
                                 hero_weight *=
-                                    libm::exp(-alpha_et * sigma_h * cos_z * boundary_dist);
+                                    libm::exp(-alpha_et * sigma_h * cos_bias * boundary_dist);
                             }
                             // ALIS boundary crossing: exp(-(sigma_w - sigma_h) * D).
                             for w in 0..num_wl {
@@ -2075,7 +2079,7 @@ fn trace_secondary_chain_alis(
                 // Hero exp transform correction.
                 if alpha_et > 0.0 {
                     hero_weight *= (sigma_h / sigma_prime_h)
-                        * libm::exp(-alpha_et * sigma_h * cos_z * free_path);
+                        * libm::exp(-alpha_et * sigma_h * cos_bias * free_path);
                 }
                 // ALIS scatter: (sigma_w/sigma_h) * exp(-(sigma_w - sigma_h) * d).
                 for w in 0..num_wl {
