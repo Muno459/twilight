@@ -1574,6 +1574,656 @@ fn trace_secondary_chain_scalar(
     total
 }
 
+/// Scalar phase function value for given scattering angle.
+///
+/// Convenience helper: evaluates the mixed Rayleigh+HG phase function for
+/// the optics at this wavelength. Used by ALIS weight ratio corrections.
+#[inline]
+fn scalar_phase_value(cos_theta: f64, optics: &crate::atmosphere::ShellOptics) -> f64 {
+    if optics.rayleigh_fraction > 0.99 {
+        rayleigh_phase(cos_theta)
+    } else {
+        optics.rayleigh_fraction * rayleigh_phase(cos_theta)
+            + (1.0 - optics.rayleigh_fraction)
+                * henyey_greenstein_phase(cos_theta, optics.asymmetry)
+    }
+}
+
+/// Multi-wavelength scout: compute optical depth to boundary for all wavelengths.
+///
+/// Same geometry as `scout_tau_to_boundary` but accumulates tau for all active
+/// wavelengths along the path. The refracted ray path is wavelength-independent
+/// (air refractive index dispersion is negligible over the visible range).
+///
+/// Early-exits when the hero wavelength's tau exceeds `FORCED_TAU_CUTOFF`,
+/// since the forced scatter decision is based on the hero.
+fn scout_tau_to_boundary_alis(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    start_dir: Vec3,
+    hero_wl: usize,
+    num_wl: usize,
+) -> ([f64; 64], bool) {
+    let surface_radius = atm.surface_radius();
+    let num_shells = atm.num_shells;
+    let mut pos = start_pos;
+    let mut dir = start_dir;
+    let mut tau = [0.0f64; 64];
+
+    let mut shell_idx = match atm.shell_index(pos.length()) {
+        Some(idx) => idx,
+        None => return (tau, false),
+    };
+
+    for _ in 0..200 {
+        let shell = &atm.shells[shell_idx];
+
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
+            Some((dist, is_outward)) => {
+                for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
+                    *tau_w += atm.optics[shell_idx][w].extinction * dist;
+                }
+
+                let boundary_pos = pos + dir * dist;
+                let n_from = atm.refractive_index[shell_idx];
+                let next_shell = if is_outward {
+                    shell_idx + 1
+                } else {
+                    shell_idx.wrapping_sub(1)
+                };
+                let n_to = if next_shell < num_shells {
+                    atm.refractive_index[next_shell]
+                } else {
+                    1.0
+                };
+                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                };
+                pos = boundary_pos + dir * 1e-3;
+
+                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                    return (tau, true);
+                }
+                if next_shell >= num_shells {
+                    return (tau, false);
+                }
+
+                shell_idx = next_shell;
+            }
+            None => return (tau, false),
+        }
+
+        if tau[hero_wl] > FORCED_TAU_CUTOFF {
+            return (tau, false);
+        }
+    }
+
+    (tau, false)
+}
+
+/// Multi-wavelength advance: advance to hero's optical depth, tracking all wavelengths.
+///
+/// Advances along the ray until the hero wavelength accumulates `tau_target`
+/// optical depth. Returns the position, direction, scatter shell, and the
+/// per-wavelength optical depths at the scatter position.
+fn advance_to_optical_depth_alis(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    start_dir: Vec3,
+    tau_target: f64,
+    hero_wl: usize,
+    num_wl: usize,
+) -> (Vec3, Vec3, usize, [f64; 64]) {
+    let surface_radius = atm.surface_radius();
+    let num_shells = atm.num_shells;
+    let mut pos = start_pos;
+    let mut dir = start_dir;
+    let mut tau_accumulated = [0.0f64; 64];
+    let mut hero_tau = 0.0;
+
+    let mut shell_idx = match atm.shell_index(pos.length()) {
+        Some(idx) => idx,
+        None => return (pos, dir, 0, tau_accumulated),
+    };
+
+    for _ in 0..200 {
+        let shell = &atm.shells[shell_idx];
+        let hero_extinction = atm.optics[shell_idx][hero_wl].extinction;
+
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
+            Some((boundary_dist, is_outward)) => {
+                let tau_shell_hero = hero_extinction * boundary_dist;
+
+                if hero_tau + tau_shell_hero >= tau_target {
+                    // Scatter point is within this shell.
+                    let tau_remaining = tau_target - hero_tau;
+                    let dist = if hero_extinction > 1e-30 {
+                        tau_remaining / hero_extinction
+                    } else {
+                        boundary_dist
+                    };
+                    for (w, tau_w) in tau_accumulated.iter_mut().enumerate().take(num_wl) {
+                        *tau_w += atm.optics[shell_idx][w].extinction * dist;
+                    }
+                    pos = pos + dir * dist;
+                    return (pos, dir, shell_idx, tau_accumulated);
+                }
+
+                // Cross boundary
+                hero_tau += tau_shell_hero;
+                for (w, tau_w) in tau_accumulated.iter_mut().enumerate().take(num_wl) {
+                    *tau_w += atm.optics[shell_idx][w].extinction * boundary_dist;
+                }
+
+                let boundary_pos = pos + dir * boundary_dist;
+                let n_from = atm.refractive_index[shell_idx];
+                let next_shell = if is_outward {
+                    shell_idx + 1
+                } else {
+                    shell_idx.wrapping_sub(1)
+                };
+                let n_to = if next_shell < num_shells {
+                    atm.refractive_index[next_shell]
+                } else {
+                    1.0
+                };
+                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                };
+                pos = boundary_pos + dir * 1e-3;
+
+                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                    return (pos, dir, shell_idx, tau_accumulated);
+                }
+                if next_shell >= num_shells {
+                    return (pos, dir, shell_idx, tau_accumulated);
+                }
+
+                shell_idx = next_shell;
+            }
+            None => return (pos, dir, shell_idx, tau_accumulated),
+        }
+    }
+
+    (pos, dir, shell_idx, tau_accumulated)
+}
+
+/// ALIS secondary chain tracer: trace ONE hero path, evaluate ALL wavelengths.
+///
+/// ALIS (Adjusted Lambda Importance Sampling) traces the photon path using the
+/// hero wavelength's extinction and phase function, while tracking per-wavelength
+/// weight ratios. At each NEE point, all wavelengths are evaluated using a single
+/// multi-wavelength shadow ray (`shadow_ray_transmittance_spectrum`).
+///
+/// Weight corrections for non-hero wavelengths account for:
+/// - Different extinction (free-path PDF ratio at boundary crossings and scatters)
+/// - Different SSA (survival probability)
+/// - Different phase function (direction sampling ratio at each bounce)
+///
+/// Returns per-wavelength MC contributions `[f64; 64]` to be multiplied by
+/// the LOS-step weighting factor for each wavelength.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn trace_secondary_chain_alis(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    sun_dir: Vec3,
+    hero_wl: usize,
+    start_shell: usize,
+    rng_state: &mut u64,
+    ray_idx: usize,
+    total_rays: usize,
+    num_wl: usize,
+) -> [f64; 64] {
+    use crate::single_scatter::shadow_ray_transmittance_spectrum;
+
+    let local_up = start_pos.normalize();
+    let hero_optics = &atm.optics[start_shell][hero_wl];
+
+    // --- SZA-adaptive zenith parameters ---
+    let cos_sza = sun_dir.dot(local_up);
+    let (zenith_frac, n) = zenith_params_for_sza(cos_sza);
+
+    // --- Stratified initial direction sampling ---
+    let xi_jitter = xorshift_f64(rng_state);
+    let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
+
+    // Sample initial direction from hero's phase function (phase branch) or
+    // zenith-biased distribution (zenith branch). Track cos_theta_init for
+    // phase function ratio correction on non-hero wavelengths.
+    let (dir, initial_weight, cos_theta_init, is_phase_branch) = if xi_mix < (1.0 - zenith_frac) {
+        // Phase function branch
+        let ct = if xorshift_f64(rng_state) < hero_optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        } else {
+            sample_henyey_greenstein(xorshift_f64(rng_state), hero_optics.asymmetry)
+        };
+        let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let branch_w = 0.5 / (1.0 - zenith_frac);
+        (scatter_direction(sun_dir, ct, phi_init), branch_w, ct, true)
+    } else {
+        // Zenith-biased branch (wavelength-independent)
+        let (d, cos_z) = sample_zenith_biased(local_up, n, rng_state);
+        let shape_w = zenith_importance_weight(cos_z, n);
+        let branch_w = 0.5 / zenith_frac;
+        (d, shape_w * branch_w, 0.0, false)
+    };
+
+    // Initialize per-wavelength weight ratios: weight_ratio[w] = weight_w / hero_weight.
+    // Corrections for SSA and initial direction sampling (phase function ratio).
+    let mut weight_ratio = [0.0f64; 64];
+    let hero_phase_init = if is_phase_branch {
+        scalar_phase_value(cos_theta_init, hero_optics)
+    } else {
+        1.0
+    };
+    for w in 0..num_wl {
+        let optics_w = &atm.optics[start_shell][w];
+        let ssa_ratio = if hero_optics.ssa > 1e-30 {
+            optics_w.ssa / hero_optics.ssa
+        } else {
+            0.0
+        };
+        let dir_ratio = if is_phase_branch && hero_phase_init > 1e-30 {
+            scalar_phase_value(cos_theta_init, optics_w) / hero_phase_init
+        } else {
+            1.0
+        };
+        weight_ratio[w] = ssa_ratio * dir_ratio;
+    }
+
+    let mut pos = start_pos;
+    let mut current_dir = dir;
+    let mut hero_weight = hero_optics.ssa * initial_weight;
+    let mut total = [0.0f64; 64];
+
+    // Forced scattering + exponential transform setup (same as scalar tracer).
+    let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
+    let use_forced = sza_deg_local >= ZENITH_SZA_START;
+    let sza_t_et =
+        ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
+    let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+
+    for _scatter in 0..HYBRID_MAX_BOUNCES {
+        // --- Decide scatter mode for this bounce ---
+        let mut forced_this_bounce = false;
+        let mut tau_maxes = [0.0f64; 64];
+
+        if use_forced {
+            let (tms, hit_ground) =
+                scout_tau_to_boundary_alis(atm, pos, current_dir, hero_wl, num_wl);
+            tau_maxes = tms;
+            forced_this_bounce = !hit_ground && tms[hero_wl] < FORCED_TAU_CUTOFF;
+        }
+
+        let scatter_shell;
+
+        if forced_this_bounce {
+            // Upfront forced scattering on hero wavelength.
+            let tau_max_h = tau_maxes[hero_wl];
+            let exp_neg_tau_h = libm::exp(-tau_max_h);
+            let one_minus_exp_h = 1.0 - exp_neg_tau_h;
+            hero_weight *= one_minus_exp_h;
+            if hero_weight < 1e-30 {
+                break;
+            }
+
+            // ALIS forced scatter probability ratio.
+            for w in 0..num_wl {
+                let one_minus_exp_w = 1.0 - libm::exp(-tau_maxes[w]);
+                weight_ratio[w] *= if one_minus_exp_h > 1e-30 {
+                    one_minus_exp_w / one_minus_exp_h
+                } else {
+                    0.0
+                };
+            }
+
+            // Sample from hero's truncated exponential, advance all wavelengths.
+            let xi = xorshift_f64(rng_state);
+            let tau_s = -libm::log(1.0 - xi * one_minus_exp_h + 1e-30);
+            let (sp, sd, ss, taus_at_pos) =
+                advance_to_optical_depth_alis(atm, pos, current_dir, tau_s, hero_wl, num_wl);
+            pos = sp;
+            current_dir = sd;
+            scatter_shell = ss;
+
+            // Position PDF ratio correction for non-hero wavelengths.
+            // Hero PDF at pos: sigma_h * exp(-tau_h_pos) / (1 - exp(-tau_max_h))
+            // Non-hero w PDF:  sigma_w * exp(-tau_w_pos) / (1 - exp(-tau_max_w))
+            // The (1-exp(-tau_max)) factors are already in weight_ratio.
+            // Remaining ratio: (sigma_w * exp(-tau_w_pos)) / (sigma_h * exp(-tau_h_pos))
+            let sigma_h = atm.optics[scatter_shell][hero_wl].extinction;
+            if sigma_h > 1e-30 {
+                let tau_h_pos = taus_at_pos[hero_wl];
+                for w in 0..num_wl {
+                    let sigma_w = atm.optics[scatter_shell][w].extinction;
+                    weight_ratio[w] *=
+                        (sigma_w / sigma_h) * libm::exp(-(taus_at_pos[w] - tau_h_pos));
+                }
+            }
+        } else {
+            // Analog scatter: hero walks shell-by-shell with exponential transform.
+            let mut scatter_found = false;
+            let mut found_shell = 0usize;
+
+            for _ in 0..200 {
+                let r = pos.length();
+                let shell_idx = match atm.shell_index(r) {
+                    Some(idx) => idx,
+                    None => break,
+                };
+
+                let shell = &atm.shells[shell_idx];
+                let hero_ext = atm.optics[shell_idx][hero_wl].extinction;
+
+                if hero_ext < 1e-20 {
+                    match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                        Some((dist, is_outward)) => {
+                            // ALIS: non-hero wavelengths may have nonzero extinction
+                            // in shells where the hero has ~zero. Apply exp(-sigma_w*D).
+                            for w in 0..num_wl {
+                                let sigma_w = atm.optics[shell_idx][w].extinction;
+                                if sigma_w > 1e-30 {
+                                    weight_ratio[w] *= libm::exp(-sigma_w * dist);
+                                }
+                            }
+                            let (np, nd) =
+                                cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
+                            pos = np;
+                            current_dir = nd;
+                            continue;
+                        }
+                        None => break,
+                    }
+                }
+
+                // Exponential transform: modified extinction for hero.
+                let cos_z = current_dir.dot(pos.normalize());
+                let sigma_h = hero_ext;
+                let sigma_prime_h = sigma_h * (1.0 - alpha_et * cos_z);
+
+                let xi = xorshift_f64(rng_state);
+                let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime_h;
+
+                match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                    Some((boundary_dist, is_outward)) => {
+                        if free_path >= boundary_dist {
+                            // Hero exp transform boundary correction.
+                            if alpha_et > 0.0 {
+                                hero_weight *=
+                                    libm::exp(-alpha_et * sigma_h * cos_z * boundary_dist);
+                            }
+                            // ALIS boundary crossing: exp(-(sigma_w - sigma_h) * D).
+                            for w in 0..num_wl {
+                                let sigma_w = atm.optics[shell_idx][w].extinction;
+                                weight_ratio[w] *= libm::exp(-(sigma_w - sigma_h) * boundary_dist);
+                            }
+
+                            let (np, nd) = cross_boundary(
+                                pos,
+                                current_dir,
+                                boundary_dist,
+                                is_outward,
+                                shell_idx,
+                                atm,
+                            );
+                            pos = np;
+                            current_dir = nd;
+
+                            // Ground reflection.
+                            if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
+                                let hero_albedo = atm.surface_albedo[hero_wl];
+                                hero_weight *= hero_albedo;
+                                if hero_weight < 1e-30 {
+                                    break;
+                                }
+                                for w in 0..num_wl {
+                                    let albedo_ratio = if hero_albedo > 1e-30 {
+                                        atm.surface_albedo[w] / hero_albedo
+                                    } else {
+                                        0.0
+                                    };
+                                    weight_ratio[w] *= albedo_ratio;
+                                }
+                                let normal = pos.normalize();
+                                current_dir = sample_hemisphere(normal, rng_state);
+                                continue;
+                            }
+                            continue;
+                        }
+                    }
+                    None => break,
+                }
+
+                // Scatter within this shell.
+                // Hero exp transform correction.
+                if alpha_et > 0.0 {
+                    hero_weight *= (sigma_h / sigma_prime_h)
+                        * libm::exp(-alpha_et * sigma_h * cos_z * free_path);
+                }
+                // ALIS scatter: (sigma_w/sigma_h) * exp(-(sigma_w - sigma_h) * d).
+                for w in 0..num_wl {
+                    let sigma_w = atm.optics[shell_idx][w].extinction;
+                    if sigma_h > 1e-30 {
+                        weight_ratio[w] *=
+                            (sigma_w / sigma_h) * libm::exp(-(sigma_w - sigma_h) * free_path);
+                    }
+                }
+                pos = pos + current_dir * free_path;
+                found_shell = shell_idx;
+                scatter_found = true;
+                break;
+            }
+
+            if !scatter_found {
+                break;
+            }
+            scatter_shell = found_shell;
+        }
+
+        // NEE for ALL wavelengths using multi-wavelength shadow ray.
+        let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
+        let cos_angle_nee = sun_dir.dot(-current_dir);
+
+        for w in 0..num_wl {
+            if t_suns[w] > 1e-30 {
+                let optics_w = &atm.optics[scatter_shell][w];
+                let phase_w = scalar_phase_value(cos_angle_nee, optics_w);
+                total[w] += hero_weight * weight_ratio[w] * t_suns[w] * phase_w * INV_4PI;
+            }
+        }
+
+        // Apply hero SSA.
+        let hero_scatter_optics = &atm.optics[scatter_shell][hero_wl];
+        hero_weight *= hero_scatter_optics.ssa;
+        if hero_weight < 1e-30 {
+            break;
+        }
+
+        // ALIS SSA ratio correction.
+        for w in 0..num_wl {
+            let ssa_w = atm.optics[scatter_shell][w].ssa;
+            let ssa_ratio = if hero_scatter_optics.ssa > 1e-30 {
+                ssa_w / hero_scatter_optics.ssa
+            } else {
+                0.0
+            };
+            weight_ratio[w] *= ssa_ratio;
+        }
+
+        // Sample new direction from hero's phase function.
+        let cos_theta = if xorshift_f64(rng_state) < hero_scatter_optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        } else {
+            sample_henyey_greenstein(xorshift_f64(rng_state), hero_scatter_optics.asymmetry)
+        };
+        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let new_dir = scatter_direction(current_dir, cos_theta, phi);
+
+        // ALIS phase function ratio for direction sampling.
+        // Correction: phase_w(cos_theta) / phase_hero(cos_theta).
+        let phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics);
+        if phase_hero > 1e-30 {
+            for w in 0..num_wl {
+                let optics_w = &atm.optics[scatter_shell][w];
+                let phase_w = scalar_phase_value(cos_theta, optics_w);
+                weight_ratio[w] *= phase_w / phase_hero;
+            }
+        }
+
+        current_dir = new_dir;
+    }
+
+    total
+}
+
+/// ALIS hybrid multi-scatter spectral radiance for all wavelengths.
+///
+/// Combines deterministic single-scatter integration (order 1) with ALIS MC
+/// secondary chains (orders 2+). Each chain traces ONE hero wavelength path
+/// but evaluates ALL wavelengths simultaneously, giving ~N_wl fewer chains
+/// than per-wavelength tracing.
+///
+/// The hero wavelength rotates round-robin across rays, giving even coverage.
+/// Per-wavelength weight ratios correct for differences in extinction, SSA,
+/// and phase function, keeping the estimator exactly unbiased.
+///
+/// Returns spectral radiance array `[f64; 64]` for all wavelengths.
+#[allow(clippy::needless_range_loop)]
+pub fn hybrid_scatter_radiance_alis(
+    atm: &AtmosphereModel,
+    observer_pos: Vec3,
+    view_dir: Vec3,
+    sun_dir: Vec3,
+    secondary_rays: usize,
+    rng_state: &mut u64,
+) -> [f64; 64] {
+    use crate::geometry::ray_sphere_intersect;
+    use crate::single_scatter::shadow_ray_transmittance_spectrum;
+
+    let num_wl = atm.num_wavelengths;
+    let toa_radius = atm.toa_radius();
+    let surface_radius = atm.surface_radius();
+    let mut radiance = [0.0f64; 64];
+
+    // Find LOS extent.
+    let los_max = match ray_sphere_intersect(observer_pos, view_dir, toa_radius) {
+        Some(hit) if hit.t_far > 0.0 => hit.t_far,
+        _ => return radiance,
+    };
+
+    let ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+    let los_end = match ground_hit {
+        Some(ref hit) if hit.t_near > 1e-3 && hit.t_near < los_max => hit.t_near,
+        _ => los_max,
+    };
+
+    if los_end <= 0.0 {
+        return radiance;
+    }
+
+    let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
+    let ds = los_end / num_steps as f64;
+
+    // Per-wavelength accumulated optical depth from observer.
+    let mut tau_obs = [0.0f64; 64];
+
+    for step in 0..num_steps {
+        let s = (step as f64 + 0.5) * ds;
+        let scatter_pos = observer_pos + view_dir * s;
+        let r = scatter_pos.length();
+
+        if r > toa_radius || r < surface_radius {
+            continue;
+        }
+
+        let shell_idx = match atm.shell_index(r) {
+            Some(idx) => idx,
+            None => continue,
+        };
+
+        // Check if any wavelength still has observable transmittance.
+        let mut any_visible = false;
+        for w in 0..num_wl {
+            let tau_mid = tau_obs[w] + atm.optics[shell_idx][w].extinction * ds * 0.5;
+            if libm::exp(-tau_mid) > 1e-30 {
+                any_visible = true;
+                break;
+            }
+        }
+        if !any_visible {
+            break;
+        }
+
+        // --- Order 1: deterministic single-scatter NEE (all wavelengths) ---
+        let t_suns = shadow_ray_transmittance_spectrum(atm, scatter_pos, sun_dir, num_wl);
+        let cos_theta_1 = sun_dir.dot(-view_dir);
+
+        for w in 0..num_wl {
+            let optics = &atm.optics[shell_idx][w];
+            let beta_scat = optics.extinction * optics.ssa;
+            if beta_scat < 1e-30 {
+                continue;
+            }
+
+            let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
+            let t_obs = libm::exp(-tau_obs_mid);
+            if t_obs < 1e-30 || t_suns[w] < 1e-30 {
+                continue;
+            }
+
+            let phase = scalar_phase_value(cos_theta_1, optics);
+            radiance[w] += beta_scat * phase * INV_4PI * t_suns[w] * t_obs * ds;
+        }
+
+        // --- Orders 2+: ALIS MC secondary chains ---
+        if secondary_rays > 0 {
+            let mut mc_totals = [0.0f64; 64];
+
+            for ray in 0..secondary_rays {
+                // Round-robin hero selection across wavelengths.
+                let hero_wl = ray % num_wl;
+
+                let chain_result = trace_secondary_chain_alis(
+                    atm,
+                    scatter_pos,
+                    sun_dir,
+                    hero_wl,
+                    shell_idx,
+                    rng_state,
+                    ray,
+                    secondary_rays,
+                    num_wl,
+                );
+
+                for w in 0..num_wl {
+                    mc_totals[w] += chain_result[w];
+                }
+            }
+
+            let inv_rays = 1.0 / secondary_rays as f64;
+            for w in 0..num_wl {
+                let optics = &atm.optics[shell_idx][w];
+                let beta_scat = optics.extinction * optics.ssa;
+                if beta_scat < 1e-30 {
+                    continue;
+                }
+                let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
+                let t_obs = libm::exp(-tau_obs_mid);
+                if t_obs < 1e-30 {
+                    continue;
+                }
+                radiance[w] += mc_totals[w] * inv_rays * beta_scat * t_obs * ds;
+            }
+        }
+
+        for w in 0..num_wl {
+            tau_obs[w] += atm.optics[shell_idx][w].extinction * ds;
+        }
+    }
+
+    radiance
+}
+
 /// Compute hybrid multi-scatter spectral radiance for all wavelengths.
 ///
 /// This is the primary function for physically-accurate twilight computation.
@@ -1600,6 +2250,23 @@ pub fn hybrid_scatter_spectrum(
     base_seed: u64,
     polarized: bool,
 ) -> [f64; 64] {
+    // ALIS path: trace ONE hero path per chain, evaluate ALL wavelengths.
+    // ~N_wl fewer chains than per-wavelength tracing, same expected value.
+    // Only available for scalar (non-polarized) mode; Stokes ALIS would need
+    // per-wavelength Mueller matrices which breaks the single-path assumption.
+    if !polarized {
+        let mut rng = base_seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        return hybrid_scatter_radiance_alis(
+            atm,
+            observer_pos,
+            view_dir,
+            sun_dir,
+            secondary_rays,
+            &mut rng,
+        );
+    }
+
+    // Polarized path: per-wavelength tracing (full Stokes [I,Q,U,V]).
     let mut radiance = [0.0f64; 64];
     let num_wl = atm.num_wavelengths;
 
@@ -2784,6 +3451,294 @@ mod tests {
                 dolp > 0.01,
                 "90-deg scatter should show polarization: DOLP={:.4}",
                 dolp
+            );
+        }
+    }
+
+    // ── ALIS (Adjusted Lambda Importance Sampling) ──
+
+    #[test]
+    fn alis_returns_correct_array_size() {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let altitudes_km = [0.0, 10.0, 50.0, 100.0];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..atm.num_shells {
+            for w in 0..3 {
+                let factor = if w == 0 {
+                    4.0
+                } else if w == 1 {
+                    1.0
+                } else {
+                    0.3
+                };
+                atm.optics[s][w] = ShellOptics {
+                    extinction: 1e-5 * factor * libm::exp(-atm.shells[s].altitude_mid / 8500.0),
+                    ssa: 1.0,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+
+        let obs = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let mut rng = 12345u64;
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+        assert_eq!(result.len(), 64);
+        // Active wavelengths should be non-negative
+        for w in 0..3 {
+            assert!(
+                result[w] >= 0.0,
+                "ALIS result[{}] should be non-negative, got {:.4e}",
+                w,
+                result[w]
+            );
+        }
+        // Unused wavelengths should be zero
+        for w in 3..64 {
+            assert!(
+                result[w].abs() < 1e-30,
+                "Unused ALIS result[{}] should be zero, got {:.4e}",
+                w,
+                result[w]
+            );
+        }
+    }
+
+    #[test]
+    fn alis_positive_at_civil_twilight() {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let altitudes_km = [0.0, 10.0, 50.0, 100.0];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..atm.num_shells {
+            for w in 0..3 {
+                let factor = if w == 0 {
+                    4.0
+                } else if w == 1 {
+                    1.0
+                } else {
+                    0.3
+                };
+                atm.optics[s][w] = ShellOptics {
+                    extinction: 1e-5 * factor * libm::exp(-atm.shells[s].altitude_mid / 8500.0),
+                    ssa: 1.0,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+
+        let obs = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let mut rng = 42u64;
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 200, &mut rng);
+        for w in 0..3 {
+            assert!(
+                result[w] > 0.0,
+                "ALIS at SZA=92 should produce positive radiance at wl[{}], got {:.4e}",
+                w,
+                result[w]
+            );
+        }
+    }
+
+    #[test]
+    fn alis_matches_per_wavelength_statistically() {
+        // ALIS should give the same expected value as per-wavelength tracing.
+        // We compare the mean over many seeds and check the ratio is close to 1.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let altitudes_km = [0.0, 10.0, 50.0, 100.0];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..atm.num_shells {
+            for w in 0..3 {
+                let factor = if w == 0 {
+                    4.0
+                } else if w == 1 {
+                    1.0
+                } else {
+                    0.3
+                };
+                atm.optics[s][w] = ShellOptics {
+                    extinction: 1e-5 * factor * libm::exp(-atm.shells[s].altitude_mid / 8500.0),
+                    ssa: 1.0,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+
+        let obs = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(96.0, 180.0, 0.0, 0.0);
+
+        let num_seeds = 20;
+        let rays = 100;
+        let mut alis_sum = [0.0f64; 3];
+        let mut perwl_sum = [0.0f64; 3];
+
+        for seed in 0..num_seeds {
+            let base = seed * 1000 + 7777;
+            let mut rng_alis = base;
+            let alis = hybrid_scatter_radiance_alis(&atm, obs, view, sun, rays, &mut rng_alis);
+            for w in 0..3 {
+                alis_sum[w] += alis[w];
+            }
+
+            for w in 0..3 {
+                let mut rng_perwl = (base as u64)
+                    .wrapping_add(w as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1);
+                let val =
+                    hybrid_scatter_radiance(&atm, obs, view, sun, w, rays, &mut rng_perwl, false);
+                perwl_sum[w] += val;
+            }
+        }
+
+        for w in 0..3 {
+            let alis_mean = alis_sum[w] / num_seeds as f64;
+            let perwl_mean = perwl_sum[w] / num_seeds as f64;
+            if perwl_mean > 1e-20 {
+                let ratio = alis_mean / perwl_mean;
+                assert!(
+                    ratio > 0.5 && ratio < 2.0,
+                    "ALIS/per-wl ratio at wl[{}] = {:.3} (ALIS={:.4e}, per-wl={:.4e}), expected ~1.0",
+                    w,
+                    ratio,
+                    alis_mean,
+                    perwl_mean,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alis_zero_in_empty_atmosphere() {
+        use crate::atmosphere::{AtmosphereModel, EARTH_RADIUS_M};
+
+        let altitudes_km = [0.0, 50.0, 100.0];
+        let wavelengths = [550.0];
+        let atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+
+        let obs = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let mut rng = 42u64;
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+        assert!(
+            result[0].abs() < 1e-30,
+            "Empty atmosphere ALIS should give zero, got {:.4e}",
+            result[0]
+        );
+    }
+
+    #[test]
+    fn alis_deep_twilight_non_negative() {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let altitudes_km = [0.0, 10.0, 50.0, 100.0];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..atm.num_shells {
+            for w in 0..3 {
+                let factor = if w == 0 {
+                    4.0
+                } else if w == 1 {
+                    1.0
+                } else {
+                    0.3
+                };
+                atm.optics[s][w] = ShellOptics {
+                    extinction: 1e-5 * factor * libm::exp(-atm.shells[s].altitude_mid / 8500.0),
+                    ssa: 1.0,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+
+        let obs = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
+
+        for sza in &[96.0, 100.0, 104.0, 106.0] {
+            let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
+            let mut rng = 12345u64;
+            let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+            for w in 0..3 {
+                assert!(
+                    result[w] >= 0.0,
+                    "ALIS at SZA={} wl[{}] should be non-negative, got {:.4e}",
+                    sza,
+                    w,
+                    result[w]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alis_scout_tau_boundary_matches_single() {
+        // Multi-wavelength scout should give the same tau as single-wavelength scout
+        // for the hero wavelength.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let altitudes_km = [0.0, 10.0, 50.0, 100.0];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..atm.num_shells {
+            for w in 0..3 {
+                let factor = if w == 0 {
+                    4.0
+                } else if w == 1 {
+                    1.0
+                } else {
+                    0.3
+                };
+                atm.optics[s][w] = ShellOptics {
+                    extinction: 1e-5 * factor * libm::exp(-atm.shells[s].altitude_mid / 8500.0),
+                    ssa: 1.0,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+
+        let pos = crate::geometry::Vec3::new(EARTH_RADIUS_M + 20000.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(0.5, 0.5, 0.707).normalize();
+
+        // Single-wavelength scout for each hero
+        for hero in 0..3 {
+            let (tau_single, hit_single) = scout_tau_to_boundary(&atm, pos, dir, hero);
+            let (tau_multi, hit_multi) = scout_tau_to_boundary_alis(&atm, pos, dir, hero, 3);
+
+            assert_eq!(
+                hit_single, hit_multi,
+                "hit_ground mismatch for hero={}: single={}, multi={}",
+                hero, hit_single, hit_multi
+            );
+            let rel_err = if tau_single > 1e-30 {
+                ((tau_multi[hero] - tau_single) / tau_single).abs()
+            } else {
+                (tau_multi[hero] - tau_single).abs()
+            };
+            assert!(
+                rel_err < 1e-10,
+                "ALIS scout tau for hero={} differs: single={:.6e}, multi={:.6e}, err={:.4e}",
+                hero,
+                tau_single,
+                tau_multi[hero],
+                rel_err
             );
         }
     }

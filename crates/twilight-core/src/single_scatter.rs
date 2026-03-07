@@ -470,7 +470,7 @@ pub fn single_scatter_spectrum(
 /// The refracted path is the same for all wavelengths (refractive index
 /// dispersion in air is negligible over the visible range), so we trace
 /// the geometry once and accumulate per-wavelength optical depths.
-fn shadow_ray_transmittance_spectrum(
+pub fn shadow_ray_transmittance_spectrum(
     atm: &AtmosphereModel,
     start_pos: Vec3,
     sun_dir: Vec3,
