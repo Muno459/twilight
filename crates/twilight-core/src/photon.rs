@@ -763,6 +763,25 @@ const INV_4PI: f64 = 1.0 / (4.0 * core::f64::consts::PI);
 /// (where analog scattering is already efficient).
 const FORCED_TAU_CUTOFF: f64 = 20.0;
 
+/// Maximum directional bias parameter for the exponential transform.
+///
+/// The exponential transform modifies the free-path sampling within each shell
+/// to bias photons in the upward (zenith) direction. The modified extinction is:
+///   sigma' = sigma * (1 - alpha * cos_z)
+/// where cos_z = dot(dir, local_up).
+///
+/// - Upward (cos_z > 0): sigma' < sigma, longer mean free path, photon climbs faster
+/// - Downward (cos_z < 0): sigma' > sigma, shorter mean free path, photon absorbed sooner
+///
+/// At alpha=0.5: sigma' in [0.5*sigma, 1.5*sigma], always positive.
+/// Weight corrections keep the estimator exactly unbiased:
+///   - Scatter at distance d:   weight *= (sigma/sigma') * exp(-alpha*sigma*cos_z*d)
+///   - Boundary cross at dist D: weight *= exp(-alpha*sigma*cos_z*D)
+///
+/// Ramped from 0 (SZA < 96) to EXP_TRANSFORM_ALPHA_MAX (SZA >= 106), using
+/// the same SZA ramp as zenith-biased direction sampling.
+const EXP_TRANSFORM_ALPHA_MAX: f64 = 0.5;
+
 /// Power exponent for zenith-biased initial direction sampling.
 ///
 /// The secondary chain's hemisphere branch uses a power-cosine PDF:
@@ -1114,6 +1133,14 @@ fn trace_secondary_chain(
     let sza_deg_local = libm::acos(cos_sza_local.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
     let use_forced = sza_deg_local >= ZENITH_SZA_START;
 
+    // Exponential transform bias parameter.
+    // Ramps from 0 (SZA < 96) to EXP_TRANSFORM_ALPHA_MAX (SZA >= 106).
+    // At alpha=0: sigma'=sigma, all weight corrections are 1.0 (zero overhead).
+    // At alpha=0.5: upward photons get 2x mean free path, downward get 2/3x.
+    let sza_t_et =
+        ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
+    let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+
     for _scatter in 0..HYBRID_MAX_BOUNCES {
         // --- Decide scatter mode for this bounce ---
         let mut forced_this_bounce = false;
@@ -1146,8 +1173,11 @@ fn trace_secondary_chain(
             current_dir = sd;
             scatter_shell = ss;
         } else {
-            // Analog scatter: standard shell-by-shell free-path walk.
-            // If the photon escapes the atmosphere, the chain terminates.
+            // Analog scatter with exponential transform.
+            // Modified extinction: sigma' = sigma * (1 - alpha * cos_z)
+            // where cos_z = dot(dir, local_up). Upward photons get longer
+            // mean free path, downward get shorter. Weight corrections keep
+            // the estimator exactly unbiased.
             let mut scatter_found = false;
             let mut found_shell = 0usize;
 
@@ -1174,12 +1204,24 @@ fn trace_secondary_chain(
                     }
                 }
 
+                // Exponential transform: modified extinction
+                let cos_z = current_dir.dot(pos.normalize());
+                let sigma = optics.extinction;
+                let sigma_prime = sigma * (1.0 - alpha_et * cos_z);
+                // sigma_prime > 0 guaranteed: alpha_et <= 0.5, |cos_z| <= 1
+
                 let xi = xorshift_f64(rng_state);
-                let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+                let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
 
                 match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
                     Some((boundary_dist, is_outward)) => {
                         if free_path >= boundary_dist {
+                            // Boundary crossing weight correction:
+                            // exp(-(sigma - sigma') * D) = exp(-alpha * sigma * cos_z * D)
+                            if alpha_et > 0.0 {
+                                weight *= libm::exp(-alpha_et * sigma * cos_z * boundary_dist);
+                            }
+
                             let (np, nd) = cross_boundary(
                                 pos,
                                 current_dir,
@@ -1210,7 +1252,12 @@ fn trace_secondary_chain(
                     None => break,
                 }
 
-                // Scatter within this shell
+                // Scatter within this shell.
+                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_z * d)
+                if alpha_et > 0.0 {
+                    weight *=
+                        (sigma / sigma_prime) * libm::exp(-alpha_et * sigma * cos_z * free_path);
+                }
                 pos = pos + current_dir * free_path;
                 found_shell = shell_idx;
                 scatter_found = true;
@@ -1365,6 +1412,11 @@ fn trace_secondary_chain_scalar(
     let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
     let use_forced = sza_deg_local >= ZENITH_SZA_START;
 
+    // Exponential transform bias parameter (same ramp as Stokes version).
+    let sza_t_et =
+        ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
+    let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+
     for _scatter in 0..HYBRID_MAX_BOUNCES {
         // --- Decide scatter mode for this bounce ---
         let mut forced_this_bounce = false;
@@ -1420,12 +1472,22 @@ fn trace_secondary_chain_scalar(
                     }
                 }
 
+                // Exponential transform: modified extinction
+                let cos_z = current_dir.dot(pos.normalize());
+                let sigma = optics.extinction;
+                let sigma_prime = sigma * (1.0 - alpha_et * cos_z);
+
                 let xi = xorshift_f64(rng_state);
-                let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+                let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
 
                 match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
                     Some((boundary_dist, is_outward)) => {
                         if free_path >= boundary_dist {
+                            // Boundary crossing weight correction
+                            if alpha_et > 0.0 {
+                                weight *= libm::exp(-alpha_et * sigma * cos_z * boundary_dist);
+                            }
+
                             let (np, nd) = cross_boundary(
                                 pos,
                                 current_dir,
@@ -1454,7 +1516,12 @@ fn trace_secondary_chain_scalar(
                     None => break,
                 }
 
-                // Scatter within this shell
+                // Scatter within this shell.
+                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_z * d)
+                if alpha_et > 0.0 {
+                    weight *=
+                        (sigma / sigma_prime) * libm::exp(-alpha_et * sigma * cos_z * free_path);
+                }
                 pos = pos + current_dir * free_path;
                 found_shell = shell_idx;
                 scatter_found = true;

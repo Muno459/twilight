@@ -67,6 +67,13 @@ constant float ZENITH_SZA_START_DEG = 96.0f;
 // weight is indistinguishable from 1.0 and we fall back to analog scatter.
 constant float FORCED_TAU_CUTOFF = 20.0f;
 
+// Maximum directional bias for the exponential transform.
+// sigma' = sigma * (1 - alpha * cos_z). At alpha=0.5, sigma' in [0.5*sigma, 1.5*sigma].
+constant float EXP_TRANSFORM_ALPHA_MAX = 0.5f;
+
+// SZA at which the exponential transform reaches full strength.
+constant float ZENITH_SZA_FULL_DEG = 106.0f;
+
 // ============================================================================
 // Buffer accessor helpers
 // ============================================================================
@@ -1172,6 +1179,11 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
     bool use_forced = (sza_deg >= ZENITH_SZA_START_DEG);
 
+    // Exponential transform bias parameter (ramps with SZA)
+    float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
+                           / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
+    float alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+
     for (uint scatter_iter = 0; scatter_iter < HYBRID_MAX_BOUNCES; scatter_iter++) {
         // --- Decide scatter mode for this bounce ---
         bool forced_this_bounce = false;
@@ -1223,13 +1235,24 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                     continue;
                 }
 
+                // Exponential transform: modified extinction
+                float cos_z = dot(current_dir, normalize(pos));
+                float sigma = op.extinction;
+                float sigma_prime = sigma * (1.0f - alpha_et * cos_z);
+
                 float xi = xorshift_f32(rng);
-                float free_path = -log(1.0f - xi + 1e-30f) / op.extinction;
+                float free_path = -log(1.0f - xi + 1e-30f) / sigma_prime;
 
                 ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
                 if (!bnd.found) break;
 
                 if (free_path >= bnd.dist) {
+                    // Boundary crossing weight correction:
+                    // exp(-(sigma - sigma') * D) = exp(-alpha * sigma * cos_z * D)
+                    if (alpha_et > 0.0f) {
+                        weight *= exp(-alpha_et * sigma * cos_z * bnd.dist);
+                    }
+
                     float3 boundary_pos = pos + current_dir * bnd.dist;
                     boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
 
@@ -1257,7 +1280,11 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                     continue;
                 }
 
-                // Scatter within this shell
+                // Scatter within this shell.
+                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_z * d)
+                if (alpha_et > 0.0f) {
+                    weight *= (sigma / sigma_prime) * exp(-alpha_et * sigma * cos_z * free_path);
+                }
                 pos = pos + current_dir * free_path;
                 scatter_shell = us;
                 scatter_found = true;
