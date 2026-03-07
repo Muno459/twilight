@@ -74,6 +74,13 @@ constant float EXP_TRANSFORM_ALPHA_MAX = 0.5f;
 // SZA at which the exponential transform reaches full strength.
 constant float ZENITH_SZA_FULL_DEG = 106.0f;
 
+// Power exponent for zenith-biased initial direction sampling.
+// cos^n(theta_zenith) concentrates rays near zenith at deep twilight.
+constant float ZENITH_BIAS_N = 5.0f;
+
+// Maximum fraction of rays using zenith-biased sampling at deep twilight.
+constant float ZENITH_MAX_FRACTION = 0.95f;
+
 // ============================================================================
 // Buffer accessor helpers
 // ============================================================================
@@ -722,6 +729,40 @@ float3 sample_hemisphere(float3 normal, thread ulong &rng) {
     return scatter_direction(normal, cos_theta, phi);
 }
 
+// Sample from power-cosine distribution biased toward normal.
+// PDF: p(omega) = (n+1)/(2*pi) * cos^n(theta).
+// Consumes exactly 2 RNG draws (matching sample_hemisphere).
+// Returns (direction, cos_theta).
+struct ZenithSample {
+    float3 dir;
+    float cos_theta;
+};
+
+ZenithSample sample_zenith_biased(float3 normal, float n, thread ulong &rng) {
+    float xi1 = xorshift_f32(rng);
+    float xi2 = xorshift_f32(rng);
+    float cos_theta = pow(xi1, 1.0f / (n + 1.0f));
+    float phi = 2.0f * PI * xi2;
+    float3 dir = scatter_direction(normal, cos_theta, phi);
+    return ZenithSample{dir, cos_theta};
+}
+
+// Importance weight correction for zenith-biased sampling.
+// w = p_cosine(theta) / p_zenith(theta) = 2/(n+1) * cos^(1-n)(theta)
+inline float zenith_importance_weight(float cos_theta, float n) {
+    float cos_nm1 = pow(cos_theta, n - 1.0f);
+    return 2.0f / ((n + 1.0f) * cos_nm1);
+}
+
+// SZA-adaptive zenith bias parameters.
+// Returns (zenith_frac, n) via out parameters.
+inline void zenith_params_for_sza(float sza_deg, thread float &zenith_frac, thread float &n_out) {
+    float sza_t = clamp((sza_deg - ZENITH_SZA_START_DEG)
+                        / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
+    zenith_frac = 0.5f + (ZENITH_MAX_FRACTION - 0.5f) * sza_t;
+    n_out = 1.0f + (ZENITH_BIAS_N - 1.0f) * sza_t;
+}
+
 // ============================================================================
 // Kernel 1: single_scatter_spectrum
 //
@@ -1128,11 +1169,22 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     float3 local_up = normalize(start_pos);
     float surface_radius = EARTH_RADIUS_M;
 
-    // Importance sampling: 50/50 phase-function vs upward-biased
+    // SZA-adaptive zenith bias parameters
+    float cos_sza = dot(sun_dir, local_up);
+    float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
+    float zenith_frac, zenith_n;
+    zenith_params_for_sza(sza_deg, zenith_frac, zenith_n);
+
+    // Two-branch importance sampling with branch probability weights.
+    // Phase branch prob = (1 - zenith_frac), zenith branch prob = zenith_frac.
+    // Branch weights: phase = 0.5/(1-zenith_frac), zenith = 0.5/zenith_frac.
+    // At SZA <= 96: zenith_frac=0.5, n=1, both weights = 1.0 exactly.
     float xi_mix = xorshift_f32(rng);
     float3 dir;
     float cos_theta_init;
-    if (xi_mix < 0.5f) {
+    float initial_weight;
+    if (xi_mix < (1.0f - zenith_frac)) {
+        // Phase function branch
         if (xorshift_f32(rng) < start_optics.rayleigh_fraction) {
             cos_theta_init = sample_rayleigh_analytic(xorshift_f32(rng));
         } else {
@@ -1140,10 +1192,15 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         }
         float phi_init = 2.0f * PI * xorshift_f32(rng);
         dir = scatter_direction(sun_dir, cos_theta_init, phi_init);
+        initial_weight = 0.5f / (1.0f - zenith_frac);
     } else {
-        dir = sample_hemisphere(local_up, rng);
-        // Compute cos_theta for the initial scatter (for Stokes update)
+        // Zenith-biased branch with shape + branch weight correction
+        ZenithSample zs = sample_zenith_biased(local_up, zenith_n, rng);
+        dir = zs.dir;
         cos_theta_init = dot(sun_dir, dir);
+        float shape_w = zenith_importance_weight(zs.cos_theta, zenith_n);
+        float branch_w = 0.5f / zenith_frac;
+        initial_weight = shape_w * branch_w;
     }
 
     // Initialize Stokes state: apply first scatter's Mueller to incoming state
@@ -1169,14 +1226,13 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     float3 pos = start_pos;
     float3 current_dir = dir;
     float3 prev_dir = sun_dir; // direction before current propagation segment
-    float weight = start_optics.ssa;
+    float weight = start_optics.ssa * initial_weight;
 
     // KBN accumulators for each Stokes component
     KahanAccum total_I, total_Q, total_U, total_V;
 
     // Upfront forced scattering gate: only at deep twilight
-    float cos_sza = dot(sun_dir, local_up);
-    float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
+    // (cos_sza and sza_deg already computed above for zenith bias)
     bool use_forced = (sza_deg >= ZENITH_SZA_START_DEG);
 
     // Exponential transform bias parameter (ramps with SZA)
