@@ -576,6 +576,27 @@ const HYBRID_LOS_STEPS: usize = 200;
 /// Maximum bounces for secondary chains in the hybrid integrator.
 const HYBRID_MAX_BOUNCES: usize = 50;
 
+/// Altitude (km) above which chain splitting activates. At deep twilight
+/// the shadow boundary is near 20-40 km, so chains reaching this altitude
+/// have a realistic chance of connecting to sunlight via NEE. Splitting
+/// here multiplies sampling in this critical region.
+const SPLIT_ALTITUDE_KM: f64 = 15.0;
+
+/// Number of sub-chains created at a split point. Each sub-chain carries
+/// weight / SPLIT_FACTOR, keeping the estimator unbiased:
+/// E[K * (w/K) * contribution] = E[w * contribution].
+const SPLIT_FACTOR: usize = 4;
+
+/// Maximum depth of recursive splitting. Prevents exponential blowup
+/// (at most SPLIT_FACTOR^MAX_SPLIT_DEPTH total sub-chains per ray).
+const MAX_SPLIT_DEPTH: usize = 2;
+
+/// Maximum stack capacity for chain splitting.
+/// With SPLIT_FACTOR=4, MAX_SPLIT_DEPTH=2: up to (4-1) + (4-1)*4 = 15
+/// frames could be live simultaneously (worst case). In practice, chains
+/// terminate early so the stack rarely grows beyond ~6 frames.
+const SPLIT_STACK_CAPACITY: usize = 15;
+
 /// Compute multi-scatter spectral radiance using a hybrid approach.
 ///
 /// This combines the deterministic single-scatter integrator (order 1, exact)
@@ -729,7 +750,7 @@ pub fn hybrid_scatter_radiance(
         if secondary_rays > 0 {
             if polarized {
                 let mut mc_stokes = StokesVector::unpolarized(0.0);
-                for _ray in 0..secondary_rays {
+                for ray in 0..secondary_rays {
                     let chain_stokes = trace_secondary_chain(
                         atm,
                         scatter_pos,
@@ -738,6 +759,8 @@ pub fn hybrid_scatter_radiance(
                         wavelength_idx,
                         optics,
                         rng_state,
+                        ray,
+                        secondary_rays,
                     );
                     mc_stokes = mc_stokes.add(&chain_stokes);
                 }
@@ -747,7 +770,7 @@ pub fn hybrid_scatter_radiance(
                 stokes_total = stokes_total.add(&mc_avg.scale(scale_m));
             } else {
                 let mut mc_scalar = 0.0_f64;
-                for _ray in 0..secondary_rays {
+                for ray in 0..secondary_rays {
                     mc_scalar += trace_secondary_chain_scalar(
                         atm,
                         scatter_pos,
@@ -755,6 +778,8 @@ pub fn hybrid_scatter_radiance(
                         wavelength_idx,
                         optics,
                         rng_state,
+                        ray,
+                        secondary_rays,
                     );
                 }
                 let inv_rays = 1.0 / secondary_rays as f64;
@@ -781,6 +806,17 @@ pub fn hybrid_scatter_radiance(
 ///
 /// Returns the multi-scatter Stokes contribution that should be multiplied
 /// by the LOS-step weighting factor.
+///
+/// # Variance reduction
+///
+/// Same two unbiased techniques as `trace_secondary_chain_scalar`:
+///
+/// 1. **Stratified initial direction sampling** via `ray_idx` / `total_rays`.
+/// 2. **Altitude-based chain splitting** above `SPLIT_ALTITUDE_KM`.
+///
+/// The RNG consumption order is identical to the scalar version so both
+/// produce the same chain trajectories (given the same seed and ray index).
+#[allow(clippy::too_many_arguments)]
 fn trace_secondary_chain(
     atm: &AtmosphereModel,
     start_pos: Vec3,
@@ -789,13 +825,17 @@ fn trace_secondary_chain(
     wavelength_idx: usize,
     start_optics: &crate::atmosphere::ShellOptics,
     rng_state: &mut u64,
+    ray_idx: usize,
+    total_rays: usize,
 ) -> crate::scattering::StokesVector {
     use crate::scattering::{scatter_stokes_fast, scattering_plane_cos_sin, StokesVector};
     use crate::single_scatter::shadow_ray_transmittance;
 
     let local_up = start_pos.normalize();
 
-    let xi_mix = xorshift_f64(rng_state);
+    // --- Stratified initial direction sampling ---
+    let xi_jitter = xorshift_f64(rng_state);
+    let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
     let (dir, cos_theta_init) = if xi_mix < 0.5 {
         let cos_theta_init = if xorshift_f64(rng_state) < start_optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(rng_state))
@@ -830,124 +870,189 @@ fn trace_secondary_chain(
         }
     }
 
+    // --- Chain splitting state ---
+    // Stack for sub-chains.
+    // Stokes version needs: pos, dir, prev_dir, stokes, weight, rng, bounce, split_depth
+    let mut stack_pos: [Vec3; SPLIT_STACK_CAPACITY] =
+        [Vec3::new(0.0, 0.0, 0.0); SPLIT_STACK_CAPACITY];
+    let mut stack_dir: [Vec3; SPLIT_STACK_CAPACITY] =
+        [Vec3::new(0.0, 0.0, 0.0); SPLIT_STACK_CAPACITY];
+    let mut stack_prev: [Vec3; SPLIT_STACK_CAPACITY] =
+        [Vec3::new(0.0, 0.0, 0.0); SPLIT_STACK_CAPACITY];
+    let mut stack_stokes: [StokesVector; SPLIT_STACK_CAPACITY] =
+        [StokesVector::unpolarized(0.0); SPLIT_STACK_CAPACITY];
+    let mut stack_weight: [f64; SPLIT_STACK_CAPACITY] = [0.0; SPLIT_STACK_CAPACITY];
+    let mut stack_rng: [u64; SPLIT_STACK_CAPACITY] = [0; SPLIT_STACK_CAPACITY];
+    let mut stack_bounce: [usize; SPLIT_STACK_CAPACITY] = [0; SPLIT_STACK_CAPACITY];
+    let mut stack_split: [usize; SPLIT_STACK_CAPACITY] = [0; SPLIT_STACK_CAPACITY];
+    let mut stack_len: usize = 0;
+
     let mut pos = start_pos;
     let mut current_dir = dir;
     let mut prev_dir = sun_dir;
     let mut weight = start_optics.ssa;
     let mut total_stokes = StokesVector::unpolarized(0.0);
+    let mut bounce_start: usize = 0;
+    let mut split_depth: usize = 0;
+    let surface_r = atm.surface_radius();
+    let split_radius = surface_r + SPLIT_ALTITUDE_KM * 1000.0;
 
-    for _bounce in 0..HYBRID_MAX_BOUNCES {
-        let r = pos.length();
+    'outer: loop {
+        for bounce in bounce_start..HYBRID_MAX_BOUNCES {
+            let r = pos.length();
 
-        let shell_idx = match atm.shell_index(r) {
-            Some(idx) => idx,
-            None => break,
-        };
+            let shell_idx = match atm.shell_index(r) {
+                Some(idx) => idx,
+                None => break,
+            };
 
-        let shell = &atm.shells[shell_idx];
-        let optics = &atm.optics[shell_idx][wavelength_idx];
+            let shell = &atm.shells[shell_idx];
+            let optics = &atm.optics[shell_idx][wavelength_idx];
 
-        if optics.extinction < 1e-20 {
+            if optics.extinction < 1e-20 {
+                match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                    Some((dist, is_outward)) => {
+                        let (new_pos, new_dir) =
+                            cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
+                        pos = new_pos;
+                        current_dir = new_dir;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let xi = xorshift_f64(rng_state);
+            let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+
             match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                Some((dist, is_outward)) => {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    current_dir = new_dir;
-                    continue;
+                Some((boundary_dist, is_outward)) => {
+                    if free_path >= boundary_dist {
+                        let (new_pos, new_dir) = cross_boundary(
+                            pos,
+                            current_dir,
+                            boundary_dist,
+                            is_outward,
+                            shell_idx,
+                            atm,
+                        );
+                        pos = new_pos;
+                        current_dir = new_dir;
+
+                        // Ground reflection: depolarizes
+                        if !is_outward && pos.length() <= surface_r + 1.0 {
+                            let albedo = atm.surface_albedo[wavelength_idx];
+                            weight *= albedo;
+                            if weight < 1e-30 {
+                                break;
+                            }
+                            let normal = pos.normalize();
+                            prev_dir = current_dir;
+                            current_dir = sample_hemisphere(normal, rng_state);
+                            stokes = StokesVector::unpolarized(1.0);
+                            continue;
+                        }
+                        continue;
+                    }
                 }
                 None => break,
             }
-        }
 
-        let xi = xorshift_f64(rng_state);
-        let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+            // Scatter event
+            pos = pos + current_dir * free_path;
 
-        match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-            Some((boundary_dist, is_outward)) => {
-                if free_path >= boundary_dist {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, current_dir, boundary_dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    current_dir = new_dir;
+            // NEE: apply Mueller to photon's actual Stokes state
+            let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
 
-                    // Ground reflection: depolarizes
-                    if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
-                        let albedo = atm.surface_albedo[wavelength_idx];
-                        weight *= albedo;
-                        if weight < 1e-30 {
-                            break;
-                        }
-                        let normal = pos.normalize();
-                        prev_dir = current_dir;
-                        current_dir = sample_hemisphere(normal, rng_state);
-                        stokes = StokesVector::unpolarized(1.0);
-                        continue;
-                    }
-                    continue;
-                }
+            if t_sun_secondary > 1e-30 {
+                let cos_angle_nee = sun_dir.dot(-current_dir);
+                let (cn, sn) = scattering_plane_cos_sin(prev_dir, current_dir, -sun_dir);
+                let nee_stokes = scatter_stokes_fast(
+                    &stokes,
+                    cos_angle_nee,
+                    optics.rayleigh_fraction,
+                    optics.asymmetry,
+                    cn,
+                    sn,
+                );
+
+                let scale = weight * t_sun_secondary / (4.0 * core::f64::consts::PI);
+                total_stokes = total_stokes.add(&nee_stokes.scale(scale));
             }
-            None => break,
-        }
 
-        // Scatter event
-        pos = pos + current_dir * free_path;
+            // Apply SSA
+            weight *= optics.ssa;
+            if weight < 1e-30 {
+                break;
+            }
 
-        // NEE: apply Mueller to photon's actual Stokes state
-        let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
+            // Sample new direction and update Stokes state
+            let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
+                sample_rayleigh_analytic(xorshift_f64(rng_state))
+            } else {
+                sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
+            };
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+            let new_dir = scatter_direction(current_dir, cos_theta, phi);
 
-        if t_sun_secondary > 1e-30 {
-            let cos_angle_nee = sun_dir.dot(-current_dir);
-            let (cn, sn) = scattering_plane_cos_sin(prev_dir, current_dir, -sun_dir);
-            let nee_stokes = scatter_stokes_fast(
+            // Update Stokes through this scatter (fused, no matrices, no trig)
+            let (cs, ss) = scattering_plane_cos_sin(prev_dir, current_dir, new_dir);
+            stokes = scatter_stokes_fast(
                 &stokes,
-                cos_angle_nee,
+                cos_theta,
                 optics.rayleigh_fraction,
                 optics.asymmetry,
-                cn,
-                sn,
+                cs,
+                ss,
             );
 
-            let scale = weight * t_sun_secondary / (4.0 * core::f64::consts::PI);
-            total_stokes = total_stokes.add(&nee_stokes.scale(scale));
+            // Normalize by I (importance weighting -- keeps stokes I = 1)
+            let i_val = stokes.intensity();
+            if i_val > 1e-30 {
+                stokes = stokes.scale(1.0 / i_val);
+            } else {
+                stokes = StokesVector::unpolarized(1.0);
+            }
+
+            prev_dir = current_dir;
+            current_dir = new_dir;
+
+            // --- Altitude-based chain splitting ---
+            if split_depth < MAX_SPLIT_DEPTH && pos.length() > split_radius {
+                let new_weight = weight / SPLIT_FACTOR as f64;
+                for k in 1..SPLIT_FACTOR {
+                    if stack_len < stack_pos.len() {
+                        let forked_rng =
+                            (*rng_state) ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        stack_pos[stack_len] = pos;
+                        stack_dir[stack_len] = current_dir;
+                        stack_prev[stack_len] = prev_dir;
+                        stack_stokes[stack_len] = stokes;
+                        stack_weight[stack_len] = new_weight;
+                        stack_rng[stack_len] = forked_rng;
+                        stack_bounce[stack_len] = bounce + 1;
+                        stack_split[stack_len] = split_depth + 1;
+                        stack_len += 1;
+                    }
+                }
+                weight = new_weight;
+                split_depth += 1;
+            }
         }
 
-        // Apply SSA
-        weight *= optics.ssa;
-        if weight < 1e-30 {
-            break;
+        // Chain terminated -- pop from stack if any sub-chains remain
+        if stack_len == 0 {
+            break 'outer;
         }
-
-        // Sample new direction and update Stokes state
-        let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
-        } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
-        };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-        let new_dir = scatter_direction(current_dir, cos_theta, phi);
-
-        // Update Stokes through this scatter (fused, no matrices, no trig)
-        let (cs, ss) = scattering_plane_cos_sin(prev_dir, current_dir, new_dir);
-        stokes = scatter_stokes_fast(
-            &stokes,
-            cos_theta,
-            optics.rayleigh_fraction,
-            optics.asymmetry,
-            cs,
-            ss,
-        );
-
-        // Normalize by I (importance weighting -- keeps stokes I = 1)
-        let i_val = stokes.intensity();
-        if i_val > 1e-30 {
-            stokes = stokes.scale(1.0 / i_val);
-        } else {
-            stokes = StokesVector::unpolarized(1.0);
-        }
-
-        prev_dir = current_dir;
-        current_dir = new_dir;
+        stack_len -= 1;
+        pos = stack_pos[stack_len];
+        current_dir = stack_dir[stack_len];
+        prev_dir = stack_prev[stack_len];
+        stokes = stack_stokes[stack_len];
+        weight = stack_weight[stack_len];
+        *rng_state = stack_rng[stack_len];
+        bounce_start = stack_bounce[stack_len];
+        split_depth = stack_split[stack_len];
     }
 
     total_stokes
@@ -963,6 +1068,22 @@ fn trace_secondary_chain(
 ///
 /// This saves 3x `scatter_stokes_fast`, 3x `scattering_plane_cos_sin`,
 /// and multiple 4-component Stokes operations per bounce.
+///
+/// # Variance reduction
+///
+/// Two unbiased variance reduction techniques are applied:
+///
+/// 1. **Stratified initial direction sampling**: The `ray_idx` / `total_rays`
+///    parameters enable stratification of the initial branch choice (phase
+///    function vs hemisphere) across rays at each LOS step. This ensures
+///    exactly floor(N/2) rays use each strategy instead of random splitting.
+///
+/// 2. **Altitude-based chain splitting**: When a photon scatters at altitude
+///    above `SPLIT_ALTITUDE_KM`, it splits into `SPLIT_FACTOR` sub-chains,
+///    each carrying `weight / SPLIT_FACTOR`. This increases sampling in the
+///    critical region where photons can connect to sunlit altitudes via NEE.
+///    Uses an iterative stack to remain `no_std` compatible.
+#[allow(clippy::too_many_arguments)]
 fn trace_secondary_chain_scalar(
     atm: &AtmosphereModel,
     start_pos: Vec3,
@@ -970,13 +1091,18 @@ fn trace_secondary_chain_scalar(
     wavelength_idx: usize,
     start_optics: &crate::atmosphere::ShellOptics,
     rng_state: &mut u64,
+    ray_idx: usize,
+    total_rays: usize,
 ) -> f64 {
     use crate::single_scatter::shadow_ray_transmittance;
 
     let local_up = start_pos.normalize();
 
-    // --- Initial direction sampling (RNG consumption matches Stokes version) ---
-    let xi_mix = xorshift_f64(rng_state);
+    // --- Stratified initial direction sampling ---
+    // Instead of random xi_mix, stratify across rays so exactly half use
+    // each branch. Still consume one RNG draw (jitter within the stratum).
+    let xi_jitter = xorshift_f64(rng_state);
+    let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
     let dir = if xi_mix < 0.5 {
         let _cos_theta_init = if xorshift_f64(rng_state) < start_optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(rng_state))
@@ -989,99 +1115,161 @@ fn trace_secondary_chain_scalar(
         sample_hemisphere(local_up, rng_state)
     };
 
+    // --- Chain splitting state ---
+    // Stack frame: (pos, dir, weight, rng_state, bounce_start, split_depth)
+    // Uses a fixed-size array with a length counter (no_std, no unsafe).
+    let mut stack_pos: [Vec3; SPLIT_STACK_CAPACITY] =
+        [Vec3::new(0.0, 0.0, 0.0); SPLIT_STACK_CAPACITY];
+    let mut stack_dir: [Vec3; SPLIT_STACK_CAPACITY] =
+        [Vec3::new(0.0, 0.0, 0.0); SPLIT_STACK_CAPACITY];
+    let mut stack_weight: [f64; SPLIT_STACK_CAPACITY] = [0.0; SPLIT_STACK_CAPACITY];
+    let mut stack_rng: [u64; SPLIT_STACK_CAPACITY] = [0; SPLIT_STACK_CAPACITY];
+    let mut stack_bounce: [usize; SPLIT_STACK_CAPACITY] = [0; SPLIT_STACK_CAPACITY];
+    let mut stack_split: [usize; SPLIT_STACK_CAPACITY] = [0; SPLIT_STACK_CAPACITY];
+    let mut stack_len: usize = 0;
+
     let mut pos = start_pos;
     let mut current_dir = dir;
     let mut weight = start_optics.ssa;
     let mut total = 0.0_f64;
+    let mut bounce_start: usize = 0;
+    let mut split_depth: usize = 0;
+    let surface_r = atm.surface_radius();
+    let split_radius = surface_r + SPLIT_ALTITUDE_KM * 1000.0;
 
-    for _bounce in 0..HYBRID_MAX_BOUNCES {
-        let r = pos.length();
+    'outer: loop {
+        for bounce in bounce_start..HYBRID_MAX_BOUNCES {
+            let r = pos.length();
 
-        let shell_idx = match atm.shell_index(r) {
-            Some(idx) => idx,
-            None => break,
-        };
+            let shell_idx = match atm.shell_index(r) {
+                Some(idx) => idx,
+                None => break,
+            };
 
-        let shell = &atm.shells[shell_idx];
-        let optics = &atm.optics[shell_idx][wavelength_idx];
+            let shell = &atm.shells[shell_idx];
+            let optics = &atm.optics[shell_idx][wavelength_idx];
 
-        if optics.extinction < 1e-20 {
+            if optics.extinction < 1e-20 {
+                match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                    Some((dist, is_outward)) => {
+                        let (new_pos, new_dir) =
+                            cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
+                        pos = new_pos;
+                        current_dir = new_dir;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let xi = xorshift_f64(rng_state);
+            let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+
             match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                Some((dist, is_outward)) => {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    current_dir = new_dir;
-                    continue;
+                Some((boundary_dist, is_outward)) => {
+                    if free_path >= boundary_dist {
+                        let (new_pos, new_dir) = cross_boundary(
+                            pos,
+                            current_dir,
+                            boundary_dist,
+                            is_outward,
+                            shell_idx,
+                            atm,
+                        );
+                        pos = new_pos;
+                        current_dir = new_dir;
+
+                        // Ground reflection
+                        if !is_outward && pos.length() <= surface_r + 1.0 {
+                            let albedo = atm.surface_albedo[wavelength_idx];
+                            weight *= albedo;
+                            if weight < 1e-30 {
+                                break;
+                            }
+                            let normal = pos.normalize();
+                            current_dir = sample_hemisphere(normal, rng_state);
+                            continue;
+                        }
+                        continue;
+                    }
                 }
                 None => break,
             }
-        }
 
-        let xi = xorshift_f64(rng_state);
-        let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+            // Scatter event
+            pos = pos + current_dir * free_path;
 
-        match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-            Some((boundary_dist, is_outward)) => {
-                if free_path >= boundary_dist {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, current_dir, boundary_dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    current_dir = new_dir;
+            // NEE: scalar phase function (no Mueller matrix)
+            let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
 
-                    // Ground reflection
-                    if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
-                        let albedo = atm.surface_albedo[wavelength_idx];
-                        weight *= albedo;
-                        if weight < 1e-30 {
-                            break;
-                        }
-                        let normal = pos.normalize();
-                        current_dir = sample_hemisphere(normal, rng_state);
-                        continue;
-                    }
-                    continue;
-                }
+            if t_sun_secondary > 1e-30 {
+                let cos_angle_nee = sun_dir.dot(-current_dir);
+                let phase = if optics.rayleigh_fraction > 0.99 {
+                    rayleigh_phase(cos_angle_nee)
+                } else {
+                    optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
+                        + (1.0 - optics.rayleigh_fraction)
+                            * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
+                };
+
+                let scale = weight * t_sun_secondary / (4.0 * core::f64::consts::PI);
+                total += phase * scale;
             }
-            None => break,
-        }
 
-        // Scatter event
-        pos = pos + current_dir * free_path;
+            // Apply SSA
+            weight *= optics.ssa;
+            if weight < 1e-30 {
+                break;
+            }
 
-        // NEE: scalar phase function (no Mueller matrix)
-        let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
-
-        if t_sun_secondary > 1e-30 {
-            let cos_angle_nee = sun_dir.dot(-current_dir);
-            let phase = if optics.rayleigh_fraction > 0.99 {
-                rayleigh_phase(cos_angle_nee)
+            // Sample new direction (RNG consumption matches Stokes version)
+            let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
+                sample_rayleigh_analytic(xorshift_f64(rng_state))
             } else {
-                optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
-                    + (1.0 - optics.rayleigh_fraction)
-                        * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
+                sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
             };
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+            let new_dir = scatter_direction(current_dir, cos_theta, phi);
 
-            let scale = weight * t_sun_secondary / (4.0 * core::f64::consts::PI);
-            total += phase * scale;
+            current_dir = new_dir;
+
+            // --- Altitude-based chain splitting ---
+            // After scattering, check if we are above the split altitude and
+            // haven't already split at this depth. If so, fork SPLIT_FACTOR
+            // sub-chains. We continue inline with sub-chain 0 and push
+            // sub-chains 1..SPLIT_FACTOR-1 onto the stack.
+            if split_depth < MAX_SPLIT_DEPTH && pos.length() > split_radius {
+                let new_weight = weight / SPLIT_FACTOR as f64;
+                // Push SPLIT_FACTOR - 1 sub-chains onto the stack
+                for k in 1..SPLIT_FACTOR {
+                    if stack_len < stack_pos.len() {
+                        let forked_rng =
+                            (*rng_state) ^ (k as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        stack_pos[stack_len] = pos;
+                        stack_dir[stack_len] = current_dir;
+                        stack_weight[stack_len] = new_weight;
+                        stack_rng[stack_len] = forked_rng;
+                        stack_bounce[stack_len] = bounce + 1;
+                        stack_split[stack_len] = split_depth + 1;
+                        stack_len += 1;
+                    }
+                }
+                weight = new_weight;
+                split_depth += 1;
+            }
         }
 
-        // Apply SSA
-        weight *= optics.ssa;
-        if weight < 1e-30 {
-            break;
+        // Chain terminated -- pop from stack if any sub-chains remain
+        if stack_len == 0 {
+            break 'outer;
         }
-
-        // Sample new direction (RNG consumption matches Stokes version)
-        let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
-        } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
-        };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-        let new_dir = scatter_direction(current_dir, cos_theta, phi);
-
-        current_dir = new_dir;
+        stack_len -= 1;
+        pos = stack_pos[stack_len];
+        current_dir = stack_dir[stack_len];
+        weight = stack_weight[stack_len];
+        *rng_state = stack_rng[stack_len];
+        bounce_start = stack_bounce[stack_len];
+        split_depth = stack_split[stack_len];
     }
 
     total
