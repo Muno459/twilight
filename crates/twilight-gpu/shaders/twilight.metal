@@ -62,6 +62,11 @@ constant float BOUNDARY_NUDGE_M = 2.0f;
 // Below this, chains scatter naturally and rarely escape.
 constant float ZENITH_SZA_START_DEG = 96.0f;
 
+// Early-exit threshold for scout_tau_to_boundary.
+// At tau > 20, 1-exp(-20) = 0.999999998 in f32. The forced-scattering
+// weight is indistinguishable from 1.0 and we fall back to analog scatter.
+constant float FORCED_TAU_CUTOFF = 20.0f;
+
 // ============================================================================
 // Buffer accessor helpers
 // ============================================================================
@@ -965,6 +970,68 @@ kernel void mcrt_trace_photon(
 }
 
 // ============================================================================
+// Forced scattering scout: compute tau_max to atmosphere boundary
+//
+// Marches shell-by-shell with refraction. Early-exits at tau > FORCED_TAU_CUTOFF
+// (20.0) since the weight correction is indistinguishable from 1.0 at that point.
+// Returns (tau_max, hit_ground). When hit_ground is true, forced scattering
+// should NOT be used -- the analog loop handles ground reflection.
+// ============================================================================
+
+struct ScoutResult {
+    float tau;
+    bool  hit_ground;
+};
+
+ScoutResult scout_tau_to_boundary(device const float* atm, float3 start_pos,
+                                   float3 start_dir, uint wl_idx) {
+    uint ns = atm_num_shells(atm);
+    float surface_radius = atm[ATM_SHELLS_START]; // r_inner of shell 0
+    float3 pos = start_pos;
+    float3 dir = start_dir;
+    float tau = 0.0f;
+
+    int sidx = shell_index_binary(atm, length(pos));
+    if (sidx < 0) return ScoutResult{0.0f, false};
+    uint us = uint(sidx);
+
+    for (uint iter = 0; iter < 200; iter++) {
+        float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
+        float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
+        uint optics_idx = us * MAX_WAVELENGTHS + wl_idx;
+        float extinction = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE];
+
+        ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
+        if (!bnd.found) return ScoutResult{tau, false};
+
+        tau += extinction * bnd.dist;
+
+        // Refract at boundary
+        float3 boundary_pos = pos + dir * bnd.dist;
+        boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? r_outer : r_inner);
+        float n_from = read_refractive_index(atm, us);
+        uint next_shell = bnd.is_outward ? us + 1 : us - 1;
+        float n_to = (next_shell < ns) ? read_refractive_index(atm, next_shell) : 1.0f;
+        dir = refract_at_boundary(dir, boundary_pos, n_from, n_to);
+        pos = radial_nudge(boundary_pos, bnd.is_outward);
+
+        // Hit ground
+        if (!bnd.is_outward && length(pos) <= surface_radius + 1.0f) {
+            return ScoutResult{tau, true};
+        }
+        // Exited atmosphere
+        if (next_shell >= ns) return ScoutResult{tau, false};
+
+        us = next_shell;
+
+        // Early exit: at tau > 20, weight correction is 1.0 to f32 precision
+        if (tau > FORCED_TAU_CUTOFF) return ScoutResult{tau, false};
+    }
+
+    return ScoutResult{tau, false};
+}
+
+// ============================================================================
 // Forced scattering helper: advance along a ray to a target optical depth
 //
 // Marches shell-by-shell with refraction, consuming tau_target of optical
@@ -1100,100 +1167,104 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     // KBN accumulators for each Stokes component
     KahanAccum total_I, total_Q, total_U, total_V;
 
-    // Forced scattering gate: only at deep twilight where escape is common
+    // Upfront forced scattering gate: only at deep twilight
     float cos_sza = dot(sun_dir, local_up);
     float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
     bool use_forced = (sza_deg >= ZENITH_SZA_START_DEG);
 
     for (uint scatter_iter = 0; scatter_iter < HYBRID_MAX_BOUNCES; scatter_iter++) {
-        // --- Free-flight phase: walk shell-by-shell to find scatter point ---
-        float3 flight_start_pos = pos;
-        float3 flight_start_dir = current_dir;
-        float tau_flight = 0.0f;
-        bool scatter_found = false;
+        // --- Decide scatter mode for this bounce ---
+        bool forced_this_bounce = false;
+        float tau_max = 0.0f;
+
+        if (use_forced) {
+            ScoutResult scout = scout_tau_to_boundary(atm, pos, current_dir, wl_idx);
+            tau_max = scout.tau;
+            // Force scatter only when path exits to space AND is optically thin.
+            forced_this_bounce = !scout.hit_ground && scout.tau < FORCED_TAU_CUTOFF;
+        }
+
         uint scatter_shell = 0;
 
-        for (uint step = 0; step < 200; step++) {
-            float r = length(pos);
-            int sidx = shell_index_binary(atm, r);
-            if (sidx < 0) break; // exited atmosphere
-
-            uint us = uint(sidx);
-            ShellGeom sh = read_shell(atm, us);
-            ShellOptics op = read_optics(atm, us, wl_idx);
-
-            if (op.extinction < 1e-20f) {
-                ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
-                if (!bnd.found) break;
-                float3 boundary_pos = pos + current_dir * bnd.dist;
-                boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
-                float n_from = read_refractive_index(atm, us);
-                uint next_s = bnd.is_outward ? us + 1 : us - 1;
-                float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
-                current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
-                pos = radial_nudge(boundary_pos, bnd.is_outward);
-                continue;
-            }
-
+        if (forced_this_bounce) {
+            // Upfront forced scattering (unbiased): no analog walk, no double-counting
+            float exp_neg_tau = exp(-tau_max);
+            weight *= (1.0f - exp_neg_tau);
+            if (weight < 1e-30f) break;
             float xi = xorshift_f32(rng);
-            float free_path = -log(1.0f - xi + 1e-30f) / op.extinction;
+            float tau_s = -log(1.0f - xi * (1.0f - exp_neg_tau) + 1e-30f);
+            AdvanceResult adv = advance_to_optical_depth(atm, pos, current_dir, tau_s, wl_idx);
+            pos = adv.pos;
+            current_dir = adv.dir;
+            scatter_shell = adv.shell_idx;
+        } else {
+            // Analog scatter: standard shell-by-shell free-path walk
+            bool scatter_found = false;
 
-            ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
-            if (!bnd.found) break;
+            for (uint step = 0; step < 200; step++) {
+                float r = length(pos);
+                int sidx = shell_index_binary(atm, r);
+                if (sidx < 0) break; // exited atmosphere
 
-            if (free_path >= bnd.dist) {
-                // Accumulate optical depth for potential forced scattering
-                tau_flight += op.extinction * bnd.dist;
+                uint us = uint(sidx);
+                ShellGeom sh = read_shell(atm, us);
+                ShellOptics op = read_optics(atm, us, wl_idx);
 
-                float3 boundary_pos = pos + current_dir * bnd.dist;
-                boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
-
-                // Ground reflection: depolarizes
-                if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
-                    float albedo = read_albedo(atm, wl_idx);
-                    weight *= albedo;
-                    if (weight < 1e-30f) break;
-                    float3 normal = normalize(boundary_pos);
-                    prev_dir = current_dir;
-                    current_dir = sample_hemisphere(normal, rng);
-                    pos = radial_nudge(boundary_pos, true);
-                    stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
-                    tau_flight = 0.0f;
-                    continue;
-                }
-
-                // Refract and nudge past boundary
-                {
+                if (op.extinction < 1e-20f) {
+                    ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
+                    if (!bnd.found) break;
+                    float3 boundary_pos = pos + current_dir * bnd.dist;
+                    boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
                     float n_from = read_refractive_index(atm, us);
                     uint next_s = bnd.is_outward ? us + 1 : us - 1;
                     float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
                     current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
+                    pos = radial_nudge(boundary_pos, bnd.is_outward);
+                    continue;
                 }
-                pos = radial_nudge(boundary_pos, bnd.is_outward);
-                continue;
+
+                float xi = xorshift_f32(rng);
+                float free_path = -log(1.0f - xi + 1e-30f) / op.extinction;
+
+                ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
+                if (!bnd.found) break;
+
+                if (free_path >= bnd.dist) {
+                    float3 boundary_pos = pos + current_dir * bnd.dist;
+                    boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
+
+                    // Ground reflection: depolarizes
+                    if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
+                        float albedo = read_albedo(atm, wl_idx);
+                        weight *= albedo;
+                        if (weight < 1e-30f) break;
+                        float3 normal = normalize(boundary_pos);
+                        prev_dir = current_dir;
+                        current_dir = sample_hemisphere(normal, rng);
+                        pos = radial_nudge(boundary_pos, true);
+                        stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
+                        continue;
+                    }
+
+                    // Refract and nudge past boundary
+                    {
+                        float n_from = read_refractive_index(atm, us);
+                        uint next_s = bnd.is_outward ? us + 1 : us - 1;
+                        float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
+                        current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
+                    }
+                    pos = radial_nudge(boundary_pos, bnd.is_outward);
+                    continue;
+                }
+
+                // Scatter within this shell
+                pos = pos + current_dir * free_path;
+                scatter_shell = us;
+                scatter_found = true;
+                break;
             }
 
-            // Scatter within this shell (fast path, zero overhead)
-            pos = pos + current_dir * free_path;
-            scatter_shell = us;
-            scatter_found = true;
-            break;
-        }
-
-        if (!scatter_found) {
-            // Photon would exit the atmosphere.
-            if (!use_forced || weight < 1e-30f || tau_flight < 1e-30f) break;
-            // Forced scattering: resample scatter point within traversed path
-            float exp_neg_tau = exp(-tau_flight);
-            weight *= (1.0f - exp_neg_tau);
-            if (weight < 1e-30f) break;
-            float xi_forced = xorshift_f32(rng);
-            float tau_s = -log(1.0f - xi_forced * (1.0f - exp_neg_tau) + 1e-30f);
-            AdvanceResult adv = advance_to_optical_depth(atm, flight_start_pos,
-                                                         flight_start_dir, tau_s, wl_idx);
-            pos = adv.pos;
-            current_dir = adv.dir;
-            scatter_shell = adv.shell_idx;
+            if (!scatter_found) break; // chain terminates: escaped atmosphere
         }
 
         ShellOptics op = read_optics(atm, scatter_shell, wl_idx);
