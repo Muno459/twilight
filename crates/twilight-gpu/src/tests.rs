@@ -1359,7 +1359,7 @@ mod layer4_wgpu {
 const CROSS_BACKEND_RTOL: f64 = 1e-4;
 
 /// Helper: collect all available backends on this machine.
-#[allow(dead_code)]
+#[allow(dead_code, unused_mut)]
 fn init_all_backends() -> Vec<(crate::BackendKind, Box<dyn crate::GpuBackend>)> {
     let mut backends = Vec::new();
 
@@ -2397,7 +2397,7 @@ fn test_parity_scatter_direction() {
         crate::parity::scatter_direction_f32([0.3, 0.7, -0.5], 1.0, 0.0), // normalized via identity scatter
     ];
     let cos_thetas = [-0.8f32, -0.3, 0.0, 0.5, 0.9];
-    let phis = [0.0f32, 1.57, 3.14, 4.71];
+    let phis = [0.0f32, 1.57, core::f32::consts::PI, 4.71];
 
     let mut max_angle_err = 0.0f64;
 
@@ -2568,7 +2568,11 @@ fn test_parity_next_shell_boundary() {
         // Oblique outward
         (
             [(EARTH_RADIUS_M + 3_000.0) as f32, 0.0, 0.0],
-            [0.7071, 0.7071, 0.0],
+            [
+                core::f32::consts::FRAC_1_SQRT_2,
+                core::f32::consts::FRAC_1_SQRT_2,
+                0.0,
+            ],
         ),
     ];
 

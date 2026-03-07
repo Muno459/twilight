@@ -880,7 +880,7 @@ mod tests {
     fn scatter_direction_preserves_unit_length() {
         let dir = Vec3::new(0.0, 0.0, 1.0);
         for cos_theta in &[-0.9, -0.5, 0.0, 0.5, 0.9] {
-            for phi in &[0.0, 1.0, 3.14159, 5.0] {
+            for phi in &[0.0, 1.0, core::f64::consts::PI, 5.0] {
                 let new_dir = scatter_direction(dir, *cos_theta, *phi);
                 assert!(
                     (new_dir.length() - 1.0).abs() < 1e-6,
@@ -1010,8 +1010,8 @@ mod tests {
 
     #[test]
     fn stokes_intensity_method() {
-        let s = StokesVector::new(3.14, 0.1, 0.2, 0.3);
-        assert!((s.intensity() - 3.14).abs() < EPSILON);
+        let s = StokesVector::new(2.78, 0.1, 0.2, 0.3);
+        assert!((s.intensity() - 2.78).abs() < EPSILON);
     }
 
     #[test]

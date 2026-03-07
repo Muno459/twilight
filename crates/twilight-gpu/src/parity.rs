@@ -940,7 +940,7 @@ mod tests {
             normalize3([0.3, 0.7, -0.5]),
         ];
         let cos_thetas = [-0.9f32, -0.3, 0.0, 0.5, 0.95];
-        let phis = [0.0f32, 1.0, 3.14, 5.5];
+        let phis = [0.0f32, 1.0, 2.78, 5.5];
 
         for &dir in &dirs {
             for &ct in &cos_thetas {
