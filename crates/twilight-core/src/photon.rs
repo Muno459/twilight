@@ -949,6 +949,29 @@ const SPLIT_FACTORS_TRANSITION: [usize; NUM_SPLIT_LEVELS] = [2, 2, 1];
 /// weight_ratio[64]). At 20 particles: 1.6 KB (scalar) or 12 KB (ALIS).
 const MAX_SPLIT_PARTICLES: usize = 20;
 
+/// Exponential scale height for LOS ray-budget redistribution at moderate
+/// twilight (SZA = 96).
+///
+/// At moderate twilight, chains at most altitudes are productive. A large
+/// scale height (100 km) gives very mild redistribution (~2.7x ratio from
+/// surface to TOA), barely perturbing the uniform baseline.
+const LOS_IMP_H_MODERATE_M: f64 = 100_000.0;
+
+/// Exponential scale height for LOS ray-budget redistribution at deep
+/// twilight (SZA >= 106).
+///
+/// At deep twilight, chains starting below ~15 km must climb 50+ km AND
+/// travel 1800+ km laterally to reach sunlit atmosphere (~0.001% success
+/// rate). A smaller scale height (30 km) provides stronger redistribution
+/// (~28x ratio from surface to TOA), shifting the budget away from these
+/// hopeless low-altitude chains toward higher-altitude LOS steps.
+///
+/// Chains at very high altitude (80-100 km) receive more rays but terminate
+/// nearly instantly (atmosphere escape on first step) at negligible cost.
+/// The real savings come from NOT launching expensive 50-bounce chains at
+/// 0-15 km altitude.
+const LOS_IMP_H_DEEP_M: f64 = 30_000.0;
+
 /// State of a single particle in the altitude-splitting work stack (scalar mode).
 ///
 /// When a chain scatters above a split altitude, it spawns K copies (each with
@@ -1086,6 +1109,11 @@ fn vspg_importance(alt_m: f64, sza_deg: f64) -> f64 {
 ///
 /// When VSPG importance is uniform (SZA <= 96), the weight correction
 /// is 1.0 and sampling equals standard forced scattering.
+///
+/// NOTE: Production tracers now use the fused `scout_with_vspg_segments` +
+/// `vspg_sample_from_segments` path. This standalone function is retained
+/// for unit tests that verify VSPG sampling correctness in isolation.
+#[cfg(test)]
 fn vspg_sample_scatter_tau(
     atm: &AtmosphereModel,
     start_pos: Vec3,
@@ -1236,6 +1264,246 @@ fn vspg_sample_scatter_tau(
     let weight_correction = i_avg / seg.importance;
 
     (tau_s, weight_correction)
+}
+
+/// Sample a forced-scatter optical depth from pre-collected VSPG segments.
+///
+/// This is the CDF-inversion half of VSPG sampling, separated from the
+/// shell-walk half to enable fusion with the scout pass. The segments
+/// must have been collected by `scout_with_vspg_segments()` or
+/// `scout_with_vspg_segments_alis()`.
+///
+/// Returns `(tau_s, weight_correction)` -- same semantics as
+/// `vspg_sample_scatter_tau`.
+fn vspg_sample_from_segments(
+    segments: &[VspgSegment; VSPG_MAX_SEGMENTS],
+    num_seg: usize,
+    tau_max: f64,
+    rng: &mut u64,
+) -> (f64, f64) {
+    if num_seg == 0 {
+        let xi = xorshift_f64(rng);
+        let one_minus_exp = 1.0 - libm::exp(-tau_max);
+        return (-libm::log(1.0 - xi * one_minus_exp + 1e-30), 1.0);
+    }
+
+    let mut p_sum = 0.0_f64;
+    let mut q_sum = 0.0_f64;
+    let mut q_cdf = [0.0f64; VSPG_MAX_SEGMENTS];
+
+    for i in 0..num_seg {
+        let p_i = libm::exp(-segments[i].tau_lo) - libm::exp(-segments[i].tau_hi);
+        p_sum += p_i;
+        q_sum += segments[i].importance * p_i;
+        q_cdf[i] = q_sum;
+    }
+
+    if q_sum < 1e-30 {
+        let xi = xorshift_f64(rng);
+        let one_minus_exp = 1.0 - libm::exp(-tau_max);
+        return (-libm::log(1.0 - xi * one_minus_exp + 1e-30), 1.0);
+    }
+
+    let xi_segment = xorshift_f64(rng) * q_sum;
+    let mut j = 0usize;
+    while j + 1 < num_seg && q_cdf[j] < xi_segment {
+        j += 1;
+    }
+
+    let seg = &segments[j];
+    let p_j = libm::exp(-seg.tau_lo) - libm::exp(-seg.tau_hi);
+    let xi_within = xorshift_f64(rng);
+    let tau_s = -libm::log(libm::exp(-seg.tau_lo) - xi_within * p_j + 1e-30);
+    let tau_s = tau_s.clamp(seg.tau_lo, seg.tau_hi);
+
+    let i_avg = q_sum / p_sum;
+    let weight_correction = i_avg / seg.importance;
+
+    (tau_s, weight_correction)
+}
+
+/// Fused scout + VSPG segment collection for single-wavelength tracers.
+///
+/// Walks the ray path through shells once, simultaneously computing:
+/// - Total optical depth to boundary (`tau_max`) -- replaces `scout_tau_to_boundary`
+/// - Per-shell VSPG segments -- replaces the walk in `vspg_sample_scatter_tau`
+///
+/// This eliminates the redundant shell re-walk that `vspg_sample_scatter_tau`
+/// performs after `scout_tau_to_boundary`, saving ~33% of shell-walk cost
+/// per forced-scatter bounce at deep twilight.
+///
+/// Returns `(tau_max, hit_ground, num_segments)`. Segments are written to
+/// the caller-provided buffer.
+fn scout_with_vspg_segments(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    start_dir: Vec3,
+    wavelength_idx: usize,
+    sza_deg: f64,
+    segments: &mut [VspgSegment; VSPG_MAX_SEGMENTS],
+) -> (f64, bool, usize) {
+    let surface_radius = atm.surface_radius();
+    let num_shells = atm.num_shells;
+    let mut pos = start_pos;
+    let mut dir = start_dir;
+    let mut tau = 0.0;
+    let mut num_seg: usize = 0;
+
+    let mut shell_idx = match atm.shell_index(pos.length()) {
+        Some(idx) => idx,
+        None => return (0.0, false, 0),
+    };
+
+    for _ in 0..200 {
+        let shell = &atm.shells[shell_idx];
+        let optics = &atm.optics[shell_idx][wavelength_idx];
+
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
+            Some((dist, is_outward)) => {
+                let tau_shell = optics.extinction * dist;
+                let tau_end = tau + tau_shell;
+
+                // Collect VSPG segment if shell has nonzero optical depth.
+                if num_seg < VSPG_MAX_SEGMENTS && tau_shell > 1e-30 {
+                    segments[num_seg] = VspgSegment {
+                        tau_lo: tau,
+                        tau_hi: tau_end,
+                        importance: vspg_importance(shell.altitude_mid, sza_deg),
+                    };
+                    num_seg += 1;
+                }
+
+                tau = tau_end;
+
+                // Refract at boundary.
+                let boundary_pos = pos + dir * dist;
+                let n_from = atm.refractive_index[shell_idx];
+                let next_shell = if is_outward {
+                    shell_idx + 1
+                } else {
+                    shell_idx.wrapping_sub(1)
+                };
+                let n_to = if next_shell < num_shells {
+                    atm.refractive_index[next_shell]
+                } else {
+                    1.0
+                };
+                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                };
+                pos = boundary_pos + dir * 1e-3;
+
+                // Hit ground.
+                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                    return (tau, true, num_seg);
+                }
+                // Exited atmosphere.
+                if next_shell >= num_shells {
+                    return (tau, false, num_seg);
+                }
+
+                shell_idx = next_shell;
+            }
+            None => return (tau, false, num_seg),
+        }
+
+        if tau > FORCED_TAU_CUTOFF {
+            return (tau, false, num_seg);
+        }
+    }
+
+    (tau, false, num_seg)
+}
+
+/// Fused scout + VSPG segment collection for ALIS (multi-wavelength) tracers.
+///
+/// Like `scout_with_vspg_segments`, but accumulates optical depth for all
+/// wavelengths simultaneously. VSPG segments use the hero wavelength's
+/// tau values and altitude-based importance.
+///
+/// Returns `(tau_maxes, hit_ground, num_segments)`. `tau_maxes[w]` gives
+/// the total optical depth for wavelength w. Segments are written to
+/// the caller-provided buffer (hero-wavelength tau values).
+#[allow(clippy::too_many_arguments)]
+fn scout_with_vspg_segments_alis(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    start_dir: Vec3,
+    hero_wl: usize,
+    num_wl: usize,
+    sza_deg: f64,
+    segments: &mut [VspgSegment; VSPG_MAX_SEGMENTS],
+) -> ([f64; 64], bool, usize) {
+    let surface_radius = atm.surface_radius();
+    let num_shells = atm.num_shells;
+    let mut pos = start_pos;
+    let mut dir = start_dir;
+    let mut tau = [0.0f64; 64];
+    let mut num_seg: usize = 0;
+
+    let mut shell_idx = match atm.shell_index(pos.length()) {
+        Some(idx) => idx,
+        None => return (tau, false, 0),
+    };
+
+    for _ in 0..200 {
+        let shell = &atm.shells[shell_idx];
+
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
+            Some((dist, is_outward)) => {
+                // Accumulate per-wavelength tau.
+                let hero_tau_before = tau[hero_wl];
+                for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
+                    *tau_w += atm.optics[shell_idx][w].extinction * dist;
+                }
+                let hero_tau_shell = tau[hero_wl] - hero_tau_before;
+
+                // Collect VSPG segment using hero wavelength tau.
+                if num_seg < VSPG_MAX_SEGMENTS && hero_tau_shell > 1e-30 {
+                    segments[num_seg] = VspgSegment {
+                        tau_lo: hero_tau_before,
+                        tau_hi: tau[hero_wl],
+                        importance: vspg_importance(shell.altitude_mid, sza_deg),
+                    };
+                    num_seg += 1;
+                }
+
+                // Refract at boundary.
+                let boundary_pos = pos + dir * dist;
+                let n_from = atm.refractive_index[shell_idx];
+                let next_shell = if is_outward {
+                    shell_idx + 1
+                } else {
+                    shell_idx.wrapping_sub(1)
+                };
+                let n_to = if next_shell < num_shells {
+                    atm.refractive_index[next_shell]
+                } else {
+                    1.0
+                };
+                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                };
+                pos = boundary_pos + dir * 1e-3;
+
+                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                    return (tau, true, num_seg);
+                }
+                if next_shell >= num_shells {
+                    return (tau, false, num_seg);
+                }
+
+                shell_idx = next_shell;
+            }
+            None => return (tau, false, num_seg),
+        }
+
+        if tau[hero_wl] > FORCED_TAU_CUTOFF {
+            return (tau, false, num_seg);
+        }
+    }
+
+    (tau, false, num_seg)
 }
 
 /// Compute multi-scatter spectral radiance using a hybrid approach.
@@ -1908,12 +2176,28 @@ fn trace_secondary_chain_scalar(
 
         for _bounce in 0..BOUNCE_SAFETY_LIMIT {
             // --- Decide scatter mode for this bounce ---
+            // Fused scout + VSPG: single shell walk collects both tau_max
+            // and VSPG segments, eliminating the redundant re-walk.
             let mut forced_this_bounce = false;
             let mut tau_max = 0.0;
+            let mut vspg_segs = [VspgSegment {
+                tau_lo: 0.0,
+                tau_hi: 0.0,
+                importance: 1.0,
+            }; VSPG_MAX_SEGMENTS];
+            let mut n_vspg_segs = 0usize;
 
             if use_forced {
-                let (tm, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, wavelength_idx);
+                let (tm, hit_ground, ns) = scout_with_vspg_segments(
+                    atm,
+                    pos,
+                    current_dir,
+                    wavelength_idx,
+                    sza_deg_local,
+                    &mut vspg_segs,
+                );
                 tau_max = tm;
+                n_vspg_segs = ns;
                 let ftm = forced_tau_min_for_sza(sza_deg_local);
                 forced_this_bounce = !hit_ground && (ftm..FORCED_TAU_CUTOFF).contains(&tm);
             }
@@ -1923,18 +2207,9 @@ fn trace_secondary_chain_scalar(
             if forced_this_bounce {
                 let exp_neg_tau = libm::exp(-tau_max);
                 weight *= 1.0 - exp_neg_tau;
-                // VSPG: importance-weighted shell selection biases scatter
-                // toward high altitude at deep twilight. Weight correction
-                // keeps the estimator exactly unbiased.
-                let (tau_s, vspg_w) = vspg_sample_scatter_tau(
-                    atm,
-                    pos,
-                    current_dir,
-                    wavelength_idx,
-                    tau_max,
-                    sza_deg_local,
-                    &mut local_rng,
-                );
+                // VSPG: sample from pre-collected segments (no re-walk).
+                let (tau_s, vspg_w) =
+                    vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max, &mut local_rng);
                 weight *= vspg_w;
                 let (sp, sd, ss) =
                     advance_to_optical_depth(atm, pos, current_dir, tau_s, wavelength_idx);
@@ -2155,6 +2430,11 @@ fn scalar_phase_value(cos_theta: f64, optics: &crate::atmosphere::ShellOptics) -
 ///
 /// Early-exits when the hero wavelength's tau exceeds `FORCED_TAU_CUTOFF`,
 /// since the forced scatter decision is based on the hero.
+///
+/// NOTE: Production tracers now use the fused `scout_with_vspg_segments_alis`.
+/// This standalone function is retained for unit tests that verify ALIS scout
+/// correctness against the single-wavelength scout.
+#[cfg(test)]
 fn scout_tau_to_boundary_alis(
     atm: &AtmosphereModel,
     start_pos: Vec3,
@@ -2452,13 +2732,30 @@ fn trace_secondary_chain_alis(
 
         for _bounce in 0..BOUNCE_SAFETY_LIMIT {
             // --- Decide scatter mode for this bounce ---
+            // Fused scout + VSPG: single shell walk collects both per-wl
+            // tau_maxes and VSPG segments (hero wavelength), eliminating
+            // the redundant re-walk.
             let mut forced_this_bounce = false;
             let mut tau_maxes = [0.0f64; 64];
+            let mut vspg_segs = [VspgSegment {
+                tau_lo: 0.0,
+                tau_hi: 0.0,
+                importance: 1.0,
+            }; VSPG_MAX_SEGMENTS];
+            let mut n_vspg_segs = 0usize;
 
             if use_forced {
-                let (tms, hit_ground) =
-                    scout_tau_to_boundary_alis(atm, pos, current_dir, hero_wl, num_wl);
+                let (tms, hit_ground, ns) = scout_with_vspg_segments_alis(
+                    atm,
+                    pos,
+                    current_dir,
+                    hero_wl,
+                    num_wl,
+                    sza_deg_local,
+                    &mut vspg_segs,
+                );
                 tau_maxes = tms;
+                n_vspg_segs = ns;
                 let ftm = forced_tau_min_for_sza(sza_deg_local);
                 forced_this_bounce =
                     !hit_ground && (ftm..FORCED_TAU_CUTOFF).contains(&tms[hero_wl]);
@@ -2481,16 +2778,9 @@ fn trace_secondary_chain_alis(
                     };
                 }
 
-                // VSPG: importance-weighted shell selection for hero wavelength.
-                let (tau_s, vspg_w) = vspg_sample_scatter_tau(
-                    atm,
-                    pos,
-                    current_dir,
-                    hero_wl,
-                    tau_max_h,
-                    sza_deg_local,
-                    &mut local_rng,
-                );
+                // VSPG: sample from pre-collected segments (no re-walk).
+                let (tau_s, vspg_w) =
+                    vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max_h, &mut local_rng);
                 hero_weight *= vspg_w;
                 let (sp, sd, ss, taus_at_pos) =
                     advance_to_optical_depth_alis(atm, pos, current_dir, tau_s, hero_wl, num_wl);
@@ -2795,6 +3085,51 @@ pub fn hybrid_scatter_radiance_alis(
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
 
+    // --- LOS ray-budget redistribution (importance sampling by altitude) ---
+    //
+    // At deep twilight, MC chains starting at low-altitude LOS points are
+    // exponentially less productive: they must climb 50+ km through dense
+    // atmosphere AND travel 1800+ km laterally to reach sunlit regions.
+    // Uniform allocation wastes ~60-70% of compute on these hopeless chains.
+    //
+    // Solution: pre-scan LOS altitudes and redistribute the total MC ray
+    // budget so that high-altitude steps (where chains can efficiently reach
+    // sunlit atmosphere) receive more rays. Each step's estimator remains
+    // (1/n_i) * sum(chains), which is unbiased regardless of n_i.
+    // Only the per-step variance changes.
+    let observer_up = observer_pos.normalize();
+    let cos_sza_obs = sun_dir.dot(observer_up);
+    let sza_deg_obs = libm::acos(cos_sza_obs.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
+
+    let use_los_importance = sza_deg_obs >= ZENITH_SZA_START && secondary_rays > 0;
+    let total_mc_budget = secondary_rays * num_steps;
+
+    // Pre-scan: compute per-step importance from altitude profile.
+    let mut los_importance = [0.0f64; HYBRID_LOS_STEPS];
+    let mut sum_los_imp = 0.0f64;
+
+    if use_los_importance {
+        // SZA-adaptive scale height: large at moderate twilight (mild
+        // redistribution, ~2.7x ratio surface-to-TOA), small at deep
+        // twilight (strong redistribution, ~28x ratio).
+        let sza_t = ((sza_deg_obs - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START))
+            .clamp(0.0, 1.0);
+        let h_scale = LOS_IMP_H_MODERATE_M + (LOS_IMP_H_DEEP_M - LOS_IMP_H_MODERATE_M) * sza_t;
+
+        for step in 0..num_steps {
+            let s = (step as f64 + 0.5) * ds;
+            let p = observer_pos + view_dir * s;
+            let r = p.length();
+            if r > toa_radius || r < surface_radius {
+                continue;
+            }
+            let alt = r - surface_radius;
+            let imp = libm::exp(alt / h_scale);
+            los_importance[step] = imp;
+            sum_los_imp += imp;
+        }
+    }
+
     // Per-wavelength accumulated optical depth from observer.
     let mut tau_obs = [0.0f64; 64];
 
@@ -2847,10 +3182,28 @@ pub fn hybrid_scatter_radiance_alis(
         }
 
         // --- Orders 2+: ALIS MC secondary chains ---
-        if secondary_rays > 0 {
+        //
+        // Ray budget per step: when LOS importance sampling is active,
+        // high-altitude steps receive more rays (proportional to
+        // exp(altitude / h_scale)) and low-altitude steps receive fewer.
+        // The estimator (1/n_i) * sum(chains) is unbiased for any n_i > 0,
+        // so no weight correction is needed -- only per-step variance changes.
+        let rays_this_step = if use_los_importance && los_importance[step] > 0.0 {
+            // Proportional allocation: n_i = round(total_budget * imp_i / sum_imp).
+            // Clamp to at least 1 so every in-atmosphere step gets coverage.
+            let frac = los_importance[step] / sum_los_imp;
+            let n = libm::round(total_mc_budget as f64 * frac) as usize;
+            n.max(1)
+        } else if !use_los_importance && secondary_rays > 0 {
+            secondary_rays
+        } else {
+            0
+        };
+
+        if rays_this_step > 0 {
             let mut mc_totals = [0.0f64; 64];
 
-            for ray in 0..secondary_rays {
+            for ray in 0..rays_this_step {
                 // Round-robin hero selection across wavelengths.
                 let hero_wl = ray % num_wl;
 
@@ -2862,7 +3215,7 @@ pub fn hybrid_scatter_radiance_alis(
                     shell_idx,
                     rng_state,
                     ray,
-                    secondary_rays,
+                    rays_this_step,
                     num_wl,
                     guide,
                 );
@@ -2872,7 +3225,7 @@ pub fn hybrid_scatter_radiance_alis(
                 }
             }
 
-            let inv_rays = 1.0 / secondary_rays as f64;
+            let inv_rays = 1.0 / rays_this_step as f64;
             for w in 0..num_wl {
                 let optics = &atm.optics[shell_idx][w];
                 let beta_scat = optics.extinction * optics.ssa;
@@ -3189,23 +3542,30 @@ fn train_secondary_chain(
 
     for _bounce in 0..BOUNCE_SAFETY_LIMIT {
         // --- Forced vs analog scatter decision ---
+        // Fused scout + VSPG: single shell walk collects both tau_max
+        // and VSPG segments, eliminating the redundant re-walk.
         if use_forced {
-            let (tau_max, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, ref_wl);
+            let mut vspg_segs = [VspgSegment {
+                tau_lo: 0.0,
+                tau_hi: 0.0,
+                importance: 1.0,
+            }; VSPG_MAX_SEGMENTS];
+            let (tau_max, hit_ground, n_segs) = scout_with_vspg_segments(
+                atm,
+                pos,
+                current_dir,
+                ref_wl,
+                sza_deg_local,
+                &mut vspg_segs,
+            );
             let ftm = forced_tau_min_for_sza(sza_deg_local);
             if !hit_ground && (ftm..FORCED_TAU_CUTOFF).contains(&tau_max) {
                 let exp_neg_tau = libm::exp(-tau_max);
                 weight *= 1.0 - exp_neg_tau;
 
-                // VSPG guided distance sampling.
-                let (tau_s, vspg_w) = vspg_sample_scatter_tau(
-                    atm,
-                    pos,
-                    current_dir,
-                    ref_wl,
-                    tau_max,
-                    sza_deg_local,
-                    rng_state,
-                );
+                // VSPG: sample from pre-collected segments (no re-walk).
+                let (tau_s, vspg_w) =
+                    vspg_sample_from_segments(&vspg_segs, n_segs, tau_max, rng_state);
                 weight *= vspg_w;
 
                 let (sp, sd, ss) = advance_to_optical_depth(atm, pos, current_dir, tau_s, ref_wl);

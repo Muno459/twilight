@@ -989,7 +989,7 @@ mod tests {
         let obs_pos = geographic_to_ecef(lat, lon, 0.0);
         let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
 
-        let num_seeds = 20usize;
+        let num_seeds = 50usize;
         let rays = 200usize;
 
         eprintln!("\n{:=<80}", "");
