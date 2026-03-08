@@ -869,10 +869,14 @@ const TERMINATOR_TILT_MIN_DEG: f64 = 20.0;
 
 /// Tilt angle (degrees) of the terminator axis from zenith at SZA = ZENITH_SZA_FULL.
 ///
-/// At deep twilight (SZA 106), the terminator axis points 50 deg from
-/// zenith toward the sub-solar horizon, directing rays into the region
-/// where shadow rays can first reach sunlit atmosphere.
-const TERMINATOR_TILT_MAX_DEG: f64 = 50.0;
+/// At deep twilight (SZA 106), the terminator is ~1780 km from the observer,
+/// nearly at the horizon. The terminator axis points 60 deg from zenith
+/// toward the sub-solar horizon, directing rays into the region where
+/// shadow rays can first reach sunlit atmosphere. A 60 deg tilt balances
+/// coverage: more horizontal than 50 deg to better target the distant
+/// terminator, but not so aggressive (70+) that guide training noise
+/// at deep twilight overwhelms the signal.
+const TERMINATOR_TILT_MAX_DEG: f64 = 60.0;
 
 /// Fraction of bounces (after the first) that use guide-sampled directions
 /// when a trained PathGuide is available. The remaining fraction uses the
@@ -880,8 +884,10 @@ const TERMINATOR_TILT_MAX_DEG: f64 = 50.0;
 /// combines both, keeping the estimator exactly unbiased.
 ///
 /// At 0.5: half the bounces try the guide, half use the phase function.
+/// Higher values risk amplifying guide noise at deep twilight where pilot
+/// chains themselves struggle to produce reliable training signal.
 /// The MIS weight at each bounce is:
-///   w_mis = p_chosen / (GUIDE_MIS_FRAC * p_guide + (1 - GUIDE_MIS_FRAC) * p_phase)
+///   w_mis = p_phase / (GUIDE_MIS_FRAC * p_guide + (1 - GUIDE_MIS_FRAC) * p_phase)
 const GUIDE_MIS_FRAC: f64 = 0.5;
 
 /// Number of altitude-based splitting levels for deep twilight variance reduction.
@@ -899,10 +905,12 @@ const NUM_SPLIT_LEVELS: usize = 3;
 
 /// Altitude thresholds (meters above surface) at which splitting occurs.
 ///
-///   25 km: chain escapes the dense troposphere (major bottleneck)
-///   45 km: chain reaches mid-stratosphere (approaching shadow boundary)
+///   15 km: chain exits the dense lower troposphere (before analog fallback
+///          at FORCED_TAU_MIN = 0.02, ensuring splits happen while chains
+///          are still in forced mode with reliable weights)
+///   40 km: chain reaches upper stratosphere (approaching shadow boundary)
 ///   65 km: chain reaches mesosphere (lateral transport region)
-const SPLIT_ALTITUDES_M: [f64; NUM_SPLIT_LEVELS] = [25_000.0, 45_000.0, 65_000.0];
+const SPLIT_ALTITUDES_M: [f64; NUM_SPLIT_LEVELS] = [15_000.0, 40_000.0, 65_000.0];
 
 /// Split factors at deep twilight (SZA >= 102 deg).
 ///
