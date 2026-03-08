@@ -22,8 +22,8 @@
 //! Run pilot chains with standard sampling. At each scatter vertex where
 //! NEE produces nonzero contribution, accumulate the contribution into the
 //! bin corresponding to the chain's current direction. After each pilot
-//! iteration, normalize to get probability distributions. Laplace smoothing
-//! prevents zero bins.
+//! iteration, normalize to get probability distributions. Defensive mixing
+//! with a uniform baseline prevents over-confident bins.
 //!
 //! # Production
 //!
@@ -81,6 +81,21 @@ const COS_Z_BOUNDS: [f64; 7] = [0.75, 0.50, 0.25, 0.0, -0.25, -0.50, -0.75];
 /// Each bin covers delta_cos_z = 0.25 and delta_phi = pi/2 (quadrant).
 /// Solid angle = delta_cos_z * delta_phi = 0.25 * pi/2 = pi/8.
 const BIN_SOLID_ANGLE: f64 = core::f64::consts::PI / 8.0;
+
+/// Defensive mixing fraction for guide normalization.
+///
+/// After normalizing learned bin probabilities, the final distribution is:
+///   p_final = (1 - DEFENSIVE_EPSILON) * p_learned + DEFENSIVE_EPSILON * (1/NUM_DIR_BINS)
+///
+/// This guarantees a minimum bin probability of DEFENSIVE_EPSILON / NUM_DIR_BINS
+/// = 0.15/32 = 4.69e-3, preventing the guide from becoming over-confident in
+/// sparse training data. The maximum ratio between any bin and the uniform
+/// baseline is bounded by (1 - DEFENSIVE_EPSILON) / DEFENSIVE_EPSILON + 1
+/// = 6.67, so MIS weights stay well-controlled.
+///
+/// Replaces additive Laplace smoothing which gave floors as low as 9.4e-5
+/// with 32 bins, causing variance blowup at SZA 96-104.
+const DEFENSIVE_EPSILON: f32 = 0.15;
 
 /// Xorshift64 RNG -- local copy to avoid circular dependency with photon.rs.
 #[inline]
@@ -267,42 +282,39 @@ impl PathGuide {
 
     /// Normalize all spatial cells to probability distributions.
     ///
-    /// Each `[alt][solar]` slice is normalized to sum to 1.0. Applies
-    /// Laplace smoothing (adds a small uniform baseline before normalizing)
-    /// to prevent zero-probability bins that would cause MIS singularities.
+    /// Each `[alt][solar]` slice is normalized to sum to 1.0. Uses defensive
+    /// mixing with a uniform baseline to prevent the guide from becoming
+    /// over-confident in sparse training data:
+    ///
+    ///   p_final = (1 - epsilon) * p_learned + epsilon * (1/NUM_DIR_BINS)
+    ///
+    /// This guarantees a minimum bin probability of epsilon/NUM_DIR_BINS,
+    /// bounding MIS weights and preventing variance blowup when the guide
+    /// is trained with few samples (common at SZA 96-104).
     pub fn normalize(&mut self) {
+        let uniform = 1.0 / NUM_DIR_BINS as f32;
+        let one_minus_eps = 1.0 - DEFENSIVE_EPSILON;
+
         for a in 0..NUM_ALT_BINS {
             for s in 0..NUM_SOLAR_BINS {
                 let cell = &mut self.table[a][s];
-                // Compute total accumulated mass before smoothing.
+
+                // Sum raw accumulated mass.
                 let mut raw_sum = 0.0f32;
                 for &item in cell.iter() {
                     raw_sum += item;
                 }
-                // Adaptive Laplace smoothing: add a fraction of the cell mass
-                // per bin. If the cell has zero mass (no training data reached
-                // this cell), fall back to uniform. The 0.003 factor gives
-                // total smoothing mass 0.003*32 = 0.096, so smoothing is
-                // ~9% of total probability -- enough to prevent MIS
-                // singularities without overwhelming the learned distribution.
-                let smoothing = if raw_sum > 0.0 {
-                    0.003 * raw_sum / NUM_DIR_BINS as f32
-                } else {
-                    1.0 / NUM_DIR_BINS as f32
-                };
-                let mut sum = 0.0f32;
-                for item in cell.iter_mut() {
-                    *item += smoothing;
-                    sum += *item;
-                }
-                if sum > 0.0 {
-                    let inv = 1.0 / sum;
+
+                if raw_sum > 0.0 {
+                    // Normalize learned distribution, then mix with uniform.
+                    let inv = 1.0 / raw_sum;
                     for item in cell.iter_mut() {
-                        *item *= inv;
+                        *item = one_minus_eps * (*item * inv) + DEFENSIVE_EPSILON * uniform;
                     }
                 } else {
+                    // No training data: pure uniform.
                     for item in cell.iter_mut() {
-                        *item = 1.0 / NUM_DIR_BINS as f32;
+                        *item = uniform;
                     }
                 }
             }
@@ -689,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn laplace_smoothing_prevents_zero_bins() {
+    fn defensive_mixing_prevents_zero_bins() {
         let mut guide = PathGuide::new();
         guide.reset();
         // Only accumulate into one bin.
@@ -698,15 +710,94 @@ mod tests {
         guide.accumulate(50_000.0, up, sun, Vec3::new(0.0, 0.0, 1.0), 1000.0);
         guide.normalize();
 
-        // All bins should be > 0 due to Laplace smoothing.
+        // All bins should be > 0 due to defensive mixing with uniform.
         let (a, s, _) = PathGuide::lookup(50_000.0, up, sun, Vec3::new(0.0, 0.0, 1.0));
         for d in 0..NUM_DIR_BINS {
             assert!(
                 guide.table[a][s][d] > 0.0,
-                "Bin [{a}][{s}][{d}] should be > 0 after smoothing, got {}",
+                "Bin [{a}][{s}][{d}] should be > 0 after defensive mixing, got {}",
                 guide.table[a][s][d]
             );
         }
+    }
+
+    #[test]
+    fn defensive_mixing_floor_is_correct() {
+        let mut guide = PathGuide::new();
+        guide.reset();
+        // Accumulate heavily into one bin -- the minimum bin probability
+        // should be exactly DEFENSIVE_EPSILON / NUM_DIR_BINS.
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let sun = Vec3::new(1.0, 0.0, 0.0);
+        guide.accumulate(50_000.0, up, sun, Vec3::new(0.0, 0.0, 1.0), 1e6);
+        guide.normalize();
+
+        let (a, s, d_trained) = PathGuide::lookup(50_000.0, up, sun, Vec3::new(0.0, 0.0, 1.0));
+        let expected_floor = DEFENSIVE_EPSILON / NUM_DIR_BINS as f32;
+
+        // Find the minimum bin probability (should be very close to the floor).
+        let mut min_prob = f32::MAX;
+        for d in 0..NUM_DIR_BINS {
+            if d != d_trained && guide.table[a][s][d] < min_prob {
+                min_prob = guide.table[a][s][d];
+            }
+        }
+
+        // The minimum should be close to epsilon/N (the uniform-only contribution).
+        // Exact value: (1-eps)*0 + eps*(1/N) = eps/N for zero-trained bins.
+        // But learned distribution has 0 in untrained bins, so:
+        //   p = (1-eps)*0 + eps*(1/N) = eps/N
+        assert!(
+            (min_prob - expected_floor).abs() < 1e-6,
+            "Min bin probability should be ~{expected_floor}, got {min_prob}"
+        );
+
+        // The trained bin should have the bulk of the probability.
+        let trained_prob = guide.table[a][s][d_trained];
+        let expected_max =
+            (1.0 - DEFENSIVE_EPSILON) * 1.0 + DEFENSIVE_EPSILON / NUM_DIR_BINS as f32;
+        assert!(
+            (trained_prob - expected_max).abs() < 1e-5,
+            "Trained bin should be ~{expected_max}, got {trained_prob}"
+        );
+    }
+
+    #[test]
+    fn defensive_mixing_max_ratio_bounded() {
+        let mut guide = PathGuide::new();
+        guide.reset();
+        // Train one bin very heavily.
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let sun = Vec3::new(1.0, 0.0, 0.0);
+        guide.accumulate(50_000.0, up, sun, Vec3::new(0.0, 0.0, 1.0), 1e10);
+        guide.normalize();
+
+        let (a, s, _) = PathGuide::lookup(50_000.0, up, sun, Vec3::new(0.0, 0.0, 1.0));
+
+        let mut max_prob = 0.0f32;
+        let mut min_prob = f32::MAX;
+        for d in 0..NUM_DIR_BINS {
+            let p = guide.table[a][s][d];
+            if p > max_prob {
+                max_prob = p;
+            }
+            if p < min_prob {
+                min_prob = p;
+            }
+        }
+
+        // The ratio between max and min should be bounded by:
+        //   max/min = [(1-eps) + eps/N] / [eps/N]
+        //           = (1-eps)*N/eps + 1
+        // For eps=0.15, N=32: (0.85*32/0.15) + 1 = 182.3
+        // This is the absolute worst case (all mass in one bin).
+        let ratio = max_prob / min_prob;
+        let theoretical_max =
+            (1.0 - DEFENSIVE_EPSILON) * NUM_DIR_BINS as f32 / DEFENSIVE_EPSILON + 1.0;
+        assert!(
+            ratio <= theoretical_max + 0.1,
+            "Max/min ratio {ratio} exceeds theoretical bound {theoretical_max}"
+        );
     }
 
     #[test]

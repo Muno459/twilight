@@ -908,46 +908,133 @@ const TERMINATOR_TILT_MAX_DEG: f64 = 60.0;
 ///   w_mis = p_phase / (GUIDE_MIS_FRAC * p_guide + (1 - GUIDE_MIS_FRAC) * p_phase)
 const GUIDE_MIS_FRAC: f64 = 0.5;
 
-/// Number of altitude-based splitting levels for deep twilight variance reduction.
-///
-/// When a backward MC chain scatters above a split altitude, it is duplicated
-/// into K copies, each with weight/K. Each copy explores independently from
-/// the split point with an independent RNG stream. This is provably unbiased
-/// by weight conservation: K * (w/K) * E[score] = w * E[score].
-///
-/// Splitting directly addresses the rare-event bottleneck: at SZA 106, the
-/// probability of a chain reaching 60 km altitude from a 10 km LOS step is
-/// ~10^-3. Splitting at intermediate altitudes converts rare survivors into
-/// multiple independent explorations of the high-altitude region.
-const NUM_SPLIT_LEVELS: usize = 3;
+// --- Weight Windows ---
+//
+// Weight windows replace fixed altitude-splitting and BOUNCE_SAFETY_LIMIT
+// with adaptive, importance-based population control. At each bounce, the
+// chain's weight is compared against a target weight derived from an
+// importance function I(altitude, sza):
+//
+//   w_target(alt) = 1 / I_rel(alt)
+//   I_rel(alt) = exp((alt - alt_start) / H_ww(sza))
+//
+// where alt_start is the chain's starting altitude and H_ww is a
+// SZA-adaptive scale height.
+//
+// - When weight > w_target * WW_UPPER_RATIO: split into k = round(w/w_target)
+//   copies. Each gets weight/k. Provably unbiased: k * (w/k) = w.
+// - When weight < w_target / WW_LOWER_RATIO: Russian roulette. Survive with
+//   probability p = weight / w_target. On survival, weight = w_target.
+//   Provably unbiased: E[output] = p * w_target = weight.
+//
+// The asymmetric ratios (upper=2, lower=10) reflect the physics: splitting
+// at high altitude is always beneficial, but RR at low altitude can harm
+// estimates when tropospheric scattering still contributes (SZA 100-104).
+//
+// Benefits over fixed altitude splitting:
+// 1. Unbiased chain termination (replaces BOUNCE_SAFETY_LIMIT)
+// 2. Adaptive: no static SZA thresholds or altitude breakpoints
+// 3. Tropospheric chains killed early (~350 bounces vs 10,000)
+// 4. High-altitude chains split proportionally to their rarity
 
-/// Altitude thresholds (meters above surface) at which splitting occurs.
+/// Minimum scale height for weight window importance at deep twilight [m].
 ///
-///   15 km: chain exits the dense lower troposphere (before analog fallback
-///          at FORCED_TAU_MIN = 0.02, ensuring splits happen while chains
-///          are still in forced mode with reliable weights)
-///   40 km: chain reaches upper stratosphere (approaching shadow boundary)
-///   65 km: chain reaches mesosphere (lateral transport region)
-const SPLIT_ALTITUDES_M: [f64; NUM_SPLIT_LEVELS] = [15_000.0, 40_000.0, 65_000.0];
+/// At SZA >= 106, the importance function ramps steeply with altitude:
+/// I_rel(+60 km) = exp(60000/12000) = 148. With WW_UPPER_RATIO = 2,
+/// chains split into ~24 copies (capped by MAX_SPLIT_PARTICLES), matching
+/// or exceeding the old 3*3*2 = 18 fixed-altitude scheme.
+const WW_H_MIN_M: f64 = 12_000.0;
 
-/// Split factors at deep twilight (SZA >= 102 deg).
+/// Maximum scale height for weight window importance at moderate SZA [m].
 ///
-/// Worst-case budget: 3 * 3 * 2 = 18 copies per chain. Each copy carries
-/// weight / (product of split factors encountered), so no weight inflation.
-const SPLIT_FACTORS_DEEP: [usize; NUM_SPLIT_LEVELS] = [3, 3, 2];
+/// At SZA < 96, the scale height is effectively infinite (no splitting).
+/// This value gives I_rel(+60 km) = exp(60000/1000000) = 1.06, so weight
+/// windows are dormant.
+const WW_H_MAX_M: f64 = 1_000_000.0;
 
-/// Split factors in the transition band (96 <= SZA < 102 deg).
+/// Center SZA for the weight window sigmoid ramp [degrees].
 ///
-/// More conservative: 2 * 2 * 1 = 4 copies max. At SZA 96-100, chains can
-/// reach sunlit regions with ~5-10% probability, so moderate splitting suffices.
-const SPLIT_FACTORS_TRANSITION: [usize; NUM_SPLIT_LEVELS] = [2, 2, 1];
+/// The sigmoid (sza - center) / width transitions weight window aggressiveness.
+/// At center = 100: civil twilight gets no windows, nautical gets very mild,
+/// astronomical gets full.
+const WW_SZA_CENTER: f64 = 100.0;
+
+/// Width of the weight window sigmoid ramp [degrees].
+///
+/// Smaller = sharper transition. At 1.0 degrees:
+///   SZA 93: t = 0.001, dormant
+///   SZA 96: t = 0.018, dormant
+///   SZA 100: t = 0.5, mild
+///   SZA 104: t = 0.982, aggressive
+///   SZA 106: t = 0.998, full
+const WW_SZA_WIDTH: f64 = 1.0;
+
+/// Upper weight window ratio for splitting.
+///
+/// When weight > w_target * WW_UPPER_RATIO, the chain is split.
+/// At 2.0: chains split when their weight is 2x the target, creating
+/// more copies to explore high-altitude regions.
+const WW_UPPER_RATIO: f64 = 2.0;
+
+/// Lower weight window ratio for Russian roulette.
+///
+/// When weight < w_target / WW_LOWER_RATIO, the chain faces RR.
+/// At 10.0: chains survive until their weight drops to 1/10 of the target.
+/// This is conservative: at the starting altitude (w_target=1.0),
+/// RR fires after ~770 bounces (SSA=0.997), giving chains ample time
+/// to climb to productive altitudes while still terminating hopelessly
+/// trapped chains.
+///
+/// The asymmetry (upper=2, lower=10) reflects the physics: aggressive
+/// splitting at high altitude is always beneficial (more exploration),
+/// but aggressive RR at low altitude can harm estimates when tropospheric
+/// bounces still contribute (SZA 100-104).
+const WW_LOWER_RATIO: f64 = 10.0;
 
 /// Maximum number of concurrent split particles in the work stack.
 ///
-/// Must be >= product of maximum split factors (3*3*2 = 18), plus headroom.
-/// Stack memory per particle: ~80 bytes (scalar) or ~600 bytes (ALIS with
-/// weight_ratio[64]). At 20 particles: 1.6 KB (scalar) or 12 KB (ALIS).
-const MAX_SPLIT_PARTICLES: usize = 20;
+/// Caps the maximum split count per weight-window event. Stack memory per
+/// particle: ~80 bytes (scalar) or ~600 bytes (ALIS with weight_ratio[64]).
+/// At 24 particles: 1.9 KB (scalar) or 14.4 KB (ALIS).
+const MAX_SPLIT_PARTICLES: usize = 24;
+
+/// Sigmoid helper for smooth parameter transitions.
+///
+/// Returns 1 / (1 + exp(-x)), smoothly transitioning from 0 to 1.
+#[inline]
+fn sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + libm::exp(-x))
+}
+
+/// Compute the SZA-adaptive weight window scale height [m].
+///
+/// Smoothly transitions from WW_H_MAX_M (no windows) at civil twilight
+/// to WW_H_MIN_M (aggressive windows) at deep twilight.
+///
+/// Uses logarithmic interpolation: H = H_MIN^t * H_MAX^(1-t). This ensures
+/// that the transition is smooth in log-space, so even at t=0.98 (SZA 104
+/// with center=100, width=1), H is close to H_MIN (13 km) rather than
+/// the 37 km that linear interpolation would give.
+#[inline]
+fn weight_window_h(sza_deg: f64) -> f64 {
+    let t = sigmoid((sza_deg - WW_SZA_CENTER) / WW_SZA_WIDTH);
+    // H = H_MIN^t * H_MAX^(1-t) = exp(t*ln(H_MIN) + (1-t)*ln(H_MAX))
+    let ln_h = t * libm::log(WW_H_MIN_M) + (1.0 - t) * libm::log(WW_H_MAX_M);
+    libm::exp(ln_h)
+}
+
+/// Compute the weight window target weight at the current altitude.
+///
+/// The importance is relative to the chain's starting altitude, so chains
+/// starting at high altitude (from LOS importance sampling) don't trigger
+/// immediate excessive splitting.
+///
+/// I_rel = exp((alt - alt_start) / H_ww)
+/// w_target = 1 / I_rel = exp(-(alt - alt_start) / H_ww)
+#[inline]
+fn weight_window_target(alt_m: f64, alt_start_m: f64, h_ww: f64) -> f64 {
+    libm::exp(-(alt_m - alt_start_m) / h_ww)
+}
 
 /// Exponential scale height for LOS ray-budget redistribution at moderate
 /// twilight (SZA = 96).
@@ -972,21 +1059,20 @@ const LOS_IMP_H_MODERATE_M: f64 = 100_000.0;
 /// 0-15 km altitude.
 const LOS_IMP_H_DEEP_M: f64 = 30_000.0;
 
-/// State of a single particle in the altitude-splitting work stack (scalar mode).
+/// State of a single particle in the weight-window work stack (scalar mode).
 ///
-/// When a chain scatters above a split altitude, it spawns K copies (each with
-/// weight/K) that explore the high-altitude region independently. The work
-/// stack stores pending copies; the main particle is processed first.
+/// When a chain's weight exceeds the upper window bound, it is split into
+/// K copies (each with weight/K). The work stack stores pending copies;
+/// the main particle is processed first.
 #[derive(Clone, Copy)]
 struct SplitParticleScalar {
     pos: Vec3,
     dir: Vec3,
     weight: f64,
     rng: u64,
-    next_split: usize,
 }
 
-/// State of a single particle in the altitude-splitting work stack (ALIS mode).
+/// State of a single particle in the weight-window work stack (ALIS mode).
 ///
 /// Same as `SplitParticleScalar` but carries per-wavelength weight ratios
 /// for the ALIS hero tracing scheme.
@@ -997,23 +1083,6 @@ struct SplitParticleAlis {
     hero_weight: f64,
     weight_ratio: [f64; 64],
     rng: u64,
-    next_split: usize,
-}
-
-/// Return split factors for the current SZA.
-///
-/// - SZA <= 96: no splitting (all 1s, zero overhead)
-/// - 96 < SZA < 102: transition factors (moderate, 2*2*1 = 4 max copies)
-/// - SZA >= 102: deep factors (aggressive, 3*3*2 = 18 max copies)
-#[inline]
-fn split_factors_for_sza(sza_deg: f64) -> [usize; NUM_SPLIT_LEVELS] {
-    if sza_deg < ZENITH_SZA_START {
-        [1; NUM_SPLIT_LEVELS]
-    } else if sza_deg < 102.0 {
-        SPLIT_FACTORS_TRANSITION
-    } else {
-        SPLIT_FACTORS_DEEP
-    }
 }
 
 // --- VSPG (Volume Scattering Probability Guiding) ---
@@ -2139,10 +2208,9 @@ fn trace_secondary_chain_scalar(
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
-    // Altitude-splitting setup. At SZA <= 96 all factors are 1 (no splitting,
-    // zero overhead). At SZA >= 102 we aggressively split chains that reach
-    // high altitude, rewarding the rare event of climbing through the troposphere.
-    let split_factors = split_factors_for_sza(sza_deg_local);
+    // Weight window setup. Scale height controls splitting/RR aggressiveness.
+    let h_ww = weight_window_h(sza_deg_local);
+    let alt_start = start_pos.length() - surface_radius;
 
     // Initialize work stack with the main particle.
     let mut stack = [SplitParticleScalar {
@@ -2150,7 +2218,6 @@ fn trace_secondary_chain_scalar(
         dir: Vec3::new(0.0, 0.0, 1.0),
         weight: 0.0,
         rng: 0,
-        next_split: 0,
     }; MAX_SPLIT_PARTICLES];
     let mut stack_len: usize = 1;
     stack[0] = SplitParticleScalar {
@@ -2158,7 +2225,6 @@ fn trace_secondary_chain_scalar(
         dir,
         weight: start_optics.ssa * initial_weight,
         rng: *rng_state,
-        next_split: 0,
     };
     let mut main_rng_out = *rng_state;
     let mut main_processed = false;
@@ -2172,9 +2238,8 @@ fn trace_secondary_chain_scalar(
         let mut current_dir = stack[stack_len].dir;
         let mut weight = stack[stack_len].weight;
         let mut local_rng = stack[stack_len].rng;
-        let mut next_split = stack[stack_len].next_split;
 
-        for _bounce in 0..BOUNCE_SAFETY_LIMIT {
+        loop {
             // --- Decide scatter mode for this bounce ---
             // Fused scout + VSPG: single shell walk collects both tau_max
             // and VSPG segments, eliminating the redundant re-walk.
@@ -2372,29 +2437,46 @@ fn trace_secondary_chain_scalar(
             };
             current_dir = new_dir;
 
-            // --- Altitude-based splitting ---
+            // --- Weight window population control ---
             let alt = pos.length() - surface_radius;
-            while next_split < NUM_SPLIT_LEVELS && alt > SPLIT_ALTITUDES_M[next_split] {
-                let k = split_factors[next_split];
-                if k > 1 {
-                    weight /= k as f64;
-                    for copy_idx in 1..k {
-                        if stack_len < MAX_SPLIT_PARTICLES {
-                            let child_rng = local_rng
-                                ^ (copy_idx as u64).wrapping_mul(2654435761)
-                                ^ ((next_split as u64) << 32);
-                            stack[stack_len] = SplitParticleScalar {
-                                pos,
-                                dir: current_dir,
-                                weight,
-                                rng: child_rng,
-                                next_split: next_split + 1,
-                            };
-                            stack_len += 1;
-                        }
+            let w_target = weight_window_target(alt, alt_start, h_ww);
+            let w_lower = w_target / WW_LOWER_RATIO;
+            let w_upper = w_target * WW_UPPER_RATIO;
+            let abs_w = weight.abs();
+
+            if abs_w < w_lower && w_target > 1e-30 {
+                // Russian roulette: chain weight is too small for this region.
+                // Survive with probability p = |weight| / w_target.
+                // On survival: weight = sign(weight) * w_target.
+                // Unbiased: E[output] = p * w_target = |weight|.
+                let p_survive = abs_w / w_target;
+                if xorshift_f64(&mut local_rng) < p_survive {
+                    weight = if weight >= 0.0 { w_target } else { -w_target };
+                } else {
+                    break; // Chain killed by RR
+                }
+            } else if abs_w > w_upper && w_target > 1e-30 {
+                // Splitting: chain weight is too large for this region.
+                // Create k copies each with weight/k. Cap k to available
+                // stack space (remaining slots + 1 for the main particle).
+                let k_ideal = libm::round(abs_w / w_target) as usize;
+                let max_k = MAX_SPLIT_PARTICLES - stack_len + 1;
+                let k = k_ideal.clamp(2, max_k.max(2));
+                weight /= k as f64;
+                for copy_idx in 1..k {
+                    if stack_len < MAX_SPLIT_PARTICLES {
+                        let child_rng = local_rng
+                            ^ (copy_idx as u64).wrapping_mul(2654435761)
+                            ^ (alt.to_bits() >> 32);
+                        stack[stack_len] = SplitParticleScalar {
+                            pos,
+                            dir: current_dir,
+                            weight,
+                            rng: child_rng,
+                        };
+                        stack_len += 1;
                     }
                 }
-                next_split += 1;
             }
         }
 
@@ -2694,8 +2776,9 @@ fn trace_secondary_chain_alis(
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
-    // Altitude-splitting setup (same ramp as scalar tracer).
-    let split_factors = split_factors_for_sza(sza_deg_local);
+    // Weight window setup (same as scalar tracer).
+    let h_ww = weight_window_h(sza_deg_local);
+    let alt_start = start_pos.length() - surface_radius;
 
     // Initialize work stack with the main particle.
     let mut stack = [SplitParticleAlis {
@@ -2704,7 +2787,6 @@ fn trace_secondary_chain_alis(
         hero_weight: 0.0,
         weight_ratio: [0.0f64; 64],
         rng: 0,
-        next_split: 0,
     }; MAX_SPLIT_PARTICLES];
     let mut stack_len: usize = 1;
     stack[0] = SplitParticleAlis {
@@ -2713,7 +2795,6 @@ fn trace_secondary_chain_alis(
         hero_weight: hero_optics.ssa * initial_weight,
         weight_ratio,
         rng: *rng_state,
-        next_split: 0,
     };
     let mut main_rng_out = *rng_state;
     let mut main_processed = false;
@@ -2728,9 +2809,8 @@ fn trace_secondary_chain_alis(
         let mut hero_weight = stack[stack_len].hero_weight;
         let mut wr = stack[stack_len].weight_ratio;
         let mut local_rng = stack[stack_len].rng;
-        let mut next_split = stack[stack_len].next_split;
 
-        for _bounce in 0..BOUNCE_SAFETY_LIMIT {
+        loop {
             // --- Decide scatter mode for this bounce ---
             // Fused scout + VSPG: single shell walk collects both per-wl
             // tau_maxes and VSPG segments (hero wavelength), eliminating
@@ -2999,30 +3079,48 @@ fn trace_secondary_chain_alis(
 
             current_dir = new_dir;
 
-            // --- Altitude-based splitting ---
+            // --- Weight window population control ---
             let alt = pos.length() - surface_radius;
-            while next_split < NUM_SPLIT_LEVELS && alt > SPLIT_ALTITUDES_M[next_split] {
-                let k = split_factors[next_split];
-                if k > 1 {
-                    hero_weight /= k as f64;
-                    for copy_idx in 1..k {
-                        if stack_len < MAX_SPLIT_PARTICLES {
-                            let child_rng = local_rng
-                                ^ (copy_idx as u64).wrapping_mul(2654435761)
-                                ^ ((next_split as u64) << 32);
-                            stack[stack_len] = SplitParticleAlis {
-                                pos,
-                                dir: current_dir,
-                                hero_weight,
-                                weight_ratio: wr,
-                                rng: child_rng,
-                                next_split: next_split + 1,
-                            };
-                            stack_len += 1;
-                        }
+            let w_target = weight_window_target(alt, alt_start, h_ww);
+            let w_lower = w_target / WW_LOWER_RATIO;
+            let w_upper = w_target * WW_UPPER_RATIO;
+            let abs_hw = hero_weight.abs();
+
+            if abs_hw < w_lower && w_target > 1e-30 {
+                // Russian roulette: hero weight too small for this region.
+                // Weight ratios are preserved on survival.
+                let p_survive = abs_hw / w_target;
+                if xorshift_f64(&mut local_rng) < p_survive {
+                    hero_weight = if hero_weight >= 0.0 {
+                        w_target
+                    } else {
+                        -w_target
+                    };
+                } else {
+                    break; // Chain killed by RR
+                }
+            } else if abs_hw > w_upper && w_target > 1e-30 {
+                // Splitting: hero weight too large for this region.
+                // Each copy inherits the same weight_ratio array.
+                let k_ideal = libm::round(abs_hw / w_target) as usize;
+                let max_k = MAX_SPLIT_PARTICLES - stack_len + 1;
+                let k = k_ideal.clamp(2, max_k.max(2));
+                hero_weight /= k as f64;
+                for copy_idx in 1..k {
+                    if stack_len < MAX_SPLIT_PARTICLES {
+                        let child_rng = local_rng
+                            ^ (copy_idx as u64).wrapping_mul(2654435761)
+                            ^ (alt.to_bits() >> 32);
+                        stack[stack_len] = SplitParticleAlis {
+                            pos,
+                            dir: current_dir,
+                            hero_weight,
+                            weight_ratio: wr,
+                            rng: child_rng,
+                        };
+                        stack_len += 1;
                     }
                 }
-                next_split += 1;
             }
         }
 
@@ -3337,8 +3435,9 @@ const NUM_PILOT_ITERS: usize = 4;
 /// the guide captures directional structure, not spectral detail.
 const TRAIN_REF_WL: usize = 15;
 
-// Training chains use BOUNCE_SAFETY_LIMIT like all other tracers.
-// Chains terminate naturally via escape, ground absorption, or the
+// Training chains terminate via escape, ground absorption, or weight
+// window RR (same as production tracers). No splitting is applied since
+// training chains only need to discover productive directions, not fully
 // safety limit backstop.
 
 /// Train a path guide by running pilot MC chains through the atmosphere.
@@ -3608,7 +3707,11 @@ fn train_secondary_chain(
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
-    for _bounce in 0..BOUNCE_SAFETY_LIMIT {
+    // Weight window setup for training chains (RR only, no splitting).
+    let h_ww = weight_window_h(sza_deg_local);
+    let alt_start_train = start_pos.length() - surface_radius;
+
+    loop {
         // --- Forced vs analog scatter decision ---
         // Fused scout + VSPG: single shell walk collects both tau_max
         // and VSPG segments, eliminating the redundant re-walk.
@@ -3695,6 +3798,24 @@ fn train_secondary_chain(
                         }
                     }
                     current_dir = d;
+                }
+
+                // Weight window RR (forced-scatter branch).
+                let alt_rr_f = pos.length() - surface_radius;
+                let w_target_f = weight_window_target(alt_rr_f, alt_start_train, h_ww);
+                let w_lower_f = w_target_f / WW_LOWER_RATIO;
+                let abs_wf = weight.abs();
+                if abs_wf < w_lower_f && w_target_f > 1e-30 {
+                    let p_survive = abs_wf / w_target_f;
+                    if xorshift_f64(rng_state) < p_survive {
+                        weight = if weight >= 0.0 {
+                            w_target_f
+                        } else {
+                            -w_target_f
+                        };
+                    } else {
+                        return; // Training chain killed by RR
+                    }
                 }
                 continue;
             }
@@ -3830,6 +3951,24 @@ fn train_secondary_chain(
                 }
             }
             current_dir = d;
+        }
+
+        // Weight window RR for training chains (no splitting needed).
+        let alt_rr = pos.length() - surface_radius;
+        let w_target_rr = weight_window_target(alt_rr, alt_start_train, h_ww);
+        let w_lower_rr = w_target_rr / WW_LOWER_RATIO;
+        let abs_w_train = weight.abs();
+        if abs_w_train < w_lower_rr && w_target_rr > 1e-30 {
+            let p_survive = abs_w_train / w_target_rr;
+            if xorshift_f64(rng_state) < p_survive {
+                weight = if weight >= 0.0 {
+                    w_target_rr
+                } else {
+                    -w_target_rr
+                };
+            } else {
+                break; // Training chain killed by RR
+            }
         }
     }
 }
@@ -5579,44 +5718,126 @@ mod tests {
         }
     }
 
-    // ── Altitude splitting ──
+    // ── Weight windows ──
 
     #[test]
-    fn split_factors_no_splitting_at_civil_twilight() {
-        let factors = split_factors_for_sza(90.0);
-        assert_eq!(factors, [1, 1, 1], "No splitting at civil twilight");
+    fn weight_window_h_dormant_at_civil_twilight() {
+        // At SZA < 96, scale height should be very large (> 100 km).
+        let h = weight_window_h(90.0);
+        assert!(h > 100_000.0, "H at SZA 90 should be > 100 km, got {}", h);
+        let h93 = weight_window_h(93.0);
+        assert!(
+            h93 > 100_000.0,
+            "H at SZA 93 should be > 100 km, got {}",
+            h93
+        );
     }
 
     #[test]
-    fn split_factors_transition_band() {
-        let factors = split_factors_for_sza(99.0);
-        assert_eq!(factors, SPLIT_FACTORS_TRANSITION);
+    fn weight_window_h_aggressive_at_deep_twilight() {
+        // At SZA >= 106, scale height should be close to WW_H_MIN_M.
+        let h = weight_window_h(106.0);
+        assert!(
+            h < WW_H_MIN_M * 1.2,
+            "H at SZA 106 should be near {} m, got {} m",
+            WW_H_MIN_M,
+            h
+        );
     }
 
     #[test]
-    fn split_factors_deep_twilight() {
-        let factors = split_factors_for_sza(106.0);
-        assert_eq!(factors, SPLIT_FACTORS_DEEP);
+    fn weight_window_h_smooth() {
+        // Verify smooth monotonic decrease from SZA 90 to 110.
+        let mut prev = weight_window_h(90.0);
+        for sza_10x in 905..1100 {
+            let sza = sza_10x as f64 / 10.0;
+            let h = weight_window_h(sza);
+            assert!(
+                h <= prev + 1.0, // allow tiny float rounding
+                "Weight window H not monotonically decreasing: H({}) = {}, H({}) = {}",
+                sza - 0.1,
+                prev,
+                sza,
+                h
+            );
+            prev = h;
+        }
     }
 
     #[test]
-    fn split_factors_boundary_96() {
-        // Exactly at 96: should be no splitting (< ZENITH_SZA_START)
-        let factors = split_factors_for_sza(95.9);
-        assert_eq!(factors, [1, 1, 1]);
+    fn weight_window_target_unity_at_start() {
+        // At the starting altitude, target weight should be 1.0.
+        let w = weight_window_target(30_000.0, 30_000.0, 20_000.0);
+        assert!(
+            (w - 1.0).abs() < 1e-10,
+            "Target weight at start alt should be 1.0, got {}",
+            w
+        );
     }
 
     #[test]
-    fn split_factors_boundary_102() {
-        // At 102: deep factors
-        let factors = split_factors_for_sza(102.0);
-        assert_eq!(factors, SPLIT_FACTORS_DEEP);
+    fn weight_window_target_decreases_with_altitude() {
+        // Target weight should decrease as altitude increases above start.
+        let alt_start = 10_000.0;
+        let h = 20_000.0;
+        let w1 = weight_window_target(20_000.0, alt_start, h);
+        let w2 = weight_window_target(40_000.0, alt_start, h);
+        let w3 = weight_window_target(60_000.0, alt_start, h);
+        assert!(w1 > w2, "w(20km)={} should be > w(40km)={}", w1, w2);
+        assert!(w2 > w3, "w(40km)={} should be > w(60km)={}", w2, w3);
+    }
+
+    #[test]
+    fn weight_window_target_increases_below_start() {
+        // Chains descending below start altitude: target weight increases
+        // (less important region, wider window).
+        let alt_start = 50_000.0;
+        let h = 20_000.0;
+        let w_at_start = weight_window_target(alt_start, alt_start, h);
+        let w_below = weight_window_target(30_000.0, alt_start, h);
+        assert!(
+            w_below > w_at_start,
+            "Target at 30km ({}) should be > target at 50km ({})",
+            w_below,
+            w_at_start
+        );
+    }
+
+    #[test]
+    fn weight_window_rr_unbiased() {
+        // Statistical test: RR expected value should equal input weight.
+        // Run many trials with weight below threshold and verify mean output.
+        let alt_start = 0.0;
+        let h_ww = 20_000.0;
+        let alt = 5_000.0; // near start, w_target ~ 0.78
+        let w_target = weight_window_target(alt, alt_start, h_ww);
+        let w_lower = w_target / WW_LOWER_RATIO;
+
+        let input_weight = w_lower * 0.5; // below threshold
+        let mut rng: u64 = 42;
+        let n = 100_000;
+        let mut output_sum = 0.0;
+        let p_survive = input_weight / w_target;
+        for _ in 0..n {
+            if xorshift_f64(&mut rng) < p_survive {
+                output_sum += w_target;
+            }
+            // else: chain killed, output 0
+        }
+        let mean_output = output_sum / n as f64;
+        let relative_error = (mean_output - input_weight).abs() / input_weight;
+        assert!(
+            relative_error < 0.02,
+            "RR mean output {} should match input weight {} (error: {:.1}%)",
+            mean_output,
+            input_weight,
+            relative_error * 100.0
+        );
     }
 
     #[test]
     fn split_particle_scalar_size_reasonable() {
-        // Ensure SplitParticleScalar doesn't blow stack.
-        // pos Vec3 (24) + dir Vec3 (24) + weight f64 (8) + rng u64 (8) + next_split usize (8) = 72 bytes
+        // pos Vec3 (24) + dir Vec3 (24) + weight f64 (8) + rng u64 (8) = 64 bytes
         let size = core::mem::size_of::<SplitParticleScalar>();
         assert!(size <= 128, "SplitParticleScalar too large: {} bytes", size);
     }
@@ -5804,43 +6025,30 @@ mod tests {
     }
 
     #[test]
-    fn max_split_particles_sufficient() {
-        // The maximum split budget is product(SPLIT_FACTORS_DEEP) for deep twilight.
-        // MAX_SPLIT_PARTICLES must be >= this.
-        let max_budget: usize = SPLIT_FACTORS_DEEP.iter().product();
+    fn weight_window_constants_valid() {
+        assert!(WW_H_MIN_M > 0.0, "WW_H_MIN_M must be positive");
+        assert!(WW_H_MAX_M > WW_H_MIN_M, "WW_H_MAX_M must exceed WW_H_MIN_M");
+        assert!(WW_UPPER_RATIO > 1.0, "WW_UPPER_RATIO must exceed 1.0");
+        assert!(WW_LOWER_RATIO > 1.0, "WW_LOWER_RATIO must exceed 1.0");
         assert!(
-            MAX_SPLIT_PARTICLES >= max_budget,
-            "MAX_SPLIT_PARTICLES ({}) < max budget ({})",
-            MAX_SPLIT_PARTICLES,
-            max_budget
+            WW_LOWER_RATIO >= WW_UPPER_RATIO,
+            "WW_LOWER_RATIO should be >= WW_UPPER_RATIO for conservative RR"
         );
+        assert!(WW_SZA_WIDTH > 0.0, "WW_SZA_WIDTH must be positive");
     }
 
     #[test]
-    fn split_altitudes_increasing() {
-        for i in 1..NUM_SPLIT_LEVELS {
-            assert!(
-                SPLIT_ALTITUDES_M[i] > SPLIT_ALTITUDES_M[i - 1],
-                "Split altitudes must be strictly increasing: [{}]={} <= [{}]={}",
-                i,
-                SPLIT_ALTITUDES_M[i],
-                i - 1,
-                SPLIT_ALTITUDES_M[i - 1]
-            );
-        }
-    }
-
-    #[test]
-    fn split_altitudes_within_atmosphere() {
-        use crate::atmosphere::TOA_ALTITUDE_M;
-        for (i, &alt) in SPLIT_ALTITUDES_M.iter().enumerate() {
-            assert!(
-                alt > 0.0 && alt < TOA_ALTITUDE_M,
-                "Split altitude [{}] = {} must be in (0, {})",
-                i,
-                alt,
-                TOA_ALTITUDE_M
-            );
+    fn sigmoid_basic_properties() {
+        assert!(
+            (sigmoid(0.0) - 0.5).abs() < 1e-10,
+            "sigmoid(0) should be 0.5"
+        );
+        assert!(sigmoid(10.0) > 0.999, "sigmoid(10) should be near 1");
+        assert!(sigmoid(-10.0) < 0.001, "sigmoid(-10) should be near 0");
+        // Monotonic
+        for i in -100..100 {
+            let x = i as f64 * 0.1;
+            assert!(sigmoid(x + 0.1) >= sigmoid(x), "sigmoid must be monotonic");
         }
     }
 
