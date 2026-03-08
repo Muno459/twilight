@@ -801,12 +801,13 @@ const FORCED_TAU_CUTOFF: f64 = 20.0;
 /// deeper into the atmosphere (~20 km), giving chains more chances to
 /// survive and reach the illuminated terminator.
 ///
-/// Uses sigmoid ramp centered at SZA 100 (same as weight windows) for
-/// smooth behavior at arbitrary SZA resolution.
+/// Uses sigmoid ramp centered at SZA 102, width 1.0. At SZA <= 99 this
+/// returns ~0.05 (matching the pre-sigmoid constant), preserving the
+/// established variance characteristics at civil/nautical twilight.
 #[inline]
 fn forced_tau_min_for_sza(sza_deg: f64) -> f64 {
-    let t = sigmoid((sza_deg - 100.0) / 2.0);
-    0.05 - 0.03 * t // 0.05 at low SZA, 0.02 at high SZA
+    let t = sigmoid((sza_deg - 102.0) / 1.0);
+    0.05 - 0.03 * t // 0.05 at SZA<100, 0.02 at SZA>104
 }
 
 /// Maximum directional bias parameter for the exponential transform.
@@ -2497,100 +2498,108 @@ fn trace_secondary_chain_scalar(
             // Sample new direction: 3-way one-sample MIS between phase
             // function, path guide, and Dwivedi horizontal biasing.
             //
-            // Branch probabilities:
-            //   alpha_g = g_alpha          (guide, only when trained)
-            //   alpha_d = d_frac           (Dwivedi horizontal bias)
-            //   alpha_p = 1 - alpha_g - alpha_d   (phase function)
-            //
-            // When no guide is available, alpha_g=0 and alpha_p = 1 - d_frac.
-            //
-            // MIS weight: p_phase / (alpha_p * p_phase + alpha_g * p_guide + alpha_d * p_dwivedi)
+            // When both guide and Dwivedi are inactive (alpha_g + alpha_d < 0.01),
+            // fall through to pure phase function sampling with no MIS overhead
+            // and no extra RNG consumption. This preserves the RNG stream and
+            // avoids compounding small MIS weight perturbations over hundreds of
+            // bounces at civil/nautical twilight.
             let alt_for_guide = pos.length() - surface_radius;
-            let local_up_here = pos.normalize();
             let has_guide = guide.is_some();
             let alpha_g = if has_guide { g_alpha } else { 0.0 };
             let alpha_d = d_frac;
-            let alpha_p_mis = 1.0 - alpha_g - alpha_d;
+            let mis_active = alpha_g + alpha_d >= 0.01;
 
-            let xi_branch = xorshift_f64(&mut local_rng);
+            let new_dir = if mis_active {
+                let local_up_here = pos.normalize();
+                let alpha_p_mis = 1.0 - alpha_g - alpha_d;
+                let xi_branch = xorshift_f64(&mut local_rng);
 
-            let new_dir = if has_guide && xi_branch < alpha_g {
-                // Guide branch
-                let g = guide.unwrap();
-                let (gdir, p_guide) =
-                    g.sample(alt_for_guide, local_up_here, sun_dir, &mut local_rng);
-                let cos_t = current_dir.dot(gdir);
-                let p_phase = scalar_phase_value(cos_t, optics) * INV_4PI;
-                let cos_z_dw = gdir.dot(local_up_here);
-                let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
-                let mis_denom = alpha_p_mis * p_phase + alpha_g * p_guide + alpha_d * p_dw;
-                if mis_denom > 1e-30 {
-                    weight *= p_phase / mis_denom;
-                }
-                // Consume RNG slots to keep stream aligned
-                let _ = xorshift_f64(&mut local_rng);
-                let _ = xorshift_f64(&mut local_rng);
-                let _ = xorshift_f64(&mut local_rng);
-                gdir
-            } else if xi_branch < alpha_g + alpha_d {
-                // Dwivedi branch: sample direction biased toward horizontal
-                let xi1 = xorshift_f64(&mut local_rng);
-                let xi2 = xorshift_f64(&mut local_rng);
-                let xi_sign = xorshift_f64(&mut local_rng);
-                let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
-                let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
-                // Build direction in local frame (local_up, east, north)
-                let east = {
-                    let arbitrary = if libm::fabs(local_up_here.y) < 0.9 {
-                        Vec3::new(0.0, 1.0, 0.0)
-                    } else {
-                        Vec3::new(1.0, 0.0, 0.0)
+                if has_guide && xi_branch < alpha_g {
+                    // Guide branch
+                    let g = guide.unwrap();
+                    let (gdir, p_guide) =
+                        g.sample(alt_for_guide, local_up_here, sun_dir, &mut local_rng);
+                    let cos_t = current_dir.dot(gdir);
+                    let p_phase = scalar_phase_value(cos_t, optics) * INV_4PI;
+                    let cos_z_dw = gdir.dot(local_up_here);
+                    let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
+                    let mis_denom = alpha_p_mis * p_phase + alpha_g * p_guide + alpha_d * p_dw;
+                    if mis_denom > 1e-30 {
+                        weight *= p_phase / mis_denom;
+                    }
+                    // Consume RNG slots to keep stream aligned
+                    let _ = xorshift_f64(&mut local_rng);
+                    let _ = xorshift_f64(&mut local_rng);
+                    let _ = xorshift_f64(&mut local_rng);
+                    gdir
+                } else if xi_branch < alpha_g + alpha_d {
+                    // Dwivedi branch: sample direction biased toward horizontal
+                    let xi1 = xorshift_f64(&mut local_rng);
+                    let xi2 = xorshift_f64(&mut local_rng);
+                    let xi_sign = xorshift_f64(&mut local_rng);
+                    let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
+                    let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
+                    let east = {
+                        let arbitrary = if libm::fabs(local_up_here.y) < 0.9 {
+                            Vec3::new(0.0, 1.0, 0.0)
+                        } else {
+                            Vec3::new(1.0, 0.0, 0.0)
+                        };
+                        let e = local_up_here.cross(arbitrary);
+                        e.normalize()
                     };
-                    let e = local_up_here.cross(arbitrary);
-                    e.normalize()
-                };
-                let north = local_up_here.cross(east);
-                let d = local_up_here.scale(cos_z)
-                    + east.scale(sin_z * libm::cos(phi_dw))
-                    + north.scale(sin_z * libm::sin(phi_dw));
-                let d = d.normalize();
+                    let north = local_up_here.cross(east);
+                    let d = local_up_here.scale(cos_z)
+                        + east.scale(sin_z * libm::cos(phi_dw))
+                        + north.scale(sin_z * libm::sin(phi_dw));
+                    let d = d.normalize();
 
-                let cos_t = current_dir.dot(d);
-                let p_phase = scalar_phase_value(cos_t, optics) * INV_4PI;
-                let p_dw = dwivedi_pdf(cos_z, d_beta);
-                let p_guide = if let Some(g) = guide {
-                    g.pdf(alt_for_guide, local_up_here, sun_dir, d)
+                    let cos_t = current_dir.dot(d);
+                    let p_phase = scalar_phase_value(cos_t, optics) * INV_4PI;
+                    let p_dw = dwivedi_pdf(cos_z, d_beta);
+                    let p_guide = if let Some(g) = guide {
+                        g.pdf(alt_for_guide, local_up_here, sun_dir, d)
+                    } else {
+                        0.0
+                    };
+                    let mis_denom = alpha_p_mis * p_phase + alpha_g * p_guide + alpha_d * p_dw;
+                    if mis_denom > 1e-30 {
+                        weight *= p_phase / mis_denom;
+                    }
+                    d
                 } else {
-                    0.0
-                };
-                let mis_denom = alpha_p_mis * p_phase + alpha_g * p_guide + alpha_d * p_dw;
-                if mis_denom > 1e-30 {
-                    weight *= p_phase / mis_denom;
+                    // Phase function branch (within MIS)
+                    let cos_theta = if xorshift_f64(&mut local_rng) < optics.rayleigh_fraction {
+                        sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
+                    } else {
+                        sample_henyey_greenstein(xorshift_f64(&mut local_rng), optics.asymmetry)
+                    };
+                    let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+                    let d = scatter_direction(current_dir, cos_theta, phi);
+
+                    let p_phase = scalar_phase_value(cos_theta, optics) * INV_4PI;
+                    let cos_z_dw = d.dot(local_up_here);
+                    let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
+                    let p_guide = if let Some(g) = guide {
+                        g.pdf(alt_for_guide, local_up_here, sun_dir, d)
+                    } else {
+                        0.0
+                    };
+                    let mis_denom = alpha_p_mis * p_phase + alpha_g * p_guide + alpha_d * p_dw;
+                    if mis_denom > 1e-30 {
+                        weight *= p_phase / mis_denom;
+                    }
+                    d
                 }
-                d
             } else {
-                // Phase function branch
+                // Pure phase function: no guide, no Dwivedi, no MIS overhead.
                 let cos_theta = if xorshift_f64(&mut local_rng) < optics.rayleigh_fraction {
                     sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
                 } else {
                     sample_henyey_greenstein(xorshift_f64(&mut local_rng), optics.asymmetry)
                 };
                 let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
-                let d = scatter_direction(current_dir, cos_theta, phi);
-
-                let p_phase = scalar_phase_value(cos_theta, optics) * INV_4PI;
-                let cos_z_dw = d.dot(local_up_here);
-                let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
-                let p_guide = if let Some(g) = guide {
-                    g.pdf(alt_for_guide, local_up_here, sun_dir, d)
-                } else {
-                    0.0
-                };
-                let mis_denom = alpha_p_mis * p_phase + alpha_g * p_guide + alpha_d * p_dw;
-                if mis_denom > 1e-30 {
-                    weight *= p_phase / mis_denom;
-                }
-                d
+                scatter_direction(current_dir, cos_theta, phi)
             };
             current_dir = new_dir;
 
@@ -3178,69 +3187,100 @@ fn trace_secondary_chain_alis(
             }
 
             // Sample new direction: 3-way one-sample MIS (guide, Dwivedi,
-            // hero phase function). Same structure as scalar tracer.
+            // hero phase function). Gated: when guide + Dwivedi fractions are
+            // negligible, use pure phase function (no MIS overhead, preserves
+            // RNG stream, avoids compounding weight perturbations).
             let alt_for_guide = pos.length() - surface_radius;
-            let local_up_here = pos.normalize();
             let has_guide = guide.is_some();
             let alpha_g = if has_guide { g_alpha } else { 0.0 };
             let alpha_d = d_frac;
-            let alpha_p_mis = 1.0 - alpha_g - alpha_d;
+            let mis_active = alpha_g + alpha_d >= 0.01;
 
-            let xi_branch = xorshift_f64(&mut local_rng);
+            let (new_dir, cos_theta_for_alis) = if mis_active {
+                let local_up_here = pos.normalize();
+                let alpha_p_mis = 1.0 - alpha_g - alpha_d;
+                let xi_branch = xorshift_f64(&mut local_rng);
 
-            let (new_dir, cos_theta_for_alis) = if has_guide && xi_branch < alpha_g {
-                // Guide branch
-                let g = guide.unwrap();
-                let (gdir, p_guide) =
-                    g.sample(alt_for_guide, local_up_here, sun_dir, &mut local_rng);
-                let ct = current_dir.dot(gdir);
-                let p_phase_hero = scalar_phase_value(ct, hero_scatter_optics) * INV_4PI;
-                let cos_z_dw = gdir.dot(local_up_here);
-                let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
-                let mis_denom = alpha_p_mis * p_phase_hero + alpha_g * p_guide + alpha_d * p_dw;
-                if mis_denom > 1e-30 {
-                    hero_weight *= p_phase_hero / mis_denom;
-                }
-                let _ = xorshift_f64(&mut local_rng);
-                let _ = xorshift_f64(&mut local_rng);
-                let _ = xorshift_f64(&mut local_rng);
-                (gdir, ct)
-            } else if xi_branch < alpha_g + alpha_d {
-                // Dwivedi branch
-                let xi1 = xorshift_f64(&mut local_rng);
-                let xi2 = xorshift_f64(&mut local_rng);
-                let xi_sign = xorshift_f64(&mut local_rng);
-                let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
-                let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
-                let east = {
-                    let arbitrary = if libm::fabs(local_up_here.y) < 0.9 {
-                        Vec3::new(0.0, 1.0, 0.0)
-                    } else {
-                        Vec3::new(1.0, 0.0, 0.0)
+                if has_guide && xi_branch < alpha_g {
+                    // Guide branch
+                    let g = guide.unwrap();
+                    let (gdir, p_guide) =
+                        g.sample(alt_for_guide, local_up_here, sun_dir, &mut local_rng);
+                    let ct = current_dir.dot(gdir);
+                    let p_phase_hero = scalar_phase_value(ct, hero_scatter_optics) * INV_4PI;
+                    let cos_z_dw = gdir.dot(local_up_here);
+                    let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
+                    let mis_denom = alpha_p_mis * p_phase_hero + alpha_g * p_guide + alpha_d * p_dw;
+                    if mis_denom > 1e-30 {
+                        hero_weight *= p_phase_hero / mis_denom;
+                    }
+                    let _ = xorshift_f64(&mut local_rng);
+                    let _ = xorshift_f64(&mut local_rng);
+                    let _ = xorshift_f64(&mut local_rng);
+                    (gdir, ct)
+                } else if xi_branch < alpha_g + alpha_d {
+                    // Dwivedi branch
+                    let xi1 = xorshift_f64(&mut local_rng);
+                    let xi2 = xorshift_f64(&mut local_rng);
+                    let xi_sign = xorshift_f64(&mut local_rng);
+                    let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
+                    let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
+                    let east = {
+                        let arbitrary = if libm::fabs(local_up_here.y) < 0.9 {
+                            Vec3::new(0.0, 1.0, 0.0)
+                        } else {
+                            Vec3::new(1.0, 0.0, 0.0)
+                        };
+                        let e = local_up_here.cross(arbitrary);
+                        e.normalize()
                     };
-                    let e = local_up_here.cross(arbitrary);
-                    e.normalize()
-                };
-                let north = local_up_here.cross(east);
-                let d = local_up_here.scale(cos_z)
-                    + east.scale(sin_z * libm::cos(phi_dw))
-                    + north.scale(sin_z * libm::sin(phi_dw));
-                let d = d.normalize();
-                let ct = current_dir.dot(d);
-                let p_phase_hero = scalar_phase_value(ct, hero_scatter_optics) * INV_4PI;
-                let p_dw = dwivedi_pdf(cos_z, d_beta);
-                let p_guide = if let Some(g) = guide {
-                    g.pdf(alt_for_guide, local_up_here, sun_dir, d)
+                    let north = local_up_here.cross(east);
+                    let d = local_up_here.scale(cos_z)
+                        + east.scale(sin_z * libm::cos(phi_dw))
+                        + north.scale(sin_z * libm::sin(phi_dw));
+                    let d = d.normalize();
+                    let ct = current_dir.dot(d);
+                    let p_phase_hero = scalar_phase_value(ct, hero_scatter_optics) * INV_4PI;
+                    let p_dw = dwivedi_pdf(cos_z, d_beta);
+                    let p_guide = if let Some(g) = guide {
+                        g.pdf(alt_for_guide, local_up_here, sun_dir, d)
+                    } else {
+                        0.0
+                    };
+                    let mis_denom = alpha_p_mis * p_phase_hero + alpha_g * p_guide + alpha_d * p_dw;
+                    if mis_denom > 1e-30 {
+                        hero_weight *= p_phase_hero / mis_denom;
+                    }
+                    (d, ct)
                 } else {
-                    0.0
-                };
-                let mis_denom = alpha_p_mis * p_phase_hero + alpha_g * p_guide + alpha_d * p_dw;
-                if mis_denom > 1e-30 {
-                    hero_weight *= p_phase_hero / mis_denom;
+                    // Phase function branch (within MIS)
+                    let cos_theta =
+                        if xorshift_f64(&mut local_rng) < hero_scatter_optics.rayleigh_fraction {
+                            sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
+                        } else {
+                            sample_henyey_greenstein(
+                                xorshift_f64(&mut local_rng),
+                                hero_scatter_optics.asymmetry,
+                            )
+                        };
+                    let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+                    let d = scatter_direction(current_dir, cos_theta, phi);
+                    let p_phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics) * INV_4PI;
+                    let cos_z_dw = d.dot(local_up_here);
+                    let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
+                    let p_guide = if let Some(g) = guide {
+                        g.pdf(alt_for_guide, local_up_here, sun_dir, d)
+                    } else {
+                        0.0
+                    };
+                    let mis_denom = alpha_p_mis * p_phase_hero + alpha_g * p_guide + alpha_d * p_dw;
+                    if mis_denom > 1e-30 {
+                        hero_weight *= p_phase_hero / mis_denom;
+                    }
+                    (d, cos_theta)
                 }
-                (d, ct)
             } else {
-                // Phase function branch
+                // Pure phase function: no MIS overhead.
                 let cos_theta =
                     if xorshift_f64(&mut local_rng) < hero_scatter_optics.rayleigh_fraction {
                         sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
@@ -3252,18 +3292,6 @@ fn trace_secondary_chain_alis(
                     };
                 let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
                 let d = scatter_direction(current_dir, cos_theta, phi);
-                let p_phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics) * INV_4PI;
-                let cos_z_dw = d.dot(local_up_here);
-                let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
-                let p_guide = if let Some(g) = guide {
-                    g.pdf(alt_for_guide, local_up_here, sun_dir, d)
-                } else {
-                    0.0
-                };
-                let mis_denom = alpha_p_mis * p_phase_hero + alpha_g * p_guide + alpha_d * p_dw;
-                if mis_denom > 1e-30 {
-                    hero_weight *= p_phase_hero / mis_denom;
-                }
                 (d, cos_theta)
             };
 
@@ -3979,83 +4007,101 @@ fn train_secondary_chain(
                 weight *= scatter_optics.ssa;
 
                 // Sample new direction: 3-way MIS with previous guide + Dwivedi.
+                // Gated: pure phase function when MIS alternatives are negligible.
                 let alt_here = pos.length() - surface_radius;
-                let local_up_here = pos.normalize();
                 let has_pg = prev_guide.is_some();
                 let ag = if has_pg { g_alpha } else { 0.0 };
                 let ad = d_frac;
-                let ap = 1.0 - ag - ad;
+                let mis_on = ag + ad >= 0.01;
 
-                let xi_br = xorshift_f64(rng_state);
-                if has_pg && xi_br < ag {
-                    let pg = prev_guide.unwrap();
-                    let (gdir, p_guide) = pg.sample(alt_here, local_up_here, sun_dir, rng_state);
-                    let ct = current_dir.dot(gdir);
-                    let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
-                    let cz = gdir.dot(local_up_here);
-                    let p_dw = dwivedi_pdf(cz, d_beta);
-                    let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
-                    if mis_denom > 1e-30 {
-                        weight *= p_phase / mis_denom;
-                    }
-                    let _ = xorshift_f64(rng_state);
-                    let _ = xorshift_f64(rng_state);
-                    let _ = xorshift_f64(rng_state);
-                    current_dir = gdir;
-                } else if xi_br < ag + ad {
-                    let xi1 = xorshift_f64(rng_state);
-                    let xi2 = xorshift_f64(rng_state);
-                    let xi_sign = xorshift_f64(rng_state);
-                    let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
-                    let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
-                    let east = {
-                        let arb = if libm::fabs(local_up_here.y) < 0.9 {
-                            Vec3::new(0.0, 1.0, 0.0)
-                        } else {
-                            Vec3::new(1.0, 0.0, 0.0)
+                if mis_on {
+                    let local_up_here = pos.normalize();
+                    let ap = 1.0 - ag - ad;
+                    let xi_br = xorshift_f64(rng_state);
+                    if has_pg && xi_br < ag {
+                        let pg = prev_guide.unwrap();
+                        let (gdir, p_guide) =
+                            pg.sample(alt_here, local_up_here, sun_dir, rng_state);
+                        let ct = current_dir.dot(gdir);
+                        let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
+                        let cz = gdir.dot(local_up_here);
+                        let p_dw = dwivedi_pdf(cz, d_beta);
+                        let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
+                        if mis_denom > 1e-30 {
+                            weight *= p_phase / mis_denom;
+                        }
+                        let _ = xorshift_f64(rng_state);
+                        let _ = xorshift_f64(rng_state);
+                        let _ = xorshift_f64(rng_state);
+                        current_dir = gdir;
+                    } else if xi_br < ag + ad {
+                        let xi1 = xorshift_f64(rng_state);
+                        let xi2 = xorshift_f64(rng_state);
+                        let xi_sign = xorshift_f64(rng_state);
+                        let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
+                        let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
+                        let east = {
+                            let arb = if libm::fabs(local_up_here.y) < 0.9 {
+                                Vec3::new(0.0, 1.0, 0.0)
+                            } else {
+                                Vec3::new(1.0, 0.0, 0.0)
+                            };
+                            let e = local_up_here.cross(arb);
+                            e.normalize()
                         };
-                        let e = local_up_here.cross(arb);
-                        e.normalize()
-                    };
-                    let north = local_up_here.cross(east);
-                    let d = local_up_here.scale(cos_z)
-                        + east.scale(sin_z * libm::cos(phi_dw))
-                        + north.scale(sin_z * libm::sin(phi_dw));
-                    let d = d.normalize();
-                    let ct = current_dir.dot(d);
-                    let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
-                    let p_dw = dwivedi_pdf(cos_z, d_beta);
-                    let p_guide = if let Some(pg) = prev_guide {
-                        pg.pdf(alt_here, local_up_here, sun_dir, d)
+                        let north = local_up_here.cross(east);
+                        let d = local_up_here.scale(cos_z)
+                            + east.scale(sin_z * libm::cos(phi_dw))
+                            + north.scale(sin_z * libm::sin(phi_dw));
+                        let d = d.normalize();
+                        let ct = current_dir.dot(d);
+                        let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
+                        let p_dw = dwivedi_pdf(cos_z, d_beta);
+                        let p_guide = if let Some(pg) = prev_guide {
+                            pg.pdf(alt_here, local_up_here, sun_dir, d)
+                        } else {
+                            0.0
+                        };
+                        let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
+                        if mis_denom > 1e-30 {
+                            weight *= p_phase / mis_denom;
+                        }
+                        current_dir = d;
                     } else {
-                        0.0
-                    };
-                    let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
-                    if mis_denom > 1e-30 {
-                        weight *= p_phase / mis_denom;
+                        let cos_theta =
+                            if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
+                                sample_rayleigh_analytic(xorshift_f64(rng_state))
+                            } else {
+                                sample_henyey_greenstein(
+                                    xorshift_f64(rng_state),
+                                    scatter_optics.asymmetry,
+                                )
+                            };
+                        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+                        let d = scatter_direction(current_dir, cos_theta, phi);
+                        let p_phase = scalar_phase_value(cos_theta, scatter_optics) * INV_4PI;
+                        let cz = d.dot(local_up_here);
+                        let p_dw = dwivedi_pdf(cz, d_beta);
+                        let p_guide = if let Some(pg) = prev_guide {
+                            pg.pdf(alt_here, local_up_here, sun_dir, d)
+                        } else {
+                            0.0
+                        };
+                        let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
+                        if mis_denom > 1e-30 {
+                            weight *= p_phase / mis_denom;
+                        }
+                        current_dir = d;
                     }
-                    current_dir = d;
                 } else {
+                    // Pure phase function: no MIS overhead.
                     let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
                         sample_rayleigh_analytic(xorshift_f64(rng_state))
                     } else {
                         sample_henyey_greenstein(xorshift_f64(rng_state), scatter_optics.asymmetry)
                     };
                     let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-                    let d = scatter_direction(current_dir, cos_theta, phi);
-                    let p_phase = scalar_phase_value(cos_theta, scatter_optics) * INV_4PI;
-                    let cz = d.dot(local_up_here);
-                    let p_dw = dwivedi_pdf(cz, d_beta);
-                    let p_guide = if let Some(pg) = prev_guide {
-                        pg.pdf(alt_here, local_up_here, sun_dir, d)
-                    } else {
-                        0.0
-                    };
-                    let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
-                    if mis_denom > 1e-30 {
-                        weight *= p_phase / mis_denom;
-                    }
-                    current_dir = d;
+                    current_dir = scatter_direction(current_dir, cos_theta, phi);
                 }
 
                 // Weight window RR (forced-scatter branch).
@@ -4175,83 +4221,96 @@ fn train_secondary_chain(
         weight *= scatter_optics.ssa;
 
         // Sample new direction: 3-way MIS with previous guide + Dwivedi.
+        // Gated: pure phase function when MIS alternatives are negligible.
         let alt_here = pos.length() - surface_radius;
-        let local_up_here = pos.normalize();
         let has_pg = prev_guide.is_some();
         let ag = if has_pg { g_alpha } else { 0.0 };
         let ad = d_frac;
-        let ap = 1.0 - ag - ad;
+        let mis_on = ag + ad >= 0.01;
 
-        let xi_br = xorshift_f64(rng_state);
-        if has_pg && xi_br < ag {
-            let pg = prev_guide.unwrap();
-            let (gdir, p_guide) = pg.sample(alt_here, local_up_here, sun_dir, rng_state);
-            let ct = current_dir.dot(gdir);
-            let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
-            let cz = gdir.dot(local_up_here);
-            let p_dw = dwivedi_pdf(cz, d_beta);
-            let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
-            if mis_denom > 1e-30 {
-                weight *= p_phase / mis_denom;
-            }
-            let _ = xorshift_f64(rng_state);
-            let _ = xorshift_f64(rng_state);
-            let _ = xorshift_f64(rng_state);
-            current_dir = gdir;
-        } else if xi_br < ag + ad {
-            let xi1 = xorshift_f64(rng_state);
-            let xi2 = xorshift_f64(rng_state);
-            let xi_sign = xorshift_f64(rng_state);
-            let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
-            let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
-            let east = {
-                let arb = if libm::fabs(local_up_here.y) < 0.9 {
-                    Vec3::new(0.0, 1.0, 0.0)
-                } else {
-                    Vec3::new(1.0, 0.0, 0.0)
+        if mis_on {
+            let local_up_here = pos.normalize();
+            let ap = 1.0 - ag - ad;
+            let xi_br = xorshift_f64(rng_state);
+            if has_pg && xi_br < ag {
+                let pg = prev_guide.unwrap();
+                let (gdir, p_guide) = pg.sample(alt_here, local_up_here, sun_dir, rng_state);
+                let ct = current_dir.dot(gdir);
+                let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
+                let cz = gdir.dot(local_up_here);
+                let p_dw = dwivedi_pdf(cz, d_beta);
+                let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
+                if mis_denom > 1e-30 {
+                    weight *= p_phase / mis_denom;
+                }
+                let _ = xorshift_f64(rng_state);
+                let _ = xorshift_f64(rng_state);
+                let _ = xorshift_f64(rng_state);
+                current_dir = gdir;
+            } else if xi_br < ag + ad {
+                let xi1 = xorshift_f64(rng_state);
+                let xi2 = xorshift_f64(rng_state);
+                let xi_sign = xorshift_f64(rng_state);
+                let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
+                let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
+                let east = {
+                    let arb = if libm::fabs(local_up_here.y) < 0.9 {
+                        Vec3::new(0.0, 1.0, 0.0)
+                    } else {
+                        Vec3::new(1.0, 0.0, 0.0)
+                    };
+                    let e = local_up_here.cross(arb);
+                    e.normalize()
                 };
-                let e = local_up_here.cross(arb);
-                e.normalize()
-            };
-            let north = local_up_here.cross(east);
-            let d = local_up_here.scale(cos_z)
-                + east.scale(sin_z * libm::cos(phi_dw))
-                + north.scale(sin_z * libm::sin(phi_dw));
-            let d = d.normalize();
-            let ct = current_dir.dot(d);
-            let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
-            let p_dw = dwivedi_pdf(cos_z, d_beta);
-            let p_guide = if let Some(pg) = prev_guide {
-                pg.pdf(alt_here, local_up_here, sun_dir, d)
+                let north = local_up_here.cross(east);
+                let d = local_up_here.scale(cos_z)
+                    + east.scale(sin_z * libm::cos(phi_dw))
+                    + north.scale(sin_z * libm::sin(phi_dw));
+                let d = d.normalize();
+                let ct = current_dir.dot(d);
+                let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
+                let p_dw = dwivedi_pdf(cos_z, d_beta);
+                let p_guide = if let Some(pg) = prev_guide {
+                    pg.pdf(alt_here, local_up_here, sun_dir, d)
+                } else {
+                    0.0
+                };
+                let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
+                if mis_denom > 1e-30 {
+                    weight *= p_phase / mis_denom;
+                }
+                current_dir = d;
             } else {
-                0.0
-            };
-            let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
-            if mis_denom > 1e-30 {
-                weight *= p_phase / mis_denom;
+                let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
+                    sample_rayleigh_analytic(xorshift_f64(rng_state))
+                } else {
+                    sample_henyey_greenstein(xorshift_f64(rng_state), scatter_optics.asymmetry)
+                };
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+                let d = scatter_direction(current_dir, cos_theta, phi);
+                let p_phase = scalar_phase_value(cos_theta, scatter_optics) * INV_4PI;
+                let cz = d.dot(local_up_here);
+                let p_dw = dwivedi_pdf(cz, d_beta);
+                let p_guide = if let Some(pg) = prev_guide {
+                    pg.pdf(alt_here, local_up_here, sun_dir, d)
+                } else {
+                    0.0
+                };
+                let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
+                if mis_denom > 1e-30 {
+                    weight *= p_phase / mis_denom;
+                }
+                current_dir = d;
             }
-            current_dir = d;
         } else {
+            // Pure phase function: no MIS overhead.
             let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
                 sample_rayleigh_analytic(xorshift_f64(rng_state))
             } else {
                 sample_henyey_greenstein(xorshift_f64(rng_state), scatter_optics.asymmetry)
             };
             let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-            let d = scatter_direction(current_dir, cos_theta, phi);
-            let p_phase = scalar_phase_value(cos_theta, scatter_optics) * INV_4PI;
-            let cz = d.dot(local_up_here);
-            let p_dw = dwivedi_pdf(cz, d_beta);
-            let p_guide = if let Some(pg) = prev_guide {
-                pg.pdf(alt_here, local_up_here, sun_dir, d)
-            } else {
-                0.0
-            };
-            let mis_denom = ap * p_phase + ag * p_guide + ad * p_dw;
-            if mis_denom > 1e-30 {
-                weight *= p_phase / mis_denom;
-            }
-            current_dir = d;
+            current_dir = scatter_direction(current_dir, cos_theta, phi);
         }
 
         // Weight window RR for training chains (no splitting needed).
