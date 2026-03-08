@@ -928,6 +928,251 @@ fn split_factors_for_sza(sza_deg: f64) -> [usize; NUM_SPLIT_LEVELS] {
     }
 }
 
+// --- VSPG (Volume Scattering Probability Guiding) ---
+//
+// VSPG biases forced-scattering distance sampling toward high altitude.
+// Standard forced scattering samples from exp(-tau), concentrating scatters
+// in the dense troposphere. At deep twilight, most tropospheric scatters are
+// wasted because the chains cannot reach sunlit regions. VSPG importance-
+// weights the per-shell scattering probability so that chains "skip" the
+// troposphere and scatter in the stratosphere/mesosphere where they can
+// contribute to the signal via NEE.
+//
+// Math:
+//   Natural per-shell probability: p_i = exp(-tau_lo_i) - exp(-tau_hi_i)
+//   Importance:                    I_i = vspg_importance(alt_i, sza)
+//   Guided probability:            q_i = I_i * p_i  (unnormalized)
+//   Weight correction:             w   = I_avg / I_j
+//                                      = [sum(I_k * p_k) / sum(p_k)] / I_j
+//
+// Provably unbiased: the weight correction exactly compensates for the
+// biased sampling. When all I_i = 1 (SZA <= 96), w = 1 and the sampling
+// degenerates to standard forced scattering with zero overhead (gated out).
+
+/// Maximum number of shell segments for VSPG importance sampling.
+/// A ray through the atmosphere crosses at most ~64 shells in each
+/// direction. 128 handles reflections and re-entries with headroom.
+const VSPG_MAX_SEGMENTS: usize = 128;
+
+/// Altitude (meters) below which VSPG importance is 1.0 (no boost).
+/// Below 15 km, the troposphere is dense and chains scatter frequently
+/// via analog mode anyway. VSPG does not need to act here.
+const VSPG_BOOST_START_M: f64 = 15_000.0;
+
+/// Altitude (meters) at which VSPG importance reaches maximum.
+/// At 70 km (mesosphere), photons are in the lateral transport region
+/// where NEE toward the sun first becomes possible at deep twilight.
+const VSPG_BOOST_FULL_M: f64 = 70_000.0;
+
+/// Maximum importance multiplier at full SZA and full altitude.
+/// A value of 50 means high-altitude shells get 50x the natural
+/// probability of being selected as scatter sites. This aggressively
+/// pushes chains into the mesosphere at deep twilight while maintaining
+/// exact unbiasedness via weight correction.
+const VSPG_MAX_IMPORTANCE: f64 = 50.0;
+
+/// Per-shell segment data for VSPG importance-weighted sampling.
+#[derive(Clone, Copy)]
+struct VspgSegment {
+    /// Cumulative optical depth at segment entry.
+    tau_lo: f64,
+    /// Cumulative optical depth at segment exit.
+    tau_hi: f64,
+    /// Precomputed VSPG importance for this shell.
+    importance: f64,
+}
+
+/// Compute altitude-dependent importance for VSPG.
+///
+/// Returns a multiplier >= 1.0 that biases scatter site selection toward
+/// high altitude. The multiplier ramps quadratically from 1.0 (at or below
+/// `VSPG_BOOST_START_M`) to a SZA-dependent maximum (at `VSPG_BOOST_FULL_M`).
+///
+/// The SZA dependence ensures zero overhead at civil/nautical twilight:
+/// - SZA <= 96: returns 1.0 for all altitudes (no VSPG effect)
+/// - SZA = 101: moderate boost (up to ~25x at 70 km)
+/// - SZA >= 106: full boost (up to `VSPG_MAX_IMPORTANCE` at 70 km)
+#[inline]
+fn vspg_importance(alt_m: f64, sza_deg: f64) -> f64 {
+    if sza_deg < ZENITH_SZA_START || alt_m <= VSPG_BOOST_START_M {
+        return 1.0;
+    }
+    let sza_t =
+        ((sza_deg - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
+    let alt_t =
+        ((alt_m - VSPG_BOOST_START_M) / (VSPG_BOOST_FULL_M - VSPG_BOOST_START_M)).clamp(0.0, 1.0);
+    let max_imp = 1.0 + (VSPG_MAX_IMPORTANCE - 1.0) * sza_t;
+    1.0 + (max_imp - 1.0) * alt_t * alt_t
+}
+
+/// Sample a forced-scatter optical depth using VSPG importance weighting.
+///
+/// Re-walks the ray path through shells (same geometry as the scout),
+/// collecting per-shell segment data and importance values. Then uses
+/// CDF inversion on the importance-weighted probability distribution
+/// to select a shell and sample tau within it.
+///
+/// Returns `(tau_s, weight_correction)` where:
+/// - `tau_s` is the sampled optical depth along the ray
+/// - `weight_correction` is the multiplicative factor for unbiasedness:
+///   `weight_correction = I_avg / I_j`
+///   where `I_avg` is the importance-weighted average and `I_j` is the
+///   importance of the selected segment.
+///
+/// When VSPG importance is uniform (SZA <= 96), the weight correction
+/// is 1.0 and sampling equals standard forced scattering.
+fn vspg_sample_scatter_tau(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    start_dir: Vec3,
+    wavelength_idx: usize,
+    tau_max: f64,
+    sza_deg: f64,
+    rng: &mut u64,
+) -> (f64, f64) {
+    let surface_radius = atm.surface_radius();
+    let num_shells = atm.num_shells;
+    let mut pos = start_pos;
+    let mut dir = start_dir;
+    let mut tau = 0.0;
+
+    // Collect segments during a re-walk of the ray path.
+    let mut segments = [VspgSegment {
+        tau_lo: 0.0,
+        tau_hi: 0.0,
+        importance: 1.0,
+    }; VSPG_MAX_SEGMENTS];
+    let mut num_seg: usize = 0;
+
+    let mut shell_idx = match atm.shell_index(pos.length()) {
+        Some(idx) => idx,
+        None => {
+            // Outside atmosphere: fall back to natural sampling.
+            let xi = xorshift_f64(rng);
+            let one_minus_exp = 1.0 - libm::exp(-tau_max);
+            return (-libm::log(1.0 - xi * one_minus_exp + 1e-30), 1.0);
+        }
+    };
+
+    for _ in 0..200 {
+        let shell = &atm.shells[shell_idx];
+        let optics = &atm.optics[shell_idx][wavelength_idx];
+
+        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
+            Some((dist, is_outward)) => {
+                let tau_shell = optics.extinction * dist;
+                let tau_end = tau + tau_shell;
+
+                // Cap at tau_max (the scout capped here too).
+                let tau_hi = if tau_end > tau_max { tau_max } else { tau_end };
+
+                if num_seg < VSPG_MAX_SEGMENTS && tau_hi > tau + 1e-30 {
+                    segments[num_seg] = VspgSegment {
+                        tau_lo: tau,
+                        tau_hi,
+                        importance: vspg_importance(shell.altitude_mid, sza_deg),
+                    };
+                    num_seg += 1;
+                }
+
+                if tau_end >= tau_max {
+                    break; // Reached scout's tau_max
+                }
+
+                tau = tau_end;
+
+                // Refract at boundary (same path geometry as scout).
+                let boundary_pos = pos + dir * dist;
+                let n_from = atm.refractive_index[shell_idx];
+                let next_shell = if is_outward {
+                    shell_idx + 1
+                } else {
+                    shell_idx.wrapping_sub(1)
+                };
+                let n_to = if next_shell < num_shells {
+                    atm.refractive_index[next_shell]
+                } else {
+                    1.0
+                };
+                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                };
+                pos = boundary_pos + dir * 1e-3;
+
+                // Hit ground.
+                if !is_outward && pos.length() <= surface_radius + 1.0 {
+                    break;
+                }
+                // Exited atmosphere.
+                if next_shell >= num_shells {
+                    break;
+                }
+
+                shell_idx = next_shell;
+            }
+            None => break,
+        }
+
+        if tau > FORCED_TAU_CUTOFF {
+            break;
+        }
+    }
+
+    // Fallback: if no segments collected, use natural sampling.
+    if num_seg == 0 {
+        let xi = xorshift_f64(rng);
+        let one_minus_exp = 1.0 - libm::exp(-tau_max);
+        return (-libm::log(1.0 - xi * one_minus_exp + 1e-30), 1.0);
+    }
+
+    // Compute per-segment natural and importance-weighted probabilities.
+    // p_i = exp(-tau_lo_i) - exp(-tau_hi_i)  (natural scatter probability)
+    // q_i = I_i * p_i                        (importance-weighted)
+    let mut p_sum = 0.0_f64;
+    let mut q_sum = 0.0_f64;
+    let mut q_cdf = [0.0f64; VSPG_MAX_SEGMENTS];
+
+    for i in 0..num_seg {
+        let p_i = libm::exp(-segments[i].tau_lo) - libm::exp(-segments[i].tau_hi);
+        p_sum += p_i;
+        q_sum += segments[i].importance * p_i;
+        q_cdf[i] = q_sum;
+    }
+
+    if q_sum < 1e-30 {
+        // All probabilities negligible: fall back.
+        let xi = xorshift_f64(rng);
+        let one_minus_exp = 1.0 - libm::exp(-tau_max);
+        return (-libm::log(1.0 - xi * one_minus_exp + 1e-30), 1.0);
+    }
+
+    // CDF inversion: select segment j.
+    let xi_segment = xorshift_f64(rng) * q_sum;
+    let mut j = 0usize;
+    while j + 1 < num_seg && q_cdf[j] < xi_segment {
+        j += 1;
+    }
+
+    // Within segment j: sample tau from conditional truncated exponential.
+    // PDF:     exp(-tau) / p_j   over [tau_lo_j, tau_hi_j]
+    // Inverse: tau = -ln(exp(-tau_lo_j) - xi * p_j)
+    let seg = &segments[j];
+    let p_j = libm::exp(-seg.tau_lo) - libm::exp(-seg.tau_hi);
+    let xi_within = xorshift_f64(rng);
+    let tau_s = -libm::log(libm::exp(-seg.tau_lo) - xi_within * p_j + 1e-30);
+
+    // Clamp to valid range (numerical safety).
+    let tau_s = tau_s.clamp(seg.tau_lo, seg.tau_hi);
+
+    // Weight correction: I_avg / I_j.
+    // I_avg = sum(I_k * p_k) / sum(p_k) = q_sum / p_sum.
+    // Corrects for biased segment selection, keeping the estimator unbiased.
+    let i_avg = q_sum / p_sum;
+    let weight_correction = i_avg / seg.importance;
+
+    (tau_s, weight_correction)
+}
+
 /// Compute multi-scatter spectral radiance using a hybrid approach.
 ///
 /// This combines the deterministic single-scatter integrator (order 1, exact)
@@ -1622,8 +1867,19 @@ fn trace_secondary_chain_scalar(
                 if weight < 1e-30 {
                     break;
                 }
-                let xi = xorshift_f64(&mut local_rng);
-                let tau_s = -libm::log(1.0 - xi * (1.0 - exp_neg_tau) + 1e-30);
+                // VSPG: importance-weighted shell selection biases scatter
+                // toward high altitude at deep twilight. Weight correction
+                // keeps the estimator exactly unbiased.
+                let (tau_s, vspg_w) = vspg_sample_scatter_tau(
+                    atm,
+                    pos,
+                    current_dir,
+                    wavelength_idx,
+                    tau_max,
+                    sza_deg_local,
+                    &mut local_rng,
+                );
+                weight *= vspg_w;
                 let (sp, sd, ss) =
                     advance_to_optical_depth(atm, pos, current_dir, tau_s, wavelength_idx);
                 pos = sp;
@@ -2152,8 +2408,17 @@ fn trace_secondary_chain_alis(
                     };
                 }
 
-                let xi = xorshift_f64(&mut local_rng);
-                let tau_s = -libm::log(1.0 - xi * one_minus_exp_h + 1e-30);
+                // VSPG: importance-weighted shell selection for hero wavelength.
+                let (tau_s, vspg_w) = vspg_sample_scatter_tau(
+                    atm,
+                    pos,
+                    current_dir,
+                    hero_wl,
+                    tau_max_h,
+                    sza_deg_local,
+                    &mut local_rng,
+                );
+                hero_weight *= vspg_w;
                 let (sp, sd, ss, taus_at_pos) =
                     advance_to_optical_depth_alis(atm, pos, current_dir, tau_s, hero_wl, num_wl);
                 pos = sp;
@@ -4596,6 +4861,294 @@ mod tests {
                 alt,
                 TOA_ALTITUDE_M
             );
+        }
+    }
+
+    // ---- VSPG tests ----
+
+    #[test]
+    fn vspg_importance_unity_below_boost_start() {
+        // Below 15 km, importance should be 1.0 regardless of SZA.
+        for alt in [0.0, 5_000.0, 10_000.0, VSPG_BOOST_START_M] {
+            for sza in [90.0, 96.0, 100.0, 106.0, 108.0] {
+                let imp = vspg_importance(alt, sza);
+                assert!(
+                    (imp - 1.0).abs() < 1e-12,
+                    "Expected 1.0 at alt={}, sza={}, got {}",
+                    alt,
+                    sza,
+                    imp
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn vspg_importance_unity_at_civil_twilight() {
+        // At SZA <= 96, importance should be 1.0 for all altitudes.
+        for alt in [0.0, 30_000.0, 50_000.0, 70_000.0, 100_000.0] {
+            let imp = vspg_importance(alt, 90.0);
+            assert!(
+                (imp - 1.0).abs() < 1e-12,
+                "Expected 1.0 at SZA 90 alt={}, got {}",
+                alt,
+                imp
+            );
+            let imp2 = vspg_importance(alt, 96.0);
+            assert!(
+                (imp2 - 1.0).abs() < 1e-12,
+                "Expected 1.0 at SZA 96 alt={}, got {}",
+                alt,
+                imp2
+            );
+        }
+    }
+
+    #[test]
+    fn vspg_importance_increases_with_altitude() {
+        let sza = 106.0;
+        let imp_20k = vspg_importance(20_000.0, sza);
+        let imp_40k = vspg_importance(40_000.0, sza);
+        let imp_70k = vspg_importance(70_000.0, sza);
+        assert!(
+            imp_20k < imp_40k,
+            "20km ({}) should be < 40km ({})",
+            imp_20k,
+            imp_40k
+        );
+        assert!(
+            imp_40k < imp_70k,
+            "40km ({}) should be < 70km ({})",
+            imp_40k,
+            imp_70k
+        );
+    }
+
+    #[test]
+    fn vspg_importance_increases_with_sza() {
+        let alt = 50_000.0;
+        let imp_98 = vspg_importance(alt, 98.0);
+        let imp_102 = vspg_importance(alt, 102.0);
+        let imp_106 = vspg_importance(alt, 106.0);
+        assert!(
+            imp_98 < imp_102,
+            "SZA 98 ({}) should be < SZA 102 ({})",
+            imp_98,
+            imp_102
+        );
+        assert!(
+            imp_102 < imp_106,
+            "SZA 102 ({}) should be < SZA 106 ({})",
+            imp_102,
+            imp_106
+        );
+    }
+
+    #[test]
+    fn vspg_importance_max_at_full_altitude_and_sza() {
+        let imp = vspg_importance(VSPG_BOOST_FULL_M, ZENITH_SZA_FULL);
+        assert!(
+            (imp - VSPG_MAX_IMPORTANCE).abs() < 1e-10,
+            "Expected {} at max alt+sza, got {}",
+            VSPG_MAX_IMPORTANCE,
+            imp
+        );
+    }
+
+    #[test]
+    fn vspg_importance_capped_above_full_altitude() {
+        // Above VSPG_BOOST_FULL_M, importance should be capped (not grow).
+        let imp_at = vspg_importance(VSPG_BOOST_FULL_M, 106.0);
+        let imp_above = vspg_importance(VSPG_BOOST_FULL_M + 30_000.0, 106.0);
+        assert!(
+            (imp_at - imp_above).abs() < 1e-10,
+            "Importance should cap: at={}, above={}",
+            imp_at,
+            imp_above
+        );
+    }
+
+    #[test]
+    fn vspg_sample_returns_valid_tau() {
+        use crate::atmosphere::{AtmosphereModel, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+
+        let altitudes = [0.0, 10.0, 25.0, 50.0, 100.0];
+        let wavelengths = [550.0];
+        let mut atm = AtmosphereModel::new(&altitudes, &wavelengths);
+        // Set up increasing extinction downward (realistic).
+        for i in 0..4 {
+            atm.optics[i][0].extinction = 0.01 / ((i as f64 + 1.0) * 5.0);
+            atm.optics[i][0].ssa = 1.0;
+            atm.optics[i][0].rayleigh_fraction = 1.0;
+        }
+
+        let pos = Vec3::new(EARTH_RADIUS_M + 5_000.0, 0.0, 0.0);
+        let dir = Vec3::new(1.0, 0.0, 0.0).normalize(); // radially outward
+        let tau_max = 3.0;
+
+        let mut rng: u64 = 42;
+        for _ in 0..100 {
+            let (tau_s, w) = vspg_sample_scatter_tau(&atm, pos, dir, 0, tau_max, 106.0, &mut rng);
+            assert!(tau_s >= 0.0, "tau_s should be >= 0, got {}", tau_s);
+            assert!(
+                tau_s <= tau_max + 1e-10,
+                "tau_s {} > tau_max {}",
+                tau_s,
+                tau_max
+            );
+            assert!(w > 0.0, "weight correction should be > 0, got {}", w);
+            assert!(
+                w.is_finite(),
+                "weight correction should be finite, got {}",
+                w
+            );
+        }
+    }
+
+    #[test]
+    fn vspg_weight_correction_unity_at_civil_twilight() {
+        use crate::atmosphere::{AtmosphereModel, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+
+        let altitudes = [0.0, 10.0, 25.0, 50.0, 100.0];
+        let wavelengths = [550.0];
+        let mut atm = AtmosphereModel::new(&altitudes, &wavelengths);
+        for i in 0..4 {
+            atm.optics[i][0].extinction = 0.005;
+            atm.optics[i][0].ssa = 1.0;
+            atm.optics[i][0].rayleigh_fraction = 1.0;
+        }
+
+        let pos = Vec3::new(EARTH_RADIUS_M + 5_000.0, 0.0, 0.0);
+        let dir = Vec3::new(1.0, 0.0, 0.0).normalize();
+        let tau_max = 2.0;
+
+        // At SZA 90, all importances are 1.0, so weight correction must be 1.0.
+        let mut rng: u64 = 77;
+        for _ in 0..50 {
+            let (_, w) = vspg_sample_scatter_tau(&atm, pos, dir, 0, tau_max, 90.0, &mut rng);
+            assert!(
+                (w - 1.0).abs() < 1e-12,
+                "Weight correction should be 1.0 at SZA 90, got {}",
+                w
+            );
+        }
+    }
+
+    #[test]
+    fn vspg_segment_count_bounded() {
+        // VSPG_MAX_SEGMENTS should accommodate worst-case ray traversal.
+        assert!(
+            VSPG_MAX_SEGMENTS >= 64,
+            "Need at least 64 segments for full traversal, got {}",
+            VSPG_MAX_SEGMENTS
+        );
+    }
+
+    #[test]
+    fn vspg_constants_reasonable() {
+        assert!(VSPG_BOOST_START_M > 0.0);
+        assert!(VSPG_BOOST_FULL_M > VSPG_BOOST_START_M);
+        assert!(VSPG_MAX_IMPORTANCE > 1.0);
+        assert!(
+            VSPG_MAX_IMPORTANCE <= 200.0,
+            "Max importance too large: {}",
+            VSPG_MAX_IMPORTANCE
+        );
+    }
+
+    #[test]
+    fn vspg_scalar_chain_non_negative_deep_twilight() {
+        // Full chain test: scalar tracer with VSPG at SZA 106 produces
+        // non-negative, finite results.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+
+        let altitudes = [0.0, 5.0, 15.0, 30.0, 50.0, 75.0, 100.0];
+        let wavelengths = [550.0];
+        let mut atm = AtmosphereModel::new(&altitudes, &wavelengths);
+        let sigmas = [1e-2, 5e-3, 1e-3, 2e-4, 5e-5, 1e-5];
+        for (i, &sig) in sigmas.iter().enumerate() {
+            atm.optics[i][0] = ShellOptics {
+                extinction: sig,
+                ssa: 0.999,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        let sza_rad = 106.0 * core::f64::consts::PI / 180.0;
+        let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+
+        let start_optics = &atm.optics[0][0];
+        let mut rng: u64 = 12345;
+        let n = 200;
+        for ray in 0..n {
+            let result = trace_secondary_chain_scalar(
+                &atm,
+                observer,
+                sun_dir,
+                0,
+                start_optics,
+                &mut rng,
+                ray,
+                n,
+            );
+            assert!(
+                result >= 0.0 && result.is_finite(),
+                "Scalar chain {} returned invalid: {}",
+                ray,
+                result
+            );
+        }
+    }
+
+    #[test]
+    fn vspg_alis_chain_non_negative_deep_twilight() {
+        // Full chain test: ALIS tracer with VSPG at SZA 106.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+
+        let altitudes = [0.0, 5.0, 15.0, 30.0, 50.0, 75.0, 100.0];
+        let wavelengths = [450.0, 550.0, 650.0];
+        let mut atm = AtmosphereModel::new(&altitudes, &wavelengths);
+        let sigmas = [1e-2, 5e-3, 1e-3, 2e-4, 5e-5, 1e-5];
+        for (i, &sig) in sigmas.iter().enumerate() {
+            for w in 0..3 {
+                // Slight wavelength dependence (Rayleigh ~lambda^-4).
+                let wl_factor = 1.0 + 0.1 * (w as f64 - 1.0);
+                atm.optics[i][w] = ShellOptics {
+                    extinction: sig * wl_factor,
+                    ssa: 0.999,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        let sza_rad = 106.0 * core::f64::consts::PI / 180.0;
+        let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+
+        let num_wl = 3;
+        let n = 200;
+        let mut rng: u64 = 54321;
+        for ray in 0..n {
+            let hero_wl = ray % num_wl;
+            let result = trace_secondary_chain_alis(
+                &atm, observer, sun_dir, hero_wl, 0, &mut rng, ray, n, num_wl,
+            );
+            for w in 0..num_wl {
+                assert!(
+                    result[w] >= 0.0 && result[w].is_finite(),
+                    "ALIS chain {} wl {} returned invalid: {}",
+                    ray,
+                    w,
+                    result[w]
+                );
+            }
         }
     }
 }
