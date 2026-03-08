@@ -255,11 +255,12 @@ fn simulate_at_sza_mc(
 /// Stokes [I,Q,U,V] propagation per chain.
 /// SZA threshold (degrees) above which path guide training is performed.
 ///
-/// Below 96 degrees (civil twilight and brighter), the phase function sampling
-/// is already efficient and the guide adds overhead without benefit. Above 96,
-/// variance grows rapidly and directional guidance from pilot chains improves
-/// convergence.
-const GUIDE_SZA_THRESHOLD: f64 = 96.0;
+/// Below 102 degrees, the three-branch direction sampling (phase + zenith +
+/// terminator) is already effective and the guide adds MIS overhead without
+/// reliable benefit. At SZA 96-100, training chains produce noisy guides
+/// that can increase variance. Above 102 (deep twilight), the guide captures
+/// lateral-transport paths that unguided sampling almost never finds.
+const GUIDE_SZA_THRESHOLD: f64 = 102.0;
 
 fn simulate_at_sza_hybrid(
     atm: &AtmosphereModel,
