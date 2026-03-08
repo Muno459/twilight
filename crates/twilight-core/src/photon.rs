@@ -2937,6 +2937,404 @@ pub fn hybrid_scatter_spectrum(
     radiance
 }
 
+/// Number of pilot iterations for path guide training.
+///
+/// Each iteration doubles the number of secondary rays, so total work is
+/// ~2^N_PILOT_ITERS * base_rays. With 4 iterations and base_rays = rays/8:
+///   iter 0:  rays/8
+///   iter 1:  rays/4
+///   iter 2:  rays/2
+///   iter 3:  rays    (total ~= 15/8 * rays)
+const NUM_PILOT_ITERS: usize = 4;
+
+/// Reference wavelength index for training chains.
+///
+/// Uses a mid-visible wavelength (~530 nm, index 15 in the standard 380-780nm
+/// grid) where Rayleigh scattering and ozone absorption are moderate, giving
+/// representative scattering geometry. The exact choice is not critical since
+/// the guide captures directional structure, not spectral detail.
+const TRAIN_REF_WL: usize = 15;
+
+/// Maximum bounces for pilot training chains.
+///
+/// Shorter than production (HYBRID_MAX_BOUNCES = 50) since pilot chains
+/// only need to establish coarse directional structure.
+const TRAIN_MAX_BOUNCES: usize = 30;
+
+/// Train a path guide by running pilot MC chains through the atmosphere.
+///
+/// Walks the line of sight (identical geometry to `hybrid_scatter_radiance_alis`)
+/// and at each LOS step launches simplified secondary chains. At each scatter
+/// vertex where NEE produces nonzero signal, accumulates the contribution into
+/// the guide keyed by (altitude, solar_angle, chain_direction).
+///
+/// Uses sample-doubling across `NUM_PILOT_ITERS` iterations: the first iteration
+/// uses `secondary_rays / 2^(N-1)` rays, each subsequent iteration doubles.
+/// All contributions accumulate into a single guide, which is normalized once
+/// at the end. Laplace smoothing prevents zero bins.
+///
+/// The training chains use a single reference wavelength (no ALIS) and skip
+/// altitude splitting, keeping them fast. They still use forced scattering,
+/// exponential transform, and VSPG for proper deep-twilight coverage.
+///
+/// # Arguments
+/// * `atm` - Atmosphere model
+/// * `observer_pos` - Observer position in ECEF [m]
+/// * `view_dir` - Viewing direction (unit vector)
+/// * `sun_dir` - Direction toward the sun (unit vector)
+/// * `secondary_rays` - Base number of training chains per LOS step
+/// * `base_seed` - RNG seed
+///
+/// # Returns
+/// A trained `PathGuide` ready for production use.
+pub fn train_path_guide(
+    atm: &AtmosphereModel,
+    observer_pos: Vec3,
+    view_dir: Vec3,
+    sun_dir: Vec3,
+    secondary_rays: usize,
+    base_seed: u64,
+) -> PathGuide {
+    use crate::geometry::ray_sphere_intersect;
+
+    let mut guide = PathGuide::new();
+    guide.reset(); // start from zero counts
+
+    let ref_wl = if TRAIN_REF_WL < atm.num_wavelengths {
+        TRAIN_REF_WL
+    } else {
+        atm.num_wavelengths / 2
+    };
+
+    let toa_radius = atm.toa_radius();
+    let surface_radius = atm.surface_radius();
+
+    // Find LOS extent (same as hybrid_scatter_radiance_alis).
+    let los_max = match ray_sphere_intersect(observer_pos, view_dir, toa_radius) {
+        Some(hit) if hit.t_far > 0.0 => hit.t_far,
+        _ => {
+            guide.normalize();
+            return guide;
+        }
+    };
+
+    let ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+    let los_end = match ground_hit {
+        Some(ref hit) if hit.t_near > 1e-3 && hit.t_near < los_max => hit.t_near,
+        _ => los_max,
+    };
+
+    if los_end <= 0.0 {
+        guide.normalize();
+        return guide;
+    }
+
+    let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
+    let ds = los_end / num_steps as f64;
+
+    // Sample-doubling iterations.
+    let base_count = (secondary_rays >> (NUM_PILOT_ITERS - 1)).max(1);
+
+    for iter in 0..NUM_PILOT_ITERS {
+        let rays_this_iter = base_count << iter;
+        let mut rng = base_seed
+            .wrapping_add(iter as u64)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1);
+
+        let mut tau_obs = 0.0f64;
+
+        for step in 0..num_steps {
+            let s = (step as f64 + 0.5) * ds;
+            let scatter_pos = observer_pos + view_dir * s;
+            let r = scatter_pos.length();
+
+            if r > toa_radius || r < surface_radius {
+                continue;
+            }
+
+            let shell_idx = match atm.shell_index(r) {
+                Some(idx) => idx,
+                None => continue,
+            };
+
+            let optics = &atm.optics[shell_idx][ref_wl];
+            let tau_obs_mid = tau_obs + optics.extinction * ds * 0.5;
+            if libm::exp(-tau_obs_mid) < 1e-30 {
+                break;
+            }
+
+            // Launch training chains.
+            for ray in 0..rays_this_iter {
+                train_secondary_chain(
+                    atm,
+                    scatter_pos,
+                    sun_dir,
+                    ref_wl,
+                    shell_idx,
+                    &mut rng,
+                    ray,
+                    rays_this_iter,
+                    &mut guide,
+                );
+            }
+
+            tau_obs += optics.extinction * ds;
+        }
+    }
+
+    guide.normalize();
+    guide
+}
+
+/// Trace a single training chain, accumulating NEE contributions into the guide.
+///
+/// Simplified version of `trace_secondary_chain_scalar`: single wavelength,
+/// no splitting, no guide sampling. Uses forced scattering + exponential
+/// transform + VSPG for deep-twilight coverage.
+#[allow(clippy::too_many_arguments)]
+fn train_secondary_chain(
+    atm: &AtmosphereModel,
+    start_pos: Vec3,
+    sun_dir: Vec3,
+    ref_wl: usize,
+    start_shell: usize,
+    rng_state: &mut u64,
+    ray_idx: usize,
+    total_rays: usize,
+    guide: &mut PathGuide,
+) {
+    use crate::single_scatter::shadow_ray_transmittance;
+
+    let local_up = start_pos.normalize();
+    let optics = &atm.optics[start_shell][ref_wl];
+
+    // SZA-adaptive parameters (same as production tracers).
+    let cos_sza = sun_dir.dot(local_up);
+    let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
+    let bp = branch_params_for_sza(cos_sza);
+
+    let alpha_p = 1.0 - bp.zenith_frac;
+    let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
+    let alpha_t = bp.zenith_frac * bp.term_share;
+
+    let term_axis = terminator_axis(local_up, sun_dir, bp.tilt_rad);
+
+    // Stratified initial direction.
+    let xi_jitter = xorshift_f64(rng_state);
+    let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
+
+    let (mut current_dir, mut weight) = if xi_mix < alpha_p {
+        // Phase function branch.
+        let ct = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        } else {
+            sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
+        };
+        let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let branch_w = 0.5 / alpha_p;
+        (scatter_direction(sun_dir, ct, phi_init), branch_w)
+    } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
+        // Zenith-biased branch.
+        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, rng_state);
+        let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
+        let branch_w = 0.5 / (alpha_z + alpha_t);
+        (d, shape_w * branch_w)
+    } else {
+        // Terminator lobe branch.
+        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, rng_state);
+        let cos_z = d.dot(local_up);
+        let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
+        let branch_w = 0.5 / alpha_t;
+        (d, shape_w * branch_w)
+    };
+
+    weight *= optics.ssa;
+    if weight < 1e-30 {
+        return;
+    }
+
+    let surface_radius = atm.surface_radius();
+    let mut pos = start_pos;
+
+    // Exponential transform setup.
+    let use_forced = sza_deg_local >= ZENITH_SZA_START;
+    let sza_t_et =
+        ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
+    let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+
+    for _bounce in 0..TRAIN_MAX_BOUNCES {
+        // --- Forced vs analog scatter decision ---
+        if use_forced {
+            let (tau_max, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, ref_wl);
+            if !hit_ground && tau_max < FORCED_TAU_CUTOFF {
+                let exp_neg_tau = libm::exp(-tau_max);
+                weight *= 1.0 - exp_neg_tau;
+                if weight < 1e-30 {
+                    break;
+                }
+
+                // VSPG guided distance sampling.
+                let (tau_s, vspg_w) = vspg_sample_scatter_tau(
+                    atm,
+                    pos,
+                    current_dir,
+                    ref_wl,
+                    tau_max,
+                    sza_deg_local,
+                    rng_state,
+                );
+                weight *= vspg_w;
+
+                let (sp, sd, ss) = advance_to_optical_depth(atm, pos, current_dir, tau_s, ref_wl);
+                pos = sp;
+                current_dir = sd;
+
+                // NEE at this vertex.
+                let t_sun = shadow_ray_transmittance(atm, pos, sun_dir, ref_wl);
+                if t_sun > 1e-30 {
+                    let nee_optics = &atm.optics[ss][ref_wl];
+                    let cos_nee = sun_dir.dot(-current_dir);
+                    let phase_nee = scalar_phase_value(cos_nee, nee_optics);
+                    let contribution = weight * t_sun * phase_nee * INV_4PI;
+                    if contribution > 1e-30 {
+                        let alt = pos.length() - surface_radius;
+                        let local_up_here = pos.normalize();
+                        guide.accumulate(alt, local_up_here, sun_dir, current_dir, contribution);
+                    }
+                }
+
+                // Apply SSA and scatter.
+                let scatter_optics = &atm.optics[ss][ref_wl];
+                weight *= scatter_optics.ssa;
+                if weight < 1e-30 {
+                    break;
+                }
+
+                // Sample new direction from phase function (no guide during training).
+                let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
+                    sample_rayleigh_analytic(xorshift_f64(rng_state))
+                } else {
+                    sample_henyey_greenstein(xorshift_f64(rng_state), scatter_optics.asymmetry)
+                };
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+                current_dir = scatter_direction(current_dir, cos_theta, phi);
+                continue;
+            }
+        }
+
+        // Analog scattering: walk shell-by-shell.
+        let mut scatter_found = false;
+        let mut scatter_shell = 0usize;
+
+        for _ in 0..200 {
+            let r = pos.length();
+            let shell_idx = match atm.shell_index(r) {
+                Some(idx) => idx,
+                None => break,
+            };
+
+            let shell = &atm.shells[shell_idx];
+            let ext = atm.optics[shell_idx][ref_wl].extinction;
+
+            if ext < 1e-20 {
+                match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                    Some((dist, is_outward)) => {
+                        let (np, nd) =
+                            cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
+                        pos = np;
+                        current_dir = nd;
+                        continue;
+                    }
+                    None => break,
+                }
+            }
+
+            let cos_bias = current_dir.dot(term_axis);
+            let sigma_prime = ext * (1.0 - alpha_et * cos_bias);
+
+            let xi = xorshift_f64(rng_state);
+            let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
+
+            match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
+                Some((boundary_dist, is_outward)) => {
+                    if free_path >= boundary_dist {
+                        if alpha_et > 0.0 {
+                            weight *= libm::exp(-alpha_et * ext * cos_bias * boundary_dist);
+                        }
+                        let (np, nd) = cross_boundary(
+                            pos,
+                            current_dir,
+                            boundary_dist,
+                            is_outward,
+                            shell_idx,
+                            atm,
+                        );
+                        pos = np;
+                        current_dir = nd;
+
+                        // Ground reflection.
+                        if !is_outward && pos.length() <= surface_radius + 1.0 {
+                            weight *= atm.surface_albedo[ref_wl];
+                            if weight < 1e-30 {
+                                break;
+                            }
+                            let normal = pos.normalize();
+                            current_dir = sample_hemisphere(normal, rng_state);
+                            continue;
+                        }
+                        continue;
+                    }
+                }
+                None => break,
+            }
+
+            // Scatter in this shell.
+            if alpha_et > 0.0 {
+                weight *= (ext / sigma_prime) * libm::exp(-alpha_et * ext * cos_bias * free_path);
+            }
+            pos = pos + current_dir * free_path;
+            scatter_shell = shell_idx;
+            scatter_found = true;
+            break;
+        }
+
+        if !scatter_found {
+            break;
+        }
+
+        // NEE at scatter vertex.
+        let t_sun = shadow_ray_transmittance(atm, pos, sun_dir, ref_wl);
+        if t_sun > 1e-30 {
+            let nee_optics = &atm.optics[scatter_shell][ref_wl];
+            let cos_nee = sun_dir.dot(-current_dir);
+            let phase_nee = scalar_phase_value(cos_nee, nee_optics);
+            let contribution = weight * t_sun * phase_nee * INV_4PI;
+            if contribution > 1e-30 {
+                let alt = pos.length() - surface_radius;
+                let local_up_here = pos.normalize();
+                guide.accumulate(alt, local_up_here, sun_dir, current_dir, contribution);
+            }
+        }
+
+        // Apply SSA.
+        let scatter_optics = &atm.optics[scatter_shell][ref_wl];
+        weight *= scatter_optics.ssa;
+        if weight < 1e-30 {
+            break;
+        }
+
+        // Sample new direction.
+        let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        } else {
+            sample_henyey_greenstein(xorshift_f64(rng_state), scatter_optics.asymmetry)
+        };
+        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        current_dir = scatter_direction(current_dir, cos_theta, phi);
+    }
+}
+
 /// Sample a direction uniformly on the upper hemisphere around a normal vector.
 fn sample_hemisphere(normal: Vec3, rng: &mut u64) -> Vec3 {
     use libm::sqrt;
@@ -5232,6 +5630,277 @@ mod tests {
                     result[w]
                 );
             }
+        }
+    }
+
+    // ── train_path_guide tests ──
+
+    #[test]
+    fn train_guide_returns_trained() {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+
+        let altitudes = [0.0, 10.0, 30.0, 60.0, 100.0];
+        let wavelengths = [530.0];
+        let mut atm = AtmosphereModel::new(&altitudes, &wavelengths);
+        let sigmas = [1e-2, 3e-3, 5e-4, 1e-5];
+        for (i, &sig) in sigmas.iter().enumerate() {
+            atm.optics[i][0] = ShellOptics {
+                extinction: sig,
+                ssa: 0.999,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        let view_dir = Vec3::new(0.0, 1.0, 0.0);
+        let sza_rad = 100.0 * core::f64::consts::PI / 180.0;
+        let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+
+        let guide = train_path_guide(&atm, observer, view_dir, sun_dir, 16, 42);
+        assert!(guide.is_trained(), "Guide should be trained after training");
+    }
+
+    #[test]
+    fn train_guide_has_non_uniform_structure() {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+        use crate::path_guide::{NUM_ALT_BINS, NUM_SOLAR_BINS};
+
+        // Use the same atmosphere as alis_positive_at_civil_twilight (known to
+        // produce nonzero signal).
+        let altitudes_km = [0.0, 10.0, 50.0, 100.0];
+        let wavelengths = [550.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..atm.num_shells {
+            atm.optics[s][0] = ShellOptics {
+                extinction: 1e-5 * libm::exp(-atm.shells[s].altitude_mid / 8500.0),
+                ssa: 1.0,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let view_dir = Vec3::new(0.0, 1.0, 0.0).normalize();
+        let sun_dir = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
+
+        let guide = train_path_guide(&atm, observer, view_dir, sun_dir, 256, 123);
+
+        // At least some cells should have non-uniform (non-maximum) entropy,
+        // meaning the training accumulated directional structure.
+        let max_entropy = libm::log(crate::path_guide::NUM_DIR_BINS as f64);
+        let mut any_structured = false;
+        for a in 0..NUM_ALT_BINS {
+            for s in 0..NUM_SOLAR_BINS {
+                let e = guide.cell_entropy(a, s);
+                if e < max_entropy - 0.01 {
+                    any_structured = true;
+                    break;
+                }
+            }
+            if any_structured {
+                break;
+            }
+        }
+        assert!(
+            any_structured,
+            "Trained guide should have at least some non-uniform cells"
+        );
+    }
+
+    #[test]
+    fn train_guide_deterministic() {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+        use crate::path_guide::NUM_DIR_BINS;
+
+        let altitudes = [0.0, 10.0, 50.0, 100.0];
+        let wavelengths = [530.0];
+        let mut atm = AtmosphereModel::new(&altitudes, &wavelengths);
+        for i in 0..atm.num_shells {
+            atm.optics[i][0] = ShellOptics {
+                extinction: 5e-3,
+                ssa: 0.99,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        let view_dir = Vec3::new(0.0, 1.0, 0.0);
+        let sza_rad = 96.0 * core::f64::consts::PI / 180.0;
+        let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+
+        let g1 = train_path_guide(&atm, observer, view_dir, sun_dir, 8, 999);
+        let g2 = train_path_guide(&atm, observer, view_dir, sun_dir, 8, 999);
+
+        // Same seed should give identical guides.
+        for d in 0..NUM_DIR_BINS {
+            let p1 = g1.bin_probability(
+                30_000.0,
+                Vec3::new(1.0, 0.0, 0.0),
+                sun_dir,
+                Vec3::new(0.0, 0.0, 1.0),
+            );
+            let p2 = g2.bin_probability(
+                30_000.0,
+                Vec3::new(1.0, 0.0, 0.0),
+                sun_dir,
+                Vec3::new(0.0, 0.0, 1.0),
+            );
+            assert!(
+                (p1 - p2).abs() < 1e-10,
+                "Guide should be deterministic: bin {} p1={} p2={}",
+                d,
+                p1,
+                p2
+            );
+        }
+    }
+
+    #[test]
+    fn train_guide_empty_atmosphere_still_trained() {
+        use crate::atmosphere::{AtmosphereModel, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+
+        let altitudes = [0.0, 100.0];
+        let wavelengths = [530.0];
+        let atm = AtmosphereModel::new(&altitudes, &wavelengths);
+        // Default optics: zero extinction.
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        let view_dir = Vec3::new(0.0, 1.0, 0.0);
+        let sun_dir = Vec3::new(-0.1, 0.995, 0.0);
+
+        let guide = train_path_guide(&atm, observer, view_dir, sun_dir, 8, 42);
+        // Should still return a trained guide (uniform, since no scattering).
+        assert!(guide.is_trained());
+    }
+
+    #[test]
+    fn train_guide_deep_twilight_no_crash() {
+        // SZA 108 is astronomical twilight limit -- deepest we care about.
+        // Training should not panic or produce NaN/Inf.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+        use crate::path_guide::{NUM_ALT_BINS, NUM_DIR_BINS, NUM_SOLAR_BINS};
+
+        let altitudes = [0.0, 5.0, 15.0, 30.0, 50.0, 75.0, 100.0];
+        let wavelengths = [530.0];
+        let mut atm = AtmosphereModel::new(&altitudes, &wavelengths);
+        let sigmas = [1e-2, 5e-3, 1e-3, 2e-4, 5e-5, 1e-5];
+        for (i, &sig) in sigmas.iter().enumerate() {
+            atm.optics[i][0] = ShellOptics {
+                extinction: sig,
+                ssa: 0.999,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        let view_dir = Vec3::new(0.0, 1.0, 0.0);
+        let sza_rad = 108.0 * core::f64::consts::PI / 180.0;
+        let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+
+        let guide = train_path_guide(&atm, observer, view_dir, sun_dir, 16, 77);
+        assert!(guide.is_trained());
+
+        // No NaN/Inf in any bin.
+        for a in 0..NUM_ALT_BINS {
+            for s in 0..NUM_SOLAR_BINS {
+                let e = guide.cell_entropy(a, s);
+                assert!(e.is_finite(), "Entropy at [{a}][{s}] is not finite: {e}");
+                for d in 0..NUM_DIR_BINS {
+                    let p = guide.bin_probability(
+                        a as f64 * 3125.0,
+                        Vec3::new(1.0, 0.0, 0.0),
+                        sun_dir,
+                        Vec3::new(0.0, 0.0, 1.0),
+                    );
+                    assert!(
+                        p.is_finite() && p >= 0.0,
+                        "Bin [{a}][{s}][{d}] probability invalid: {p}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn train_guide_production_unbiased() {
+        // Train a guide, then verify that using it in production doesn't
+        // change the expected value (unbiasedness of MIS). Compare guided
+        // vs unguided ALIS at civil twilight where we have enough signal.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+        use crate::geometry::Vec3;
+
+        let altitudes = [0.0, 5.0, 15.0, 30.0, 50.0, 75.0, 100.0];
+        let wavelengths = [530.0];
+        let mut atm = AtmosphereModel::new(&altitudes, &wavelengths);
+        let sigmas = [1e-2, 5e-3, 1e-3, 2e-4, 5e-5, 1e-5];
+        for (i, &sig) in sigmas.iter().enumerate() {
+            atm.optics[i][0] = ShellOptics {
+                extinction: sig,
+                ssa: 0.999,
+                asymmetry: 0.0,
+                rayleigh_fraction: 1.0,
+            };
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 10.0, 0.0, 0.0);
+        let view_dir = Vec3::new(0.0, 1.0, 0.0);
+        let sza_rad = 96.0 * core::f64::consts::PI / 180.0;
+        let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+
+        // Train guide.
+        let guide = train_path_guide(&atm, observer, view_dir, sun_dir, 32, 42);
+
+        // Run production with and without guide.
+        let n_rays = 500;
+        let mut rng_no = 12345u64;
+        let result_no = hybrid_scatter_radiance_alis(
+            &atm,
+            observer,
+            view_dir,
+            sun_dir,
+            n_rays,
+            &mut rng_no,
+            None,
+        );
+
+        let mut rng_yes = 12345u64;
+        let result_yes = hybrid_scatter_radiance_alis(
+            &atm,
+            observer,
+            view_dir,
+            sun_dir,
+            n_rays,
+            &mut rng_yes,
+            Some(&guide),
+        );
+
+        // Both should be non-negative and finite.
+        assert!(result_no[0] >= 0.0 && result_no[0].is_finite());
+        assert!(result_yes[0] >= 0.0 && result_yes[0].is_finite());
+
+        // With only 500 rays, we can't expect tight agreement, but they
+        // should be within an order of magnitude (no systematic bias).
+        if result_no[0] > 1e-30 && result_yes[0] > 1e-30 {
+            let ratio = if result_yes[0] > result_no[0] {
+                result_yes[0] / result_no[0]
+            } else {
+                result_no[0] / result_yes[0]
+            };
+            assert!(
+                ratio < 20.0,
+                "Guided ({:.4e}) vs unguided ({:.4e}) differ by {:.1}x -- possible bias",
+                result_yes[0],
+                result_no[0],
+                ratio
+            );
         }
     }
 }

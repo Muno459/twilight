@@ -224,10 +224,25 @@ impl PathGuide {
     /// Laplace smoothing (adds a small uniform baseline before normalizing)
     /// to prevent zero-probability bins that would cause MIS singularities.
     pub fn normalize(&mut self) {
-        let smoothing = 1.0 / NUM_DIR_BINS as f32;
         for a in 0..NUM_ALT_BINS {
             for s in 0..NUM_SOLAR_BINS {
                 let cell = &mut self.table[a][s];
+                // Compute total accumulated mass before smoothing.
+                let mut raw_sum = 0.0f32;
+                for &item in cell.iter() {
+                    raw_sum += item;
+                }
+                // Adaptive Laplace smoothing: add a fraction of the cell mass
+                // per bin. If the cell has zero mass (no training data reached
+                // this cell), fall back to uniform. The 0.01 factor means
+                // smoothing contributes at most ~8% (0.01*8/(1+0.08)) of the
+                // total probability, enough to prevent MIS singularities
+                // without overwhelming the learned distribution.
+                let smoothing = if raw_sum > 0.0 {
+                    0.01 * raw_sum / NUM_DIR_BINS as f32
+                } else {
+                    1.0 / NUM_DIR_BINS as f32
+                };
                 let mut sum = 0.0f32;
                 for item in cell.iter_mut() {
                     *item += smoothing;

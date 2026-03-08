@@ -253,6 +253,14 @@ fn simulate_at_sza_mc(
 ///
 /// For polarized mode, uses rayon parallelism over wavelengths with full
 /// Stokes [I,Q,U,V] propagation per chain.
+/// SZA threshold (degrees) above which path guide training is performed.
+///
+/// Below 96 degrees (civil twilight and brighter), the phase function sampling
+/// is already efficient and the guide adds overhead without benefit. Above 96,
+/// variance grows rapidly and directional guidance from pilot chains improves
+/// convergence.
+const GUIDE_SZA_THRESHOLD: f64 = 96.0;
+
 fn simulate_at_sza_hybrid(
     atm: &AtmosphereModel,
     config: &SimulationConfig,
@@ -265,6 +273,25 @@ fn simulate_at_sza_hybrid(
         // ALIS path: all wavelengths in a single call.
         let sza_bits = sza_deg.to_bits();
         let mut rng = sza_bits.wrapping_mul(6364136223846793005).wrapping_add(1);
+
+        // Train path guide at deep twilight for directional importance sampling.
+        let guide = if sza_deg >= GUIDE_SZA_THRESHOLD && secondary_rays > 0 {
+            // Use the same ray budget for training as for production: the
+            // sample-doubling inside train_path_guide keeps total training
+            // cost at ~2x the production ray count.
+            let train_seed = sza_bits.wrapping_mul(2862933555777941757).wrapping_add(1);
+            Some(photon::train_path_guide(
+                atm,
+                observer_pos,
+                view_dir,
+                sun_dir,
+                secondary_rays,
+                train_seed,
+            ))
+        } else {
+            None
+        };
+
         let radiance_array = photon::hybrid_scatter_radiance_alis(
             atm,
             observer_pos,
@@ -272,7 +299,7 @@ fn simulate_at_sza_hybrid(
             sun_dir,
             secondary_rays,
             &mut rng,
-            None, // TODO: wire path guide through simulation pipeline
+            guide.as_ref(),
         );
         return build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance);
     }
