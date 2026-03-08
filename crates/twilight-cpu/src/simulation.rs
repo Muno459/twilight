@@ -276,16 +276,19 @@ fn simulate_at_sza_hybrid(
 
         // Train path guide at deep twilight for directional importance sampling.
         let guide = if sza_deg >= GUIDE_SZA_THRESHOLD && secondary_rays > 0 {
-            // Use the same ray budget for training as for production: the
-            // sample-doubling inside train_path_guide keeps total training
-            // cost at ~2x the production ray count.
+            // At deep twilight (SZA >= 102), training chains rarely find
+            // productive paths to the sunlit terminator. Increase training
+            // budget to compensate. Training chains are single-wavelength
+            // with no ALIS or splitting, so 4x cost is modest.
+            let train_multiplier = if sza_deg >= 102.0 { 4usize } else { 1 };
+            let train_rays = secondary_rays * train_multiplier;
             let train_seed = sza_bits.wrapping_mul(2862933555777941757).wrapping_add(1);
             Some(photon::train_path_guide(
                 atm,
                 observer_pos,
                 view_dir,
                 sun_dir,
-                secondary_rays,
+                train_rays,
                 train_seed,
             ))
         } else {
@@ -1003,10 +1006,12 @@ mod tests {
         for &sza_deg in &[93.0, 96.0, 100.0, 104.0, 106.0] {
             let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
 
-            // Train guide once for this SZA.
+            // Train guide once for this SZA (with deep-twilight multiplier).
             let sza_bits = sza_deg.to_bits();
             let train_seed = sza_bits.wrapping_mul(2862933555777941757).wrapping_add(1);
-            let guide = photon::train_path_guide(&atm, obs_pos, view, sun, rays, train_seed);
+            let train_multiplier = if sza_deg >= 102.0 { 4usize } else { 1 };
+            let train_rays = rays * train_multiplier;
+            let guide = photon::train_path_guide(&atm, obs_pos, view, sun, train_rays, train_seed);
 
             // Run with and without guide across independent seeds.
             let mut totals_no = Vec::with_capacity(num_seeds);
