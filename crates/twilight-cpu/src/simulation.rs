@@ -272,6 +272,7 @@ fn simulate_at_sza_hybrid(
             sun_dir,
             secondary_rays,
             &mut rng,
+            None, // TODO: wire path guide through simulation pipeline
         );
         return build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance);
     }

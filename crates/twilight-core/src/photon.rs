@@ -6,6 +6,7 @@
 
 use crate::atmosphere::AtmosphereModel;
 use crate::geometry::{next_shell_boundary, refract_at_boundary, RefractResult, Vec3};
+use crate::path_guide::PathGuide;
 use crate::scattering::{
     henyey_greenstein_phase, rayleigh_phase, sample_henyey_greenstein, sample_rayleigh_analytic,
     scatter_direction, scatter_stokes_fast, scattering_plane_cos_sin, StokesVector,
@@ -843,6 +844,16 @@ const TERMINATOR_TILT_MIN_DEG: f64 = 20.0;
 /// where shadow rays can first reach sunlit atmosphere.
 const TERMINATOR_TILT_MAX_DEG: f64 = 50.0;
 
+/// Fraction of bounces (after the first) that use guide-sampled directions
+/// when a trained PathGuide is available. The remaining fraction uses the
+/// standard phase function sampling. One-sample MIS with balance heuristic
+/// combines both, keeping the estimator exactly unbiased.
+///
+/// At 0.5: half the bounces try the guide, half use the phase function.
+/// The MIS weight at each bounce is:
+///   w_mis = p_chosen / (GUIDE_MIS_FRAC * p_guide + (1 - GUIDE_MIS_FRAC) * p_phase)
+const GUIDE_MIS_FRAC: f64 = 0.5;
+
 /// Number of altitude-based splitting levels for deep twilight variance reduction.
 ///
 /// When a backward MC chain scatters above a split altitude, it is duplicated
@@ -1356,6 +1367,7 @@ pub fn hybrid_scatter_radiance(
                         rng_state,
                         ray,
                         secondary_rays,
+                        None, // no path guide in per-wavelength mode
                     );
                 }
                 let inv_rays = 1.0 / secondary_rays as f64;
@@ -1749,6 +1761,7 @@ fn trace_secondary_chain_scalar(
     rng_state: &mut u64,
     ray_idx: usize,
     total_rays: usize,
+    guide: Option<&PathGuide>,
 ) -> f64 {
     use crate::single_scatter::shadow_ray_transmittance;
 
@@ -2000,26 +2013,54 @@ fn trace_secondary_chain_scalar(
                 break;
             }
 
-            // Sample new direction
-            let cos_theta = if xorshift_f64(&mut local_rng) < optics.rayleigh_fraction {
-                sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
+            // Sample new direction: one-sample MIS between phase function
+            // and path guide (when trained). At each bounce, flip a coin:
+            //   - With prob GUIDE_MIS_FRAC: sample from guide, weight by
+            //     balance heuristic MIS weight
+            //   - Otherwise: sample from phase function, same MIS weight
+            // When no guide is available, always use phase function (no overhead).
+            let alt_for_guide = pos.length() - surface_radius;
+            let use_guide_this_bounce =
+                guide.is_some() && xorshift_f64(&mut local_rng) < GUIDE_MIS_FRAC;
+
+            let new_dir = if use_guide_this_bounce {
+                let g = guide.unwrap();
+                let local_up_here = pos.normalize();
+                let (gdir, p_guide) =
+                    g.sample(alt_for_guide, local_up_here, sun_dir, &mut local_rng);
+                let cos_t = current_dir.dot(gdir);
+                let p_phase = scalar_phase_value(cos_t, optics) * INV_4PI;
+                let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                if mis_denom > 1e-30 {
+                    weight *= p_guide / mis_denom;
+                }
+                // Consume RNG slots to keep stream aligned with non-guide path
+                let _ = xorshift_f64(&mut local_rng);
+                let _ = xorshift_f64(&mut local_rng);
+                let _ = xorshift_f64(&mut local_rng);
+                gdir
             } else {
-                sample_henyey_greenstein(xorshift_f64(&mut local_rng), optics.asymmetry)
+                let cos_theta = if xorshift_f64(&mut local_rng) < optics.rayleigh_fraction {
+                    sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
+                } else {
+                    sample_henyey_greenstein(xorshift_f64(&mut local_rng), optics.asymmetry)
+                };
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+                let d = scatter_direction(current_dir, cos_theta, phi);
+                if let Some(g) = guide {
+                    let local_up_here = pos.normalize();
+                    let p_phase = scalar_phase_value(cos_theta, optics) * INV_4PI;
+                    let p_guide = g.pdf(alt_for_guide, local_up_here, sun_dir, d);
+                    let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                    if mis_denom > 1e-30 {
+                        weight *= p_phase / mis_denom;
+                    }
+                }
+                d
             };
-            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
-            let new_dir = scatter_direction(current_dir, cos_theta, phi);
             current_dir = new_dir;
 
             // --- Altitude-based splitting ---
-            // After a full bounce (NEE + SSA + new direction), check if the
-            // scatter position crossed an altitude threshold. If so, create
-            // K-1 independent copies with weight/K. Each copy explores the
-            // high-altitude region independently from this point.
-            //
-            // The NEE at this scatter point was already evaluated with the
-            // pre-split weight. The continuation uses weight/K for each of
-            // the K particles (main + copies). Weight conservation holds:
-            // K * (w/K) * E[future] = w * E[future].
             let alt = pos.length() - surface_radius;
             while next_split < NUM_SPLIT_LEVELS && alt > SPLIT_ALTITUDES_M[next_split] {
                 let k = split_factors[next_split];
@@ -2255,6 +2296,7 @@ fn trace_secondary_chain_alis(
     ray_idx: usize,
     total_rays: usize,
     num_wl: usize,
+    guide: Option<&PathGuide>,
 ) -> [f64; 64] {
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
 
@@ -2579,25 +2621,57 @@ fn trace_secondary_chain_alis(
                 wr[w] *= ssa_ratio;
             }
 
-            // Sample new direction from hero's phase function.
-            let cos_theta = if xorshift_f64(&mut local_rng) < hero_scatter_optics.rayleigh_fraction
-            {
-                sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
+            // Sample new direction: one-sample MIS (guide vs hero phase function).
+            let alt_for_guide = pos.length() - surface_radius;
+            let use_guide_this_bounce =
+                guide.is_some() && xorshift_f64(&mut local_rng) < GUIDE_MIS_FRAC;
+
+            let (new_dir, cos_theta_for_alis) = if use_guide_this_bounce {
+                let g = guide.unwrap();
+                let local_up_here = pos.normalize();
+                let (gdir, p_guide) =
+                    g.sample(alt_for_guide, local_up_here, sun_dir, &mut local_rng);
+                let ct = current_dir.dot(gdir);
+                let p_phase_hero = scalar_phase_value(ct, hero_scatter_optics) * INV_4PI;
+                let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase_hero;
+                if mis_denom > 1e-30 {
+                    hero_weight *= p_guide / mis_denom;
+                }
+                let _ = xorshift_f64(&mut local_rng);
+                let _ = xorshift_f64(&mut local_rng);
+                let _ = xorshift_f64(&mut local_rng);
+                (gdir, ct)
             } else {
-                sample_henyey_greenstein(
-                    xorshift_f64(&mut local_rng),
-                    hero_scatter_optics.asymmetry,
-                )
+                let cos_theta =
+                    if xorshift_f64(&mut local_rng) < hero_scatter_optics.rayleigh_fraction {
+                        sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
+                    } else {
+                        sample_henyey_greenstein(
+                            xorshift_f64(&mut local_rng),
+                            hero_scatter_optics.asymmetry,
+                        )
+                    };
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+                let d = scatter_direction(current_dir, cos_theta, phi);
+                if let Some(g) = guide {
+                    let local_up_here = pos.normalize();
+                    let p_phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics) * INV_4PI;
+                    let p_guide = g.pdf(alt_for_guide, local_up_here, sun_dir, d);
+                    let mis_denom =
+                        GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase_hero;
+                    if mis_denom > 1e-30 {
+                        hero_weight *= p_phase_hero / mis_denom;
+                    }
+                }
+                (d, cos_theta)
             };
-            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
-            let new_dir = scatter_direction(current_dir, cos_theta, phi);
 
             // ALIS phase function ratio for direction sampling.
-            let phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics);
+            let phase_hero = scalar_phase_value(cos_theta_for_alis, hero_scatter_optics);
             if phase_hero > 1e-30 {
                 for w in 0..num_wl {
                     let optics_w = &atm.optics[scatter_shell][w];
-                    let phase_w = scalar_phase_value(cos_theta, optics_w);
+                    let phase_w = scalar_phase_value(cos_theta_for_alis, optics_w);
                     wr[w] *= phase_w / phase_hero;
                 }
             }
@@ -2605,7 +2679,6 @@ fn trace_secondary_chain_alis(
             current_dir = new_dir;
 
             // --- Altitude-based splitting ---
-            // Same logic as scalar tracer, but each child carries weight_ratio.
             let alt = pos.length() - surface_radius;
             while next_split < NUM_SPLIT_LEVELS && alt > SPLIT_ALTITUDES_M[next_split] {
                 let k = split_factors[next_split];
@@ -2656,6 +2729,7 @@ fn trace_secondary_chain_alis(
 ///
 /// Returns spectral radiance array `[f64; 64]` for all wavelengths.
 #[allow(clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_scatter_radiance_alis(
     atm: &AtmosphereModel,
     observer_pos: Vec3,
@@ -2663,6 +2737,7 @@ pub fn hybrid_scatter_radiance_alis(
     sun_dir: Vec3,
     secondary_rays: usize,
     rng_state: &mut u64,
+    guide: Option<&PathGuide>,
 ) -> [f64; 64] {
     use crate::geometry::ray_sphere_intersect;
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
@@ -2760,6 +2835,7 @@ pub fn hybrid_scatter_radiance_alis(
                     ray,
                     secondary_rays,
                     num_wl,
+                    guide,
                 );
 
                 for w in 0..num_wl {
@@ -2808,6 +2884,7 @@ pub fn hybrid_scatter_radiance_alis(
 ///
 /// # Returns
 /// Spectral radiance array `[f64; 64]`, one value per wavelength channel.
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_scatter_spectrum(
     atm: &AtmosphereModel,
     observer_pos: Vec3,
@@ -2816,6 +2893,7 @@ pub fn hybrid_scatter_spectrum(
     secondary_rays: usize,
     base_seed: u64,
     polarized: bool,
+    guide: Option<&PathGuide>,
 ) -> [f64; 64] {
     // ALIS path: trace ONE hero path per chain, evaluate ALL wavelengths.
     // ~N_wl fewer chains than per-wavelength tracing, same expected value.
@@ -2830,6 +2908,7 @@ pub fn hybrid_scatter_spectrum(
             sun_dir,
             secondary_rays,
             &mut rng,
+            guide,
         );
     }
 
@@ -3647,7 +3726,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 10, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 10, 42, true, None);
         assert_eq!(spectrum.len(), 64);
     }
 
@@ -3658,7 +3737,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(96.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 spectrum[w] >= 0.0,
@@ -3676,7 +3755,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -3695,7 +3774,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         assert!(
             spectrum[0].abs() < 1e-20,
             "Empty atmosphere should give zero hybrid contribution, got {}",
@@ -3710,8 +3789,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
-        let s2 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let s1 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
+        let s2 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 (s1[w] - s2[w]).abs() < 1e-15,
@@ -3839,7 +3918,7 @@ mod tests {
 
         for sza in &[92.0, 96.0, 102.0] {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
-            let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true);
+            let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true, None);
             for w in 0..atm.num_wavelengths {
                 assert!(
                     spectrum[w] >= 0.0,
@@ -3861,7 +3940,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -4142,7 +4221,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let mut rng = 12345u64;
-        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng, None);
         assert_eq!(result.len(), 64);
         // Active wavelengths should be non-negative
         for w in 0..3 {
@@ -4194,7 +4273,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let mut rng = 42u64;
-        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 200, &mut rng);
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 200, &mut rng, None);
         for w in 0..3 {
             assert!(
                 result[w] > 0.0,
@@ -4244,7 +4323,8 @@ mod tests {
         for seed in 0..num_seeds {
             let base = seed * 1000 + 7777;
             let mut rng_alis = base;
-            let alis = hybrid_scatter_radiance_alis(&atm, obs, view, sun, rays, &mut rng_alis);
+            let alis =
+                hybrid_scatter_radiance_alis(&atm, obs, view, sun, rays, &mut rng_alis, None);
             for w in 0..3 {
                 alis_sum[w] += alis[w];
             }
@@ -4290,7 +4370,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let mut rng = 42u64;
-        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng, None);
         assert!(
             result[0].abs() < 1e-30,
             "Empty atmosphere ALIS should give zero, got {:.4e}",
@@ -4329,7 +4409,7 @@ mod tests {
         for sza in &[96.0, 100.0, 104.0, 106.0] {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
             let mut rng = 12345u64;
-            let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+            let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng, None);
             for w in 0..3 {
                 assert!(
                     result[w] >= 0.0,
@@ -4709,6 +4789,7 @@ mod tests {
                 &mut rng,
                 ray,
                 n,
+                None,
             );
         }
         let mean = total / n as f64;
@@ -4753,6 +4834,7 @@ mod tests {
                 &mut rng,
                 ray,
                 n,
+                None,
             );
             assert!(
                 val >= 0.0,
@@ -4802,7 +4884,7 @@ mod tests {
         for ray in 0..n {
             let hero_wl = ray % num_wl;
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut rng, ray, n, num_wl,
+                &atm, observer, sun_dir, hero_wl, 0, &mut rng, ray, n, num_wl, None,
             );
             for w in 0..num_wl {
                 assert!(
@@ -5095,6 +5177,7 @@ mod tests {
                 &mut rng,
                 ray,
                 n,
+                None,
             );
             assert!(
                 result >= 0.0 && result.is_finite(),
@@ -5138,7 +5221,7 @@ mod tests {
         for ray in 0..n {
             let hero_wl = ray % num_wl;
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut rng, ray, n, num_wl,
+                &atm, observer, sun_dir, hero_wl, 0, &mut rng, ray, n, num_wl, None,
             );
             for w in 0..num_wl {
                 assert!(
