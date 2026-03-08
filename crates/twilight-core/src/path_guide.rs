@@ -5,17 +5,17 @@
 //! directions via one-sample MIS with the phase function.
 //!
 //! The atmosphere's spherical symmetry reduces the full guiding problem to a
-//! compact 2D spatial grid (altitude x solar_angle) with a coarse directional
-//! distribution at each grid cell. Total storage: 16 KiB in fixed arrays,
-//! trivially fits in `#![no_std]`.
+//! compact 2D spatial grid (altitude x solar_angle) with a directional
+//! distribution at each grid cell. Total storage: 64 KiB in fixed arrays,
+//! fits in `#![no_std]`.
 //!
 //! # Direction parameterization
 //!
 //! At each scatter vertex, the outgoing direction is parameterized by:
-//! - cos_zenith: dot(dir, local_up) -- 4 bands
-//! - sun_side: dot(dir, sun_horiz) >= 0 -- 2 half-planes
+//! - cos_zenith: dot(dir, local_up) -- 8 bands (delta_cos = 0.25)
+//! - azimuthal quadrant: toward/away sun x positive/negative cross -- 4 quadrants
 //!
-//! Total: 8 direction bins per spatial cell.
+//! Total: 32 direction bins per spatial cell.
 //!
 //! # Training
 //!
@@ -41,8 +41,17 @@ pub const NUM_ALT_BINS: usize = 32;
 pub const NUM_SOLAR_BINS: usize = 16;
 
 /// Number of direction bins per spatial cell.
-/// 4 cos_zenith bands x 2 sun-relative azimuthal half-planes.
-pub const NUM_DIR_BINS: usize = 8;
+/// 8 cos_zenith bands x 4 azimuthal quadrants = 32 bins.
+///
+/// Quadrants are defined by two horizontal axes at the scatter vertex:
+/// - sun_horiz: projection of sun_dir onto the local horizontal plane
+/// - cross: local_up x sun_horiz (perpendicular, along the terminator)
+///
+/// Q0: toward sun + positive cross
+/// Q1: toward sun + negative cross
+/// Q2: away from sun + positive cross
+/// Q3: away from sun + negative cross
+pub const NUM_DIR_BINS: usize = 32;
 
 /// Top of atmosphere altitude for binning [m].
 const TOA_ALT_M: f64 = 100_000.0;
@@ -50,19 +59,28 @@ const TOA_ALT_M: f64 = 100_000.0;
 /// Altitude bin width [m].
 const ALT_BIN_WIDTH: f64 = TOA_ALT_M / NUM_ALT_BINS as f64;
 
-/// Boundaries for cos_zenith bands.
-///   [1.0,  0.5): strongly upward   (bin 0,1)
-///   [0.5,  0.0): moderately upward  (bin 2,3)
-///   [0.0, -0.5): moderately downward(bin 4,5)
-///   [-0.5,-1.0]: strongly downward  (bin 6,7)
-/// Even index = toward sun, odd = away from sun.
-const COS_Z_BOUNDS: [f64; 3] = [0.5, 0.0, -0.5];
+/// Number of cos_zenith bands.
+const NUM_Z_BANDS: usize = 8;
+
+/// Number of azimuthal quadrants.
+const NUM_AZ_QUADS: usize = 4;
+
+/// Boundaries for cos_zenith bands (8 bands, delta_cos = 0.25).
+///   [0.75, 1.0]: steeply upward
+///   [0.50, 0.75): upward
+///   [0.25, 0.50): moderately upward
+///   [0.00, 0.25): slightly upward
+///   [-0.25, 0.00): slightly downward
+///   [-0.50, -0.25): moderately downward
+///   [-0.75, -0.50): downward
+///   [-1.0, -0.75): steeply downward
+const COS_Z_BOUNDS: [f64; 7] = [0.75, 0.50, 0.25, 0.0, -0.25, -0.50, -0.75];
 
 /// Solid angle of each direction bin.
 ///
-/// Each bin covers delta_cos_z = 0.5 and delta_phi = pi (half-plane).
-/// Solid angle = delta_cos_z * delta_phi = 0.5 * pi = pi/2.
-const BIN_SOLID_ANGLE: f64 = core::f64::consts::PI / 2.0;
+/// Each bin covers delta_cos_z = 0.25 and delta_phi = pi/2 (quadrant).
+/// Solid angle = delta_cos_z * delta_phi = 0.25 * pi/2 = pi/8.
+const BIN_SOLID_ANGLE: f64 = core::f64::consts::PI / 8.0;
 
 /// Xorshift64 RNG -- local copy to avoid circular dependency with photon.rs.
 #[inline]
@@ -78,7 +96,7 @@ fn xorshift_f64(state: &mut u64) -> f64 {
 /// 2D path guiding table for atmospheric MCRT.
 ///
 /// Fixed-size, `no_std`-compatible. Total memory:
-/// 32 * 16 * 8 * 4 bytes = 16,384 bytes = 16 KiB.
+/// 32 * 16 * 32 * 4 bytes = 65,536 bytes = 64 KiB.
 #[derive(Clone)]
 pub struct PathGuide {
     /// Directional probability weights.
@@ -138,20 +156,47 @@ impl PathGuide {
 
     /// Compute direction bin index.
     ///
-    /// 4 cos_zenith bands x 2 sun-relative azimuthal half-planes = 8 bins.
-    /// Even index = toward sun, odd index = away from sun.
+    /// 8 cos_zenith bands x 4 azimuthal quadrants = 32 bins.
+    /// Layout: z_band * 4 + az_quad.
+    /// az_quad: 0=toward_sun+pos_cross, 1=toward_sun+neg_cross,
+    ///          2=away_sun+pos_cross, 3=away_sun+neg_cross.
     #[inline]
-    fn dir_bin(cos_zenith: f64, toward_sun: bool) -> usize {
-        let z_band = if cos_zenith >= COS_Z_BOUNDS[0] {
-            0
-        } else if cos_zenith >= COS_Z_BOUNDS[1] {
-            1
-        } else if cos_zenith >= COS_Z_BOUNDS[2] {
-            2
+    fn dir_bin(cos_zenith: f64, toward_sun: bool, pos_cross: bool) -> usize {
+        // Binary search over 7 boundaries for 8 bands.
+        let z_band = if cos_zenith >= COS_Z_BOUNDS[3] {
+            // cos_z >= 0.0
+            if cos_zenith >= COS_Z_BOUNDS[1] {
+                if cos_zenith >= COS_Z_BOUNDS[0] {
+                    0
+                } else {
+                    1
+                }
+            } else if cos_zenith >= COS_Z_BOUNDS[2] {
+                2
+            } else {
+                3
+            }
         } else {
-            3
+            // cos_z < 0.0
+            if cos_zenith >= COS_Z_BOUNDS[5] {
+                if cos_zenith >= COS_Z_BOUNDS[4] {
+                    4
+                } else {
+                    5
+                }
+            } else if cos_zenith >= COS_Z_BOUNDS[6] {
+                6
+            } else {
+                7
+            }
         };
-        z_band * 2 + if toward_sun { 0 } else { 1 }
+        let az_quad = match (toward_sun, pos_cross) {
+            (true, true) => 0,
+            (true, false) => 1,
+            (false, true) => 2,
+            (false, false) => 3,
+        };
+        z_band * NUM_AZ_QUADS + az_quad
     }
 
     /// Compute the sun-horizontal unit vector.
@@ -195,8 +240,10 @@ impl PathGuide {
         let s = Self::solar_bin(cos_solar);
         let cos_z = dir.dot(local_up);
         let sun_h = Self::sun_horiz(local_up, sun_dir);
+        let cross = local_up.cross(sun_h);
         let toward = dir.dot(sun_h) >= 0.0;
-        let d = Self::dir_bin(cos_z, toward);
+        let pos_cross = dir.dot(cross) >= 0.0;
+        let d = Self::dir_bin(cos_z, toward, pos_cross);
         (a, s, d)
     }
 
@@ -234,12 +281,12 @@ impl PathGuide {
                 }
                 // Adaptive Laplace smoothing: add a fraction of the cell mass
                 // per bin. If the cell has zero mass (no training data reached
-                // this cell), fall back to uniform. The 0.01 factor means
-                // smoothing contributes at most ~8% (0.01*8/(1+0.08)) of the
-                // total probability, enough to prevent MIS singularities
-                // without overwhelming the learned distribution.
+                // this cell), fall back to uniform. The 0.003 factor gives
+                // total smoothing mass 0.003*32 = 0.096, so smoothing is
+                // ~9% of total probability -- enough to prevent MIS
+                // singularities without overwhelming the learned distribution.
                 let smoothing = if raw_sum > 0.0 {
-                    0.01 * raw_sum / NUM_DIR_BINS as f32
+                    0.003 * raw_sum / NUM_DIR_BINS as f32
                 } else {
                     1.0 / NUM_DIR_BINS as f32
                 };
@@ -308,28 +355,30 @@ impl PathGuide {
             }
         }
 
-        // Decode bin -> (z_band, toward_sun)
-        let z_band = selected / 2;
-        let toward_sun = selected.is_multiple_of(2);
+        // Decode bin -> (z_band, az_quad)
+        let z_band = selected / NUM_AZ_QUADS;
+        let az_quad = selected % NUM_AZ_QUADS;
 
         // Sample cos_zenith uniformly within the band.
-        let (cos_z_lo, cos_z_hi) = match z_band {
-            0 => (COS_Z_BOUNDS[0], 1.0),
-            1 => (COS_Z_BOUNDS[1], COS_Z_BOUNDS[0]),
-            2 => (COS_Z_BOUNDS[2], COS_Z_BOUNDS[1]),
-            _ => (-1.0, COS_Z_BOUNDS[2]),
+        let (cos_z_lo, cos_z_hi) = if z_band == 0 {
+            (COS_Z_BOUNDS[0], 1.0)
+        } else if z_band < NUM_Z_BANDS - 1 {
+            (COS_Z_BOUNDS[z_band], COS_Z_BOUNDS[z_band - 1])
+        } else {
+            (-1.0, COS_Z_BOUNDS[NUM_Z_BANDS - 2])
         };
         let xi_z = xorshift_f64(rng);
         let cos_z = cos_z_lo + (cos_z_hi - cos_z_lo) * xi_z;
         let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
 
-        // Sample azimuth uniformly within the half-plane.
+        // Sample azimuth uniformly within the quadrant (pi/2 range).
         let xi_phi = xorshift_f64(rng);
-        let phi_half = xi_phi * core::f64::consts::PI;
-        let phi = if toward_sun {
-            phi_half
-        } else {
-            phi_half + core::f64::consts::PI
+        let phi_quarter = xi_phi * core::f64::consts::FRAC_PI_2;
+        let phi = match az_quad {
+            0 => phi_quarter, // toward sun + pos cross: [0, pi/2)
+            1 => core::f64::consts::FRAC_PI_2 * 3.0 + phi_quarter, // toward sun + neg cross: [3pi/2, 2pi)
+            2 => core::f64::consts::FRAC_PI_2 + phi_quarter, // away sun + pos cross: [pi/2, pi)
+            _ => core::f64::consts::PI + phi_quarter,        // away sun + neg cross: [pi, 3pi/2)
         };
 
         // Build direction in local frame (up, sun_horiz, cross).
@@ -486,17 +535,22 @@ mod tests {
     }
 
     #[test]
-    fn dir_bin_8_bins() {
-        // Strongly upward, toward sun
-        assert_eq!(PathGuide::dir_bin(0.8, true), 0);
-        // Strongly upward, away from sun
-        assert_eq!(PathGuide::dir_bin(0.8, false), 1);
-        // Moderately upward, toward sun
-        assert_eq!(PathGuide::dir_bin(0.3, true), 2);
-        // Moderately downward, toward sun
-        assert_eq!(PathGuide::dir_bin(-0.3, true), 4);
-        // Strongly downward, away from sun
-        assert_eq!(PathGuide::dir_bin(-0.8, false), 7);
+    fn dir_bin_32_bins() {
+        // 8 z_bands x 4 az_quads = 32 bins.  bin = z_band * 4 + az_quad.
+        // Steeply upward (cos_z >= 0.75), toward sun + pos cross -> Q0
+        assert_eq!(PathGuide::dir_bin(0.8, true, true), 0);
+        // Steeply upward, toward sun + neg cross -> Q1
+        assert_eq!(PathGuide::dir_bin(0.8, true, false), 1);
+        // Steeply upward, away sun + pos cross -> Q2
+        assert_eq!(PathGuide::dir_bin(0.8, false, true), 2);
+        // Steeply upward, away sun + neg cross -> Q3
+        assert_eq!(PathGuide::dir_bin(0.8, false, false), 3);
+        // Upward (0.50..0.75), toward sun + pos cross -> band 1, Q0
+        assert_eq!(PathGuide::dir_bin(0.6, true, true), 4);
+        // Slightly upward (0.00..0.25), away sun + neg cross -> band 3, Q3
+        assert_eq!(PathGuide::dir_bin(0.1, false, false), 15);
+        // Steeply downward (cos_z < -0.75), away sun + neg cross -> band 7, Q3
+        assert_eq!(PathGuide::dir_bin(-0.8, false, false), 31);
     }
 
     #[test]
@@ -547,9 +601,9 @@ mod tests {
         let _up = Vec3::new(0.0, 0.0, 1.0);
         let _sun = Vec3::new(1.0, 0.0, 0.0);
 
-        // Each bin has probability 1/8, solid angle pi/2.
-        // PDF = (1/8) / (pi/2) = 1/(4*pi).
-        // Integral = 8 * (1/8) / (pi/2) * (pi/2) = 1.0.
+        // Each bin has probability 1/32, solid angle pi/8.
+        // PDF = (1/32) / (pi/8) = 1/(4*pi).
+        // Integral = 32 * (1/32) / (pi/8) * (pi/8) = 1.0.
         // Or equivalently: sum of bin_probs = 1.0.
         let mut sum = 0.0;
         for d in 0..NUM_DIR_BINS {
@@ -630,7 +684,8 @@ mod tests {
     #[test]
     fn memory_footprint() {
         let bytes = PathGuide::memory_bytes();
-        assert_eq!(bytes, 16384, "Expected 16 KiB, got {} bytes", bytes);
+        // 32 alt x 16 solar x 32 dir x 4 bytes = 65536 bytes = 64 KiB
+        assert_eq!(bytes, 65536, "Expected 64 KiB, got {} bytes", bytes);
     }
 
     #[test]

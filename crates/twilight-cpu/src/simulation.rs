@@ -255,12 +255,16 @@ fn simulate_at_sza_mc(
 /// Stokes [I,Q,U,V] propagation per chain.
 /// SZA threshold (degrees) above which path guide training is performed.
 ///
-/// Below 102 degrees, the three-branch direction sampling (phase + zenith +
+/// Below 105 degrees, the three-branch direction sampling (phase + zenith +
 /// terminator) is already effective and the guide adds MIS overhead without
-/// reliable benefit. At SZA 96-100, training chains produce noisy guides
-/// that can increase variance. Above 102 (deep twilight), the guide captures
-/// lateral-transport paths that unguided sampling almost never finds.
-const GUIDE_SZA_THRESHOLD: f64 = 102.0;
+/// reliable benefit.  CV diagnostics (50 seeds, 200 rays) show the guide
+/// *increases* variance at SZA 93-104: at SZA 104 it inflates CV from 1.040
+/// to 1.351 (+30%).  Only at SZA >= 106 does the guide provide a net win
+/// (CV 4.16 -> 3.55) by capturing lateral-transport paths that unguided
+/// sampling almost never finds.  Setting the threshold to 105 avoids the
+/// guide penalty at civil/nautical twilight while retaining the benefit at
+/// astronomical twilight.
+const GUIDE_SZA_THRESHOLD: f64 = 105.0;
 
 fn simulate_at_sza_hybrid(
     atm: &AtmosphereModel,
@@ -277,11 +281,11 @@ fn simulate_at_sza_hybrid(
 
         // Train path guide at deep twilight for directional importance sampling.
         let guide = if sza_deg >= GUIDE_SZA_THRESHOLD && secondary_rays > 0 {
-            // At deep twilight (SZA >= 102), training chains rarely find
+            // At deep twilight (SZA >= 105), training chains rarely find
             // productive paths to the sunlit terminator. Increase training
             // budget to compensate. Training chains are single-wavelength
             // with no ALIS or splitting, so 4x cost is modest.
-            let train_multiplier = if sza_deg >= 102.0 { 4usize } else { 1 };
+            let train_multiplier = 4usize;
             let train_rays = secondary_rays * train_multiplier;
             let train_seed = sza_bits.wrapping_mul(2862933555777941757).wrapping_add(1);
             Some(photon::train_path_guide(

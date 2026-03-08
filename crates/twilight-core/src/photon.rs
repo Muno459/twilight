@@ -3348,10 +3348,17 @@ const TRAIN_REF_WL: usize = 15;
 /// vertex where NEE produces nonzero signal, accumulates the contribution into
 /// the guide keyed by (altitude, solar_angle, chain_direction).
 ///
-/// Uses sample-doubling across `NUM_PILOT_ITERS` iterations: the first iteration
-/// uses `secondary_rays / 2^(N-1)` rays, each subsequent iteration doubles.
-/// All contributions accumulate into a single guide, which is normalized once
-/// at the end. Laplace smoothing prevents zero bins.
+/// Uses sample-doubling across `NUM_PILOT_ITERS` iterations with **iterative
+/// guide refinement**: the first iteration runs unguided, builds a rough guide,
+/// then each subsequent iteration uses one-sample MIS with the previous
+/// iteration's guide to direct training chains toward productive paths.
+/// Each iteration accumulates into a fresh guide; the final normalized
+/// guide is returned. Laplace smoothing prevents zero bins.
+///
+/// This iterative approach is critical at deep twilight (SZA >= 106) where
+/// unguided chains almost never reach sunlit atmosphere. The guide bootstraps
+/// from the few successful first-iteration chains, with each subsequent
+/// iteration concentrating more training budget on productive path space.
 ///
 /// The training chains use a single reference wavelength (no ALIS) and skip
 /// altitude splitting, keeping them fast. They still use forced scattering,
@@ -3412,8 +3419,33 @@ pub fn train_path_guide(
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
 
-    // Sample-doubling iterations.
+    // Sample-doubling iterations with iterative guide refinement.
+    //
+    // Iteration 0: always unguided (phase function + three-branch direction
+    // sampling only). Accumulates a rough guide from whatever NEE signal the
+    // chains find.
+    //
+    // Iterations 1..N at deep twilight (SZA >= 102): training chains use
+    // one-sample MIS with the previous iteration's guide, directing chains
+    // toward previously-discovered productive regions. Each iteration
+    // accumulates into a fresh guide, which is then normalized.
+    //
+    // At moderate twilight (SZA < 102), iterative refinement is SKIPPED:
+    // unguided training is already effective there, and the MIS weight
+    // corrections from a noisy guide only add variance to the training
+    // signal.
+    //
+    // At deep twilight (SZA >= 102) unguided chains almost never reach
+    // sunlit atmosphere. Iterative refinement lets the guide bootstrap from
+    // the few successful chains, progressively concentrating training budget
+    // on productive path space.
+    let observer_up = observer_pos.normalize();
+    let cos_sza_train = sun_dir.dot(observer_up);
+    let sza_deg_train = libm::acos(cos_sza_train.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
+    let use_iterative_refinement = sza_deg_train >= 102.0;
+
     let base_count = (secondary_rays >> (NUM_PILOT_ITERS - 1)).max(1);
+    let mut prev_guide: Option<PathGuide> = None;
 
     for iter in 0..NUM_PILOT_ITERS {
         let rays_this_iter = base_count << iter;
@@ -3423,6 +3455,20 @@ pub fn train_path_guide(
             .wrapping_add(1);
 
         let mut tau_obs = 0.0f64;
+
+        // Only use the previous iteration's guide at deep twilight (iter > 0).
+        let pg_for_iter = if use_iterative_refinement && iter > 0 {
+            // Each iteration accumulates into a fresh guide when using
+            // iterative refinement, so the accumulated distribution reflects
+            // only the current iteration's sampling (with the previous guide).
+            guide.reset();
+            prev_guide.as_ref()
+        } else {
+            // At moderate twilight: all iterations accumulate into the SAME
+            // guide (no reset). The final normalize captures the full
+            // sample-doubling budget (~15/8 * rays total).
+            None
+        };
 
         for step in 0..num_steps {
             let s = (step as f64 + 0.5) * ds;
@@ -3444,7 +3490,7 @@ pub fn train_path_guide(
                 break;
             }
 
-            // Launch training chains.
+            // Launch training chains (with MIS from previous guide at deep twilight).
             for ray in 0..rays_this_iter {
                 train_secondary_chain(
                     atm,
@@ -3456,22 +3502,43 @@ pub fn train_path_guide(
                     ray,
                     rays_this_iter,
                     &mut guide,
+                    pg_for_iter,
                 );
             }
 
             tau_obs += optics.extinction * ds;
         }
+
+        // For iterative refinement: normalize after each iteration and
+        // snapshot for the next.  For non-iterative mode: skip normalize
+        // here -- all iterations accumulate raw counts, and a single
+        // normalize at the end captures the full sample-doubling budget.
+        if use_iterative_refinement {
+            guide.normalize();
+            prev_guide = Some(guide.clone());
+        }
     }
 
-    guide.normalize();
+    // Final normalize: for iterative mode this re-normalizes the last
+    // iteration (no-op since it's already normalized); for non-iterative
+    // mode this is the single normalize over all accumulated raw counts.
+    if !guide.is_trained() {
+        guide.normalize();
+    }
     guide
 }
 
 /// Trace a single training chain, accumulating NEE contributions into the guide.
 ///
 /// Simplified version of `trace_secondary_chain_scalar`: single wavelength,
-/// no splitting, no guide sampling. Uses forced scattering + exponential
-/// transform + VSPG for deep-twilight coverage.
+/// no splitting.  Uses forced scattering + exponential transform + VSPG for
+/// deep-twilight coverage.
+///
+/// When `prev_guide` is `Some`, direction sampling at each bounce uses
+/// one-sample MIS between the phase function and the previous iteration's
+/// guide (same MIS formulation as the production tracer).  This lets later
+/// training iterations discover productive paths that unguided sampling
+/// misses at deep twilight.
 #[allow(clippy::too_many_arguments)]
 fn train_secondary_chain(
     atm: &AtmosphereModel,
@@ -3483,6 +3550,7 @@ fn train_secondary_chain(
     ray_idx: usize,
     total_rays: usize,
     guide: &mut PathGuide,
+    prev_guide: Option<&PathGuide>,
 ) {
     use crate::single_scatter::shadow_ray_transmittance;
 
@@ -3590,14 +3658,44 @@ fn train_secondary_chain(
                 let scatter_optics = &atm.optics[ss][ref_wl];
                 weight *= scatter_optics.ssa;
 
-                // Sample new direction from phase function (no guide during training).
-                let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
-                    sample_rayleigh_analytic(xorshift_f64(rng_state))
+                // Sample new direction: MIS with previous guide (if available),
+                // otherwise plain phase function.
+                let alt_here = pos.length() - surface_radius;
+                let use_prev_guide =
+                    prev_guide.is_some() && xorshift_f64(rng_state) < GUIDE_MIS_FRAC;
+                if use_prev_guide {
+                    let pg = prev_guide.unwrap();
+                    let local_up_here = pos.normalize();
+                    let (gdir, p_guide) = pg.sample(alt_here, local_up_here, sun_dir, rng_state);
+                    let ct = current_dir.dot(gdir);
+                    let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
+                    let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                    if mis_denom > 1e-30 {
+                        weight *= p_phase / mis_denom;
+                    }
+                    let _ = xorshift_f64(rng_state);
+                    let _ = xorshift_f64(rng_state);
+                    let _ = xorshift_f64(rng_state);
+                    current_dir = gdir;
                 } else {
-                    sample_henyey_greenstein(xorshift_f64(rng_state), scatter_optics.asymmetry)
-                };
-                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-                current_dir = scatter_direction(current_dir, cos_theta, phi);
+                    let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
+                        sample_rayleigh_analytic(xorshift_f64(rng_state))
+                    } else {
+                        sample_henyey_greenstein(xorshift_f64(rng_state), scatter_optics.asymmetry)
+                    };
+                    let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+                    let d = scatter_direction(current_dir, cos_theta, phi);
+                    if let Some(pg) = prev_guide {
+                        let local_up_here = pos.normalize();
+                        let p_phase = scalar_phase_value(cos_theta, scatter_optics) * INV_4PI;
+                        let p_guide = pg.pdf(alt_here, local_up_here, sun_dir, d);
+                        let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                        if mis_denom > 1e-30 {
+                            weight *= p_phase / mis_denom;
+                        }
+                    }
+                    current_dir = d;
+                }
                 continue;
             }
         }
@@ -3697,14 +3795,42 @@ fn train_secondary_chain(
         let scatter_optics = &atm.optics[scatter_shell][ref_wl];
         weight *= scatter_optics.ssa;
 
-        // Sample new direction.
-        let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        // Sample new direction: MIS with previous guide (if available).
+        let alt_here = pos.length() - surface_radius;
+        let use_prev_guide = prev_guide.is_some() && xorshift_f64(rng_state) < GUIDE_MIS_FRAC;
+        if use_prev_guide {
+            let pg = prev_guide.unwrap();
+            let local_up_here = pos.normalize();
+            let (gdir, p_guide) = pg.sample(alt_here, local_up_here, sun_dir, rng_state);
+            let ct = current_dir.dot(gdir);
+            let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
+            let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+            if mis_denom > 1e-30 {
+                weight *= p_phase / mis_denom;
+            }
+            let _ = xorshift_f64(rng_state);
+            let _ = xorshift_f64(rng_state);
+            let _ = xorshift_f64(rng_state);
+            current_dir = gdir;
         } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), scatter_optics.asymmetry)
-        };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
-        current_dir = scatter_direction(current_dir, cos_theta, phi);
+            let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
+                sample_rayleigh_analytic(xorshift_f64(rng_state))
+            } else {
+                sample_henyey_greenstein(xorshift_f64(rng_state), scatter_optics.asymmetry)
+            };
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+            let d = scatter_direction(current_dir, cos_theta, phi);
+            if let Some(pg) = prev_guide {
+                let local_up_here = pos.normalize();
+                let p_phase = scalar_phase_value(cos_theta, scatter_optics) * INV_4PI;
+                let p_guide = pg.pdf(alt_here, local_up_here, sun_dir, d);
+                let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                if mis_denom > 1e-30 {
+                    weight *= p_phase / mis_denom;
+                }
+            }
+            current_dir = d;
+        }
     }
 }
 
