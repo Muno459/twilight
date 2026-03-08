@@ -794,6 +794,24 @@ const FORCED_TAU_CUTOFF: f64 = 20.0;
 /// switches to analog above ~20 km where tau drops below 0.02.
 const FORCED_TAU_MIN: f64 = 0.02;
 
+/// Returns the SZA-adaptive forced-scatter optical-depth floor.
+///
+/// At moderate twilight (SZA < 102), a higher threshold (0.05) lets more
+/// bounces go analog above ~12 km, where chains escape cleanly and the
+/// forced-scatter weight penalty (1-exp(-tau)) is wasteful.
+///
+/// At deep twilight (SZA >= 102), a lower threshold (0.02) keeps forced
+/// scattering active deeper into the atmosphere (~20 km), giving chains
+/// more chances to survive and reach the illuminated terminator.
+#[inline]
+fn forced_tau_min_for_sza(sza_deg: f64) -> f64 {
+    if sza_deg >= 102.0 {
+        FORCED_TAU_MIN
+    } else {
+        0.05
+    }
+}
+
 /// Maximum directional bias parameter for the exponential transform.
 ///
 /// The exponential transform modifies the free-path sampling within each shell
@@ -1582,9 +1600,10 @@ fn trace_secondary_chain(
             // Force scatter only when path exits to space AND has moderate optical
             // depth. Ground-bound paths: analog (ground reflection). Dense paths
             // (tau >= 20): analog (equivalent, no scout overhead). Very thin paths
-            // (tau < FORCED_TAU_MIN): analog to avoid weight death -- the forced-
+            // (tau < forced_tau_min): analog to avoid weight death -- the forced-
             // scatter weight (1-exp(-tau)) is punishingly small for tau < 0.3.
-            forced_this_bounce = !hit_ground && (FORCED_TAU_MIN..FORCED_TAU_CUTOFF).contains(&tm);
+            let ftm = forced_tau_min_for_sza(sza_deg_local);
+            forced_this_bounce = !hit_ground && (ftm..FORCED_TAU_CUTOFF).contains(&tm);
         }
 
         let scatter_shell;
@@ -1895,8 +1914,8 @@ fn trace_secondary_chain_scalar(
             if use_forced {
                 let (tm, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, wavelength_idx);
                 tau_max = tm;
-                forced_this_bounce =
-                    !hit_ground && (FORCED_TAU_MIN..FORCED_TAU_CUTOFF).contains(&tm);
+                let ftm = forced_tau_min_for_sza(sza_deg_local);
+                forced_this_bounce = !hit_ground && (ftm..FORCED_TAU_CUTOFF).contains(&tm);
             }
 
             let scatter_shell;
@@ -2440,8 +2459,9 @@ fn trace_secondary_chain_alis(
                 let (tms, hit_ground) =
                     scout_tau_to_boundary_alis(atm, pos, current_dir, hero_wl, num_wl);
                 tau_maxes = tms;
+                let ftm = forced_tau_min_for_sza(sza_deg_local);
                 forced_this_bounce =
-                    !hit_ground && (FORCED_TAU_MIN..FORCED_TAU_CUTOFF).contains(&tms[hero_wl]);
+                    !hit_ground && (ftm..FORCED_TAU_CUTOFF).contains(&tms[hero_wl]);
             }
 
             let scatter_shell;
@@ -3171,7 +3191,8 @@ fn train_secondary_chain(
         // --- Forced vs analog scatter decision ---
         if use_forced {
             let (tau_max, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, ref_wl);
-            if !hit_ground && (FORCED_TAU_MIN..FORCED_TAU_CUTOFF).contains(&tau_max) {
+            let ftm = forced_tau_min_for_sza(sza_deg_local);
+            if !hit_ground && (ftm..FORCED_TAU_CUTOFF).contains(&tau_max) {
                 let exp_neg_tau = libm::exp(-tau_max);
                 weight *= 1.0 - exp_neg_tau;
 
