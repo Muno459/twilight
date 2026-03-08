@@ -893,17 +893,34 @@ const TERMINATOR_TILT_MIN_DEG: f64 = 20.0;
 /// at deep twilight overwhelms the signal.
 const TERMINATOR_TILT_MAX_DEG: f64 = 60.0;
 
-/// Fraction of bounces (after the first) that use guide-sampled directions
-/// when a trained PathGuide is available. The remaining fraction uses the
-/// standard phase function sampling. One-sample MIS with balance heuristic
-/// combines both, keeping the estimator exactly unbiased.
+/// SZA-adaptive fraction of bounces (after the first) that use guide-sampled
+/// directions when a trained PathGuide is available. The remaining fraction
+/// uses the standard phase function sampling. One-sample MIS with balance
+/// heuristic combines both, keeping the estimator exactly unbiased.
 ///
-/// At 0.5: half the bounces try the guide, half use the phase function.
-/// Higher values risk amplifying guide noise at deep twilight where pilot
-/// chains themselves struggle to produce reliable training signal.
+/// The fraction ramps smoothly from 0.3 at moderate twilight (where the
+/// guide has limited training signal and the phase function is adequate)
+/// to 0.6 at deep twilight (where the guide captures lateral-transport
+/// paths that the phase function almost never samples).
+///
 /// The MIS weight at each bounce is:
-///   w_mis = p_phase / (GUIDE_MIS_FRAC * p_guide + (1 - GUIDE_MIS_FRAC) * p_phase)
-const GUIDE_MIS_FRAC: f64 = 0.5;
+///   w_mis = p_phase / (alpha * p_guide + (1 - alpha) * p_phase)
+/// where alpha = guide_alpha(sza_deg).
+const GUIDE_ALPHA_MIN: f64 = 0.3;
+const GUIDE_ALPHA_MAX: f64 = 0.6;
+const GUIDE_ALPHA_SZA_CENTER: f64 = 103.0;
+const GUIDE_ALPHA_SZA_WIDTH: f64 = 1.5;
+
+/// Returns the SZA-adaptive guide MIS fraction.
+///
+/// At SZA < 100: ~0.3 (mostly phase function sampling).
+/// At SZA = 103: 0.45 (balanced).
+/// At SZA > 106: ~0.6 (guide-dominant).
+#[inline]
+fn guide_alpha(sza_deg: f64) -> f64 {
+    let t = sigmoid((sza_deg - GUIDE_ALPHA_SZA_CENTER) / GUIDE_ALPHA_SZA_WIDTH);
+    GUIDE_ALPHA_MIN + (GUIDE_ALPHA_MAX - GUIDE_ALPHA_MIN) * t
+}
 
 // --- Weight Windows ---
 //
@@ -2151,7 +2168,9 @@ fn trace_secondary_chain_scalar(
 
     // --- SZA-adaptive 3-branch parameters ---
     let cos_sza = sun_dir.dot(local_up);
+    let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
     let bp = branch_params_for_sza(cos_sza);
+    let g_alpha = guide_alpha(sza_deg_local);
 
     let alpha_p = 1.0 - bp.zenith_frac;
     let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
@@ -2389,13 +2408,12 @@ fn trace_secondary_chain_scalar(
 
             // Sample new direction: one-sample MIS between phase function
             // and path guide (when trained). At each bounce, flip a coin:
-            //   - With prob GUIDE_MIS_FRAC: sample from guide, weight by
+            //   - With prob g_alpha: sample from guide, weight by
             //     balance heuristic MIS weight
             //   - Otherwise: sample from phase function, same MIS weight
             // When no guide is available, always use phase function (no overhead).
             let alt_for_guide = pos.length() - surface_radius;
-            let use_guide_this_bounce =
-                guide.is_some() && xorshift_f64(&mut local_rng) < GUIDE_MIS_FRAC;
+            let use_guide_this_bounce = guide.is_some() && xorshift_f64(&mut local_rng) < g_alpha;
 
             let new_dir = if use_guide_this_bounce {
                 let g = guide.unwrap();
@@ -2404,7 +2422,7 @@ fn trace_secondary_chain_scalar(
                     g.sample(alt_for_guide, local_up_here, sun_dir, &mut local_rng);
                 let cos_t = current_dir.dot(gdir);
                 let p_phase = scalar_phase_value(cos_t, optics) * INV_4PI;
-                let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                let mis_denom = g_alpha * p_guide + (1.0 - g_alpha) * p_phase;
                 if mis_denom > 1e-30 {
                     weight *= p_phase / mis_denom;
                 }
@@ -2425,7 +2443,7 @@ fn trace_secondary_chain_scalar(
                     let local_up_here = pos.normalize();
                     let p_phase = scalar_phase_value(cos_theta, optics) * INV_4PI;
                     let p_guide = g.pdf(alt_for_guide, local_up_here, sun_dir, d);
-                    let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                    let mis_denom = g_alpha * p_guide + (1.0 - g_alpha) * p_phase;
                     if mis_denom > 1e-30 {
                         weight *= p_phase / mis_denom;
                     }
@@ -2699,7 +2717,9 @@ fn trace_secondary_chain_alis(
 
     // --- SZA-adaptive 3-branch parameters ---
     let cos_sza = sun_dir.dot(local_up);
+    let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
     let bp = branch_params_for_sza(cos_sza);
+    let g_alpha = guide_alpha(sza_deg_local);
 
     let alpha_p = 1.0 - bp.zenith_frac;
     let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
@@ -3015,8 +3035,7 @@ fn trace_secondary_chain_alis(
 
             // Sample new direction: one-sample MIS (guide vs hero phase function).
             let alt_for_guide = pos.length() - surface_radius;
-            let use_guide_this_bounce =
-                guide.is_some() && xorshift_f64(&mut local_rng) < GUIDE_MIS_FRAC;
+            let use_guide_this_bounce = guide.is_some() && xorshift_f64(&mut local_rng) < g_alpha;
 
             let (new_dir, cos_theta_for_alis) = if use_guide_this_bounce {
                 let g = guide.unwrap();
@@ -3025,7 +3044,7 @@ fn trace_secondary_chain_alis(
                     g.sample(alt_for_guide, local_up_here, sun_dir, &mut local_rng);
                 let ct = current_dir.dot(gdir);
                 let p_phase_hero = scalar_phase_value(ct, hero_scatter_optics) * INV_4PI;
-                let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase_hero;
+                let mis_denom = g_alpha * p_guide + (1.0 - g_alpha) * p_phase_hero;
                 if mis_denom > 1e-30 {
                     hero_weight *= p_phase_hero / mis_denom;
                 }
@@ -3049,8 +3068,7 @@ fn trace_secondary_chain_alis(
                     let local_up_here = pos.normalize();
                     let p_phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics) * INV_4PI;
                     let p_guide = g.pdf(alt_for_guide, local_up_here, sun_dir, d);
-                    let mis_denom =
-                        GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase_hero;
+                    let mis_denom = g_alpha * p_guide + (1.0 - g_alpha) * p_phase_hero;
                     if mis_denom > 1e-30 {
                         hero_weight *= p_phase_hero / mis_denom;
                     }
@@ -3661,6 +3679,7 @@ fn train_secondary_chain(
     let cos_sza = sun_dir.dot(local_up);
     let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
     let bp = branch_params_for_sza(cos_sza);
+    let g_alpha = guide_alpha(sza_deg_local);
 
     let alpha_p = 1.0 - bp.zenith_frac;
     let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
@@ -3744,7 +3763,11 @@ fn train_secondary_chain(
                 pos = sp;
                 current_dir = sd;
 
-                // NEE at this vertex.
+                // NEE at this vertex: accumulate binary (1.0) for any
+                // nonzero signal. Binary accumulation is more robust than
+                // proportional (weight * t_sun * phase) at deep twilight,
+                // where extreme weight variance can cause the guide to
+                // over-concentrate on rare high-weight outlier paths.
                 let t_sun = shadow_ray_transmittance(atm, pos, sun_dir, ref_wl);
                 if t_sun > 1e-30 {
                     let nee_optics = &atm.optics[ss][ref_wl];
@@ -3754,7 +3777,7 @@ fn train_secondary_chain(
                     if contribution > 1e-30 {
                         let alt = pos.length() - surface_radius;
                         let local_up_here = pos.normalize();
-                        guide.accumulate(alt, local_up_here, sun_dir, current_dir, contribution);
+                        guide.accumulate(alt, local_up_here, sun_dir, current_dir, 1.0);
                     }
                 }
 
@@ -3765,15 +3788,14 @@ fn train_secondary_chain(
                 // Sample new direction: MIS with previous guide (if available),
                 // otherwise plain phase function.
                 let alt_here = pos.length() - surface_radius;
-                let use_prev_guide =
-                    prev_guide.is_some() && xorshift_f64(rng_state) < GUIDE_MIS_FRAC;
+                let use_prev_guide = prev_guide.is_some() && xorshift_f64(rng_state) < g_alpha;
                 if use_prev_guide {
                     let pg = prev_guide.unwrap();
                     let local_up_here = pos.normalize();
                     let (gdir, p_guide) = pg.sample(alt_here, local_up_here, sun_dir, rng_state);
                     let ct = current_dir.dot(gdir);
                     let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
-                    let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                    let mis_denom = g_alpha * p_guide + (1.0 - g_alpha) * p_phase;
                     if mis_denom > 1e-30 {
                         weight *= p_phase / mis_denom;
                     }
@@ -3793,7 +3815,7 @@ fn train_secondary_chain(
                         let local_up_here = pos.normalize();
                         let p_phase = scalar_phase_value(cos_theta, scatter_optics) * INV_4PI;
                         let p_guide = pg.pdf(alt_here, local_up_here, sun_dir, d);
-                        let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                        let mis_denom = g_alpha * p_guide + (1.0 - g_alpha) * p_phase;
                         if mis_denom > 1e-30 {
                             weight *= p_phase / mis_denom;
                         }
@@ -3899,7 +3921,7 @@ fn train_secondary_chain(
             break;
         }
 
-        // NEE at scatter vertex.
+        // NEE at scatter vertex: binary accumulation (see forced branch above).
         let t_sun = shadow_ray_transmittance(atm, pos, sun_dir, ref_wl);
         if t_sun > 1e-30 {
             let nee_optics = &atm.optics[scatter_shell][ref_wl];
@@ -3909,7 +3931,7 @@ fn train_secondary_chain(
             if contribution > 1e-30 {
                 let alt = pos.length() - surface_radius;
                 let local_up_here = pos.normalize();
-                guide.accumulate(alt, local_up_here, sun_dir, current_dir, contribution);
+                guide.accumulate(alt, local_up_here, sun_dir, current_dir, 1.0);
             }
         }
 
@@ -3919,14 +3941,14 @@ fn train_secondary_chain(
 
         // Sample new direction: MIS with previous guide (if available).
         let alt_here = pos.length() - surface_radius;
-        let use_prev_guide = prev_guide.is_some() && xorshift_f64(rng_state) < GUIDE_MIS_FRAC;
+        let use_prev_guide = prev_guide.is_some() && xorshift_f64(rng_state) < g_alpha;
         if use_prev_guide {
             let pg = prev_guide.unwrap();
             let local_up_here = pos.normalize();
             let (gdir, p_guide) = pg.sample(alt_here, local_up_here, sun_dir, rng_state);
             let ct = current_dir.dot(gdir);
             let p_phase = scalar_phase_value(ct, scatter_optics) * INV_4PI;
-            let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+            let mis_denom = g_alpha * p_guide + (1.0 - g_alpha) * p_phase;
             if mis_denom > 1e-30 {
                 weight *= p_phase / mis_denom;
             }
@@ -3946,7 +3968,7 @@ fn train_secondary_chain(
                 let local_up_here = pos.normalize();
                 let p_phase = scalar_phase_value(cos_theta, scatter_optics) * INV_4PI;
                 let p_guide = pg.pdf(alt_here, local_up_here, sun_dir, d);
-                let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
+                let mis_denom = g_alpha * p_guide + (1.0 - g_alpha) * p_phase;
                 if mis_denom > 1e-30 {
                     weight *= p_phase / mis_denom;
                 }
@@ -6050,6 +6072,61 @@ mod tests {
         for i in -100..100 {
             let x = i as f64 * 0.1;
             assert!(sigmoid(x + 0.1) >= sigmoid(x), "sigmoid must be monotonic");
+        }
+    }
+
+    #[test]
+    fn guide_alpha_smooth_ramp() {
+        // At civil twilight (SZA 93), alpha should be near GUIDE_ALPHA_MIN.
+        let a93 = guide_alpha(93.0);
+        assert!(
+            (a93 - GUIDE_ALPHA_MIN).abs() < 0.01,
+            "guide_alpha(93) = {}, expected ~{}",
+            a93,
+            GUIDE_ALPHA_MIN
+        );
+        // At deep twilight (SZA 110), alpha should be near GUIDE_ALPHA_MAX.
+        let a110 = guide_alpha(110.0);
+        assert!(
+            (a110 - GUIDE_ALPHA_MAX).abs() < 0.01,
+            "guide_alpha(110) = {}, expected ~{}",
+            a110,
+            GUIDE_ALPHA_MAX
+        );
+        // At center (SZA 103), should be midpoint.
+        let a103 = guide_alpha(103.0);
+        let expected_mid = (GUIDE_ALPHA_MIN + GUIDE_ALPHA_MAX) / 2.0;
+        assert!(
+            (a103 - expected_mid).abs() < 0.01,
+            "guide_alpha(103) = {}, expected ~{}",
+            a103,
+            expected_mid
+        );
+        // Monotonic.
+        let mut prev = guide_alpha(90.0);
+        for sza in 91..=115 {
+            let cur = guide_alpha(sza as f64);
+            assert!(
+                cur >= prev - 1e-10,
+                "guide_alpha must be monotonic: guide_alpha({}) = {} < guide_alpha({}) = {}",
+                sza,
+                cur,
+                sza - 1,
+                prev
+            );
+            prev = cur;
+        }
+        // Always in [GUIDE_ALPHA_MIN, GUIDE_ALPHA_MAX].
+        for sza in 80..=120 {
+            let a = guide_alpha(sza as f64);
+            assert!(
+                a >= GUIDE_ALPHA_MIN - 1e-10 && a <= GUIDE_ALPHA_MAX + 1e-10,
+                "guide_alpha({}) = {} out of range [{}, {}]",
+                sza,
+                a,
+                GUIDE_ALPHA_MIN,
+                GUIDE_ALPHA_MAX
+            );
         }
     }
 
