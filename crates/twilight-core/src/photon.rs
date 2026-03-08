@@ -1124,17 +1124,85 @@ fn weight_window_h(sza_deg: f64) -> f64 {
     libm::exp(ln_h)
 }
 
-/// Compute the weight window target weight at the current altitude.
+/// Compute the weight window target weight at the current position.
 ///
-/// The importance is relative to the chain's starting altitude, so chains
-/// starting at high altitude (from LOS importance sampling) don't trigger
-/// immediate excessive splitting.
+/// Combines altitude importance (chains climbing higher are more productive)
+/// with CADIS lateral importance (chains progressing toward the sunlit
+/// terminator are more productive).
 ///
-/// I_rel = exp((alt - alt_start) / H_ww)
-/// w_target = 1 / I_rel = exp(-(alt - alt_start) / H_ww)
+/// Altitude importance (relative to start):
+///   I_alt = exp((alt - alt_start) / H_ww)
+///
+/// CADIS lateral importance (relative to start):
+///   delta_cos = pos.dot(sun_dir) - cos_sun_start
+///   I_lat = exp(cadis_k * max(0, delta_cos))
+///
+/// Combined target: w_target = 1 / (I_alt * I_lat)
+///
+/// The CADIS term only boosts importance for chains making lateral progress
+/// toward the sun. Chains moving away keep I_lat = 1 (no extra RR penalty),
+/// which is conservative and avoids killing chains that might loop back.
+///
+/// When cadis_k = 0 (civil twilight), I_lat = 1 and this degenerates to
+/// the altitude-only weight window target.
 #[inline]
-fn weight_window_target(alt_m: f64, alt_start_m: f64, h_ww: f64) -> f64 {
-    libm::exp(-(alt_m - alt_start_m) / h_ww)
+fn weight_window_target(
+    alt_m: f64,
+    alt_start_m: f64,
+    h_ww: f64,
+    cos_sun_current: f64,
+    cos_sun_start: f64,
+    cadis_k: f64,
+) -> f64 {
+    let i_alt = libm::exp((alt_m - alt_start_m) / h_ww);
+    let delta_cos = cos_sun_current - cos_sun_start;
+    let i_lat = if cadis_k > 0.0 && delta_cos > 0.0 {
+        libm::exp(cadis_k * delta_cos)
+    } else {
+        1.0
+    };
+    1.0 / (i_alt * i_lat)
+}
+
+// --- CADIS: forward-informed lateral importance ---
+//
+// At deep twilight (SZA > 103), the sunlit terminator is ~1500 km from the
+// observer. Altitude-only weight windows encourage chains to climb but not
+// to progress laterally toward the terminator. CADIS adds a lateral
+// importance term: chains that move toward the sun (increasing cos_sun)
+// get split more aggressively by the weight windows.
+//
+// The importance boost is exp(cadis_k * delta_cos), where delta_cos is
+// the increase in cos(position_angle_to_sun) from the chain's start.
+// This is 1 at the start and grows as the chain approaches the terminator.
+//
+// cadis_k ramps from 0 (civil) to CADIS_K_MAX (deep twilight).
+// The boost is one-sided: only chains making positive lateral progress
+// get higher importance. Chains moving away just have I_lat = 1.
+
+/// Maximum CADIS lateral importance exponent at deep twilight.
+///
+/// At SZA 106, a chain traveling from the observer (cos_sza = -0.276)
+/// to the terminator (cos_sun = 0) has delta_cos = 0.276.
+/// With CADIS_K_MAX = 8: boost = exp(8 * 0.276) = exp(2.21) = 9.1x.
+/// This means chains at the terminator are 9x more likely to be split,
+/// strongly concentrating population in the productive region.
+const CADIS_K_MAX: f64 = 8.0;
+
+/// SZA center for CADIS ramp [degrees].
+const CADIS_SZA_CENTER: f64 = 103.0;
+
+/// SZA width for CADIS ramp [degrees].
+const CADIS_SZA_WIDTH: f64 = 1.5;
+
+/// Returns the SZA-adaptive CADIS lateral importance strength.
+///
+/// At SZA < 100: ~0 (no lateral importance, altitude-only windows).
+/// At SZA = 103: ~4 (moderate lateral boost).
+/// At SZA > 106: ~8 (full lateral boost).
+#[inline]
+fn cadis_k(sza_deg: f64) -> f64 {
+    CADIS_K_MAX * sigmoid((sza_deg - CADIS_SZA_CENTER) / CADIS_SZA_WIDTH)
 }
 
 /// Exponential scale height for LOS ray-budget redistribution at moderate
@@ -2314,8 +2382,11 @@ fn trace_secondary_chain_scalar(
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
     // Weight window setup. Scale height controls splitting/RR aggressiveness.
+    // CADIS lateral importance encourages chains toward the sunlit terminator.
     let h_ww = weight_window_h(sza_deg_local);
     let alt_start = start_pos.length() - surface_radius;
+    let cos_sun_start = local_up.dot(sun_dir);
+    let ck = cadis_k(sza_deg_local);
 
     // Initialize work stack with the main particle.
     let mut stack = [SplitParticleScalar {
@@ -2605,7 +2676,9 @@ fn trace_secondary_chain_scalar(
 
             // --- Weight window population control ---
             let alt = pos.length() - surface_radius;
-            let w_target = weight_window_target(alt, alt_start, h_ww);
+            let cos_sun_here = pos.normalize().dot(sun_dir);
+            let w_target =
+                weight_window_target(alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck);
             let w_lower = w_target / WW_LOWER_RATIO;
             let w_upper = w_target * WW_UPPER_RATIO;
             let abs_w = weight.abs();
@@ -2946,9 +3019,11 @@ fn trace_secondary_chain_alis(
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
-    // Weight window setup (same as scalar tracer).
+    // Weight window setup (same as scalar tracer, with CADIS lateral importance).
     let h_ww = weight_window_h(sza_deg_local);
     let alt_start = start_pos.length() - surface_radius;
+    let cos_sun_start = local_up.dot(sun_dir);
+    let ck = cadis_k(sza_deg_local);
 
     // Initialize work stack with the main particle.
     let mut stack = [SplitParticleAlis {
@@ -3315,7 +3390,9 @@ fn trace_secondary_chain_alis(
 
             // --- Weight window population control ---
             let alt = pos.length() - surface_radius;
-            let w_target = weight_window_target(alt, alt_start, h_ww);
+            let cos_sun_here = pos.normalize().dot(sun_dir);
+            let w_target =
+                weight_window_target(alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck);
             let w_lower = w_target / WW_LOWER_RATIO;
             let w_upper = w_target * WW_UPPER_RATIO;
             let abs_hw = hero_weight.abs();
@@ -3951,6 +4028,8 @@ fn train_secondary_chain(
     // Weight window setup for training chains (RR only, no splitting).
     let h_ww = weight_window_h(sza_deg_local);
     let alt_start_train = start_pos.length() - surface_radius;
+    let cos_sun_start = local_up.dot(sun_dir);
+    let ck = cadis_k(sza_deg_local);
 
     loop {
         // --- Forced vs analog scatter decision ---
@@ -4106,7 +4185,15 @@ fn train_secondary_chain(
 
                 // Weight window RR (forced-scatter branch).
                 let alt_rr_f = pos.length() - surface_radius;
-                let w_target_f = weight_window_target(alt_rr_f, alt_start_train, h_ww);
+                let cos_sun_f = pos.normalize().dot(sun_dir);
+                let w_target_f = weight_window_target(
+                    alt_rr_f,
+                    alt_start_train,
+                    h_ww,
+                    cos_sun_f,
+                    cos_sun_start,
+                    ck,
+                );
                 let w_lower_f = w_target_f / WW_LOWER_RATIO;
                 let abs_wf = weight.abs();
                 if abs_wf < w_lower_f && w_target_f > 1e-30 {
@@ -4315,7 +4402,9 @@ fn train_secondary_chain(
 
         // Weight window RR for training chains (no splitting needed).
         let alt_rr = pos.length() - surface_radius;
-        let w_target_rr = weight_window_target(alt_rr, alt_start_train, h_ww);
+        let cos_sun_rr = pos.normalize().dot(sun_dir);
+        let w_target_rr =
+            weight_window_target(alt_rr, alt_start_train, h_ww, cos_sun_rr, cos_sun_start, ck);
         let w_lower_rr = w_target_rr / WW_LOWER_RATIO;
         let abs_w_train = weight.abs();
         if abs_w_train < w_lower_rr && w_target_rr > 1e-30 {
@@ -6127,7 +6216,7 @@ mod tests {
     #[test]
     fn weight_window_target_unity_at_start() {
         // At the starting altitude, target weight should be 1.0.
-        let w = weight_window_target(30_000.0, 30_000.0, 20_000.0);
+        let w = weight_window_target(30_000.0, 30_000.0, 20_000.0, 0.0, 0.0, 0.0);
         assert!(
             (w - 1.0).abs() < 1e-10,
             "Target weight at start alt should be 1.0, got {}",
@@ -6140,9 +6229,9 @@ mod tests {
         // Target weight should decrease as altitude increases above start.
         let alt_start = 10_000.0;
         let h = 20_000.0;
-        let w1 = weight_window_target(20_000.0, alt_start, h);
-        let w2 = weight_window_target(40_000.0, alt_start, h);
-        let w3 = weight_window_target(60_000.0, alt_start, h);
+        let w1 = weight_window_target(20_000.0, alt_start, h, 0.0, 0.0, 0.0);
+        let w2 = weight_window_target(40_000.0, alt_start, h, 0.0, 0.0, 0.0);
+        let w3 = weight_window_target(60_000.0, alt_start, h, 0.0, 0.0, 0.0);
         assert!(w1 > w2, "w(20km)={} should be > w(40km)={}", w1, w2);
         assert!(w2 > w3, "w(40km)={} should be > w(60km)={}", w2, w3);
     }
@@ -6153,8 +6242,8 @@ mod tests {
         // (less important region, wider window).
         let alt_start = 50_000.0;
         let h = 20_000.0;
-        let w_at_start = weight_window_target(alt_start, alt_start, h);
-        let w_below = weight_window_target(30_000.0, alt_start, h);
+        let w_at_start = weight_window_target(alt_start, alt_start, h, 0.0, 0.0, 0.0);
+        let w_below = weight_window_target(30_000.0, alt_start, h, 0.0, 0.0, 0.0);
         assert!(
             w_below > w_at_start,
             "Target at 30km ({}) should be > target at 50km ({})",
@@ -6164,13 +6253,71 @@ mod tests {
     }
 
     #[test]
+    fn cadis_lateral_importance_boosts_toward_sun() {
+        let alt = 30_000.0;
+        let h = 20_000.0;
+        let cos_sun_start = -0.276; // SZA 106 observer
+        let k = 8.0; // full CADIS strength
+
+        // Chain at same lateral position as start: no lateral boost.
+        let w_same = weight_window_target(alt, alt, h, cos_sun_start, cos_sun_start, k);
+        assert!(
+            (w_same - 1.0).abs() < 1e-10,
+            "No lateral boost at start: w = {}",
+            w_same
+        );
+
+        // Chain that moved toward sun (positive delta_cos): lower target = more splitting.
+        let w_toward = weight_window_target(alt, alt, h, -0.1, cos_sun_start, k);
+        assert!(
+            w_toward < w_same,
+            "Toward-sun chain should have lower target: {} >= {}",
+            w_toward,
+            w_same
+        );
+
+        // Chain that moved away from sun (negative delta_cos): no penalty.
+        let w_away = weight_window_target(alt, alt, h, -0.4, cos_sun_start, k);
+        assert!(
+            (w_away - 1.0).abs() < 1e-10,
+            "Away-from-sun should have no penalty: w = {}",
+            w_away
+        );
+
+        // CADIS off (k=0): no lateral effect.
+        let w_no_cadis = weight_window_target(alt, alt, h, 0.0, cos_sun_start, 0.0);
+        assert!(
+            (w_no_cadis - 1.0).abs() < 1e-10,
+            "CADIS off should give 1.0: w = {}",
+            w_no_cadis
+        );
+    }
+
+    #[test]
+    fn cadis_k_ramps_smoothly() {
+        assert!(cadis_k(93.0) < 0.1, "cadis_k(93) should be ~0");
+        assert!(
+            (cadis_k(110.0) - CADIS_K_MAX).abs() < 0.1,
+            "cadis_k(110) should be ~{}",
+            CADIS_K_MAX
+        );
+        // Monotonic
+        let mut prev = cadis_k(90.0);
+        for sza in 91..=115 {
+            let cur = cadis_k(sza as f64);
+            assert!(cur >= prev - 1e-10, "cadis_k must be monotonic");
+            prev = cur;
+        }
+    }
+
+    #[test]
     fn weight_window_rr_unbiased() {
         // Statistical test: RR expected value should equal input weight.
         // Run many trials with weight below threshold and verify mean output.
         let alt_start = 0.0;
         let h_ww = 20_000.0;
         let alt = 5_000.0; // near start, w_target ~ 0.78
-        let w_target = weight_window_target(alt, alt_start, h_ww);
+        let w_target = weight_window_target(alt, alt_start, h_ww, 0.0, 0.0, 0.0);
         let w_lower = w_target / WW_LOWER_RATIO;
 
         let input_weight = w_lower * 0.5; // below threshold
