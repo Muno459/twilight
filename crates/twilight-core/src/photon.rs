@@ -12,8 +12,12 @@ use crate::scattering::{
     scatter_direction, scatter_stokes_fast, scattering_plane_cos_sin, StokesVector,
 };
 
-/// Maximum number of scattering events before terminating a photon.
-pub const MAX_SCATTERS: usize = 100;
+/// Safety limit on scattering bounces to prevent infinite loops.
+///
+/// Chains terminate naturally via escape or ground absorption. No weight
+/// floor or Russian roulette is applied. This limit is purely a backstop
+/// against degenerate floating-point loops.
+pub const MAX_SCATTERS: usize = 10_000;
 
 /// Apply refraction at a shell boundary and advance the photon past it.
 ///
@@ -749,8 +753,13 @@ pub fn mc_scatter_spectrum_polarized(
 /// Number of LOS steps for the hybrid integrator.
 const HYBRID_LOS_STEPS: usize = 200;
 
-/// Maximum bounces for secondary chains in the hybrid integrator.
-const HYBRID_MAX_BOUNCES: usize = 50;
+/// Safety limit to prevent infinite loops from floating-point pathology.
+///
+/// Chains terminate naturally via atmosphere escape (analog mode) or ground
+/// absorption. No weight floor or Russian roulette is applied. This limit
+/// exists only as a backstop against degenerate floating-point loops and
+/// should never be reached in physically meaningful chains.
+const BOUNCE_SAFETY_LIMIT: usize = 10_000;
 
 /// Precomputed 1 / (4 * pi), used at every NEE evaluation.
 const INV_4PI: f64 = 1.0 / (4.0 * core::f64::consts::PI);
@@ -763,6 +772,27 @@ const INV_4PI: f64 = 1.0 / (4.0 * core::f64::consts::PI);
 /// avoids marching all 50 shells when the photon is deep in the atmosphere
 /// (where analog scattering is already efficient).
 const FORCED_TAU_CUTOFF: f64 = 20.0;
+
+/// Minimum optical depth for forced scattering to engage.
+///
+/// When tau_max is negligibly small, the forced-scatter weight `1-exp(-tau)`
+/// approaches tau, and sampling from the truncated exponential degenerates
+/// Minimum tau for forced scattering. Below this, use analog mode.
+///
+/// When the total optical depth along a ray to the next boundary is below
+/// this threshold, forced scattering produces catastrophic weight death:
+/// `weight *= (1 - exp(-tau))` ~ tau for small tau. At 50 km altitude
+/// upward, tau ~ 5e-5, killing weight by 5 orders of magnitude per bounce.
+///
+/// Below this threshold, the chain goes analog: the photon walks a real
+/// free path and either escapes the atmosphere (~99% at high altitude,
+/// providing natural unbiased termination) or actually scatters (~1%,
+/// continuing with full weight). No bias is introduced.
+///
+/// Value 0.02 keeps forced scattering active at sea level upward
+/// (tau ~ 0.098 at 550 nm) and through the lower troposphere, but
+/// switches to analog above ~20 km where tau drops below 0.02.
+const FORCED_TAU_MIN: f64 = 0.02;
 
 /// Maximum directional bias parameter for the exponential transform.
 ///
@@ -904,7 +934,6 @@ struct SplitParticleScalar {
     dir: Vec3,
     weight: f64,
     rng: u64,
-    bounces_left: usize,
     next_split: usize,
 }
 
@@ -919,7 +948,6 @@ struct SplitParticleAlis {
     hero_weight: f64,
     weight_ratio: [f64; 64],
     rng: u64,
-    bounces_left: usize,
     next_split: usize,
 }
 
@@ -1535,7 +1563,7 @@ fn trace_secondary_chain(
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
-    for _scatter in 0..HYBRID_MAX_BOUNCES {
+    for _scatter in 0..BOUNCE_SAFETY_LIMIT {
         // --- Decide scatter mode for this bounce ---
         let mut forced_this_bounce = false;
         let mut tau_max = 0.0;
@@ -1543,10 +1571,12 @@ fn trace_secondary_chain(
         if use_forced {
             let (tm, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, wavelength_idx);
             tau_max = tm;
-            // Force scatter only when path exits to space AND is optically thin.
-            // Ground-bound paths are handled by the analog loop (ground reflection).
-            // Dense paths (tau >= 20) use analog (equivalent, no scout overhead).
-            forced_this_bounce = !hit_ground && tm < FORCED_TAU_CUTOFF;
+            // Force scatter only when path exits to space AND has moderate optical
+            // depth. Ground-bound paths: analog (ground reflection). Dense paths
+            // (tau >= 20): analog (equivalent, no scout overhead). Very thin paths
+            // (tau < FORCED_TAU_MIN): analog to avoid weight death -- the forced-
+            // scatter weight (1-exp(-tau)) is punishingly small for tau < 0.3.
+            forced_this_bounce = !hit_ground && (FORCED_TAU_MIN..FORCED_TAU_CUTOFF).contains(&tm);
         }
 
         let scatter_shell;
@@ -1556,9 +1586,6 @@ fn trace_secondary_chain(
             // No analog free-path walk, no escape, no double-counting.
             let exp_neg_tau = libm::exp(-tau_max);
             weight *= 1.0 - exp_neg_tau;
-            if weight < 1e-30 {
-                break;
-            }
             let xi = xorshift_f64(rng_state);
             let tau_s = -libm::log(1.0 - xi * (1.0 - exp_neg_tau) + 1e-30);
             let (sp, sd, ss) =
@@ -1633,9 +1660,6 @@ fn trace_secondary_chain(
                             if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
                                 let albedo = atm.surface_albedo[wavelength_idx];
                                 weight *= albedo;
-                                if weight < 1e-30 {
-                                    break;
-                                }
                                 let normal = pos.normalize();
                                 prev_dir = current_dir;
                                 current_dir = sample_hemisphere(normal, rng_state);
@@ -1689,9 +1713,6 @@ fn trace_secondary_chain(
 
         // Apply SSA
         weight *= optics.ssa;
-        if weight < 1e-30 {
-            break;
-        }
 
         // Sample new direction and update Stokes state
         let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
@@ -1834,7 +1855,6 @@ fn trace_secondary_chain_scalar(
         dir: Vec3::new(0.0, 0.0, 1.0),
         weight: 0.0,
         rng: 0,
-        bounces_left: 0,
         next_split: 0,
     }; MAX_SPLIT_PARTICLES];
     let mut stack_len: usize = 1;
@@ -1843,7 +1863,6 @@ fn trace_secondary_chain_scalar(
         dir,
         weight: start_optics.ssa * initial_weight,
         rng: *rng_state,
-        bounces_left: HYBRID_MAX_BOUNCES,
         next_split: 0,
     };
     let mut main_rng_out = *rng_state;
@@ -1858,10 +1877,9 @@ fn trace_secondary_chain_scalar(
         let mut current_dir = stack[stack_len].dir;
         let mut weight = stack[stack_len].weight;
         let mut local_rng = stack[stack_len].rng;
-        let bounces_left = stack[stack_len].bounces_left;
         let mut next_split = stack[stack_len].next_split;
 
-        for _bounce in 0..bounces_left {
+        for _bounce in 0..BOUNCE_SAFETY_LIMIT {
             // --- Decide scatter mode for this bounce ---
             let mut forced_this_bounce = false;
             let mut tau_max = 0.0;
@@ -1869,7 +1887,8 @@ fn trace_secondary_chain_scalar(
             if use_forced {
                 let (tm, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, wavelength_idx);
                 tau_max = tm;
-                forced_this_bounce = !hit_ground && tm < FORCED_TAU_CUTOFF;
+                forced_this_bounce =
+                    !hit_ground && (FORCED_TAU_MIN..FORCED_TAU_CUTOFF).contains(&tm);
             }
 
             let scatter_shell;
@@ -1877,9 +1896,6 @@ fn trace_secondary_chain_scalar(
             if forced_this_bounce {
                 let exp_neg_tau = libm::exp(-tau_max);
                 weight *= 1.0 - exp_neg_tau;
-                if weight < 1e-30 {
-                    break;
-                }
                 // VSPG: importance-weighted shell selection biases scatter
                 // toward high altitude at deep twilight. Weight correction
                 // keeps the estimator exactly unbiased.
@@ -1960,9 +1976,6 @@ fn trace_secondary_chain_scalar(
                                 if !is_outward && pos.length() <= surface_radius + 1.0 {
                                     let albedo = atm.surface_albedo[wavelength_idx];
                                     weight *= albedo;
-                                    if weight < 1e-30 {
-                                        break;
-                                    }
                                     let normal = pos.normalize();
                                     current_dir = sample_hemisphere(normal, &mut local_rng);
                                     continue;
@@ -2009,9 +2022,6 @@ fn trace_secondary_chain_scalar(
             }
 
             weight *= optics.ssa;
-            if weight < 1e-30 {
-                break;
-            }
 
             // Sample new direction: one-sample MIS between phase function
             // and path guide (when trained). At each bounce, flip a coin:
@@ -2066,7 +2076,6 @@ fn trace_secondary_chain_scalar(
                 let k = split_factors[next_split];
                 if k > 1 {
                     weight /= k as f64;
-                    let remaining = bounces_left.saturating_sub(_bounce + 1);
                     for copy_idx in 1..k {
                         if stack_len < MAX_SPLIT_PARTICLES {
                             let child_rng = local_rng
@@ -2077,7 +2086,6 @@ fn trace_secondary_chain_scalar(
                                 dir: current_dir,
                                 weight,
                                 rng: child_rng,
-                                bounces_left: remaining,
                                 next_split: next_split + 1,
                             };
                             stack_len += 1;
@@ -2389,7 +2397,6 @@ fn trace_secondary_chain_alis(
         hero_weight: 0.0,
         weight_ratio: [0.0f64; 64],
         rng: 0,
-        bounces_left: 0,
         next_split: 0,
     }; MAX_SPLIT_PARTICLES];
     let mut stack_len: usize = 1;
@@ -2399,7 +2406,6 @@ fn trace_secondary_chain_alis(
         hero_weight: hero_optics.ssa * initial_weight,
         weight_ratio,
         rng: *rng_state,
-        bounces_left: HYBRID_MAX_BOUNCES,
         next_split: 0,
     };
     let mut main_rng_out = *rng_state;
@@ -2415,10 +2421,9 @@ fn trace_secondary_chain_alis(
         let mut hero_weight = stack[stack_len].hero_weight;
         let mut wr = stack[stack_len].weight_ratio;
         let mut local_rng = stack[stack_len].rng;
-        let bounces_left = stack[stack_len].bounces_left;
         let mut next_split = stack[stack_len].next_split;
 
-        for _bounce in 0..bounces_left {
+        for _bounce in 0..BOUNCE_SAFETY_LIMIT {
             // --- Decide scatter mode for this bounce ---
             let mut forced_this_bounce = false;
             let mut tau_maxes = [0.0f64; 64];
@@ -2427,7 +2432,8 @@ fn trace_secondary_chain_alis(
                 let (tms, hit_ground) =
                     scout_tau_to_boundary_alis(atm, pos, current_dir, hero_wl, num_wl);
                 tau_maxes = tms;
-                forced_this_bounce = !hit_ground && tms[hero_wl] < FORCED_TAU_CUTOFF;
+                forced_this_bounce =
+                    !hit_ground && (FORCED_TAU_MIN..FORCED_TAU_CUTOFF).contains(&tms[hero_wl]);
             }
 
             let scatter_shell;
@@ -2437,9 +2443,6 @@ fn trace_secondary_chain_alis(
                 let exp_neg_tau_h = libm::exp(-tau_max_h);
                 let one_minus_exp_h = 1.0 - exp_neg_tau_h;
                 hero_weight *= one_minus_exp_h;
-                if hero_weight < 1e-30 {
-                    break;
-                }
 
                 for w in 0..num_wl {
                     let one_minus_exp_w = 1.0 - libm::exp(-tau_maxes[w]);
@@ -2547,9 +2550,6 @@ fn trace_secondary_chain_alis(
                                 if !is_outward && pos.length() <= surface_radius + 1.0 {
                                     let hero_albedo = atm.surface_albedo[hero_wl];
                                     hero_weight *= hero_albedo;
-                                    if hero_weight < 1e-30 {
-                                        break;
-                                    }
                                     for w in 0..num_wl {
                                         let albedo_ratio = if hero_albedo > 1e-30 {
                                             atm.surface_albedo[w] / hero_albedo
@@ -2606,9 +2606,6 @@ fn trace_secondary_chain_alis(
             // Apply hero SSA.
             let hero_scatter_optics = &atm.optics[scatter_shell][hero_wl];
             hero_weight *= hero_scatter_optics.ssa;
-            if hero_weight < 1e-30 {
-                break;
-            }
 
             // ALIS SSA ratio correction.
             for w in 0..num_wl {
@@ -2690,7 +2687,6 @@ fn trace_secondary_chain_alis(
                 let k = split_factors[next_split];
                 if k > 1 {
                     hero_weight /= k as f64;
-                    let remaining = bounces_left.saturating_sub(_bounce + 1);
                     for copy_idx in 1..k {
                         if stack_len < MAX_SPLIT_PARTICLES {
                             let child_rng = local_rng
@@ -2702,7 +2698,6 @@ fn trace_secondary_chain_alis(
                                 hero_weight,
                                 weight_ratio: wr,
                                 rng: child_rng,
-                                bounces_left: remaining,
                                 next_split: next_split + 1,
                             };
                             stack_len += 1;
@@ -2961,11 +2956,9 @@ const NUM_PILOT_ITERS: usize = 4;
 /// the guide captures directional structure, not spectral detail.
 const TRAIN_REF_WL: usize = 15;
 
-/// Maximum bounces for pilot training chains.
-///
-/// Shorter than production (HYBRID_MAX_BOUNCES = 50) since pilot chains
-/// only need to establish coarse directional structure.
-const TRAIN_MAX_BOUNCES: usize = 30;
+// Training chains use BOUNCE_SAFETY_LIMIT like all other tracers.
+// Chains terminate naturally via escape, ground absorption, or the
+// safety limit backstop.
 
 /// Train a path guide by running pilot MC chains through the atmosphere.
 ///
@@ -3156,9 +3149,6 @@ fn train_secondary_chain(
     };
 
     weight *= optics.ssa;
-    if weight < 1e-30 {
-        return;
-    }
 
     let surface_radius = atm.surface_radius();
     let mut pos = start_pos;
@@ -3169,16 +3159,13 @@ fn train_secondary_chain(
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
-    for _bounce in 0..TRAIN_MAX_BOUNCES {
+    for _bounce in 0..BOUNCE_SAFETY_LIMIT {
         // --- Forced vs analog scatter decision ---
         if use_forced {
             let (tau_max, hit_ground) = scout_tau_to_boundary(atm, pos, current_dir, ref_wl);
-            if !hit_ground && tau_max < FORCED_TAU_CUTOFF {
+            if !hit_ground && (FORCED_TAU_MIN..FORCED_TAU_CUTOFF).contains(&tau_max) {
                 let exp_neg_tau = libm::exp(-tau_max);
                 weight *= 1.0 - exp_neg_tau;
-                if weight < 1e-30 {
-                    break;
-                }
 
                 // VSPG guided distance sampling.
                 let (tau_s, vspg_w) = vspg_sample_scatter_tau(
@@ -3213,9 +3200,6 @@ fn train_secondary_chain(
                 // Apply SSA and scatter.
                 let scatter_optics = &atm.optics[ss][ref_wl];
                 weight *= scatter_optics.ssa;
-                if weight < 1e-30 {
-                    break;
-                }
 
                 // Sample new direction from phase function (no guide during training).
                 let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
@@ -3282,9 +3266,6 @@ fn train_secondary_chain(
                         // Ground reflection.
                         if !is_outward && pos.length() <= surface_radius + 1.0 {
                             weight *= atm.surface_albedo[ref_wl];
-                            if weight < 1e-30 {
-                                break;
-                            }
                             let normal = pos.normalize();
                             current_dir = sample_hemisphere(normal, rng_state);
                             continue;
@@ -3326,9 +3307,6 @@ fn train_secondary_chain(
         // Apply SSA.
         let scatter_optics = &atm.optics[scatter_shell][ref_wl];
         weight *= scatter_optics.ssa;
-        if weight < 1e-30 {
-            break;
-        }
 
         // Sample new direction.
         let cos_theta = if xorshift_f64(rng_state) < scatter_optics.rayleigh_fraction {
@@ -3935,10 +3913,11 @@ mod tests {
 
     #[test]
     fn max_scatters_is_reasonable() {
-        // Should be > 10 (multi-scatter needs multiple bounces)
-        // and < 10000 (avoid infinite loops)
-        assert!(MAX_SCATTERS >= 10);
-        assert!(MAX_SCATTERS <= 10000);
+        // Safety limit: must be large enough for deep twilight chains
+        // (no weight floor, no Russian roulette). 10_000 is the backstop.
+        assert!(MAX_SCATTERS >= 1000);
+        assert_eq!(MAX_SCATTERS, 10_000);
+        assert_eq!(MAX_SCATTERS, BOUNCE_SAFETY_LIMIT);
     }
 
     // ── mc_scatter_spectrum ──
@@ -5122,7 +5101,7 @@ mod tests {
     #[test]
     fn split_particle_scalar_size_reasonable() {
         // Ensure SplitParticleScalar doesn't blow stack.
-        // 3 Vec3s (72 bytes) + f64 (8) + u64 (8) + 2 usize (16) = ~104 bytes
+        // pos Vec3 (24) + dir Vec3 (24) + weight f64 (8) + rng u64 (8) + next_split usize (8) = 72 bytes
         let size = core::mem::size_of::<SplitParticleScalar>();
         assert!(size <= 128, "SplitParticleScalar too large: {} bytes", size);
     }
@@ -5311,7 +5290,7 @@ mod tests {
 
     #[test]
     fn max_split_particles_sufficient() {
-        // The maximum split budget is 3*3*2 = 18 for deep twilight.
+        // The maximum split budget is product(SPLIT_FACTORS_DEEP) for deep twilight.
         // MAX_SPLIT_PARTICLES must be >= this.
         let max_budget: usize = SPLIT_FACTORS_DEEP.iter().product();
         assert!(
