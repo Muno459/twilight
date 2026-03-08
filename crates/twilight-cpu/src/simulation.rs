@@ -963,4 +963,122 @@ mod tests {
         let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0);
         assert_eq!(results.len(), 3, "Expected 3 steps, got {}", results.len());
     }
+
+    // ── CV diagnostic: guided vs unguided ALIS convergence ──
+
+    /// Diagnostic test: measure coefficient of variation (CV) with and without
+    /// path guide at multiple SZAs. Uses ALIS (scalar, all wavelengths in one
+    /// call) for speed. Output is purely diagnostic via eprintln, no assertions.
+    ///
+    /// Run with: cargo test -p twilight-cpu --release -- cv_diagnostic --nocapture
+    #[test]
+    fn cv_diagnostic_guided_vs_unguided() {
+        use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+        use twilight_core::photon;
+
+        let atm = make_clear_sky_atm();
+        let lat = 21.4225;
+        let lon = 39.8262;
+        let solar_azimuth = 270.0;
+        let view_zenith = 75.0;
+
+        let obs_pos = geographic_to_ecef(lat, lon, 0.0);
+        let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+
+        let num_seeds = 20usize;
+        let rays = 200usize;
+
+        eprintln!("\n{:=<80}", "");
+        eprintln!(
+            "CV DIAGNOSTIC: guided vs unguided ALIS ({} seeds x {} rays)",
+            num_seeds, rays
+        );
+        eprintln!("{:=<80}", "");
+        eprintln!(
+            "{:<8} {:>12} {:>12} {:>12} {:>12} {:>12}",
+            "SZA", "mean_no", "CV_no", "mean_yes", "CV_yes", "CV_ratio"
+        );
+        eprintln!("{:-<80}", "");
+
+        for &sza_deg in &[93.0, 96.0, 100.0, 104.0, 106.0] {
+            let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+
+            // Train guide once for this SZA.
+            let sza_bits = sza_deg.to_bits();
+            let train_seed = sza_bits.wrapping_mul(2862933555777941757).wrapping_add(1);
+            let guide = photon::train_path_guide(&atm, obs_pos, view, sun, rays, train_seed);
+
+            // Run with and without guide across independent seeds.
+            let mut totals_no = Vec::with_capacity(num_seeds);
+            let mut totals_yes = Vec::with_capacity(num_seeds);
+
+            for seed_idx in 0..num_seeds {
+                let base_rng = (seed_idx as u64)
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(sza_bits)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1);
+
+                // Unguided.
+                let mut rng_no = base_rng;
+                let result_no = photon::hybrid_scatter_radiance_alis(
+                    &atm,
+                    obs_pos,
+                    view,
+                    sun,
+                    rays,
+                    &mut rng_no,
+                    None,
+                );
+                let total_no: f64 = result_no.iter().take(atm.num_wavelengths).sum();
+                totals_no.push(total_no);
+
+                // Guided.
+                let mut rng_yes = base_rng;
+                let result_yes = photon::hybrid_scatter_radiance_alis(
+                    &atm,
+                    obs_pos,
+                    view,
+                    sun,
+                    rays,
+                    &mut rng_yes,
+                    Some(&guide),
+                );
+                let total_yes: f64 = result_yes.iter().take(atm.num_wavelengths).sum();
+                totals_yes.push(total_yes);
+            }
+
+            // Compute CV for both.
+            let mean_no = totals_no.iter().sum::<f64>() / num_seeds as f64;
+            let std_no = (totals_no.iter().map(|x| (x - mean_no).powi(2)).sum::<f64>()
+                / (num_seeds - 1) as f64)
+                .sqrt();
+            let cv_no = if mean_no.abs() > 1e-30 {
+                std_no / mean_no.abs()
+            } else {
+                0.0
+            };
+
+            let mean_yes = totals_yes.iter().sum::<f64>() / num_seeds as f64;
+            let std_yes = (totals_yes
+                .iter()
+                .map(|x| (x - mean_yes).powi(2))
+                .sum::<f64>()
+                / (num_seeds - 1) as f64)
+                .sqrt();
+            let cv_yes = if mean_yes.abs() > 1e-30 {
+                std_yes / mean_yes.abs()
+            } else {
+                0.0
+            };
+
+            let cv_ratio = if cv_no > 1e-10 { cv_yes / cv_no } else { 1.0 };
+
+            eprintln!(
+                "{:<8.1} {:>12.4e} {:>12.4} {:>12.4e} {:>12.4} {:>12.4}",
+                sza_deg, mean_no, cv_no, mean_yes, cv_yes, cv_ratio
+            );
+        }
+        eprintln!("{:=<80}\n", "");
+    }
 }

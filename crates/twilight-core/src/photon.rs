@@ -2032,7 +2032,7 @@ fn trace_secondary_chain_scalar(
                 let p_phase = scalar_phase_value(cos_t, optics) * INV_4PI;
                 let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase;
                 if mis_denom > 1e-30 {
-                    weight *= p_guide / mis_denom;
+                    weight *= p_phase / mis_denom;
                 }
                 // Consume RNG slots to keep stream aligned with non-guide path
                 let _ = xorshift_f64(&mut local_rng);
@@ -2635,7 +2635,7 @@ fn trace_secondary_chain_alis(
                 let p_phase_hero = scalar_phase_value(ct, hero_scatter_optics) * INV_4PI;
                 let mis_denom = GUIDE_MIS_FRAC * p_guide + (1.0 - GUIDE_MIS_FRAC) * p_phase_hero;
                 if mis_denom > 1e-30 {
-                    hero_weight *= p_guide / mis_denom;
+                    hero_weight *= p_phase_hero / mis_denom;
                 }
                 let _ = xorshift_f64(&mut local_rng);
                 let _ = xorshift_f64(&mut local_rng);
@@ -2667,6 +2667,12 @@ fn trace_secondary_chain_alis(
             };
 
             // ALIS phase function ratio for direction sampling.
+            // The sampling PDF is mix_hero = alpha*q + (1-alpha)*p_hero_sr for ALL
+            // wavelengths. Hero weight already carries p_hero_sr / mix_hero. Standard
+            // ALIS ratio phase_w / phase_hero gives the correct per-wavelength weight:
+            //   hero_weight * wr[w] ~ (p_hero_sr / mix_hero) * (phase_w / phase_hero)
+            //                       = p_phase_w_sr / mix_hero       (correct IS weight)
+            // No per-wavelength MIS denominator correction is needed.
             let phase_hero = scalar_phase_value(cos_theta_for_alis, hero_scatter_optics);
             if phase_hero > 1e-30 {
                 for w in 0..num_wl {
