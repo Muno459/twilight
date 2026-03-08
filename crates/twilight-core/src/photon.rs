@@ -789,27 +789,24 @@ const FORCED_TAU_CUTOFF: f64 = 20.0;
 /// providing natural unbiased termination) or actually scatters (~1%,
 /// continuing with full weight). No bias is introduced.
 ///
-/// Value 0.02 keeps forced scattering active at sea level upward
-/// (tau ~ 0.098 at 550 nm) and through the lower troposphere, but
-/// switches to analog above ~20 km where tau drops below 0.02.
-const FORCED_TAU_MIN: f64 = 0.02;
-
 /// Returns the SZA-adaptive forced-scatter optical-depth floor.
 ///
-/// At moderate twilight (SZA < 102), a higher threshold (0.05) lets more
-/// bounces go analog above ~12 km, where chains escape cleanly and the
-/// forced-scatter weight penalty (1-exp(-tau)) is wasteful.
+/// Smoothly transitions from 0.05 (moderate twilight) to 0.02 (deep twilight).
 ///
-/// At deep twilight (SZA >= 102), a lower threshold (0.02) keeps forced
-/// scattering active deeper into the atmosphere (~20 km), giving chains
-/// more chances to survive and reach the illuminated terminator.
+/// At moderate twilight, a higher threshold lets more bounces go analog
+/// above ~12 km, where chains escape cleanly and the forced-scatter weight
+/// penalty (1-exp(-tau)) is wasteful.
+///
+/// At deep twilight, a lower threshold keeps forced scattering active
+/// deeper into the atmosphere (~20 km), giving chains more chances to
+/// survive and reach the illuminated terminator.
+///
+/// Uses sigmoid ramp centered at SZA 100 (same as weight windows) for
+/// smooth behavior at arbitrary SZA resolution.
 #[inline]
 fn forced_tau_min_for_sza(sza_deg: f64) -> f64 {
-    if sza_deg >= 102.0 {
-        FORCED_TAU_MIN
-    } else {
-        0.05
-    }
+    let t = sigmoid((sza_deg - 100.0) / 2.0);
+    0.05 - 0.03 * t // 0.05 at low SZA, 0.02 at high SZA
 }
 
 /// Maximum directional bias parameter for the exponential transform.
@@ -1146,12 +1143,12 @@ struct VspgSegment {
 /// `VSPG_BOOST_START_M`) to a SZA-dependent maximum (at `VSPG_BOOST_FULL_M`).
 ///
 /// The SZA dependence ensures zero overhead at civil/nautical twilight:
-/// - SZA <= 96: returns 1.0 for all altitudes (no VSPG effect)
+/// - SZA <= 96: sza_t clamps to 0, importance = 1.0 (no VSPG effect)
 /// - SZA = 101: moderate boost (up to ~25x at 70 km)
 /// - SZA >= 106: full boost (up to `VSPG_MAX_IMPORTANCE` at 70 km)
 #[inline]
 fn vspg_importance(alt_m: f64, sza_deg: f64) -> f64 {
-    if sza_deg < ZENITH_SZA_START || alt_m <= VSPG_BOOST_START_M {
+    if alt_m <= VSPG_BOOST_START_M {
         return 1.0;
     }
     let sza_t =
@@ -3541,7 +3538,11 @@ pub fn train_path_guide(
     let observer_up = observer_pos.normalize();
     let cos_sza_train = sun_dir.dot(observer_up);
     let sza_deg_train = libm::acos(cos_sza_train.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    let use_iterative_refinement = sza_deg_train >= 102.0;
+    // Smooth ramp: iterative refinement fraction increases with SZA.
+    // At SZA < 98: refinement_frac ~ 0 (no iterative refinement).
+    // At SZA > 104: refinement_frac ~ 1 (full iterative refinement).
+    let refinement_frac = sigmoid((sza_deg_train - 101.0) / 1.5);
+    let use_iterative_refinement = refinement_frac > 0.5;
 
     let base_count = (secondary_rays >> (NUM_PILOT_ITERS - 1)).max(1);
     let mut prev_guide: Option<PathGuide> = None;

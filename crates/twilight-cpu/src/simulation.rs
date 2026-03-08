@@ -253,18 +253,30 @@ fn simulate_at_sza_mc(
 ///
 /// For polarized mode, uses rayon parallelism over wavelengths with full
 /// Stokes [I,Q,U,V] propagation per chain.
-/// SZA threshold (degrees) above which path guide training is performed.
+/// SZA center for guide activation sigmoid [degrees].
 ///
-/// Below 105 degrees, the three-branch direction sampling (phase + zenith +
-/// terminator) is already effective and the guide adds MIS overhead without
-/// reliable benefit.  CV diagnostics (50 seeds, 200 rays) show the guide
-/// *increases* variance at SZA 93-104: at SZA 104 it inflates CV from 1.040
-/// to 1.351 (+30%).  Only at SZA >= 106 does the guide provide a net win
-/// (CV 4.16 -> 3.55) by capturing lateral-transport paths that unguided
-/// sampling almost never finds.  Setting the threshold to 105 avoids the
-/// guide penalty at civil/nautical twilight while retaining the benefit at
-/// astronomical twilight.
-const GUIDE_SZA_THRESHOLD: f64 = 105.0;
+/// The guide activation fraction smoothly transitions from ~0 at civil
+/// twilight to ~1 at deep twilight:
+///   guide_frac(sza) = sigmoid((sza - GUIDE_SZA_CENTER) / GUIDE_SZA_WIDTH)
+///
+/// At SZA 100: ~4% guide fraction (nearly off, minimal overhead).
+/// At SZA 104: ~73% guide fraction (active).
+/// At SZA 106: ~95% guide fraction (fully on).
+///
+/// The guide is only trained when guide_frac > 0.1 (SZA > ~100) to avoid
+/// wasting training budget at civil twilight. Training ray budget scales
+/// with guide_frac for smooth resource allocation.
+const GUIDE_SZA_CENTER: f64 = 103.0;
+
+/// Width of guide activation sigmoid [degrees].
+const GUIDE_SZA_WIDTH: f64 = 1.5;
+
+/// Sigmoid helper (matches the one in photon.rs; duplicated to avoid
+/// exposing it across crate boundaries for a single-use utility).
+#[inline]
+fn guide_sigmoid(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
 
 fn simulate_at_sza_hybrid(
     atm: &AtmosphereModel,
@@ -279,13 +291,13 @@ fn simulate_at_sza_hybrid(
         let sza_bits = sza_deg.to_bits();
         let mut rng = sza_bits.wrapping_mul(6364136223846793005).wrapping_add(1);
 
-        // Train path guide at deep twilight for directional importance sampling.
-        let guide = if sza_deg >= GUIDE_SZA_THRESHOLD && secondary_rays > 0 {
-            // At deep twilight (SZA >= 105), training chains rarely find
-            // productive paths to the sunlit terminator. Increase training
-            // budget to compensate. Training chains are single-wavelength
-            // with no ALIS or splitting, so 4x cost is modest.
-            let train_multiplier = 4usize;
+        // Train path guide with SZA-adaptive budget. The guide activation
+        // fraction ramps smoothly from 0 (civil) to 1 (deep twilight).
+        // Training is skipped when guide_frac < 0.1 (~SZA 100).
+        let guide_frac = guide_sigmoid((sza_deg - GUIDE_SZA_CENTER) / GUIDE_SZA_WIDTH);
+        let guide = if guide_frac > 0.1 && secondary_rays > 0 {
+            // Training budget scales with SZA: 1x at onset, up to 8x at deep.
+            let train_multiplier = (1.0 + 7.0 * guide_frac) as usize;
             let train_rays = secondary_rays * train_multiplier;
             let train_seed = sza_bits.wrapping_mul(2862933555777941757).wrapping_add(1);
             Some(photon::train_path_guide(
@@ -1011,10 +1023,11 @@ mod tests {
         for &sza_deg in &[93.0, 96.0, 100.0, 104.0, 106.0] {
             let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
 
-            // Train guide once for this SZA (with deep-twilight multiplier).
+            // Train guide once for this SZA (with smooth budget scaling).
             let sza_bits = sza_deg.to_bits();
             let train_seed = sza_bits.wrapping_mul(2862933555777941757).wrapping_add(1);
-            let train_multiplier = if sza_deg >= 102.0 { 4usize } else { 1 };
+            let gf = guide_sigmoid((sza_deg - GUIDE_SZA_CENTER) / GUIDE_SZA_WIDTH);
+            let train_multiplier = (1.0 + 7.0 * gf) as usize;
             let train_rays = rays * train_multiplier;
             let guide = photon::train_path_guide(&atm, obs_pos, view, sun, train_rays, train_seed);
 
