@@ -948,20 +948,36 @@ const TERMINATOR_TILT_MAX_DEG: f64 = 60.0;
 const DWIVEDI_BETA_MAX: f64 = 3.0;
 
 /// SZA center for Dwivedi ramp [degrees].
+///
+/// Kept at 103 (where Dwivedi fraction = half of max). With WIDTH=2.0,
+/// the ramp extends ~4 degrees in each direction:
+///   SZA 99:  d_frac = 4.2%  (gentle)
+///   SZA 101: d_frac = 9.4%  (moderate)
+///   SZA 103: d_frac = 17.5% (half-max)
+///   SZA 105: d_frac = 25.6% (near-full)
+///   SZA 107: d_frac = 30.8% (near-max)
 const DWIVEDI_SZA_CENTER: f64 = 103.0;
 
 /// SZA width for Dwivedi ramp [degrees].
-const DWIVEDI_SZA_WIDTH: f64 = 1.5;
+///
+/// Widened from 1.5 to 2.0 for a gentler ramp that extends meaningful
+/// Dwivedi guidance to SZA 101-102 (9-13%) where lateral transport
+/// becomes the bottleneck, while keeping the center at 103.
+const DWIVEDI_SZA_WIDTH: f64 = 2.0;
 
-/// Fraction of bounces allocated to Dwivedi at full strength (SZA >> 103).
-/// This is taken from the phase function's share.
-const DWIVEDI_FRAC_MAX: f64 = 0.25;
+/// Fraction of bounces allocated to Dwivedi at full strength.
+///
+/// Increased from 0.25 to 0.35 to allocate more direction samples to
+/// horizontal biasing at deep twilight where lateral transport to the
+/// terminator (1300-2000 km) is the bottleneck. Phase function retains
+/// 65% at full SZA, sufficient for scattering angle sampling.
+const DWIVEDI_FRAC_MAX: f64 = 0.35;
 
 /// Returns the SZA-adaptive Dwivedi sampling fraction.
 ///
-/// At SZA < 100: ~0 (no Dwivedi bias, phase function is sufficient).
-/// At SZA = 103: ~0.125 (moderate).
-/// At SZA > 106: ~0.25 (full Dwivedi allocation).
+/// At SZA < 98: ~0 (no Dwivedi bias, phase function is sufficient).
+/// At SZA = 101: ~0.20 (moderate).
+/// At SZA > 105: ~0.37 (near-full Dwivedi allocation).
 #[inline]
 fn dwivedi_frac(sza_deg: f64) -> f64 {
     DWIVEDI_FRAC_MAX * sigmoid((sza_deg - DWIVEDI_SZA_CENTER) / DWIVEDI_SZA_WIDTH)
@@ -2651,7 +2667,7 @@ fn trace_secondary_chain_scalar(
             // pure phase function sampling with no MIS overhead and no extra
             // RNG consumption.
             let alpha_d = d_frac;
-            let mis_active = alpha_d >= 0.01;
+            let mis_active = alpha_d >= 0.02;
 
             let new_dir = if mis_active {
                 let local_up_here = pos.normalize();
@@ -3334,7 +3350,7 @@ fn trace_secondary_chain_alis(
             // negligible, use pure phase function (no MIS overhead, preserves
             // RNG stream, avoids compounding weight perturbations).
             let alpha_d = d_frac;
-            let mis_active = alpha_d >= 0.01;
+            let mis_active = alpha_d >= 0.02;
 
             let (new_dir, cos_theta_for_alis) = if mis_active {
                 let local_up_here = pos.normalize();
@@ -6085,9 +6101,9 @@ mod tests {
         assert!(dwivedi_frac(93.0) < 0.01, "dwivedi_frac(93) should be ~0");
         // At deep twilight, should approach DWIVEDI_FRAC_MAX.
         assert!(
-            (dwivedi_frac(110.0) - DWIVEDI_FRAC_MAX).abs() < 0.01,
-            "dwivedi_frac(110) = {}, expected ~{}",
-            dwivedi_frac(110.0),
+            (dwivedi_frac(115.0) - DWIVEDI_FRAC_MAX).abs() < 0.01,
+            "dwivedi_frac(115) = {}, expected ~{}",
+            dwivedi_frac(115.0),
             DWIVEDI_FRAC_MAX
         );
         // Monotonic.
