@@ -1329,23 +1329,39 @@ struct VspgSegment {
     importance: f64,
 }
 
+/// SZA at which VSPG importance begins ramping [degrees].
+///
+/// At SZA 93, the geometric shadow height is ~9 km and forced scattering
+/// starts at SZA 96. But even at SZA 94-95, biasing toward high-altitude
+/// scatter sites improves chain efficiency. Starting the VSPG ramp early
+/// ensures that by SZA 97 (shadow at 48 km), chains have substantial
+/// upward guidance rather than the minimal 0.1 * 50 = 5x that the old
+/// ZENITH_SZA_START-based ramp provided.
+const VSPG_SZA_START: f64 = 93.0;
+
+/// SZA at which VSPG importance reaches maximum [degrees].
+///
+/// By SZA 103, the shadow exceeds the TOA and purely lateral transport
+/// dominates. VSPG should be fully active before this point.
+const VSPG_SZA_FULL: f64 = 103.0;
+
 /// Compute altitude-dependent importance for VSPG.
 ///
 /// Returns a multiplier >= 1.0 that biases scatter site selection toward
 /// high altitude. The multiplier ramps quadratically from 1.0 (at or below
 /// `VSPG_BOOST_START_M`) to a SZA-dependent maximum (at `VSPG_BOOST_FULL_M`).
 ///
-/// The SZA dependence ensures zero overhead at civil/nautical twilight:
-/// - SZA <= 96: sza_t clamps to 0, importance = 1.0 (no VSPG effect)
-/// - SZA = 101: moderate boost (up to ~25x at 70 km)
-/// - SZA >= 106: full boost (up to `VSPG_MAX_IMPORTANCE` at 70 km)
+/// The SZA dependence uses VSPG's own ramp (93-103) which is wider than
+/// the zenith-bias ramp (96-106), giving meaningful guidance at SZA 97:
+/// - SZA <= 93: sza_t = 0, importance = 1.0 (no VSPG effect)
+/// - SZA = 97: sza_t = 0.4, max_imp = 20.6 (strong at high altitude)
+/// - SZA >= 103: sza_t = 1.0, full VSPG_MAX_IMPORTANCE
 #[inline]
 fn vspg_importance(alt_m: f64, sza_deg: f64) -> f64 {
     if alt_m <= VSPG_BOOST_START_M {
         return 1.0;
     }
-    let sza_t =
-        ((sza_deg - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
+    let sza_t = ((sza_deg - VSPG_SZA_START) / (VSPG_SZA_FULL - VSPG_SZA_START)).clamp(0.0, 1.0);
     let alt_t =
         ((alt_m - VSPG_BOOST_START_M) / (VSPG_BOOST_FULL_M - VSPG_BOOST_START_M)).clamp(0.0, 1.0);
     let max_imp = 1.0 + (VSPG_MAX_IMPORTANCE - 1.0) * sza_t;
@@ -6104,7 +6120,7 @@ mod tests {
 
     #[test]
     fn vspg_importance_unity_at_civil_twilight() {
-        // At SZA <= 96, importance should be 1.0 for all altitudes.
+        // At SZA <= VSPG_SZA_START (93), importance should be 1.0 for all altitudes.
         for alt in [0.0, 30_000.0, 50_000.0, 70_000.0, 100_000.0] {
             let imp = vspg_importance(alt, 90.0);
             assert!(
@@ -6113,14 +6129,22 @@ mod tests {
                 alt,
                 imp
             );
-            let imp2 = vspg_importance(alt, 96.0);
+            let imp2 = vspg_importance(alt, VSPG_SZA_START);
             assert!(
                 (imp2 - 1.0).abs() < 1e-12,
-                "Expected 1.0 at SZA 96 alt={}, got {}",
+                "Expected 1.0 at SZA {} alt={}, got {}",
+                VSPG_SZA_START,
                 alt,
                 imp2
             );
         }
+        // At SZA 96 (above VSPG_SZA_START), high-altitude importance should exceed 1.0.
+        let imp_96_70k = vspg_importance(70_000.0, 96.0);
+        assert!(
+            imp_96_70k > 1.0,
+            "Expected >1.0 at SZA 96 alt=70km, got {}",
+            imp_96_70k
+        );
     }
 
     #[test]
