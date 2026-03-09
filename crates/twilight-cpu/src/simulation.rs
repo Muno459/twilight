@@ -957,22 +957,33 @@ mod tests {
         let obs_pos = geographic_to_ecef(lat, lon, 0.0);
         let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
 
-        let num_seeds = 50usize;
+        let base_seeds = 50usize;
+        let deep_seeds = 200usize;
         let rays = 200usize;
 
         eprintln!("\n{:=<64}", "");
         eprintln!(
-            "CV BASELINE: unguided ALIS ({} seeds x {} rays)",
-            num_seeds, rays
+            "CV BASELINE: unguided ALIS ({}/{} seeds x {} rays)",
+            base_seeds, deep_seeds, rays
         );
         eprintln!("{:=<64}", "");
-        eprintln!("{:<8} {:>14} {:>12}", "SZA", "Mean radiance", "CV");
-        eprintln!("{:-<40}", "");
+        eprintln!(
+            "{:<8} {:>6} {:>14} {:>12}",
+            "SZA", "Seeds", "Mean radiance", "CV"
+        );
+        eprintln!("{:-<46}", "");
 
         let sza_list: Vec<f64> = (93..=108).map(|s| s as f64).collect();
 
         for &sza_deg in &sza_list {
             let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+
+            // Use more seeds at deep twilight where CV measurement is noisy.
+            let num_seeds = if sza_deg >= 105.0 {
+                deep_seeds
+            } else {
+                base_seeds
+            };
 
             let mut totals = Vec::with_capacity(num_seeds);
             for seed_idx in 0..num_seeds {
@@ -999,8 +1010,129 @@ mod tests {
                 0.0
             };
 
-            eprintln!("{:<8.1} {:>14.4e} {:>12.4}", sza_deg, mean, cv);
+            eprintln!(
+                "{:<8.1} {:>6} {:>14.4e} {:>12.4}",
+                sza_deg, num_seeds, mean, cv
+            );
         }
         eprintln!("{:=<64}\n", "");
+    }
+
+    /// Deep diagnostic: run targeted SZAs with 500 seeds, dump distribution stats.
+    ///
+    /// Run with: cargo test -p twilight-cpu --release -- cv_deep_diag --nocapture
+    #[test]
+    fn cv_deep_diag() {
+        use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+        use twilight_core::photon;
+
+        let atm = make_clear_sky_atm();
+        let lat = 21.4225;
+        let lon = 39.8262;
+        let solar_azimuth = 270.0;
+        let view_zenith = 75.0;
+
+        let obs_pos = geographic_to_ecef(lat, lon, 0.0);
+        let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+
+        let num_seeds = 500usize;
+        let rays = 200usize;
+        let target_szas = [97.0, 98.0, 100.0, 102.0, 106.0];
+
+        eprintln!("\n{:=<80}", "");
+        eprintln!(
+            "CV DEEP DIAGNOSTIC: {} seeds x {} rays, distribution analysis",
+            num_seeds, rays
+        );
+        eprintln!("{:=<80}", "");
+
+        for &sza_deg in &target_szas {
+            let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+
+            let mut totals = Vec::with_capacity(num_seeds);
+            for seed_idx in 0..num_seeds {
+                let sza_bits = sza_deg.to_bits();
+                let mut rng = (seed_idx as u64)
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(sza_bits)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1);
+
+                let result =
+                    photon::hybrid_scatter_radiance_alis(&atm, obs_pos, view, sun, rays, &mut rng);
+                let total: f64 = result.iter().take(atm.num_wavelengths).sum();
+                totals.push(total);
+            }
+
+            let n = totals.len();
+            let mean = totals.iter().sum::<f64>() / n as f64;
+            let std =
+                (totals.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1) as f64).sqrt();
+            let cv = if mean.abs() > 1e-30 {
+                std / mean.abs()
+            } else {
+                0.0
+            };
+
+            // CV convergence from UNSORTED data (first N seeds)
+            let mut cv_by_n = Vec::new();
+            for &sub_n in &[50usize, 100, 200, 500] {
+                if sub_n > n {
+                    break;
+                }
+                let sub = &totals[..sub_n];
+                let sub_mean = sub.iter().sum::<f64>() / sub_n as f64;
+                let sub_std = (sub.iter().map(|x| (x - sub_mean).powi(2)).sum::<f64>()
+                    / (sub_n - 1) as f64)
+                    .sqrt();
+                let sub_cv = if sub_mean.abs() > 1e-30 {
+                    sub_std / sub_mean.abs()
+                } else {
+                    0.0
+                };
+                cv_by_n.push((sub_n, sub_cv));
+            }
+
+            // Count negative seeds
+            let neg_count = totals.iter().filter(|&&x| x < 0.0).count();
+
+            // Sort for percentile analysis
+            totals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p01 = totals[(0.01 * n as f64) as usize];
+            let p05 = totals[(0.05 * n as f64) as usize];
+            let p25 = totals[(0.25 * n as f64) as usize];
+            let p50 = totals[n / 2];
+            let p75 = totals[(0.75 * n as f64) as usize];
+            let p95 = totals[(0.95 * n as f64) as usize];
+            let p99 = totals[(0.99 * n as f64) as usize];
+            let min = totals[0];
+            let max = totals[n - 1];
+
+            eprintln!("\n--- SZA {:.1} ---", sza_deg);
+            eprintln!(
+                "  Mean:    {:.4e}    Std: {:.4e}    CV: {:.4}",
+                mean, std, cv
+            );
+            eprintln!("  Neg seeds: {}/{}", neg_count, n);
+            eprintln!(
+                "  Min:  {:.4e}   Max:  {:.4e}   Range ratio: {:.1}x",
+                min,
+                max,
+                if min.abs() > 1e-30 {
+                    max / min
+                } else {
+                    f64::INFINITY
+                }
+            );
+            eprintln!("  Percentiles:");
+            eprintln!("    P1:  {:.4e}  P5:  {:.4e}  P25: {:.4e}", p01, p05, p25);
+            eprintln!("    P50: {:.4e}  P75: {:.4e}", p50, p75);
+            eprintln!("    P95: {:.4e}  P99: {:.4e}", p95, p99);
+            eprintln!("  CV convergence:");
+            for (sub_n, sub_cv) in &cv_by_n {
+                eprintln!("    n={:>4}: CV={:.4}", sub_n, sub_cv);
+            }
+        }
+        eprintln!("\n{:=<80}\n", "");
     }
 }

@@ -261,6 +261,11 @@ pub fn trace_photon(
     wavelength_idx: usize,
     rng_state: &mut u64,
 ) -> PhotonResult {
+    // Split RNG: derive independent streams from master seed.
+    let mut rng = McRng::from_seed(*rng_state);
+    // Advance master by 1 so successive calls get different seeds.
+    let _ = xorshift_f64(rng_state);
+
     let mut pos = observer_pos;
     let mut dir = initial_dir;
     let mut weight = 1.0;
@@ -305,7 +310,7 @@ pub fn trace_photon(
         }
 
         // Sample free path length (Beer-Lambert)
-        let xi = xorshift_f64(rng_state);
+        let xi = xorshift_f64(&mut rng.tau);
         let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
 
         // Check if free path reaches a shell boundary
@@ -337,7 +342,7 @@ pub fn trace_photon(
                         // Ground reflection (Lambertian)
                         let albedo = atm.surface_albedo[wavelength_idx];
                         weight *= albedo;
-                        dir = sample_hemisphere(normal, rng_state);
+                        dir = sample_hemisphere(normal, &mut rng.dir);
                         continue;
                     }
 
@@ -364,12 +369,12 @@ pub fn trace_photon(
         weight *= optics.ssa;
 
         // Sample new direction based on phase function
-        let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
+            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), optics.asymmetry)
         };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         dir = scatter_direction(dir, cos_theta, phi);
     }
 
@@ -565,6 +570,10 @@ pub fn trace_photon_polarized(
     wavelength_idx: usize,
     rng_state: &mut u64,
 ) -> PolarizedPhotonResult {
+    // Split RNG: derive independent streams from master seed.
+    let mut rng = McRng::from_seed(*rng_state);
+    let _ = xorshift_f64(rng_state);
+
     let mut pos = observer_pos;
     let mut dir = initial_dir;
     let mut weight = 1.0;
@@ -608,7 +617,7 @@ pub fn trace_photon_polarized(
         }
 
         // Sample free path
-        let xi = xorshift_f64(rng_state);
+        let xi = xorshift_f64(&mut rng.tau);
         let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
 
         // Check shell boundary
@@ -641,7 +650,7 @@ pub fn trace_photon_polarized(
                         let albedo = atm.surface_albedo[wavelength_idx];
                         weight *= albedo;
                         prev_dir = dir;
-                        dir = sample_hemisphere(normal, rng_state);
+                        dir = sample_hemisphere(normal, &mut rng.dir);
                         continue;
                     }
                     continue;
@@ -676,12 +685,12 @@ pub fn trace_photon_polarized(
         weight *= optics.ssa;
 
         // Sample new direction
-        let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
+            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), optics.asymmetry)
         };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         prev_dir = dir;
         dir = scatter_direction(dir, cos_theta, phi);
     }
@@ -1250,7 +1259,7 @@ struct SplitParticleScalar {
     pos: Vec3,
     dir: Vec3,
     weight: f64,
-    rng: u64,
+    rng: McRng,
 }
 
 /// State of a single particle in the weight-window work stack (ALIS mode).
@@ -1263,7 +1272,7 @@ struct SplitParticleAlis {
     dir: Vec3,
     hero_weight: f64,
     weight_ratio: [f64; 64],
-    rng: u64,
+    rng: McRng,
 }
 
 // --- VSPG (Volume Scattering Probability Guiding) ---
@@ -1910,6 +1919,11 @@ pub fn hybrid_scatter_radiance(
             if polarized {
                 let mut mc_stokes = StokesVector::unpolarized(0.0);
                 for ray in 0..secondary_rays {
+                    // Per-chain McRng: master advances by 1 per chain,
+                    // making inter-chain sequencing deterministic regardless
+                    // of per-chain RNG consumption.
+                    let _ = xorshift_f64(rng_state);
+                    let mut mc_rng = McRng::from_seed(*rng_state);
                     let chain_stokes = trace_secondary_chain(
                         atm,
                         scatter_pos,
@@ -1917,7 +1931,7 @@ pub fn hybrid_scatter_radiance(
                         sun_dir,
                         wavelength_idx,
                         optics,
-                        rng_state,
+                        &mut mc_rng,
                         ray,
                         secondary_rays,
                     );
@@ -1930,13 +1944,15 @@ pub fn hybrid_scatter_radiance(
             } else {
                 let mut mc_scalar = 0.0_f64;
                 for ray in 0..secondary_rays {
+                    let _ = xorshift_f64(rng_state);
+                    let mut mc_rng = McRng::from_seed(*rng_state);
                     mc_scalar += trace_secondary_chain_scalar(
                         atm,
                         scatter_pos,
                         sun_dir,
                         wavelength_idx,
                         optics,
-                        rng_state,
+                        &mut mc_rng,
                         ray,
                         secondary_rays,
                     );
@@ -1983,7 +1999,7 @@ fn trace_secondary_chain(
     sun_dir: Vec3,
     wavelength_idx: usize,
     start_optics: &crate::atmosphere::ShellOptics,
-    rng_state: &mut u64,
+    rng: &mut McRng,
     ray_idx: usize,
     total_rays: usize,
 ) -> crate::scattering::StokesVector {
@@ -2008,7 +2024,7 @@ fn trace_secondary_chain(
     let term_axis = terminator_axis(local_up, sun_dir, bp.tilt_rad);
 
     // --- Stratified initial direction sampling ---
-    let xi_jitter = xorshift_f64(rng_state);
+    let xi_jitter = xorshift_f64(&mut rng.dir);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
     // 3-branch importance sampling with correct branch probability weights.
@@ -2026,25 +2042,25 @@ fn trace_secondary_chain(
     // branch weights = 1.0 exactly (n=1 makes zenith_importance_weight=1).
     let (dir, cos_theta_init, initial_weight) = if xi_mix < alpha_p {
         // Phase function branch
-        let cos_theta_init = if xorshift_f64(rng_state) < start_optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        let cos_theta_init = if xorshift_f64(&mut rng.dir) < start_optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), start_optics.asymmetry)
+            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), start_optics.asymmetry)
         };
-        let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         let d = scatter_direction(sun_dir, cos_theta_init, phi_init);
         let branch_w = 0.5 / alpha_p;
         (d, cos_theta_init, branch_w)
     } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
         // Zenith-biased branch with shape + branch weight correction
-        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, rng_state);
+        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
         let cos_theta_init = sun_dir.dot(d);
         let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
         let branch_w = 0.5 / (alpha_z + alpha_t); // fallback if alpha_t ~ 0
         (d, cos_theta_init, shape_w * branch_w)
     } else {
         // Terminator lobe branch
-        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, rng_state);
+        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
         let cos_z = d.dot(local_up);
         let cos_theta_init = sun_dir.dot(d);
         let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
@@ -2130,7 +2146,7 @@ fn trace_secondary_chain(
             // No analog free-path walk, no escape, no double-counting.
             let exp_neg_tau = libm::exp(-tau_max);
             weight *= 1.0 - exp_neg_tau;
-            let xi = xorshift_f64(rng_state);
+            let xi = xorshift_f64(&mut rng.tau);
             let tau_s = -libm::log(1.0 - xi * (1.0 - exp_neg_tau) + 1e-30);
             let (sp, sd, ss) =
                 advance_to_optical_depth(atm, pos, current_dir, tau_s, wavelength_idx);
@@ -2177,7 +2193,7 @@ fn trace_secondary_chain(
                 let sigma_prime = sigma * (1.0 - alpha_et * cos_bias);
                 // sigma_prime > 0 guaranteed: alpha_et <= 0.5, |cos_bias| <= 1
 
-                let xi = xorshift_f64(rng_state);
+                let xi = xorshift_f64(&mut rng.tau);
                 let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
 
                 match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
@@ -2222,7 +2238,7 @@ fn trace_secondary_chain(
                                 let albedo = atm.surface_albedo[wavelength_idx];
                                 weight *= albedo;
                                 prev_dir = current_dir;
-                                current_dir = sample_hemisphere(normal, rng_state);
+                                current_dir = sample_hemisphere(normal, &mut rng.dir);
                                 stokes = StokesVector::unpolarized(1.0);
                                 continue;
                             }
@@ -2275,12 +2291,12 @@ fn trace_secondary_chain(
         weight *= optics.ssa;
 
         // Sample new direction and update Stokes state
-        let cos_theta = if xorshift_f64(rng_state) < optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), optics.asymmetry)
+            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), optics.asymmetry)
         };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         let new_dir = scatter_direction(current_dir, cos_theta, phi);
 
         // Update Stokes through this scatter (fused, no matrices, no trig)
@@ -2339,7 +2355,7 @@ fn trace_secondary_chain_scalar(
     sun_dir: Vec3,
     wavelength_idx: usize,
     start_optics: &crate::atmosphere::ShellOptics,
-    rng_state: &mut u64,
+    rng: &mut McRng,
     ray_idx: usize,
     total_rays: usize,
 ) -> f64 {
@@ -2361,19 +2377,19 @@ fn trace_secondary_chain_scalar(
     let term_axis = terminator_axis(local_up, sun_dir, bp.tilt_rad);
 
     // --- Stratified initial direction sampling ---
-    let xi_jitter = xorshift_f64(rng_state);
+    let xi_jitter = xorshift_f64(&mut rng.dir);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
     // 3-branch importance sampling. See trace_secondary_chain for derivation.
     // At SZA <= 96: alpha_p=0.5, alpha_z=0.5, alpha_t=0. Both weights = 1.0.
     let (dir, initial_weight) = if xi_mix < alpha_p {
         // Phase function branch (toward sun_dir -- effective at civil twilight)
-        let _cos_theta_init = if xorshift_f64(rng_state) < start_optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        let _cos_theta_init = if xorshift_f64(&mut rng.dir) < start_optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), start_optics.asymmetry)
+            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), start_optics.asymmetry)
         };
-        let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         let branch_w = 0.5 / alpha_p;
         (
             scatter_direction(sun_dir, _cos_theta_init, phi_init),
@@ -2381,13 +2397,13 @@ fn trace_secondary_chain_scalar(
         )
     } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
         // Zenith-biased branch with shape + branch weight correction
-        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, rng_state);
+        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
         let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
         let branch_w = 0.5 / (alpha_z + alpha_t);
         (d, shape_w * branch_w)
     } else {
         // Terminator lobe branch
-        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, rng_state);
+        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
         let cos_z = d.dot(local_up);
         let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
         let branch_w = 0.5 / alpha_t;
@@ -2414,26 +2430,30 @@ fn trace_secondary_chain_scalar(
     let ck = cadis_k(sza_deg_local);
 
     // Initialize work stack with the main particle.
+    let dummy_rng = McRng {
+        tau: 0,
+        dir: 0,
+        ctl: 0,
+    };
     let mut stack = [SplitParticleScalar {
         pos: Vec3::new(0.0, 0.0, 0.0),
         dir: Vec3::new(0.0, 0.0, 1.0),
         weight: 0.0,
-        rng: 0,
+        rng: dummy_rng,
     }; MAX_SPLIT_PARTICLES];
     let mut stack_len: usize = 1;
     stack[0] = SplitParticleScalar {
         pos: start_pos,
         dir,
         weight: start_optics.ssa * initial_weight,
-        rng: *rng_state,
+        rng: *rng,
     };
-    let mut main_rng_out = *rng_state;
     let mut main_processed = false;
 
     // Process all particles: main first, then split copies (LIFO order).
     while stack_len > 0 {
         stack_len -= 1;
-        let is_main = !main_processed;
+        let _is_main = !main_processed;
         main_processed = true;
         let mut pos = stack[stack_len].pos;
         let mut current_dir = stack[stack_len].dir;
@@ -2475,7 +2495,7 @@ fn trace_secondary_chain_scalar(
                 weight *= 1.0 - exp_neg_tau;
                 // VSPG: sample from pre-collected segments (no re-walk).
                 let (tau_s, vspg_w) =
-                    vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max, &mut local_rng);
+                    vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max, &mut local_rng.tau);
                 weight *= vspg_w;
                 let (sp, sd, ss) =
                     advance_to_optical_depth(atm, pos, current_dir, tau_s, wavelength_idx);
@@ -2519,7 +2539,7 @@ fn trace_secondary_chain_scalar(
                     let sigma = optics.extinction;
                     let sigma_prime = sigma * (1.0 - alpha_et * cos_bias);
 
-                    let xi = xorshift_f64(&mut local_rng);
+                    let xi = xorshift_f64(&mut local_rng.tau);
                     let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
 
                     match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
@@ -2562,7 +2582,7 @@ fn trace_secondary_chain_scalar(
 
                                     let albedo = atm.surface_albedo[wavelength_idx];
                                     weight *= albedo;
-                                    current_dir = sample_hemisphere(normal, &mut local_rng);
+                                    current_dir = sample_hemisphere(normal, &mut local_rng.dir);
                                     continue;
                                 }
                                 continue;
@@ -2620,13 +2640,13 @@ fn trace_secondary_chain_scalar(
             let new_dir = if mis_active {
                 let local_up_here = pos.normalize();
                 let alpha_p_mis = 1.0 - alpha_d;
-                let xi_branch = xorshift_f64(&mut local_rng);
+                let xi_branch = xorshift_f64(&mut local_rng.dir);
 
                 if xi_branch < alpha_d {
                     // Dwivedi branch: sample direction biased toward horizontal
-                    let xi1 = xorshift_f64(&mut local_rng);
-                    let xi2 = xorshift_f64(&mut local_rng);
-                    let xi_sign = xorshift_f64(&mut local_rng);
+                    let xi1 = xorshift_f64(&mut local_rng.dir);
+                    let xi2 = xorshift_f64(&mut local_rng.dir);
+                    let xi_sign = xorshift_f64(&mut local_rng.dir);
                     let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
                     let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
                     let east = {
@@ -2654,12 +2674,12 @@ fn trace_secondary_chain_scalar(
                     d
                 } else {
                     // Phase function branch (within MIS)
-                    let cos_theta = if xorshift_f64(&mut local_rng) < optics.rayleigh_fraction {
-                        sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
+                    let cos_theta = if xorshift_f64(&mut local_rng.dir) < optics.rayleigh_fraction {
+                        sample_rayleigh_analytic(xorshift_f64(&mut local_rng.dir))
                     } else {
-                        sample_henyey_greenstein(xorshift_f64(&mut local_rng), optics.asymmetry)
+                        sample_henyey_greenstein(xorshift_f64(&mut local_rng.dir), optics.asymmetry)
                     };
-                    let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+                    let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
                     let d = scatter_direction(current_dir, cos_theta, phi);
 
                     let p_phase = scalar_phase_value(cos_theta, optics) * INV_4PI;
@@ -2673,12 +2693,12 @@ fn trace_secondary_chain_scalar(
                 }
             } else {
                 // Pure phase function: no Dwivedi, no MIS overhead.
-                let cos_theta = if xorshift_f64(&mut local_rng) < optics.rayleigh_fraction {
-                    sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
+                let cos_theta = if xorshift_f64(&mut local_rng.dir) < optics.rayleigh_fraction {
+                    sample_rayleigh_analytic(xorshift_f64(&mut local_rng.dir))
                 } else {
-                    sample_henyey_greenstein(xorshift_f64(&mut local_rng), optics.asymmetry)
+                    sample_henyey_greenstein(xorshift_f64(&mut local_rng.dir), optics.asymmetry)
                 };
-                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
                 scatter_direction(current_dir, cos_theta, phi)
             };
             current_dir = new_dir;
@@ -2698,7 +2718,7 @@ fn trace_secondary_chain_scalar(
                 // On survival: weight = sign(weight) * w_target.
                 // Unbiased: E[output] = p * w_target = |weight|.
                 let p_survive = abs_w / w_target;
-                if xorshift_f64(&mut local_rng) < p_survive {
+                if xorshift_f64(&mut local_rng.ctl) < p_survive {
                     weight = if weight >= 0.0 { w_target } else { -w_target };
                 } else {
                     break; // Chain killed by RR
@@ -2713,27 +2733,22 @@ fn trace_secondary_chain_scalar(
                 weight /= k as f64;
                 for copy_idx in 1..k {
                     if stack_len < MAX_SPLIT_PARTICLES {
-                        let child_rng = local_rng
+                        let child_seed = local_rng.tau
                             ^ (copy_idx as u64).wrapping_mul(2654435761)
                             ^ (alt.to_bits() >> 32);
                         stack[stack_len] = SplitParticleScalar {
                             pos,
                             dir: current_dir,
                             weight,
-                            rng: child_rng,
+                            rng: McRng::from_seed(child_seed),
                         };
                         stack_len += 1;
                     }
                 }
             }
         }
-
-        if is_main {
-            main_rng_out = local_rng;
-        }
     }
 
-    *rng_state = main_rng_out;
     total
 }
 
@@ -2937,7 +2952,7 @@ fn trace_secondary_chain_alis(
     sun_dir: Vec3,
     hero_wl: usize,
     start_shell: usize,
-    rng_state: &mut u64,
+    rng: &mut McRng,
     ray_idx: usize,
     total_rays: usize,
     num_wl: usize,
@@ -2961,7 +2976,7 @@ fn trace_secondary_chain_alis(
     let term_axis = terminator_axis(local_up, sun_dir, bp.tilt_rad);
 
     // --- Stratified initial direction sampling ---
-    let xi_jitter = xorshift_f64(rng_state);
+    let xi_jitter = xorshift_f64(&mut rng.dir);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
     // Sample initial direction from hero's phase function (phase branch),
@@ -2970,23 +2985,23 @@ fn trace_secondary_chain_alis(
     // correction on non-hero wavelengths.
     let (dir, initial_weight, cos_theta_init, is_phase_branch) = if xi_mix < alpha_p {
         // Phase function branch
-        let ct = if xorshift_f64(rng_state) < hero_optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(rng_state))
+        let ct = if xorshift_f64(&mut rng.dir) < hero_optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
-            sample_henyey_greenstein(xorshift_f64(rng_state), hero_optics.asymmetry)
+            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), hero_optics.asymmetry)
         };
-        let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(rng_state);
+        let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         let branch_w = 0.5 / alpha_p;
         (scatter_direction(sun_dir, ct, phi_init), branch_w, ct, true)
     } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
         // Zenith-biased branch (wavelength-independent)
-        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, rng_state);
+        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
         let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
         let branch_w = 0.5 / (alpha_z + alpha_t);
         (d, shape_w * branch_w, 0.0, false)
     } else {
         // Terminator lobe branch (wavelength-independent)
-        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, rng_state);
+        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
         let cos_z = d.dot(local_up);
         let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
         let branch_w = 0.5 / alpha_t;
@@ -3033,12 +3048,17 @@ fn trace_secondary_chain_alis(
     let ck = cadis_k(sza_deg_local);
 
     // Initialize work stack with the main particle.
+    let dummy_rng = McRng {
+        tau: 0,
+        dir: 0,
+        ctl: 0,
+    };
     let mut stack = [SplitParticleAlis {
         pos: Vec3::new(0.0, 0.0, 0.0),
         dir: Vec3::new(0.0, 0.0, 1.0),
         hero_weight: 0.0,
         weight_ratio: [0.0f64; 64],
-        rng: 0,
+        rng: dummy_rng,
     }; MAX_SPLIT_PARTICLES];
     let mut stack_len: usize = 1;
     stack[0] = SplitParticleAlis {
@@ -3046,15 +3066,14 @@ fn trace_secondary_chain_alis(
         dir,
         hero_weight: hero_optics.ssa * initial_weight,
         weight_ratio,
-        rng: *rng_state,
+        rng: *rng,
     };
-    let mut main_rng_out = *rng_state;
     let mut main_processed = false;
 
     // Process all particles: main first, then split copies (LIFO order).
     while stack_len > 0 {
         stack_len -= 1;
-        let is_main = !main_processed;
+        let _is_main = !main_processed;
         main_processed = true;
         let mut pos = stack[stack_len].pos;
         let mut current_dir = stack[stack_len].dir;
@@ -3111,8 +3130,12 @@ fn trace_secondary_chain_alis(
                 }
 
                 // VSPG: sample from pre-collected segments (no re-walk).
-                let (tau_s, vspg_w) =
-                    vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max_h, &mut local_rng);
+                let (tau_s, vspg_w) = vspg_sample_from_segments(
+                    &vspg_segs,
+                    n_vspg_segs,
+                    tau_max_h,
+                    &mut local_rng.tau,
+                );
                 hero_weight *= vspg_w;
                 let (sp, sd, ss, taus_at_pos) =
                     advance_to_optical_depth_alis(atm, pos, current_dir, tau_s, hero_wl, num_wl);
@@ -3171,7 +3194,7 @@ fn trace_secondary_chain_alis(
                     let sigma_h = hero_ext;
                     let sigma_prime_h = sigma_h * (1.0 - alpha_et * cos_bias);
 
-                    let xi = xorshift_f64(&mut local_rng);
+                    let xi = xorshift_f64(&mut local_rng.tau);
                     let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime_h;
 
                     match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
@@ -3231,7 +3254,7 @@ fn trace_secondary_chain_alis(
                                         };
                                         wr[w] *= albedo_ratio;
                                     }
-                                    current_dir = sample_hemisphere(normal, &mut local_rng);
+                                    current_dir = sample_hemisphere(normal, &mut local_rng.dir);
                                     continue;
                                 }
                                 continue;
@@ -3300,13 +3323,13 @@ fn trace_secondary_chain_alis(
             let (new_dir, cos_theta_for_alis) = if mis_active {
                 let local_up_here = pos.normalize();
                 let alpha_p_mis = 1.0 - alpha_d;
-                let xi_branch = xorshift_f64(&mut local_rng);
+                let xi_branch = xorshift_f64(&mut local_rng.dir);
 
                 if xi_branch < alpha_d {
                     // Dwivedi branch
-                    let xi1 = xorshift_f64(&mut local_rng);
-                    let xi2 = xorshift_f64(&mut local_rng);
-                    let xi_sign = xorshift_f64(&mut local_rng);
+                    let xi1 = xorshift_f64(&mut local_rng.dir);
+                    let xi2 = xorshift_f64(&mut local_rng.dir);
+                    let xi_sign = xorshift_f64(&mut local_rng.dir);
                     let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
                     let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
                     let east = {
@@ -3333,16 +3356,17 @@ fn trace_secondary_chain_alis(
                     (d, ct)
                 } else {
                     // Phase function branch (within MIS)
-                    let cos_theta =
-                        if xorshift_f64(&mut local_rng) < hero_scatter_optics.rayleigh_fraction {
-                            sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
-                        } else {
-                            sample_henyey_greenstein(
-                                xorshift_f64(&mut local_rng),
-                                hero_scatter_optics.asymmetry,
-                            )
-                        };
-                    let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+                    let cos_theta = if xorshift_f64(&mut local_rng.dir)
+                        < hero_scatter_optics.rayleigh_fraction
+                    {
+                        sample_rayleigh_analytic(xorshift_f64(&mut local_rng.dir))
+                    } else {
+                        sample_henyey_greenstein(
+                            xorshift_f64(&mut local_rng.dir),
+                            hero_scatter_optics.asymmetry,
+                        )
+                    };
+                    let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
                     let d = scatter_direction(current_dir, cos_theta, phi);
                     let p_phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics) * INV_4PI;
                     let cos_z_dw = d.dot(local_up_here);
@@ -3356,15 +3380,15 @@ fn trace_secondary_chain_alis(
             } else {
                 // Pure phase function: no MIS overhead.
                 let cos_theta =
-                    if xorshift_f64(&mut local_rng) < hero_scatter_optics.rayleigh_fraction {
-                        sample_rayleigh_analytic(xorshift_f64(&mut local_rng))
+                    if xorshift_f64(&mut local_rng.dir) < hero_scatter_optics.rayleigh_fraction {
+                        sample_rayleigh_analytic(xorshift_f64(&mut local_rng.dir))
                     } else {
                         sample_henyey_greenstein(
-                            xorshift_f64(&mut local_rng),
+                            xorshift_f64(&mut local_rng.dir),
                             hero_scatter_optics.asymmetry,
                         )
                     };
-                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng);
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
                 let d = scatter_direction(current_dir, cos_theta, phi);
                 (d, cos_theta)
             };
@@ -3400,7 +3424,7 @@ fn trace_secondary_chain_alis(
                 // Russian roulette: hero weight too small for this region.
                 // Weight ratios are preserved on survival.
                 let p_survive = abs_hw / w_target;
-                if xorshift_f64(&mut local_rng) < p_survive {
+                if xorshift_f64(&mut local_rng.ctl) < p_survive {
                     hero_weight = if hero_weight >= 0.0 {
                         w_target
                     } else {
@@ -3418,7 +3442,7 @@ fn trace_secondary_chain_alis(
                 hero_weight /= k as f64;
                 for copy_idx in 1..k {
                     if stack_len < MAX_SPLIT_PARTICLES {
-                        let child_rng = local_rng
+                        let child_seed = local_rng.tau
                             ^ (copy_idx as u64).wrapping_mul(2654435761)
                             ^ (alt.to_bits() >> 32);
                         stack[stack_len] = SplitParticleAlis {
@@ -3426,20 +3450,15 @@ fn trace_secondary_chain_alis(
                             dir: current_dir,
                             hero_weight,
                             weight_ratio: wr,
-                            rng: child_rng,
+                            rng: McRng::from_seed(child_seed),
                         };
                         stack_len += 1;
                     }
                 }
             }
         }
-
-        if is_main {
-            main_rng_out = local_rng;
-        }
     }
 
-    *rng_state = main_rng_out;
     total
 }
 
@@ -3614,13 +3633,16 @@ pub fn hybrid_scatter_radiance_alis(
                 // Round-robin hero selection across wavelengths.
                 let hero_wl = ray % num_wl;
 
+                // Per-chain McRng: master advances by 1 per chain.
+                let _ = xorshift_f64(rng_state);
+                let mut mc_rng = McRng::from_seed(*rng_state);
                 let chain_result = trace_secondary_chain_alis(
                     atm,
                     scatter_pos,
                     sun_dir,
                     hero_wl,
                     shell_idx,
-                    rng_state,
+                    &mut mc_rng,
                     ray,
                     rays_this_step,
                     num_wl,
@@ -3908,6 +3930,61 @@ pub fn xorshift_f64(state: &mut u64) -> f64 {
     *state = x;
     // Convert to f64 in [0, 1)
     (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
+/// Split RNG state for Monte Carlo chains.
+///
+/// Three independent xorshift64 streams isolate:
+/// - `tau`: free-path / optical-depth sampling
+/// - `dir`: direction sampling (branch choice, scattering angles, Dwivedi, ground bounce)
+/// - `ctl`: control flow (weight-window RR, split decisions)
+///
+/// This prevents parameter changes in one category from cascading
+/// into other categories via the shared RNG stream. For example,
+/// changing the Dwivedi fraction (which affects direction sampling)
+/// no longer shifts the free-path sequence, and vice versa.
+#[derive(Clone, Copy)]
+pub struct McRng {
+    /// Free-path / optical-depth sampling stream.
+    pub tau: u64,
+    /// Direction sampling stream (branch + angles + ground bounce).
+    pub dir: u64,
+    /// Control flow stream (weight-window RR, split decisions).
+    pub ctl: u64,
+}
+
+/// SplitMix64 scramble: excellent avalanche properties for seeding RNGs.
+///
+/// Given sequential inputs (e.g., 1, 2, 3), produces outputs with no
+/// detectable correlation. Used by Java's `SplittableRandom` and
+/// recommended by Vigna for seeding xorshift generators.
+#[inline]
+fn splitmix64(state: u64) -> u64 {
+    let mut z = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+impl McRng {
+    /// Create split RNG from a single seed.
+    ///
+    /// Uses SplitMix64 scrambling to derive three independent streams.
+    /// SplitMix64 has excellent avalanche properties, so even sequential
+    /// seeds (e.g., from a master xorshift) produce well-decorrelated
+    /// stream states. Ensures no stream starts at state 0 (xorshift
+    /// fixed point).
+    #[inline]
+    pub fn from_seed(seed: u64) -> Self {
+        let s1 = splitmix64(seed);
+        let s2 = splitmix64(s1);
+        let s3 = splitmix64(s2);
+        McRng {
+            tau: s1 | 1, // ensure non-zero (xorshift fixed point at 0)
+            dir: s2 | 1,
+            ctl: s3 | 1,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5712,13 +5789,15 @@ mod tests {
         let mut total = 0.0;
         let mut rng: u64 = 42;
         for ray in 0..n {
+            let _ = xorshift_f64(&mut rng);
+            let mut mc = McRng::from_seed(rng);
             total += trace_secondary_chain_scalar(
                 &atm,
                 observer,
                 sun_dir,
                 0,
                 start_optics,
-                &mut rng,
+                &mut mc,
                 ray,
                 n,
             );
@@ -5756,13 +5835,15 @@ mod tests {
         let n = 500;
         let mut rng: u64 = 777;
         for ray in 0..n {
+            let _ = xorshift_f64(&mut rng);
+            let mut mc = McRng::from_seed(rng);
             let val = trace_secondary_chain_scalar(
                 &atm,
                 observer,
                 sun_dir,
                 0,
                 start_optics,
-                &mut rng,
+                &mut mc,
                 ray,
                 n,
             );
@@ -5813,8 +5894,10 @@ mod tests {
         let mut rng: u64 = 999;
         for ray in 0..n {
             let hero_wl = ray % num_wl;
+            let _ = xorshift_f64(&mut rng);
+            let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut rng, ray, n, num_wl,
+                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl,
             );
             for w in 0..num_wl {
                 assert!(
@@ -6222,13 +6305,15 @@ mod tests {
         let mut rng: u64 = 12345;
         let n = 200;
         for ray in 0..n {
+            let _ = xorshift_f64(&mut rng);
+            let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_scalar(
                 &atm,
                 observer,
                 sun_dir,
                 0,
                 start_optics,
-                &mut rng,
+                &mut mc,
                 ray,
                 n,
             );
@@ -6273,8 +6358,10 @@ mod tests {
         let mut rng: u64 = 54321;
         for ray in 0..n {
             let hero_wl = ray % num_wl;
+            let _ = xorshift_f64(&mut rng);
+            let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut rng, ray, n, num_wl,
+                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl,
             );
             for w in 0..num_wl {
                 assert!(
