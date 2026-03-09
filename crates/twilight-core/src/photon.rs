@@ -1189,17 +1189,23 @@ const CADIS_SZA_CENTER: f64 = 100.0;
 
 /// SZA width for CADIS ramp [degrees].
 ///
-/// Width 3.0 gives a gentler transition than the original 1.5:
-///   SZA 97: t=0.27, k=2.2 (mild -- chains still mostly vertical)
+/// Width 3.5 gives a gentle transition centered at SZA 100:
+///   SZA 97: t=0.30, k=2.4 (mild -- chains still mostly vertical)
 ///   SZA 100: t=0.50, k=4.0 (moderate -- lateral transport begins)
-///   SZA 103: t=0.73, k=5.8 (strong -- deep shadow)
-///   SZA 106: t=0.88, k=7.1 (near full)
+///   SZA 103: t=0.70, k=5.6 (strong -- deep shadow)
+///   SZA 104: t=0.76, k=6.0 (strong)
+///   SZA 106: t=0.85, k=6.8 (near full)
+///
+/// Width 3.5 (vs 3.0) slightly reduces cadis_k at SZA 104-105,
+/// recovering a regression where the previous width=3.0 over-boosted
+/// lateral importance at those SZAs (cadis_k 6.38/6.74 vs sweet spot
+/// ~5.5-6.0).
 ///
 /// Engaging at SZA 100 is physics-motivated: the geometric shadow height
 /// exceeds the atmosphere height (~98 km at SZA 100), so the entire
 /// atmospheric column above the observer is in shadow and light MUST
 /// arrive via lateral scattering from the terminator.
-const CADIS_SZA_WIDTH: f64 = 3.0;
+const CADIS_SZA_WIDTH: f64 = 3.5;
 
 /// Returns the SZA-adaptive CADIS lateral importance strength.
 ///
@@ -5596,9 +5602,10 @@ mod tests {
             cadis_k(93.0)
         );
         assert!(
-            (cadis_k(110.0) - CADIS_K_MAX).abs() < 0.3,
-            "cadis_k(110) should be ~{}",
-            CADIS_K_MAX
+            (cadis_k(110.0) - CADIS_K_MAX).abs() < 0.5,
+            "cadis_k(110) should be ~{}, got {:.2}",
+            CADIS_K_MAX,
+            cadis_k(110.0)
         );
         // Monotonic
         let mut prev = cadis_k(90.0);
