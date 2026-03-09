@@ -1265,60 +1265,6 @@ const LOS_IMP_H_MODERATE_M: f64 = 100_000.0;
 /// 0-15 km altitude.
 const LOS_IMP_H_DEEP_M: f64 = 30_000.0;
 
-// --- Adaptive Ray Scaling (ARS) ---
-//
-// At deep twilight (SZA > 98), the backward MC estimator has inherently high
-// variance due to the rare-event nature of chains finding the sunlit
-// terminator 1300+ km away via random walk. The heavy-tailed per-seed
-// distribution means CV grows with sample count as rare outlier chains are
-// captured.
-//
-// Adaptive ray scaling compensates by automatically increasing the per-seed
-// ray budget at deep SZAs. More rays per seed reduces within-seed variance
-// by averaging over more MC chains. CV scales as ~1/sqrt(N), so 4x rays
-// gives ~2x CV reduction.
-//
-// Zero bias: the estimator (1/N * sum) is unbiased for any N. The only cost
-// is proportional compute time.
-//
-// The multiplier ramps linearly from 1 (SZA <= ARS_SZA_START) to
-// ARS_MAX_MULT (SZA >= ARS_SZA_FULL).
-
-/// Maximum ray count multiplier at deep twilight.
-///
-/// At SZA >= 108 (astronomical twilight boundary), the ray budget is
-/// multiplied by this factor. 8x rays gives ~2.8x CV reduction
-/// (assuming CLT holds; actual improvement may be less with heavy tails).
-const ARS_MAX_MULT: usize = 8;
-
-/// SZA below which no adaptive ray scaling is applied [degrees].
-///
-/// At SZA 98, CV is ~0.2-0.4 (50 seeds), which is acceptable.
-/// Ray scaling begins ramping at SZA > 98.
-const ARS_SZA_START: f64 = 98.0;
-
-/// SZA at which maximum adaptive ray scaling is reached [degrees].
-const ARS_SZA_FULL: f64 = 108.0;
-
-/// Returns the adaptive ray multiplier for the given observer SZA.
-///
-/// Returns 1 for SZA <= 98, ramps linearly to ARS_MAX_MULT at SZA >= 108.
-/// No bias is introduced: the estimator (1/N * sum) is unbiased for any N.
-///
-/// Schedule (at integer SZAs):
-///   SZA  98: 1x    SZA 101: 3x    SZA 104: 5x    SZA 107: 7x
-///   SZA  99: 2x    SZA 102: 4x    SZA 105: 6x    SZA 108: 8x
-///   SZA 100: 2x    SZA 103: 5x    SZA 106: 7x
-#[inline]
-fn adaptive_ray_multiplier(sza_deg: f64) -> usize {
-    if sza_deg <= ARS_SZA_START {
-        return 1;
-    }
-    let t = ((sza_deg - ARS_SZA_START) / (ARS_SZA_FULL - ARS_SZA_START)).clamp(0.0, 1.0);
-    let mult = 1.0 + (ARS_MAX_MULT as f64 - 1.0) * t;
-    (libm::round(mult) as usize).max(1)
-}
-
 /// State of a single particle in the weight-window work stack (scalar mode).
 ///
 /// When a chain's weight exceeds the upper window bound, it is split into
@@ -1927,13 +1873,6 @@ pub fn hybrid_scatter_radiance(
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
 
-    // Adaptive ray scaling: increase ray budget at deep SZAs.
-    let observer_up = observer_pos.normalize();
-    let cos_sza_obs = sun_dir.dot(observer_up);
-    let sza_deg_obs = libm::acos(cos_sza_obs.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    let ars_mult = adaptive_ray_multiplier(sza_deg_obs);
-    let scaled_rays = secondary_rays * ars_mult;
-
     // Dual path: full Stokes [I,Q,U,V] when polarized, scalar when not.
     let mut stokes_total = StokesVector::unpolarized(0.0);
     let mut scalar_total = 0.0_f64;
@@ -2008,10 +1947,10 @@ pub fn hybrid_scatter_radiance(
         }
 
         // --- Orders 2+: MC secondary chains ---
-        if scaled_rays > 0 {
+        if secondary_rays > 0 {
             if polarized {
                 let mut mc_stokes = StokesVector::unpolarized(0.0);
-                for ray in 0..scaled_rays {
+                for ray in 0..secondary_rays {
                     // Per-chain McRng: master advances by 1 per chain,
                     // making inter-chain sequencing deterministic regardless
                     // of per-chain RNG consumption.
@@ -2026,17 +1965,17 @@ pub fn hybrid_scatter_radiance(
                         optics,
                         &mut mc_rng,
                         ray,
-                        scaled_rays,
+                        secondary_rays,
                     );
                     mc_stokes = mc_stokes.add(&chain_stokes);
                 }
-                let inv_rays = 1.0 / scaled_rays as f64;
+                let inv_rays = 1.0 / secondary_rays as f64;
                 let mc_avg = mc_stokes.scale(inv_rays);
                 let scale_m = beta_scat * t_obs * ds;
                 stokes_total = stokes_total.add(&mc_avg.scale(scale_m));
             } else {
                 let mut mc_scalar = 0.0_f64;
-                for ray in 0..scaled_rays {
+                for ray in 0..secondary_rays {
                     let _ = xorshift_f64(rng_state);
                     let mut mc_rng = McRng::from_seed(*rng_state);
                     mc_scalar += trace_secondary_chain_scalar(
@@ -2047,10 +1986,10 @@ pub fn hybrid_scatter_radiance(
                         optics,
                         &mut mc_rng,
                         ray,
-                        scaled_rays,
+                        secondary_rays,
                     );
                 }
-                let inv_rays = 1.0 / scaled_rays as f64;
+                let inv_rays = 1.0 / secondary_rays as f64;
                 let scale_m = beta_scat * t_obs * ds;
                 scalar_total += mc_scalar * inv_rays * scale_m;
             }
@@ -3620,14 +3559,8 @@ pub fn hybrid_scatter_radiance_alis(
     let cos_sza_obs = sun_dir.dot(observer_up);
     let sza_deg_obs = libm::acos(cos_sza_obs.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
 
-    // Adaptive ray scaling: increase ray budget at deep SZAs to reduce
-    // per-seed variance. The multiplier ramps from 1x (SZA <= 98) to 8x
-    // (SZA >= 108). Unbiased: (1/N * sum) is correct for any N.
-    let ars_mult = adaptive_ray_multiplier(sza_deg_obs);
-    let scaled_rays = secondary_rays * ars_mult;
-
-    let use_los_importance = sza_deg_obs >= ZENITH_SZA_START && scaled_rays > 0;
-    let total_mc_budget = scaled_rays * num_steps;
+    let use_los_importance = sza_deg_obs >= ZENITH_SZA_START && secondary_rays > 0;
+    let total_mc_budget = secondary_rays * num_steps;
 
     // Pre-scan: compute per-step importance from altitude profile.
     let mut los_importance = [0.0f64; HYBRID_LOS_STEPS];
@@ -3719,8 +3652,8 @@ pub fn hybrid_scatter_radiance_alis(
             let frac = los_importance[step] / sum_los_imp;
             let n = libm::round(total_mc_budget as f64 * frac) as usize;
             n.max(1)
-        } else if !use_los_importance && scaled_rays > 0 {
-            scaled_rays
+        } else if !use_los_importance && secondary_rays > 0 {
+            secondary_rays
         } else {
             0
         };
