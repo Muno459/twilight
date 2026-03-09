@@ -253,31 +253,6 @@ fn simulate_at_sza_mc(
 ///
 /// For polarized mode, uses rayon parallelism over wavelengths with full
 /// Stokes [I,Q,U,V] propagation per chain.
-/// SZA center for guide activation sigmoid [degrees].
-///
-/// The guide activation fraction smoothly transitions from ~0 at civil
-/// twilight to ~1 at deep twilight:
-///   guide_frac(sza) = sigmoid((sza - GUIDE_SZA_CENTER) / GUIDE_SZA_WIDTH)
-///
-/// At SZA 100: ~4% guide fraction (nearly off, minimal overhead).
-/// At SZA 104: ~73% guide fraction (active).
-/// At SZA 106: ~95% guide fraction (fully on).
-///
-/// The guide is only trained when guide_frac > 0.1 (SZA > ~100) to avoid
-/// wasting training budget at civil twilight. Training ray budget scales
-/// with guide_frac for smooth resource allocation.
-const GUIDE_SZA_CENTER: f64 = 103.0;
-
-/// Width of guide activation sigmoid [degrees].
-const GUIDE_SZA_WIDTH: f64 = 1.5;
-
-/// Sigmoid helper (matches the one in photon.rs; duplicated to avoid
-/// exposing it across crate boundaries for a single-use utility).
-#[inline]
-fn guide_sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
-
 fn simulate_at_sza_hybrid(
     atm: &AtmosphereModel,
     config: &SimulationConfig,
@@ -291,27 +266,6 @@ fn simulate_at_sza_hybrid(
         let sza_bits = sza_deg.to_bits();
         let mut rng = sza_bits.wrapping_mul(6364136223846793005).wrapping_add(1);
 
-        // Train path guide with SZA-adaptive budget. The guide activation
-        // fraction ramps smoothly from 0 (civil) to 1 (deep twilight).
-        // Training is skipped when guide_frac < 0.1 (~SZA 100).
-        let guide_frac = guide_sigmoid((sza_deg - GUIDE_SZA_CENTER) / GUIDE_SZA_WIDTH);
-        let guide = if guide_frac > 0.1 && secondary_rays > 0 {
-            // Training budget scales with SZA: 1x at onset, up to 8x at deep.
-            let train_multiplier = (1.0 + 7.0 * guide_frac) as usize;
-            let train_rays = secondary_rays * train_multiplier;
-            let train_seed = sza_bits.wrapping_mul(2862933555777941757).wrapping_add(1);
-            Some(photon::train_path_guide(
-                atm,
-                observer_pos,
-                view_dir,
-                sun_dir,
-                train_rays,
-                train_seed,
-            ))
-        } else {
-            None
-        };
-
         let radiance_array = photon::hybrid_scatter_radiance_alis(
             atm,
             observer_pos,
@@ -319,7 +273,6 @@ fn simulate_at_sza_hybrid(
             sun_dir,
             secondary_rays,
             &mut rng,
-            guide.as_ref(),
         );
         return build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance);
     }
@@ -984,15 +937,14 @@ mod tests {
         assert_eq!(results.len(), 3, "Expected 3 steps, got {}", results.len());
     }
 
-    // ── CV diagnostic: guided vs unguided ALIS convergence ──
+    // ── CV baseline diagnostic ──
 
-    /// Diagnostic test: measure coefficient of variation (CV) with and without
-    /// path guide at multiple SZAs. Uses ALIS (scalar, all wavelengths in one
-    /// call) for speed. Output is purely diagnostic via eprintln, no assertions.
+    /// Measure coefficient of variation across 16 SZAs to establish
+    /// baseline variance of the unguided pipeline.
     ///
-    /// Run with: cargo test -p twilight-cpu --release -- cv_diagnostic --nocapture
+    /// Run with: cargo test -p twilight-cpu --release -- cv_baseline --nocapture
     #[test]
-    fn cv_diagnostic_guided_vs_unguided() {
+    fn cv_baseline() {
         use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
         use twilight_core::photon;
 
@@ -1008,100 +960,47 @@ mod tests {
         let num_seeds = 50usize;
         let rays = 200usize;
 
-        eprintln!("\n{:=<80}", "");
+        eprintln!("\n{:=<64}", "");
         eprintln!(
-            "CV DIAGNOSTIC: guided vs unguided ALIS ({} seeds x {} rays)",
+            "CV BASELINE: unguided ALIS ({} seeds x {} rays)",
             num_seeds, rays
         );
-        eprintln!("{:=<80}", "");
-        eprintln!(
-            "{:<8} {:>12} {:>12} {:>12} {:>12} {:>12}",
-            "SZA", "mean_no", "CV_no", "mean_yes", "CV_yes", "CV_ratio"
-        );
-        eprintln!("{:-<80}", "");
+        eprintln!("{:=<64}", "");
+        eprintln!("{:<8} {:>14} {:>12}", "SZA", "Mean radiance", "CV");
+        eprintln!("{:-<40}", "");
 
-        for &sza_deg in &[93.0, 96.0, 100.0, 104.0, 106.0] {
+        let sza_list: Vec<f64> = (93..=108).map(|s| s as f64).collect();
+
+        for &sza_deg in &sza_list {
             let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
 
-            // Train guide once for this SZA (with smooth budget scaling).
-            let sza_bits = sza_deg.to_bits();
-            let train_seed = sza_bits.wrapping_mul(2862933555777941757).wrapping_add(1);
-            let gf = guide_sigmoid((sza_deg - GUIDE_SZA_CENTER) / GUIDE_SZA_WIDTH);
-            let train_multiplier = (1.0 + 7.0 * gf) as usize;
-            let train_rays = rays * train_multiplier;
-            let guide = photon::train_path_guide(&atm, obs_pos, view, sun, train_rays, train_seed);
-
-            // Run with and without guide across independent seeds.
-            let mut totals_no = Vec::with_capacity(num_seeds);
-            let mut totals_yes = Vec::with_capacity(num_seeds);
-
+            let mut totals = Vec::with_capacity(num_seeds);
             for seed_idx in 0..num_seeds {
-                let base_rng = (seed_idx as u64)
+                let sza_bits = sza_deg.to_bits();
+                let mut rng = (seed_idx as u64)
                     .wrapping_mul(2862933555777941757)
                     .wrapping_add(sza_bits)
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1);
 
-                // Unguided.
-                let mut rng_no = base_rng;
-                let result_no = photon::hybrid_scatter_radiance_alis(
-                    &atm,
-                    obs_pos,
-                    view,
-                    sun,
-                    rays,
-                    &mut rng_no,
-                    None,
-                );
-                let total_no: f64 = result_no.iter().take(atm.num_wavelengths).sum();
-                totals_no.push(total_no);
-
-                // Guided.
-                let mut rng_yes = base_rng;
-                let result_yes = photon::hybrid_scatter_radiance_alis(
-                    &atm,
-                    obs_pos,
-                    view,
-                    sun,
-                    rays,
-                    &mut rng_yes,
-                    Some(&guide),
-                );
-                let total_yes: f64 = result_yes.iter().take(atm.num_wavelengths).sum();
-                totals_yes.push(total_yes);
+                let result =
+                    photon::hybrid_scatter_radiance_alis(&atm, obs_pos, view, sun, rays, &mut rng);
+                let total: f64 = result.iter().take(atm.num_wavelengths).sum();
+                totals.push(total);
             }
 
-            // Compute CV for both.
-            let mean_no = totals_no.iter().sum::<f64>() / num_seeds as f64;
-            let std_no = (totals_no.iter().map(|x| (x - mean_no).powi(2)).sum::<f64>()
+            let mean = totals.iter().sum::<f64>() / num_seeds as f64;
+            let std = (totals.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
                 / (num_seeds - 1) as f64)
                 .sqrt();
-            let cv_no = if mean_no.abs() > 1e-30 {
-                std_no / mean_no.abs()
+            let cv = if mean.abs() > 1e-30 {
+                std / mean.abs()
             } else {
                 0.0
             };
 
-            let mean_yes = totals_yes.iter().sum::<f64>() / num_seeds as f64;
-            let std_yes = (totals_yes
-                .iter()
-                .map(|x| (x - mean_yes).powi(2))
-                .sum::<f64>()
-                / (num_seeds - 1) as f64)
-                .sqrt();
-            let cv_yes = if mean_yes.abs() > 1e-30 {
-                std_yes / mean_yes.abs()
-            } else {
-                0.0
-            };
-
-            let cv_ratio = if cv_no > 1e-10 { cv_yes / cv_no } else { 1.0 };
-
-            eprintln!(
-                "{:<8.1} {:>12.4e} {:>12.4} {:>12.4e} {:>12.4} {:>12.4}",
-                sza_deg, mean_no, cv_no, mean_yes, cv_yes, cv_ratio
-            );
+            eprintln!("{:<8.1} {:>14.4e} {:>12.4}", sza_deg, mean, cv);
         }
-        eprintln!("{:=<80}\n", "");
+        eprintln!("{:=<64}\n", "");
     }
 }
