@@ -1291,6 +1291,436 @@ struct SplitParticleAlis {
     rng: McRng,
 }
 
+// --- BDPT (Bidirectional Path Tracing) ---
+//
+// At deep twilight (SZA > 100), backward chains must travel 1000+ km laterally
+// to reach sunlit atmosphere. The success rate drops to ~0.001% at SZA 106.
+// BDPT traces light subpaths FORWARD from the sunlit TOA into the atmosphere,
+// recording scatter vertices. These vertices are then connected to eye subpath
+// (LOS integration) points, providing an alternative path to the sun that
+// bypasses the lateral transport bottleneck.
+//
+// Connection transmittance at high altitude (80-100 km) is 95-99.7% even at
+// 1500 km separation, so BDPT connections are highly efficient.
+//
+// MIS (Multiple Importance Sampling) via the balance heuristic prevents
+// double-counting between NEE and BDPT connections.
+
+/// Maximum number of scatter vertices stored per light subpath.
+///
+/// CRITICAL: Must be 1 (single scatter at entry). With multiple bounces,
+/// the light subpath random-walks AWAY from the observer because the entry
+/// direction (-sun_dir) pushes photons into the sunlit hemisphere. After
+/// 8 bounces, vertices end up 5000+ km from the observer, far beyond the
+/// 3000 km connection range where high-altitude chords stay above the
+/// troposphere. With 1 vertex, the scatter position stays near the
+/// terminator entry point, within ~700-1500 km of the observer's
+/// high-altitude LOS steps.
+const BDPT_MAX_LIGHT_VERTICES: usize = 1;
+
+/// Number of independent light subpaths traced per call to
+/// `hybrid_scatter_radiance_alis`. With BDPT_MAX_LIGHT_VERTICES=1, each
+/// subpath produces exactly 1 vertex, so this equals the total number of
+/// light vertices. More subpaths = better angular coverage of the
+/// illuminated terminator at the cost of more transmittance evaluations.
+const BDPT_NUM_LIGHT_SUBPATHS: usize = 16;
+
+/// SZA threshold (degrees) below which BDPT is disabled.
+///
+/// At SZA < 98, backward chains already have high success rates and NEE
+/// works well. BDPT overhead (transmittance evaluations for connections)
+/// would be wasted. Ramps in via sigmoid from 101 to 105.
+const BDPT_SZA_START: f64 = 101.0;
+
+/// SZA at which BDPT reaches full strength.
+/// Reserved for future defensive MIS integration.
+#[allow(dead_code)]
+const BDPT_SZA_FULL: f64 = 105.0;
+
+/// A recorded scatter vertex on a light subpath.
+///
+/// Stores position, incoming direction, shell index, hero weight, and
+/// per-wavelength ALIS weight ratios. The incoming direction is needed
+/// to evaluate the phase function at the connection point.
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // pdf_fwd reserved for balance-heuristic MIS refinement
+struct LightVertex {
+    /// Position of the scatter event (in Earth-centered coordinates).
+    pos: Vec3,
+    /// Incoming direction at this vertex (direction the photon was traveling
+    /// BEFORE scattering here). Used to evaluate phase function for the
+    /// connection: phase(dir_in, connection_dir).
+    dir_in: Vec3,
+    /// Shell index at the scatter position.
+    shell_idx: usize,
+    /// Hero wavelength weight accumulated along the light path up to this
+    /// vertex (includes transmittance, SSA, and phase function weights from
+    /// all previous bounces).
+    hero_weight: f64,
+    /// ALIS weight ratios: `weight_ratio[w] = weight_w / hero_weight`.
+    weight_ratio: [f64; 64],
+    /// Forward PDF (probability density of generating this vertex from the
+    /// light source). Used for MIS weight computation.
+    pdf_fwd: f64,
+}
+
+/// Returns the SZA-adaptive BDPT strength fraction.
+///
+/// 0.0 at SZA < 98, ramps to 1.0 at SZA >= 102.
+/// Reserved for future defensive MIS integration.
+#[allow(dead_code)]
+#[inline]
+fn bdpt_strength(sza_deg: f64) -> f64 {
+    sigmoid(
+        (sza_deg - (BDPT_SZA_START + BDPT_SZA_FULL) * 0.5)
+            / ((BDPT_SZA_FULL - BDPT_SZA_START) * 0.25),
+    )
+}
+
+/// Trace a single light subpath from the sunlit TOA into the atmosphere.
+///
+/// The light subpath enters the top-of-atmosphere (TOA) from the sunlit side,
+/// walks through the atmosphere using forced scattering with VSPG, and records
+/// a vertex at each scatter event. The photon enters with direction `-sun_dir`
+/// (from sun toward Earth) at a position on the illuminated TOA hemisphere.
+///
+/// Entry point sampling: the entry position on the TOA sphere is importance-
+/// sampled near the terminator (the great circle nearest to the observer's
+/// location projected along the sun direction). This concentrates light
+/// subpaths in the region most useful for connections to deep-twilight eye
+/// vertices.
+///
+/// Returns the number of vertices written to `vertices`.
+///
+/// Physics: uses forced scattering with VSPG (Volume Scattering Probability
+/// Guiding) to guarantee scatter events and bias them toward high altitude,
+/// where connection transmittance to the eye path is highest. The observer's
+/// SZA drives VSPG importance so boosting is active even though the light
+/// subpath enters from the sunlit side. ALIS weight ratios track
+/// per-wavelength corrections across all bounces.
+#[allow(clippy::needless_range_loop)]
+#[allow(clippy::too_many_arguments)]
+fn trace_light_subpath(
+    atm: &AtmosphereModel,
+    sun_dir: Vec3,
+    observer_pos: Vec3,
+    hero_wl: usize,
+    num_wl: usize,
+    sza_deg_obs: f64,
+    rng: &mut McRng,
+    vertices: &mut [LightVertex; BDPT_MAX_LIGHT_VERTICES],
+) -> usize {
+    let toa_radius = atm.toa_radius();
+    let mut n_vertices = 0usize;
+
+    // --- Sample entry point on illuminated TOA hemisphere ---
+    //
+    // The illuminated hemisphere is the half of the TOA sphere facing the sun.
+    // We importance-sample near the terminator (edge of the illuminated disk)
+    // because that is closest to the observer at deep twilight and thus has
+    // the highest connection transmittance.
+    //
+    // Strategy: sample a point on the TOA disk (as seen from the sun) using
+    // a radial distribution biased toward the rim. The disk has radius
+    // toa_radius. For a uniform disk, PDF in (r, phi) is r / (pi * R^2).
+    // We use r = R * sqrt(xi) for uniform, or bias toward rim with
+    // r = R * xi^(1/3) to get more terminator samples (PDF = 3*r^2 / R^3).
+    //
+    // For the azimuthal direction on the disk, we importance-sample toward
+    // the observer's projected position on the terminator plane.
+
+    // Build coordinate system on the sun-facing disk.
+    // The disk normal is -sun_dir (pointing toward the sun from the disk).
+    let disk_normal = sun_dir.scale(-1.0); // points toward sun
+    let arbitrary = if libm::fabs(disk_normal.y) < 0.9 {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3::new(1.0, 0.0, 0.0)
+    };
+    let disk_u = disk_normal.cross(arbitrary).normalize();
+    let disk_v = disk_normal.cross(disk_u);
+
+    // Project observer position onto the terminator plane to get preferred
+    // azimuthal direction for entry point sampling.
+    let obs_proj_u = observer_pos.dot(disk_u);
+    let obs_proj_v = observer_pos.dot(disk_v);
+    let obs_proj_len = libm::sqrt(obs_proj_u * obs_proj_u + obs_proj_v * obs_proj_v);
+    let pref_phi = if obs_proj_len > 1e-6 {
+        libm::atan2(obs_proj_v, obs_proj_u)
+    } else {
+        0.0
+    };
+
+    // Sample radial position on the illuminated disk. Concentrate near the
+    // terminator (r_frac -> 1.0) because:
+    // 1. At r_frac=0.79 (median of cbrt sampling), the entry point is ~4000 km
+    //    inside the sunlit hemisphere, and after scattering, vertices end up
+    //    5000+ km from the observer -- beyond connection range.
+    // 2. At r_frac=0.999, z_along_sun = R*sqrt(1-0.999^2) = R*0.045 = 289 km,
+    //    so the entry point is only ~350 km from the observer's terminator
+    //    projection, well within connection range.
+    //
+    // Sample r_frac uniformly from [1-delta, 1) where delta is small.
+    // PDF(r_frac) = 1/delta on [1-delta, 1).
+    const BDPT_R_DELTA: f64 = 0.01; // r_frac in [0.99, 1.0)
+    let xi_r = xorshift_f64(&mut rng.tau);
+    let r_frac = 1.0 - BDPT_R_DELTA * xi_r; // uniform in [1-delta, 1]
+                                            // Clamp away from exactly 1.0 to avoid r_sq >= toa_r_sq guard
+    let r_frac = if r_frac > 0.9999 { 0.9999 } else { r_frac };
+    let r_disk = toa_radius * r_frac;
+
+    // Azimuthal sampling: CONCENTRATED around the observer's projected direction.
+    //
+    // The observer at deep twilight is near the shadow boundary. Light vertices
+    // must be within ~1500 km of the observer's high-altitude LOS steps for the
+    // connection chord to stay above the troposphere. The chord minimum altitude
+    // for two vertices at height h separated by distance d is:
+    //   h_min ≈ h - d^2 / (8*R)
+    // At h=70 km and d=1200 km: h_min = 70 - 28.3 = 41.7 km (good)
+    // At h=70 km and d=2000 km: h_min = 70 - 78.7 = -8.7 km (underground)
+    //
+    // With PI/32 half-width (~5.6 deg), the arc on the TOA rim spans:
+    //   2 * R * sin(PI/32) ≈ 2 * 6471 * 0.098 ≈ 1268 km
+    // This keeps entry points within ~634 km of the observer's projected
+    // direction on the terminator, so after a single scatter the light vertex
+    // is within ~1000-1400 km of the observer's high-altitude LOS steps.
+    //
+    // PDF(phi) = 1 / (2 * delta_phi) on [pref_phi - delta, pref_phi + delta].
+    const BDPT_PHI_HALF_WIDTH: f64 = core::f64::consts::PI / 32.0;
+    let xi_phi = xorshift_f64(&mut rng.tau);
+    let phi_disk = pref_phi + BDPT_PHI_HALF_WIDTH * (2.0 * xi_phi - 1.0);
+
+    // Position on the disk (in sun-facing plane at distance toa_radius from center).
+    let disk_x = r_disk * libm::cos(phi_disk);
+    let disk_y = r_disk * libm::sin(phi_disk);
+
+    // Convert disk position to 3D position on the TOA sphere.
+    // The disk center is at sun_dir * toa_radius (the sub-solar point on TOA).
+    // But we want a point ON the sphere, not on a flat disk. Project:
+    // entry_pos is the point on the sphere whose projection onto the disk is (disk_x, disk_y).
+    // We want the point on the TOA sphere that is at distance r_disk from the
+    // sun axis. The z-coordinate along sun_dir is sqrt(R^2 - r^2).
+    let r_sq = r_disk * r_disk;
+    let toa_r_sq = toa_radius * toa_radius;
+    if r_sq >= toa_r_sq {
+        return 0; // shouldn't happen with r_frac < 1
+    }
+    let z_along_sun = libm::sqrt(toa_r_sq - r_sq); // positive = toward sun
+
+    // Entry point on the illuminated hemisphere (sun-facing side).
+    // The sub-solar point is at sun_dir * toa_radius, so positive z
+    // along sun_dir = toward the sun = illuminated side.
+    let entry_pos = sun_dir.scale(z_along_sun) + disk_u.scale(disk_x) + disk_v.scale(disk_y);
+
+    // Verify the entry point is on the TOA sphere (debug sanity).
+    let entry_r = entry_pos.length();
+    if libm::fabs(entry_r - toa_radius) > 1.0 {
+        return 0; // numerical issue
+    }
+
+    // Entry direction: photon comes from the sun, so direction is -sun_dir.
+    // At the TOA boundary, we need to refract into the atmosphere. Since
+    // n(vacuum) ~ 1.0 and n(top_shell) ~ 1.0000000x, refraction is negligible.
+    let entry_dir = sun_dir.scale(-1.0);
+
+    // Compute entry weight for importance sampling on the illuminated hemisphere.
+    //
+    // The MC estimator targets: I = integral_{hemisphere} L_sun * cos_inc * [stuff] dA
+    // We sample (r_frac, phi) from joint density:
+    //   f(r_frac, phi) = (1/delta_r) * 1/(2*delta_phi)
+    // in the space (r_frac in [1-delta_r, 1], phi in [pref_phi-delta_phi, pref_phi+delta_phi]).
+    //
+    // The sphere area element: dA = R^2 * r_frac * dr_frac * dphi / cos_inc
+    // where cos_inc = sqrt(1 - r_frac^2) = z_along_sun / R.
+    //
+    // The PDF per unit sphere area:
+    //   p(A) = f(r_frac, phi) * cos_inc / (R^2 * r_frac)
+    //        = cos_inc / (delta_r * 2*delta_phi * R^2 * r_frac)
+    //
+    // Entry weight = cos_inc / p(A)
+    //              = delta_r * 2*delta_phi * R^2 * r_frac
+    let cos_inc = z_along_sun / toa_radius;
+    if cos_inc < 1e-10 {
+        return 0; // grazing entry, degenerate
+    }
+    let entry_weight = BDPT_R_DELTA * 2.0 * BDPT_PHI_HALF_WIDTH * toa_r_sq * r_frac;
+
+    // Entry PDF per unit sphere area (for MIS pdf_accumulated tracking).
+    // p(A) = cos_inc / entry_weight
+    let entry_pdf = if entry_weight > 1e-30 {
+        cos_inc / entry_weight
+    } else {
+        1e-30
+    };
+
+    // Initialize hero weight and ALIS weight ratios.
+    let mut hero_weight = entry_weight;
+    let mut weight_ratio = [0.0f64; 64];
+    for w in 0..num_wl {
+        weight_ratio[w] = 1.0; // at entry, all wavelengths have the same geometric weight
+    }
+
+    // Nudge radially inward (not along ray direction) to ensure the position
+    // is strictly inside the TOA sphere. For rim-biased entry near the
+    // terminator, entry_dir is nearly tangential to the sphere, so nudging
+    // along the ray barely changes the radius. Radial nudge guarantees
+    // shell_index() returns a valid shell on the first call.
+    let inward = entry_pos.normalize().scale(-1.0); // unit vector toward Earth center
+    let mut pos = entry_pos + inward * 10.0; // 10 m radially inward
+    let mut dir = entry_dir;
+    let mut pdf_accumulated = entry_pdf;
+
+    // Walk through atmosphere using forced scattering with VSPG.
+    //
+    // At high altitude (>30 km), extinction is tiny (sigma ~ 1e-8 /m)
+    // and analog scattering MFP is hundreds of km. With analog mode,
+    // ~96% of light subpaths traverse the entire atmosphere without
+    // scattering and produce zero vertices. Forced scattering guarantees
+    // a scatter event at each bounce, with weight correction
+    // (1 - exp(-tau_max)) for the probability of scattering before the
+    // boundary. VSPG (Volume Scattering Probability Guiding) biases the
+    // scatter position toward high altitude where BDPT connections to the
+    // eye path have high transmittance (95-99.7% at 80-100 km).
+    //
+    // The observer's SZA drives VSPG importance: at SZA 103+, high-altitude
+    // shells get up to 50x the natural sampling probability.
+    for _bounce in 0..BDPT_MAX_LIGHT_VERTICES {
+        // Scout: compute total optical depth and VSPG segments along ray.
+        // Uses observer's SZA for importance so that high-altitude scatters
+        // are boosted (where connections to the deep-twilight eye path work).
+        let mut vspg_segs = [VspgSegment {
+            tau_lo: 0.0,
+            tau_hi: 0.0,
+            importance: 1.0,
+        }; VSPG_MAX_SEGMENTS];
+        let (tau_maxes, _hit_ground, n_vspg_segs) = scout_with_vspg_segments_alis(
+            atm,
+            pos,
+            dir,
+            hero_wl,
+            num_wl,
+            sza_deg_obs,
+            &mut vspg_segs,
+        );
+
+        let tau_max_h = tau_maxes[hero_wl];
+
+        // If total optical depth is negligible, the ray is in essentially
+        // transparent atmosphere -- no meaningful scatter possible.
+        if tau_max_h < 1e-6 {
+            break;
+        }
+
+        // Forced scattering weight correction: probability of scattering
+        // before the boundary. For hero wavelength: w *= (1 - exp(-tau_max_h)).
+        let exp_neg_tau_h = libm::exp(-tau_max_h);
+        let one_minus_exp_h = 1.0 - exp_neg_tau_h;
+        hero_weight *= one_minus_exp_h;
+
+        // ALIS forced scattering weight ratio correction for non-hero
+        // wavelengths: each wavelength has a different total optical depth,
+        // so its forced scattering weight differs.
+        for w in 0..num_wl {
+            let one_minus_exp_w = 1.0 - libm::exp(-tau_maxes[w]);
+            weight_ratio[w] *= if one_minus_exp_h > 1e-30 {
+                one_minus_exp_w / one_minus_exp_h
+            } else {
+                0.0
+            };
+        }
+
+        // VSPG importance-weighted scatter position sampling.
+        // Biases toward high-altitude shells; weight correction maintains
+        // exact unbiasedness.
+        let (tau_s, vspg_w) =
+            vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max_h, &mut rng.tau);
+        hero_weight *= vspg_w;
+
+        // Advance to the sampled scatter position, tracking per-wavelength
+        // optical depths for ALIS corrections.
+        let (sp, sd, scatter_shell, taus_at_pos) =
+            advance_to_optical_depth_alis(atm, pos, dir, tau_s, hero_wl, num_wl);
+        pos = sp;
+        dir = sd;
+
+        // ALIS extinction ratio correction at scatter site: accounts for
+        // the fact that each wavelength has different extinction, so the
+        // probability of scattering at this exact position differs.
+        let sigma_h = atm.optics[scatter_shell][hero_wl].extinction;
+        if sigma_h > 1e-30 {
+            let tau_h_pos = taus_at_pos[hero_wl];
+            for w in 0..num_wl {
+                let sigma_w = atm.optics[scatter_shell][w].extinction;
+                weight_ratio[w] *= (sigma_w / sigma_h) * libm::exp(-(taus_at_pos[w] - tau_h_pos));
+            }
+        }
+
+        // Apply SSA: probability of scattering vs absorption.
+        let hero_optics = &atm.optics[scatter_shell][hero_wl];
+        hero_weight *= hero_optics.ssa;
+        for w in 0..num_wl {
+            let ssa_ratio = if hero_optics.ssa > 1e-30 {
+                atm.optics[scatter_shell][w].ssa / hero_optics.ssa
+            } else {
+                0.0
+            };
+            weight_ratio[w] *= ssa_ratio;
+        }
+
+        // Update forward PDF (isotropic approximation for future MIS).
+        let scatter_pdf = if sigma_h > 1e-30 {
+            sigma_h * INV_4PI
+        } else {
+            INV_4PI
+        };
+        pdf_accumulated *= scatter_pdf;
+
+        // Record vertex BEFORE sampling new direction (dir_in = current dir).
+        if n_vertices < BDPT_MAX_LIGHT_VERTICES {
+            vertices[n_vertices] = LightVertex {
+                pos,
+                dir_in: dir,
+                shell_idx: scatter_shell,
+                hero_weight,
+                weight_ratio,
+                pdf_fwd: pdf_accumulated,
+            };
+            n_vertices += 1;
+        }
+
+        // Sample new scattering direction from hero phase function.
+        let cos_theta = if xorshift_f64(&mut rng.dir) < hero_optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
+        } else {
+            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), hero_optics.asymmetry)
+        };
+        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
+        let new_dir = scatter_direction(dir, cos_theta, phi);
+
+        // ALIS phase function ratio correction.
+        let phase_hero = scalar_phase_value(cos_theta, hero_optics);
+        if phase_hero > 1e-30 {
+            for w in 0..num_wl {
+                let optics_w = &atm.optics[scatter_shell][w];
+                let phase_w = scalar_phase_value(cos_theta, optics_w);
+                weight_ratio[w] *= phase_w / phase_hero;
+            }
+        }
+
+        // Include phase in forward PDF.
+        let phase_fwd = scalar_phase_value(cos_theta, hero_optics) * INV_4PI;
+        pdf_accumulated *= if phase_fwd > 1e-30 {
+            phase_fwd / scatter_pdf
+        } else {
+            1.0
+        };
+
+        dir = new_dir;
+    }
+
+    n_vertices
+}
+
 // --- VSPG (Volume Scattering Probability Guiding) ---
 //
 // VSPG biases forced-scattering distance sampling toward high altitude.
@@ -3588,6 +4018,77 @@ pub fn hybrid_scatter_radiance_alis(
         }
     }
 
+    // --- BDPT: trace light subpaths from the sunlit TOA ---
+    //
+    // At deep twilight (SZA > 98), backward chains struggle to reach
+    // sunlit atmosphere. Light subpaths enter from the illuminated TOA
+    // and scatter into the atmosphere. Their vertices are later connected
+    // to each LOS step to provide an alternative path to the sun.
+    use crate::single_scatter::transmittance_between_points_spectrum;
+
+    let bdpt_active = sza_deg_obs >= BDPT_SZA_START && secondary_rays > 0;
+    // BDPT connections: additive mode (no defensive MIS).
+    // Both backward chains and BDPT connections contribute at full weight.
+    // BDPT adds an independent estimator of multi-scatter radiance via
+    // light subpath vertices connected to high-altitude LOS steps.
+    // At SZA 101-108 this provides additional signal for paths that
+    // backward chains struggle to find (lateral transport to sunlit atm).
+
+    // Storage for all light vertices across all subpaths.
+    // Max total: BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES = 16 * 1 = 16 vertices.
+    // Each LightVertex is ~590 bytes, so 16 * 590 = ~9.4 KB on the stack. Acceptable.
+    const MAX_TOTAL_LIGHT_VERTS: usize = 16; // BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES
+    let dummy_lv = LightVertex {
+        pos: Vec3::new(0.0, 0.0, 0.0),
+        dir_in: Vec3::new(0.0, 0.0, 1.0),
+        shell_idx: 0,
+        hero_weight: 0.0,
+        weight_ratio: [0.0f64; 64],
+        pdf_fwd: 0.0,
+    };
+    let mut all_light_vertices = [dummy_lv; MAX_TOTAL_LIGHT_VERTS];
+    let mut total_light_verts = 0usize;
+
+    if bdpt_active {
+        // Derive light subpath seeds from the current rng_state WITHOUT
+        // advancing it. This is critical: any advance to rng_state shifts
+        // all backward chain seeds, causing regressions due to RNG stream
+        // sensitivity in the heavy-tailed distribution. By using splitmix64
+        // to scramble the current state, we get decorrelated light seeds
+        // while keeping the backward chain sequence identical.
+        let light_base_seed = splitmix64(*rng_state ^ 0xBDFF_BDFF_BDFF_BDFF);
+
+        for subpath_idx in 0..BDPT_NUM_LIGHT_SUBPATHS {
+            let hero_wl = subpath_idx % num_wl;
+            // Derive per-subpath seed via splitmix64 chain from the base seed.
+            let subpath_seed = splitmix64(light_base_seed.wrapping_add(subpath_idx as u64));
+            let mut light_rng = McRng::from_seed(subpath_seed);
+            let mut subpath_verts = [dummy_lv; BDPT_MAX_LIGHT_VERTICES];
+            let n_verts = trace_light_subpath(
+                atm,
+                sun_dir,
+                observer_pos,
+                hero_wl,
+                num_wl,
+                sza_deg_obs,
+                &mut light_rng,
+                &mut subpath_verts,
+            );
+            for v in 0..n_verts {
+                if total_light_verts < MAX_TOTAL_LIGHT_VERTS {
+                    all_light_vertices[total_light_verts] = subpath_verts[v];
+                    total_light_verts += 1;
+                }
+            }
+        }
+    }
+
+    let inv_num_light_subpaths = if bdpt_active && total_light_verts > 0 {
+        1.0 / BDPT_NUM_LIGHT_SUBPATHS as f64
+    } else {
+        0.0
+    };
+
     // Per-wavelength accumulated optical depth from observer.
     let mut tau_obs = [0.0f64; 64];
 
@@ -3699,6 +4200,111 @@ pub fn hybrid_scatter_radiance_alis(
                 }
                 radiance[w] += mc_totals[w] * inv_rays * beta_scat * t_obs * ds;
             }
+        }
+
+        // --- BDPT connections: connect all light vertices to this LOS step ---
+        //
+        // For each light vertex L, evaluate the connection contribution:
+        //   contrib = eye_weight * light_weight * phase_eye * phase_light * G * T_conn
+        //
+        // Optimizations to avoid expensive transmittance evaluations:
+        // - Skip LOS steps below 30 km: connection through troposphere has ~0 transmittance
+        // - Skip connections > 3000 km: G = 1/d^2 makes contributions negligible
+        if bdpt_active && total_light_verts > 0 {
+            let eye_alt = r - surface_radius;
+
+            // Below 60 km, the connection chord between eye and light vertex
+            // dips into the dense troposphere where transmittance is ~0.
+            // For two vertices at altitude h separated by distance d, the
+            // chord minimum altitude is h_min ≈ h - d²/(8R).
+            // At h=60 km, d=1200 km: h_min = 60 - 28 = 32 km (marginal).
+            // At h=60 km, d=800 km:  h_min = 60 - 13 = 47 km (good).
+            if eye_alt >= 60_000.0 {
+                for lv_idx in 0..total_light_verts {
+                    let lv = &all_light_vertices[lv_idx];
+
+                    // Connection geometry.
+                    let diff = Vec3::new(
+                        lv.pos.x - scatter_pos.x,
+                        lv.pos.y - scatter_pos.y,
+                        lv.pos.z - scatter_pos.z,
+                    );
+                    let dist_sq = diff.length_sq();
+
+                    // Skip degenerate and very long connections.
+                    // At 3000 km, G = 1/(3e6)^2 = 1.1e-13, negligible.
+                    if !(1.0..=9.0e12_f64).contains(&dist_sq) {
+                        continue;
+                    }
+                    let dist = libm::sqrt(dist_sq);
+                    let connection_dir = diff.scale(1.0 / dist); // eye -> light
+
+                    let g_term = 1.0 / dist_sq;
+
+                    // Phase function at eye vertex.
+                    // Light arrives at E from -connection_dir (from L toward E),
+                    // leaves toward observer via -view_dir.
+                    // cos(scattering angle) = dot(-connection_dir, -view_dir)
+                    //                       = dot(connection_dir, view_dir).
+                    // Align with NEE convention: cos_theta_1 = sun_dir.dot(-view_dir)
+                    // where sun_dir points E->sun. Here connection_dir points E->L,
+                    // so cos_theta_eye = connection_dir.dot(-view_dir) gives the
+                    // angle between the arriving light and the observer direction,
+                    // matching the NEE pattern.
+                    let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
+
+                    // Phase function at light vertex.
+                    // Light was traveling in L.dir_in, scatters toward E.
+                    // Direction from L toward E is -connection_dir.
+                    // cos(scattering angle) = dot(L.dir_in, -connection_dir).
+                    let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
+
+                    // Connection transmittance (all wavelengths).
+                    let t_conn =
+                        transmittance_between_points_spectrum(atm, scatter_pos, lv.pos, num_wl);
+
+                    for w in 0..num_wl {
+                        let optics_eye = &atm.optics[shell_idx][w];
+                        let beta_scat_eye = optics_eye.extinction * optics_eye.ssa;
+                        if beta_scat_eye < 1e-30 || t_conn[w] < 1e-30 {
+                            continue;
+                        }
+
+                        let tau_obs_mid = tau_obs[w] + optics_eye.extinction * ds * 0.5;
+                        let t_obs = libm::exp(-tau_obs_mid);
+                        if t_obs < 1e-30 {
+                            continue;
+                        }
+
+                        let phase_eye = scalar_phase_value(cos_theta_eye, optics_eye);
+                        let optics_light = &atm.optics[lv.shell_idx][w];
+                        let phase_light = scalar_phase_value(cos_theta_light, optics_light);
+
+                        // BDPT connection contribution (additive, no MIS):
+                        //   t_obs * beta_scat * ds  (eye vertex LOS weight)
+                        //   * L.hero_weight * L.wr[w]  (light subpath weight)
+                        //   * phase_eye/(4pi) * phase_light/(4pi)  (scattering at both ends)
+                        //   * G * T_conn  (geometric + transmittance)
+                        //   * 1/N_light_subpaths  (MC average)
+                        let contrib = t_obs
+                            * beta_scat_eye
+                            * ds
+                            * lv.hero_weight
+                            * lv.weight_ratio[w]
+                            * phase_eye
+                            * INV_4PI
+                            * phase_light
+                            * INV_4PI
+                            * g_term
+                            * t_conn[w]
+                            * inv_num_light_subpaths;
+
+                        if contrib.is_finite() {
+                            radiance[w] += contrib;
+                        }
+                    }
+                }
+            } // end altitude gate
         }
 
         for w in 0..num_wl {
@@ -5313,6 +5919,204 @@ mod tests {
                     result[w]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bdpt_light_subpath_vertex_diagnostic() {
+        // Diagnostic: verify that forced-scattering light subpaths produce
+        // vertices at useful altitudes with reasonable weights.
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        let altitudes_km = [
+            0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 90.0, 100.0,
+        ];
+        let wavelengths = [400.0, 550.0, 700.0];
+        let mut atm = AtmosphereModel::new(&altitudes_km, &wavelengths);
+        for s in 0..atm.num_shells {
+            for w in 0..3 {
+                let factor = if w == 0 {
+                    4.0
+                } else if w == 1 {
+                    1.0
+                } else {
+                    0.3
+                };
+                atm.optics[s][w] = ShellOptics {
+                    extinction: 1e-5 * factor * libm::exp(-atm.shells[s].altitude_mid / 8500.0),
+                    ssa: 1.0,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+
+        let observer = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+
+        // First: directly test the entry point geometry and scout.
+        {
+            extern crate std;
+            let sza_deg = 102.0;
+            let sza_rad = sza_deg * core::f64::consts::PI / 180.0;
+            let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+            let entry_dir = sun_dir.scale(-1.0);
+
+            // Sub-solar point entry (r_frac = 0, disk center)
+            let entry_center = sun_dir.scale(-atm.toa_radius());
+            let r_center = entry_center.length();
+            std::eprintln!(
+                "Sub-solar entry: r={:.1} m, toa={:.1} m, diff={:.3} m",
+                r_center,
+                atm.toa_radius(),
+                r_center - atm.toa_radius()
+            );
+            let nudged_center = entry_center + entry_center.normalize().scale(-10.0);
+            let r_nudged = nudged_center.length();
+            std::eprintln!(
+                "  After radial nudge: r={:.1} m, shell={:?}",
+                r_nudged,
+                atm.shell_index(r_nudged)
+            );
+
+            // Rim entry (r_frac ~ 0.99)
+            let disk_normal = sun_dir.scale(-1.0);
+            let arbitrary = if libm::fabs(disk_normal.y) < 0.9 {
+                Vec3::new(0.0, 1.0, 0.0)
+            } else {
+                Vec3::new(1.0, 0.0, 0.0)
+            };
+            let disk_u = disk_normal.cross(arbitrary).normalize();
+            let r_frac = 0.99;
+            let r_disk = atm.toa_radius() * r_frac;
+            let z_along = libm::sqrt(atm.toa_radius() * atm.toa_radius() - r_disk * r_disk);
+            let entry_rim = sun_dir.scale(-z_along) + disk_u.scale(r_disk);
+            let r_rim = entry_rim.length();
+            std::eprintln!(
+                "Rim entry (r_frac=0.99): r={:.1} m, toa={:.1} m, diff={:.3} m",
+                r_rim,
+                atm.toa_radius(),
+                r_rim - atm.toa_radius()
+            );
+
+            // Check entry direction dot with radial
+            let cos_entry = entry_dir.dot(entry_rim.normalize());
+            std::eprintln!(
+                "  entry_dir . radial = {:.6} (>0 means outward!)",
+                cos_entry
+            );
+
+            // Nudge radially inward
+            let nudged_rim = entry_rim + entry_rim.normalize().scale(-10.0);
+            let r_nudged_rim = nudged_rim.length();
+            std::eprintln!(
+                "  After radial nudge: r={:.1} m, shell={:?}",
+                r_nudged_rim,
+                atm.shell_index(r_nudged_rim)
+            );
+
+            // Scout from nudged rim position
+            let mut vspg_segs = [VspgSegment {
+                tau_lo: 0.0,
+                tau_hi: 0.0,
+                importance: 1.0,
+            }; VSPG_MAX_SEGMENTS];
+            let (tau_maxes, hit_ground, n_segs) = scout_with_vspg_segments_alis(
+                &atm,
+                nudged_rim,
+                entry_dir,
+                1,
+                3,
+                sza_deg,
+                &mut vspg_segs,
+            );
+            std::eprintln!(
+                "  Scout from rim: tau_hero={:.6e}, hit_ground={}, n_segs={}",
+                tau_maxes[1],
+                hit_ground,
+                n_segs
+            );
+
+            // Also scout from center
+            let (tau_c, hg_c, ns_c) = scout_with_vspg_segments_alis(
+                &atm,
+                nudged_center,
+                entry_dir,
+                1,
+                3,
+                sza_deg,
+                &mut vspg_segs,
+            );
+            std::eprintln!(
+                "  Scout from center: tau_hero={:.6e}, hit_ground={}, n_segs={}",
+                tau_c[1],
+                hg_c,
+                ns_c
+            );
+        }
+
+        for sza_deg in &[102.0, 105.0, 108.0] {
+            let sza_rad = sza_deg * core::f64::consts::PI / 180.0;
+            let sun_dir = Vec3::new(libm::cos(sza_rad), libm::sin(sza_rad), 0.0);
+
+            let mut total_verts = 0usize;
+            let mut max_weight = 0.0f64;
+            let mut min_alt = f64::MAX;
+            let mut max_alt = 0.0f64;
+            let num_subpaths = 100;
+
+            for sp in 0..num_subpaths {
+                let hero_wl = sp % 3;
+                let seed = splitmix64(12345u64.wrapping_add(sp as u64));
+                let mut rng = McRng::from_seed(seed);
+                let mut verts = [LightVertex {
+                    pos: Vec3::new(0.0, 0.0, 0.0),
+                    dir_in: Vec3::new(0.0, 0.0, 1.0),
+                    shell_idx: 0,
+                    hero_weight: 0.0,
+                    weight_ratio: [0.0; 64],
+                    pdf_fwd: 0.0,
+                }; BDPT_MAX_LIGHT_VERTICES];
+                let nv = trace_light_subpath(
+                    &atm, sun_dir, observer, hero_wl, 3, *sza_deg, &mut rng, &mut verts,
+                );
+                total_verts += nv;
+                for v in 0..nv {
+                    let alt = verts[v].pos.length() - EARTH_RADIUS_M;
+                    if alt < min_alt {
+                        min_alt = alt;
+                    }
+                    if alt > max_alt {
+                        max_alt = alt;
+                    }
+                    let hw = libm::fabs(verts[v].hero_weight);
+                    if hw > max_weight {
+                        max_weight = hw;
+                    }
+                }
+            }
+
+            let avg_verts = total_verts as f64 / num_subpaths as f64;
+
+            #[cfg(test)]
+            {
+                extern crate std;
+                std::eprintln!(
+                    "SZA={}: avg_verts={:.1}, total={}, alt=[{:.0},{:.0}] m, max_weight={:.4e}",
+                    sza_deg,
+                    avg_verts,
+                    total_verts,
+                    if min_alt < f64::MAX { min_alt } else { 0.0 },
+                    max_alt,
+                    max_weight
+                );
+            }
+
+            // With forced scattering, every subpath should produce at least 1 vertex.
+            assert!(
+                total_verts >= num_subpaths,
+                "SZA={}: forced scattering should guarantee >= 1 vertex/subpath, got {} total from {}",
+                sza_deg, total_verts, num_subpaths
+            );
         }
     }
 
