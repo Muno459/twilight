@@ -1308,21 +1308,18 @@ struct SplitParticleAlis {
 
 /// Maximum number of scatter vertices stored per light subpath.
 ///
-/// CRITICAL: Must be 1 (single scatter at entry). With multiple bounces,
-/// the light subpath random-walks AWAY from the observer because the entry
-/// direction (-sun_dir) pushes photons into the sunlit hemisphere. After
-/// 8 bounces, vertices end up 5000+ km from the observer, far beyond the
-/// 3000 km connection range where high-altitude chords stay above the
-/// troposphere. With 1 vertex, the scatter position stays near the
-/// terminator entry point, within ~700-1500 km of the observer's
-/// high-altitude LOS steps.
+/// Set to 1 (single scatter at entry). After the first scatter near the
+/// terminator, subsequent bounces drift the photon toward the sunlit
+/// hemisphere via the entry direction (-sun_dir). The connection distance
+/// filter (3000 km) rejects these distant vertices, wasting compute.
+/// With 1 vertex per subpath, we maximize the number of independent
+/// terminator entry points (subpaths) for better angular coverage.
 const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 
 /// Number of independent light subpaths traced per call to
 /// `hybrid_scatter_radiance_alis`. With BDPT_MAX_LIGHT_VERTICES=1, each
-/// subpath produces exactly 1 vertex, so this equals the total number of
-/// light vertices. More subpaths = better angular coverage of the
-/// illuminated terminator at the cost of more transmittance evaluations.
+/// subpath produces exactly 1 vertex. 16 subpaths gives good angular
+/// coverage of the illuminated terminator strip near the observer.
 const BDPT_NUM_LIGHT_SUBPATHS: usize = 16;
 
 /// SZA threshold (degrees) below which BDPT is disabled.
