@@ -1326,8 +1326,8 @@ const BDPT_NUM_LIGHT_SUBPATHS: usize = 16;
 ///
 /// At SZA < 98, backward chains already have high success rates and NEE
 /// works well. BDPT overhead (transmittance evaluations for connections)
-/// would be wasted. Ramps in via sigmoid from 101 to 105.
-const BDPT_SZA_START: f64 = 101.0;
+/// would be wasted. Ramps in via sigmoid from 99 to 105.
+const BDPT_SZA_START: f64 = 99.0;
 
 /// SZA at which BDPT reaches full strength.
 /// Reserved for future defensive MIS integration.
@@ -1459,7 +1459,7 @@ fn trace_light_subpath(
     //
     // Sample r_frac uniformly from [1-delta, 1) where delta is small.
     // PDF(r_frac) = 1/delta on [1-delta, 1).
-    const BDPT_R_DELTA: f64 = 0.01; // r_frac in [0.99, 1.0)
+    const BDPT_R_DELTA: f64 = 0.03; // r_frac in [0.97, 1.0)
     let xi_r = xorshift_f64(&mut rng.tau);
     let r_frac = 1.0 - BDPT_R_DELTA * xi_r; // uniform in [1-delta, 1]
                                             // Clamp away from exactly 1.0 to avoid r_sq >= toa_r_sq guard
