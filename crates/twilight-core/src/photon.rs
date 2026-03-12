@@ -1485,7 +1485,7 @@ fn trace_light_subpath(
     // is within ~1000-1400 km of the observer's high-altitude LOS steps.
     //
     // PDF(phi) = 1 / (2 * delta_phi) on [pref_phi - delta, pref_phi + delta].
-    const BDPT_PHI_HALF_WIDTH: f64 = core::f64::consts::PI / 32.0;
+    const BDPT_PHI_HALF_WIDTH: f64 = core::f64::consts::PI / 16.0;
     // Stratified jittered sampling: divide the azimuthal strip into
     // num_subpaths equal bins and place this subpath's sample within
     // its assigned bin. This ensures uniform terminator coverage and
