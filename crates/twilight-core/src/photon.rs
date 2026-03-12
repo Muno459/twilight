@@ -4205,18 +4205,14 @@ pub fn hybrid_scatter_radiance_alis(
         //   contrib = eye_weight * light_weight * phase_eye * phase_light * G * T_conn
         //
         // Optimizations to avoid expensive transmittance evaluations:
-        // - Skip LOS steps below 30 km: connection through troposphere has ~0 transmittance
+        // - Skip LOS steps below 10 km (deep troposphere, t_obs negligible)
+        // - Per-connection chord minimum altitude check (reject if chord dips below 20 km)
         // - Skip connections > 3000 km: G = 1/d^2 makes contributions negligible
         if bdpt_active && total_light_verts > 0 {
-            let eye_alt = r - surface_radius;
-
-            // Below 60 km, the connection chord between eye and light vertex
-            // dips into the dense troposphere where transmittance is ~0.
-            // For two vertices at altitude h separated by distance d, the
-            // chord minimum altitude is h_min ≈ h - d²/(8R).
-            // At h=60 km, d=1200 km: h_min = 60 - 28 = 32 km (marginal).
-            // At h=60 km, d=800 km:  h_min = 60 - 13 = 47 km (good).
-            if eye_alt >= 60_000.0 {
+            // Pre-filter: skip LOS steps deep in the troposphere where
+            // observer transmittance is negligible. The per-connection chord
+            // minimum altitude check below handles fine-grained filtering.
+            if r - surface_radius >= 10_000.0 {
                 for lv_idx in 0..total_light_verts {
                     let lv = &all_light_vertices[lv_idx];
 
@@ -4233,6 +4229,29 @@ pub fn hybrid_scatter_radiance_alis(
                     if !(1.0..=9.0e12_f64).contains(&dist_sq) {
                         continue;
                     }
+
+                    // Per-connection chord minimum altitude check.
+                    // Find the closest approach of the straight-line chord
+                    // (scatter_pos -> lv.pos) to Earth's center.
+                    // Parametric line: P(t) = scatter_pos + t * diff, t in [0,1].
+                    // Closest point to origin at t = -scatter_pos.dot(diff) / |diff|^2.
+                    // If t in (0,1), compute r_min = |P(t)|; reject if below 20 km.
+                    // If t outside (0,1), min altitude is at an endpoint (already filtered).
+                    let dot_sd =
+                        scatter_pos.x * diff.x + scatter_pos.y * diff.y + scatter_pos.z * diff.z;
+                    let t_closest = -dot_sd / dist_sq;
+                    if t_closest > 0.0 && t_closest < 1.0 {
+                        let px = scatter_pos.x + t_closest * diff.x;
+                        let py = scatter_pos.y + t_closest * diff.y;
+                        let pz = scatter_pos.z + t_closest * diff.z;
+                        let r_min_sq = px * px + py * py + pz * pz;
+                        // 20 km above surface: reject if chord dips into troposphere.
+                        let r_threshold = surface_radius + 20_000.0;
+                        if r_min_sq < r_threshold * r_threshold {
+                            continue;
+                        }
+                    }
+
                     let dist = libm::sqrt(dist_sq);
                     let connection_dir = diff.scale(1.0 / dist); // eye -> light
 
@@ -4301,7 +4320,7 @@ pub fn hybrid_scatter_radiance_alis(
                         }
                     }
                 }
-            } // end altitude gate
+            } // end BDPT connections
         }
 
         for w in 0..num_wl {
