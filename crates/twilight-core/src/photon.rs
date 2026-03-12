@@ -1406,6 +1406,8 @@ fn trace_light_subpath(
     sza_deg_obs: f64,
     rng: &mut McRng,
     vertices: &mut [LightVertex; BDPT_MAX_LIGHT_VERTICES],
+    subpath_idx: usize,
+    num_subpaths: usize,
 ) -> usize {
     let toa_radius = atm.toa_radius();
     let mut n_vertices = 0usize;
@@ -1484,8 +1486,13 @@ fn trace_light_subpath(
     //
     // PDF(phi) = 1 / (2 * delta_phi) on [pref_phi - delta, pref_phi + delta].
     const BDPT_PHI_HALF_WIDTH: f64 = core::f64::consts::PI / 32.0;
+    // Stratified jittered sampling: divide the azimuthal strip into
+    // num_subpaths equal bins and place this subpath's sample within
+    // its assigned bin. This ensures uniform terminator coverage and
+    // eliminates random clustering of entry points.
+    let bin_width = 2.0 * BDPT_PHI_HALF_WIDTH / num_subpaths as f64;
     let xi_phi = xorshift_f64(&mut rng.tau);
-    let phi_disk = pref_phi + BDPT_PHI_HALF_WIDTH * (2.0 * xi_phi - 1.0);
+    let phi_disk = pref_phi - BDPT_PHI_HALF_WIDTH + (subpath_idx as f64 + xi_phi) * bin_width;
 
     // Position on the disk (in sun-facing plane at distance toa_radius from center).
     let disk_x = r_disk * libm::cos(phi_disk);
@@ -4070,6 +4077,8 @@ pub fn hybrid_scatter_radiance_alis(
                 sza_deg_obs,
                 &mut light_rng,
                 &mut subpath_verts,
+                subpath_idx,
+                BDPT_NUM_LIGHT_SUBPATHS,
             );
             for v in 0..n_verts {
                 if total_light_verts < MAX_TOTAL_LIGHT_VERTS {
@@ -6093,7 +6102,16 @@ mod tests {
                     pdf_fwd: 0.0,
                 }; BDPT_MAX_LIGHT_VERTICES];
                 let nv = trace_light_subpath(
-                    &atm, sun_dir, observer, hero_wl, 3, *sza_deg, &mut rng, &mut verts,
+                    &atm,
+                    sun_dir,
+                    observer,
+                    hero_wl,
+                    3,
+                    *sza_deg,
+                    &mut rng,
+                    &mut verts,
+                    sp,
+                    num_subpaths,
                 );
                 total_verts += nv;
                 for v in 0..nv {
