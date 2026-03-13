@@ -1422,8 +1422,6 @@ fn bdpt_chord_min_alt(sza_deg: f64) -> f64 {
 const BDPT_SZA_START: f64 = 99.0;
 
 /// SZA at which BDPT reaches full strength.
-/// Reserved for future defensive MIS integration.
-#[allow(dead_code)]
 const BDPT_SZA_FULL: f64 = 105.0;
 
 /// A recorded scatter vertex on a light subpath.
@@ -1457,7 +1455,6 @@ struct LightVertex {
 ///
 /// 0.0 at SZA < 98, ramps to 1.0 at SZA >= 102.
 /// Reserved for future defensive MIS integration.
-#[allow(dead_code)]
 #[inline]
 fn bdpt_strength(sza_deg: f64) -> f64 {
     sigmoid(
@@ -3287,20 +3284,24 @@ fn trace_secondary_chain_scalar(
                 // stack space (remaining slots + 1 for the main particle).
                 let k_ideal = libm::round(abs_w / w_target) as usize;
                 let max_k = MAX_SPLIT_PARTICLES - stack_len + 1;
-                let k = k_ideal.clamp(2, max_k.max(2));
-                weight /= k as f64;
-                for copy_idx in 1..k {
-                    if stack_len < MAX_SPLIT_PARTICLES {
-                        let child_seed = local_rng.tau
-                            ^ (copy_idx as u64).wrapping_mul(2654435761)
-                            ^ (alt.to_bits() >> 32);
-                        stack[stack_len] = SplitParticleScalar {
-                            pos,
-                            dir: current_dir,
-                            weight,
-                            rng: McRng::from_seed(child_seed),
-                        };
-                        stack_len += 1;
+                if max_k >= 2 {
+                    let k = k_ideal.clamp(2, max_k);
+                    weight /= k as f64;
+                    for copy_idx in 1..k {
+                        if stack_len < MAX_SPLIT_PARTICLES {
+                            let child_seed = splitmix64(
+                                local_rng.tau
+                                    ^ (copy_idx as u64).wrapping_mul(2654435761)
+                                    ^ (alt.to_bits() >> 32),
+                            );
+                            stack[stack_len] = SplitParticleScalar {
+                                pos,
+                                dir: current_dir,
+                                weight,
+                                rng: McRng::from_seed(child_seed),
+                            };
+                            stack_len += 1;
+                        }
                     }
                 }
             }
@@ -3996,21 +3997,25 @@ fn trace_secondary_chain_alis(
                 // Each copy inherits the same weight_ratio array.
                 let k_ideal = libm::round(abs_hw / w_target) as usize;
                 let max_k = MAX_SPLIT_PARTICLES - stack_len + 1;
-                let k = k_ideal.clamp(2, max_k.max(2));
-                hero_weight /= k as f64;
-                for copy_idx in 1..k {
-                    if stack_len < MAX_SPLIT_PARTICLES {
-                        let child_seed = local_rng.tau
-                            ^ (copy_idx as u64).wrapping_mul(2654435761)
-                            ^ (alt.to_bits() >> 32);
-                        stack[stack_len] = SplitParticleAlis {
-                            pos,
-                            dir: current_dir,
-                            hero_weight,
-                            weight_ratio: wr,
-                            rng: McRng::from_seed(child_seed),
-                        };
-                        stack_len += 1;
+                if max_k >= 2 {
+                    let k = k_ideal.clamp(2, max_k);
+                    hero_weight /= k as f64;
+                    for copy_idx in 1..k {
+                        if stack_len < MAX_SPLIT_PARTICLES {
+                            let child_seed = splitmix64(
+                                local_rng.tau
+                                    ^ (copy_idx as u64).wrapping_mul(2654435761)
+                                    ^ (alt.to_bits() >> 32),
+                            );
+                            stack[stack_len] = SplitParticleAlis {
+                                pos,
+                                dir: current_dir,
+                                hero_weight,
+                                weight_ratio: wr,
+                                rng: McRng::from_seed(child_seed),
+                            };
+                            stack_len += 1;
+                        }
                     }
                 }
             }
@@ -4123,11 +4128,17 @@ pub fn hybrid_scatter_radiance_alis(
     use crate::single_scatter::transmittance_between_points_spectrum;
 
     let bdpt_active = sza_deg_obs >= BDPT_SZA_START && secondary_rays > 0;
-    // BDPT connections: additive mode (no defensive MIS).
-    // Both backward chains and BDPT connections contribute at full weight.
-    // BDPT adds an independent estimator of multi-scatter radiance via
-    // light subpath vertices connected to high-altitude LOS steps.
-    // At SZA 101-108 this provides additional signal for paths that
+
+    // MIS Blend: backward chains and BDPT compute exactly the same
+    // multi-scattering integral. To prevent a 2x additive bias, we blend them.
+    // BDPT takes over almost completely at deep twilight (SZA 108), suppressing
+    // the backward chain's extreme CV 4+ variance outliers down to ~0.
+    let w_bdpt = if bdpt_active {
+        bdpt_strength(sza_deg_obs)
+    } else {
+        0.0
+    };
+    let w_back = 1.0 - w_bdpt;
     // backward chains struggle to find (lateral transport to sunlit atm).
 
     let inv_num_light_subpaths = if bdpt_active {
@@ -4264,7 +4275,7 @@ pub fn hybrid_scatter_radiance_alis(
                 if t_obs < 1e-30 {
                     continue;
                 }
-                radiance[w] += mc_totals[w] * inv_rays * beta_scat * t_obs * ds;
+                radiance[w] += w_back * mc_totals[w] * inv_rays * beta_scat * t_obs * ds;
             }
         }
 
@@ -4381,82 +4392,65 @@ pub fn hybrid_scatter_radiance_alis(
                     break;
                 }
 
-                // Pre-filter: skip LOS steps deep in the troposphere.
-                if r - surface_radius >= 10_000.0 {
-                    for lv_idx in 0..n_batch_verts {
-                        let lv = &batch_vertices[lv_idx];
+                for lv_idx in 0..n_batch_verts {
+                    let lv = &batch_vertices[lv_idx];
 
-                        let diff = Vec3::new(
-                            lv.pos.x - scatter_pos.x,
-                            lv.pos.y - scatter_pos.y,
-                            lv.pos.z - scatter_pos.z,
-                        );
-                        let dist_sq = diff.length_sq();
+                    let diff = Vec3::new(
+                        lv.pos.x - scatter_pos.x,
+                        lv.pos.y - scatter_pos.y,
+                        lv.pos.z - scatter_pos.z,
+                    );
+                    let dist_sq = diff.length_sq();
 
-                        if !(1.0..=9.0e12_f64).contains(&dist_sq) {
+                    if !(1.0..=9.0e12_f64).contains(&dist_sq) {
+                        continue;
+                    }
+
+                    // No biased chord altitude filtering.
+                    // We rely on exact physical `t_conn` evaluation.
+
+                    let dist = libm::sqrt(dist_sq);
+                    let connection_dir = diff.scale(1.0 / dist);
+                    let g_term = 1.0 / dist_sq;
+
+                    let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
+                    let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
+
+                    let t_conn =
+                        transmittance_between_points_spectrum(atm, scatter_pos, lv.pos, num_wl);
+
+                    for w in 0..num_wl {
+                        let optics_eye = &atm.optics[shell_idx][w];
+                        let beta_scat_eye = optics_eye.extinction * optics_eye.ssa;
+                        if beta_scat_eye < 1e-30 || t_conn[w] < 1e-30 {
                             continue;
                         }
 
-                        // Per-connection chord minimum altitude check.
-                        let dot_sd = scatter_pos.x * diff.x
-                            + scatter_pos.y * diff.y
-                            + scatter_pos.z * diff.z;
-                        let t_closest = -dot_sd / dist_sq;
-                        if t_closest > 0.0 && t_closest < 1.0 {
-                            let px = scatter_pos.x + t_closest * diff.x;
-                            let py = scatter_pos.y + t_closest * diff.y;
-                            let pz = scatter_pos.z + t_closest * diff.z;
-                            let r_min_sq = px * px + py * py + pz * pz;
-                            let chord_alt = bdpt_chord_min_alt(sza_deg_obs);
-                            let r_threshold = surface_radius + chord_alt;
-                            if r_min_sq < r_threshold * r_threshold {
-                                continue;
-                            }
+                        let tau_obs_mid = tau_obs_bdpt[w] + optics_eye.extinction * ds * 0.5;
+                        let t_obs = libm::exp(-tau_obs_mid);
+                        if t_obs < 1e-30 {
+                            continue;
                         }
 
-                        let dist = libm::sqrt(dist_sq);
-                        let connection_dir = diff.scale(1.0 / dist);
-                        let g_term = 1.0 / dist_sq;
+                        let phase_eye = scalar_phase_value(cos_theta_eye, optics_eye);
+                        let optics_light = &atm.optics[lv.shell_idx][w];
+                        let phase_light = scalar_phase_value(cos_theta_light, optics_light);
 
-                        let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
-                        let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
+                        let contrib = t_obs
+                            * beta_scat_eye
+                            * ds
+                            * lv.hero_weight
+                            * lv.weight_ratio[w]
+                            * phase_eye
+                            * INV_4PI
+                            * phase_light
+                            * INV_4PI
+                            * g_term
+                            * t_conn[w]
+                            * inv_num_light_subpaths;
 
-                        let t_conn =
-                            transmittance_between_points_spectrum(atm, scatter_pos, lv.pos, num_wl);
-
-                        for w in 0..num_wl {
-                            let optics_eye = &atm.optics[shell_idx][w];
-                            let beta_scat_eye = optics_eye.extinction * optics_eye.ssa;
-                            if beta_scat_eye < 1e-30 || t_conn[w] < 1e-30 {
-                                continue;
-                            }
-
-                            let tau_obs_mid = tau_obs_bdpt[w] + optics_eye.extinction * ds * 0.5;
-                            let t_obs = libm::exp(-tau_obs_mid);
-                            if t_obs < 1e-30 {
-                                continue;
-                            }
-
-                            let phase_eye = scalar_phase_value(cos_theta_eye, optics_eye);
-                            let optics_light = &atm.optics[lv.shell_idx][w];
-                            let phase_light = scalar_phase_value(cos_theta_light, optics_light);
-
-                            let contrib = t_obs
-                                * beta_scat_eye
-                                * ds
-                                * lv.hero_weight
-                                * lv.weight_ratio[w]
-                                * phase_eye
-                                * INV_4PI
-                                * phase_light
-                                * INV_4PI
-                                * g_term
-                                * t_conn[w]
-                                * inv_num_light_subpaths;
-
-                            if contrib.is_finite() {
-                                radiance[w] += contrib;
-                            }
+                        if contrib.is_finite() {
+                            radiance[w] += w_bdpt * contrib;
                         }
                     }
                 }
@@ -4729,7 +4723,13 @@ fn terminator_shape_weight(cos_z: f64, cos_t: f64, m: f64) -> f64 {
     if cos_t_m < 1e-30 {
         return 0.0;
     }
-    2.0 * cos_z / ((m + 1.0) * cos_t_m)
+    let cos_min = power_cos_min(m);
+    if cos_min > 1e-6 {
+        let trunc_norm = 1.0 - libm::pow(cos_min, m + 1.0);
+        2.0 * cos_z * trunc_norm / ((m + 1.0) * cos_t_m)
+    } else {
+        2.0 * cos_z / ((m + 1.0) * cos_t_m)
+    }
 }
 
 /// Simple xorshift64 PRNG suitable for no_std Monte Carlo.
