@@ -1305,6 +1305,8 @@ const LOS_IMP_H_MODERATE_M: f64 = 100_000.0;
 /// nearly instantly (atmosphere escape on first step) at negligible cost.
 /// The real savings come from NOT launching expensive 50-bounce chains at
 /// 0-15 km altitude.
+///
+/// Tested 15 km: inconclusive, possible SZA 98 regression. Keeping 30 km.
 const LOS_IMP_H_DEEP_M: f64 = 30_000.0;
 
 /// State of a single particle in the weight-window work stack (scalar mode).
