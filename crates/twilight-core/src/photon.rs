@@ -1384,6 +1384,8 @@ const BDPT_NUM_LIGHT_SUBPATHS: usize = 4096;
 /// keep the stack-allocated LightVertex buffer under ~600 KB (1024 * 590 bytes).
 /// Each batch re-walks the LOS to evaluate connections (cheap: just tau
 /// accumulation), then the buffer is reused for the next batch.
+/// Tested 2048: no runtime improvement (bottleneck is per-connection
+/// transmittance evaluation, not LOS re-walk overhead).
 const BDPT_BATCH_SIZE: usize = 1024;
 
 /// Chord minimum altitude above surface at moderate twilight [m].
