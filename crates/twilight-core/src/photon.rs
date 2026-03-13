@@ -4320,6 +4320,7 @@ pub fn hybrid_scatter_radiance_alis(
             // Pre-filter: skip LOS steps deep in the troposphere where
             // observer transmittance is negligible. The per-connection chord
             // minimum altitude check below handles fine-grained filtering.
+            // Tested 5 km: no measurable improvement, keeping 10 km.
             if r - surface_radius >= 10_000.0 {
                 for lv_idx in 0..total_light_verts {
                     let lv = &all_light_vertices[lv_idx];
@@ -4334,6 +4335,7 @@ pub fn hybrid_scatter_radiance_alis(
 
                     // Skip degenerate and very long connections.
                     // At 3000 km, G = 1/(3e6)^2 = 1.1e-13, negligible.
+                    // Tested 4000 km: no measurable improvement, keeping 3000 km.
                     if !(1.0..=9.0e12_f64).contains(&dist_sq) {
                         continue;
                     }
