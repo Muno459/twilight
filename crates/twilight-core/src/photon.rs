@@ -4209,8 +4209,27 @@ pub fn hybrid_scatter_radiance_alis(
             let mut mc_totals = [0.0f64; 64];
 
             for ray in 0..rays_this_step {
-                // Round-robin hero selection across wavelengths.
-                let hero_wl = ray % num_wl;
+                // Select hero as the wavelength with maximum extinction at
+                // this LOS step's shell. This ensures sigma_w/sigma_h <= 1
+                // at every scatter event, preventing ALIS weight ratio wr[w]
+                // from growing exponentially over many bounces.
+                // In a Rayleigh-dominated atmosphere, lambda^-4 scaling
+                // preserves the extinction ordering across all shells, so
+                // the hero remains max-extinction throughout the chain.
+                // Round-robin offset ensures different wavelengths get hero
+                // turns when multiple wavelengths have similar extinction.
+                let hero_wl = {
+                    let mut best = ray % num_wl;
+                    let mut best_ext = atm.optics[shell_idx][best].extinction;
+                    for w in 0..num_wl {
+                        let ext = atm.optics[shell_idx][w].extinction;
+                        if ext > best_ext {
+                            best = w;
+                            best_ext = ext;
+                        }
+                    }
+                    best
+                };
 
                 // Per-chain McRng: master advances by 1 per chain.
                 let _ = xorshift_f64(rng_state);
