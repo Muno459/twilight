@@ -1373,7 +1373,9 @@ const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 ///   256 -> 512:  SZA 106 CV 1.16 -> 0.89 (-23%)
 ///   512 -> 1024: SZA 107 CV 1.22 -> 0.89 (-27%)
 ///   1024-> 2048: SZA 108 CV 1.25 -> 0.98 (-21%)
-///   2048-> 4096: batched processing (bypasses stack overflow at 4096)
+///   2048-> 4096: SZA 106 CV 0.641 -> 0.545 (-15%, batched processing)
+///   8192: 50-seed SZA 106 0.370->0.262 (-29%) but +45% runtime, 1/sqrt(N)
+///         diminishing returns. Not worth the cost.
 const BDPT_NUM_LIGHT_SUBPATHS: usize = 4096;
 
 /// Batch size for BDPT vertex processing.
