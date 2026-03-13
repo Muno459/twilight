@@ -1362,9 +1362,11 @@ const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 
 /// Number of independent light subpaths traced per call to
 /// `hybrid_scatter_radiance_alis`. With BDPT_MAX_LIGHT_VERTICES=1, each
-/// subpath produces exactly 1 vertex. 64 subpaths with stratified jittered
+/// subpath produces exactly 1 vertex. 128 subpaths with stratified jittered
 /// azimuthal sampling gives dense, uniform coverage of the terminator strip.
-const BDPT_NUM_LIGHT_SUBPATHS: usize = 64;
+/// Previously tested at 128 with fixed 20km chord threshold: slight regression.
+/// Re-testing with SZA-adaptive chord threshold (5km at deep twilight).
+const BDPT_NUM_LIGHT_SUBPATHS: usize = 128;
 
 /// Chord minimum altitude above surface at moderate twilight [m].
 ///
@@ -4109,9 +4111,9 @@ pub fn hybrid_scatter_radiance_alis(
     // backward chains struggle to find (lateral transport to sunlit atm).
 
     // Storage for all light vertices across all subpaths.
-    // Max total: BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES = 64 * 1 = 64 vertices.
-    // Each LightVertex is ~590 bytes, so 64 * 590 = ~37.8 KB on the stack. Acceptable.
-    const MAX_TOTAL_LIGHT_VERTS: usize = 64; // BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES
+    // Max total: BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES = 128 * 1 = 128 vertices.
+    // Each LightVertex is ~590 bytes, so 128 * 590 = ~75.5 KB on the stack. Acceptable.
+    const MAX_TOTAL_LIGHT_VERTS: usize = 128; // BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES
     let dummy_lv = LightVertex {
         pos: Vec3::new(0.0, 0.0, 0.0),
         dir_in: Vec3::new(0.0, 0.0, 1.0),
