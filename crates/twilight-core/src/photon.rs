@@ -1362,6 +1362,32 @@ const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 /// azimuthal sampling gives dense, uniform coverage of the terminator strip.
 const BDPT_NUM_LIGHT_SUBPATHS: usize = 64;
 
+/// Chord minimum altitude above surface at moderate twilight [m].
+///
+/// At SZA 99-102, connections are short (<800 km) and the 20 km threshold
+/// rarely rejects valid connections. Keeps tropospheric noise out.
+const BDPT_CHORD_ALT_MODERATE_M: f64 = 20_000.0;
+
+/// Chord minimum altitude above surface at deep twilight [m].
+///
+/// At SZA 106+, the terminator is ~1800 km away. With h_min ≈ h - d²/(8R),
+/// a 20 km threshold rejects connections from LOS steps below ~82 km
+/// (d=1780 km gives d²/(8R)=62 km, so h must exceed 82 km).
+/// Lowering to 5 km allows connections from 67+ km LOS steps. The
+/// transmittance evaluation naturally handles attenuation through the
+/// lower stratosphere -- no signal is fabricated, just less discarded.
+const BDPT_CHORD_ALT_DEEP_M: f64 = 5_000.0;
+
+/// Returns the SZA-adaptive chord minimum altitude threshold [m].
+///
+/// Smoothly transitions from 20 km at SZA 99 to 5 km at SZA 106+.
+/// Uses linear interpolation clamped to [deep, moderate].
+#[inline]
+fn bdpt_chord_min_alt(sza_deg: f64) -> f64 {
+    let t = ((sza_deg - BDPT_SZA_START) / (BDPT_SZA_FULL - BDPT_SZA_START)).clamp(0.0, 1.0);
+    BDPT_CHORD_ALT_MODERATE_M + (BDPT_CHORD_ALT_DEEP_M - BDPT_CHORD_ALT_MODERATE_M) * t
+}
+
 /// SZA threshold (degrees) below which BDPT is disabled.
 ///
 /// At SZA < 98, backward chains already have high success rates and NEE
@@ -4274,7 +4300,8 @@ pub fn hybrid_scatter_radiance_alis(
         //
         // Optimizations to avoid expensive transmittance evaluations:
         // - Skip LOS steps below 10 km (deep troposphere, t_obs negligible)
-        // - Per-connection chord minimum altitude check (reject if chord dips below 20 km)
+        // - Per-connection chord minimum altitude check (SZA-adaptive: 20 km at
+        //   moderate twilight, 5 km at deep twilight where longer chords are needed)
         // - Skip connections > 3000 km: G = 1/d^2 makes contributions negligible
         if bdpt_active && total_light_verts > 0 {
             // Pre-filter: skip LOS steps deep in the troposphere where
@@ -4303,8 +4330,10 @@ pub fn hybrid_scatter_radiance_alis(
                     // (scatter_pos -> lv.pos) to Earth's center.
                     // Parametric line: P(t) = scatter_pos + t * diff, t in [0,1].
                     // Closest point to origin at t = -scatter_pos.dot(diff) / |diff|^2.
-                    // If t in (0,1), compute r_min = |P(t)|; reject if below 20 km.
+                    // If t in (0,1), compute r_min = |P(t)|; reject if below threshold.
                     // If t outside (0,1), min altitude is at an endpoint (already filtered).
+                    // Threshold is SZA-adaptive: 20 km at moderate twilight (short chords),
+                    // 5 km at deep twilight (long chords need lower stratosphere path).
                     let dot_sd =
                         scatter_pos.x * diff.x + scatter_pos.y * diff.y + scatter_pos.z * diff.z;
                     let t_closest = -dot_sd / dist_sq;
@@ -4313,8 +4342,8 @@ pub fn hybrid_scatter_radiance_alis(
                         let py = scatter_pos.y + t_closest * diff.y;
                         let pz = scatter_pos.z + t_closest * diff.z;
                         let r_min_sq = px * px + py * py + pz * pz;
-                        // 20 km above surface: reject if chord dips into troposphere.
-                        let r_threshold = surface_radius + 20_000.0;
+                        let chord_alt = bdpt_chord_min_alt(sza_deg_obs);
+                        let r_threshold = surface_radius + chord_alt;
                         if r_min_sq < r_threshold * r_threshold {
                             continue;
                         }
