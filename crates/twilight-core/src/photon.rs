@@ -1362,8 +1362,16 @@ const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 
 /// Number of independent light subpaths traced per call to
 /// `hybrid_scatter_radiance_alis`. With BDPT_MAX_LIGHT_VERTICES=1, each
-/// subpath produces exactly 1 vertex. Testing 2048 subpaths to find
-/// diminishing returns point.
+/// subpath produces exactly 1 vertex. 2048 subpaths with stratified jittered
+/// azimuthal sampling gives dense, uniform coverage of the terminator strip.
+///
+/// Scaling history (with SZA-adaptive chord threshold):
+///   64  -> 128:  SZA 101 CV 1.12 -> 0.83 (-26%)
+///   128 -> 256:  SZA 106 CV 1.86 -> 1.16 (-38%)
+///   256 -> 512:  SZA 106 CV 1.16 -> 0.89 (-23%)
+///   512 -> 1024: SZA 107 CV 1.22 -> 0.89 (-27%)
+///   1024-> 2048: SZA 108 CV 1.25 -> 0.98 (-21%)
+///   4096: stack overflow (2.4 MB LightVertex array exceeds thread stack)
 const BDPT_NUM_LIGHT_SUBPATHS: usize = 2048;
 
 /// Chord minimum altitude above surface at moderate twilight [m].
@@ -4111,6 +4119,7 @@ pub fn hybrid_scatter_radiance_alis(
     // Storage for all light vertices across all subpaths.
     // Max total: BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES = 2048 * 1 = 2048 vertices.
     // Each LightVertex is ~590 bytes, so 2048 * 590 = ~1.2 MB on the stack. Acceptable.
+    // 4096 vertices (2.4 MB) causes stack overflow on default 8 MB thread stacks.
     const MAX_TOTAL_LIGHT_VERTS: usize = 2048; // BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES
     let dummy_lv = LightVertex {
         pos: Vec3::new(0.0, 0.0, 0.0),
