@@ -1362,8 +1362,10 @@ const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 
 /// Number of independent light subpaths traced per call to
 /// `hybrid_scatter_radiance_alis`. With BDPT_MAX_LIGHT_VERTICES=1, each
-/// subpath produces exactly 1 vertex. 2048 subpaths with stratified jittered
+/// subpath produces exactly 1 vertex. 4096 subpaths with stratified jittered
 /// azimuthal sampling gives dense, uniform coverage of the terminator strip.
+///
+/// Processed in batches of BDPT_BATCH_SIZE to avoid stack overflow.
 ///
 /// Scaling history (with SZA-adaptive chord threshold):
 ///   64  -> 128:  SZA 101 CV 1.12 -> 0.83 (-26%)
@@ -1371,8 +1373,16 @@ const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 ///   256 -> 512:  SZA 106 CV 1.16 -> 0.89 (-23%)
 ///   512 -> 1024: SZA 107 CV 1.22 -> 0.89 (-27%)
 ///   1024-> 2048: SZA 108 CV 1.25 -> 0.98 (-21%)
-///   4096: stack overflow (2.4 MB LightVertex array exceeds thread stack)
-const BDPT_NUM_LIGHT_SUBPATHS: usize = 2048;
+///   2048-> 4096: batched processing (bypasses stack overflow at 4096)
+const BDPT_NUM_LIGHT_SUBPATHS: usize = 4096;
+
+/// Batch size for BDPT vertex processing.
+///
+/// Light subpaths are traced and connected in batches of this size to
+/// keep the stack-allocated LightVertex buffer under ~600 KB (1024 * 590 bytes).
+/// Each batch re-walks the LOS to evaluate connections (cheap: just tau
+/// accumulation), then the buffer is reused for the next batch.
+const BDPT_BATCH_SIZE: usize = 1024;
 
 /// Chord minimum altitude above surface at moderate twilight [m].
 ///
@@ -4116,59 +4126,7 @@ pub fn hybrid_scatter_radiance_alis(
     // At SZA 101-108 this provides additional signal for paths that
     // backward chains struggle to find (lateral transport to sunlit atm).
 
-    // Storage for all light vertices across all subpaths.
-    // Max total: BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES = 2048 * 1 = 2048 vertices.
-    // Each LightVertex is ~590 bytes, so 2048 * 590 = ~1.2 MB on the stack. Acceptable.
-    // 4096 vertices (2.4 MB) causes stack overflow on default 8 MB thread stacks.
-    const MAX_TOTAL_LIGHT_VERTS: usize = 2048; // BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES
-    let dummy_lv = LightVertex {
-        pos: Vec3::new(0.0, 0.0, 0.0),
-        dir_in: Vec3::new(0.0, 0.0, 1.0),
-        shell_idx: 0,
-        hero_weight: 0.0,
-        weight_ratio: [0.0f64; 64],
-        pdf_fwd: 0.0,
-    };
-    let mut all_light_vertices = [dummy_lv; MAX_TOTAL_LIGHT_VERTS];
-    let mut total_light_verts = 0usize;
-
-    if bdpt_active {
-        // Derive light subpath seeds from the current rng_state WITHOUT
-        // advancing it. This is critical: any advance to rng_state shifts
-        // all backward chain seeds, causing regressions due to RNG stream
-        // sensitivity in the heavy-tailed distribution. By using splitmix64
-        // to scramble the current state, we get decorrelated light seeds
-        // while keeping the backward chain sequence identical.
-        let light_base_seed = splitmix64(*rng_state ^ 0xBDFF_BDFF_BDFF_BDFF);
-
-        for subpath_idx in 0..BDPT_NUM_LIGHT_SUBPATHS {
-            let hero_wl = subpath_idx % num_wl;
-            // Derive per-subpath seed via splitmix64 chain from the base seed.
-            let subpath_seed = splitmix64(light_base_seed.wrapping_add(subpath_idx as u64));
-            let mut light_rng = McRng::from_seed(subpath_seed);
-            let mut subpath_verts = [dummy_lv; BDPT_MAX_LIGHT_VERTICES];
-            let n_verts = trace_light_subpath(
-                atm,
-                sun_dir,
-                observer_pos,
-                hero_wl,
-                num_wl,
-                sza_deg_obs,
-                &mut light_rng,
-                &mut subpath_verts,
-                subpath_idx,
-                BDPT_NUM_LIGHT_SUBPATHS,
-            );
-            for v in 0..n_verts {
-                if total_light_verts < MAX_TOTAL_LIGHT_VERTS {
-                    all_light_vertices[total_light_verts] = subpath_verts[v];
-                    total_light_verts += 1;
-                }
-            }
-        }
-    }
-
-    let inv_num_light_subpaths = if bdpt_active && total_light_verts > 0 {
+    let inv_num_light_subpaths = if bdpt_active {
         1.0 / BDPT_NUM_LIGHT_SUBPATHS as f64
     } else {
         0.0
@@ -4306,137 +4264,203 @@ pub fn hybrid_scatter_radiance_alis(
             }
         }
 
-        // --- BDPT connections: connect all light vertices to this LOS step ---
-        //
-        // For each light vertex L, evaluate the connection contribution:
-        //   contrib = eye_weight * light_weight * phase_eye * phase_light * G * T_conn
-        //
-        // Optimizations to avoid expensive transmittance evaluations:
-        // - Skip LOS steps below 10 km (deep troposphere, t_obs negligible)
-        // - Per-connection chord minimum altitude check (SZA-adaptive: 20 km at
-        //   moderate twilight, 5 km at deep twilight where longer chords are needed)
-        // - Skip connections > 3000 km: G = 1/d^2 makes contributions negligible
-        if bdpt_active && total_light_verts > 0 {
-            // Pre-filter: skip LOS steps deep in the troposphere where
-            // observer transmittance is negligible. The per-connection chord
-            // minimum altitude check below handles fine-grained filtering.
-            // Tested 5 km: no measurable improvement, keeping 10 km.
-            if r - surface_radius >= 10_000.0 {
-                for lv_idx in 0..total_light_verts {
-                    let lv = &all_light_vertices[lv_idx];
-
-                    // Connection geometry.
-                    let diff = Vec3::new(
-                        lv.pos.x - scatter_pos.x,
-                        lv.pos.y - scatter_pos.y,
-                        lv.pos.z - scatter_pos.z,
-                    );
-                    let dist_sq = diff.length_sq();
-
-                    // Skip degenerate and very long connections.
-                    // At 3000 km, G = 1/(3e6)^2 = 1.1e-13, negligible.
-                    // Tested 4000 km: no measurable improvement, keeping 3000 km.
-                    if !(1.0..=9.0e12_f64).contains(&dist_sq) {
-                        continue;
-                    }
-
-                    // Per-connection chord minimum altitude check.
-                    // Find the closest approach of the straight-line chord
-                    // (scatter_pos -> lv.pos) to Earth's center.
-                    // Parametric line: P(t) = scatter_pos + t * diff, t in [0,1].
-                    // Closest point to origin at t = -scatter_pos.dot(diff) / |diff|^2.
-                    // If t in (0,1), compute r_min = |P(t)|; reject if below threshold.
-                    // If t outside (0,1), min altitude is at an endpoint (already filtered).
-                    // Threshold is SZA-adaptive: 20 km at moderate twilight (short chords),
-                    // 5 km at deep twilight (long chords need lower stratosphere path).
-                    let dot_sd =
-                        scatter_pos.x * diff.x + scatter_pos.y * diff.y + scatter_pos.z * diff.z;
-                    let t_closest = -dot_sd / dist_sq;
-                    if t_closest > 0.0 && t_closest < 1.0 {
-                        let px = scatter_pos.x + t_closest * diff.x;
-                        let py = scatter_pos.y + t_closest * diff.y;
-                        let pz = scatter_pos.z + t_closest * diff.z;
-                        let r_min_sq = px * px + py * py + pz * pz;
-                        let chord_alt = bdpt_chord_min_alt(sza_deg_obs);
-                        let r_threshold = surface_radius + chord_alt;
-                        if r_min_sq < r_threshold * r_threshold {
-                            continue;
-                        }
-                    }
-
-                    let dist = libm::sqrt(dist_sq);
-                    let connection_dir = diff.scale(1.0 / dist); // eye -> light
-
-                    let g_term = 1.0 / dist_sq;
-
-                    // Phase function at eye vertex.
-                    // Light arrives at E from -connection_dir (from L toward E),
-                    // leaves toward observer via -view_dir.
-                    // cos(scattering angle) = dot(-connection_dir, -view_dir)
-                    //                       = dot(connection_dir, view_dir).
-                    // Align with NEE convention: cos_theta_1 = sun_dir.dot(-view_dir)
-                    // where sun_dir points E->sun. Here connection_dir points E->L,
-                    // so cos_theta_eye = connection_dir.dot(-view_dir) gives the
-                    // angle between the arriving light and the observer direction,
-                    // matching the NEE pattern.
-                    let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
-
-                    // Phase function at light vertex.
-                    // Light was traveling in L.dir_in, scatters toward E.
-                    // Direction from L toward E is -connection_dir.
-                    // cos(scattering angle) = dot(L.dir_in, -connection_dir).
-                    let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
-
-                    // Connection transmittance (all wavelengths).
-                    let t_conn =
-                        transmittance_between_points_spectrum(atm, scatter_pos, lv.pos, num_wl);
-
-                    for w in 0..num_wl {
-                        let optics_eye = &atm.optics[shell_idx][w];
-                        let beta_scat_eye = optics_eye.extinction * optics_eye.ssa;
-                        if beta_scat_eye < 1e-30 || t_conn[w] < 1e-30 {
-                            continue;
-                        }
-
-                        let tau_obs_mid = tau_obs[w] + optics_eye.extinction * ds * 0.5;
-                        let t_obs = libm::exp(-tau_obs_mid);
-                        if t_obs < 1e-30 {
-                            continue;
-                        }
-
-                        let phase_eye = scalar_phase_value(cos_theta_eye, optics_eye);
-                        let optics_light = &atm.optics[lv.shell_idx][w];
-                        let phase_light = scalar_phase_value(cos_theta_light, optics_light);
-
-                        // BDPT connection contribution (additive, no MIS):
-                        //   t_obs * beta_scat * ds  (eye vertex LOS weight)
-                        //   * L.hero_weight * L.wr[w]  (light subpath weight)
-                        //   * phase_eye/(4pi) * phase_light/(4pi)  (scattering at both ends)
-                        //   * G * T_conn  (geometric + transmittance)
-                        //   * 1/N_light_subpaths  (MC average)
-                        let contrib = t_obs
-                            * beta_scat_eye
-                            * ds
-                            * lv.hero_weight
-                            * lv.weight_ratio[w]
-                            * phase_eye
-                            * INV_4PI
-                            * phase_light
-                            * INV_4PI
-                            * g_term
-                            * t_conn[w]
-                            * inv_num_light_subpaths;
-
-                        if contrib.is_finite() {
-                            radiance[w] += contrib;
-                        }
-                    }
-                }
-            } // end BDPT connections
-        }
+        // BDPT connections are now handled in a separate batched pass below.
 
         for w in 0..num_wl {
             tau_obs[w] += atm.optics[shell_idx][w].extinction * ds;
+        }
+    }
+
+    // --- BDPT connections: batched post-processing pass ---
+    //
+    // Light subpaths are traced in batches of BDPT_BATCH_SIZE and their
+    // vertices are connected to each LOS step. This avoids allocating
+    // all vertices simultaneously (which overflows the stack at 4096+
+    // vertices). Each batch re-walks the LOS to compute tau_obs and
+    // evaluate connections. The LOS re-walk is cheap (just extinction
+    // accumulation, no MC chains or shadow rays).
+    //
+    // For each light vertex L, evaluate the connection contribution:
+    //   contrib = eye_weight * light_weight * phase_eye * phase_light * G * T_conn
+    //
+    // Optimizations to avoid expensive transmittance evaluations:
+    // - Skip LOS steps below 10 km (deep troposphere, t_obs negligible)
+    // - Per-connection chord minimum altitude check (SZA-adaptive)
+    // - Skip connections > 3000 km: G = 1/d^2 makes contributions negligible
+    if bdpt_active {
+        // Derive light subpath seeds from the current rng_state WITHOUT
+        // advancing it. This is critical: any advance to rng_state shifts
+        // all backward chain seeds, causing regressions due to RNG stream
+        // sensitivity in the heavy-tailed distribution. By using splitmix64
+        // to scramble the current state, we get decorrelated light seeds
+        // while keeping the backward chain sequence identical.
+        let light_base_seed = splitmix64(*rng_state ^ 0xBDFF_BDFF_BDFF_BDFF);
+
+        let dummy_lv = LightVertex {
+            pos: Vec3::new(0.0, 0.0, 0.0),
+            dir_in: Vec3::new(0.0, 0.0, 1.0),
+            shell_idx: 0,
+            hero_weight: 0.0,
+            weight_ratio: [0.0f64; 64],
+            pdf_fwd: 0.0,
+        };
+
+        // Process subpaths in batches to keep stack usage under ~600 KB.
+        let num_batches = BDPT_NUM_LIGHT_SUBPATHS.div_ceil(BDPT_BATCH_SIZE);
+
+        for batch_idx in 0..num_batches {
+            let batch_start = batch_idx * BDPT_BATCH_SIZE;
+            let batch_end = (batch_start + BDPT_BATCH_SIZE).min(BDPT_NUM_LIGHT_SUBPATHS);
+            let batch_count = batch_end - batch_start;
+
+            // Trace this batch of light subpaths and collect vertices.
+            let mut batch_vertices = [dummy_lv; BDPT_BATCH_SIZE];
+            let mut n_batch_verts = 0usize;
+
+            for subpath_idx in batch_start..batch_end {
+                let hero_wl = subpath_idx % num_wl;
+                let subpath_seed = splitmix64(light_base_seed.wrapping_add(subpath_idx as u64));
+                let mut light_rng = McRng::from_seed(subpath_seed);
+                let mut subpath_verts = [dummy_lv; BDPT_MAX_LIGHT_VERTICES];
+                let n_verts = trace_light_subpath(
+                    atm,
+                    sun_dir,
+                    observer_pos,
+                    hero_wl,
+                    num_wl,
+                    sza_deg_obs,
+                    &mut light_rng,
+                    &mut subpath_verts,
+                    subpath_idx,
+                    BDPT_NUM_LIGHT_SUBPATHS,
+                );
+                for v in 0..n_verts {
+                    if n_batch_verts < batch_count {
+                        batch_vertices[n_batch_verts] = subpath_verts[v];
+                        n_batch_verts += 1;
+                    }
+                }
+            }
+
+            if n_batch_verts == 0 {
+                continue;
+            }
+
+            // Re-walk the LOS to evaluate connections for this batch's vertices.
+            // This is cheap: just extinction accumulation + connection evaluation.
+            let mut tau_obs_bdpt = [0.0f64; 64];
+
+            for step in 0..num_steps {
+                let s = (step as f64 + 0.5) * ds;
+                let scatter_pos = observer_pos + view_dir * s;
+                let r = scatter_pos.length();
+
+                if r > toa_radius || r < surface_radius {
+                    continue;
+                }
+
+                let shell_idx = match atm.shell_index(r) {
+                    Some(idx) => idx,
+                    None => continue,
+                };
+
+                // Check if any wavelength still has observable transmittance.
+                let mut any_visible = false;
+                for w in 0..num_wl {
+                    let tau_mid = tau_obs_bdpt[w] + atm.optics[shell_idx][w].extinction * ds * 0.5;
+                    if libm::exp(-tau_mid) > 1e-30 {
+                        any_visible = true;
+                        break;
+                    }
+                }
+                if !any_visible {
+                    break;
+                }
+
+                // Pre-filter: skip LOS steps deep in the troposphere.
+                if r - surface_radius >= 10_000.0 {
+                    for lv_idx in 0..n_batch_verts {
+                        let lv = &batch_vertices[lv_idx];
+
+                        let diff = Vec3::new(
+                            lv.pos.x - scatter_pos.x,
+                            lv.pos.y - scatter_pos.y,
+                            lv.pos.z - scatter_pos.z,
+                        );
+                        let dist_sq = diff.length_sq();
+
+                        if !(1.0..=9.0e12_f64).contains(&dist_sq) {
+                            continue;
+                        }
+
+                        // Per-connection chord minimum altitude check.
+                        let dot_sd = scatter_pos.x * diff.x
+                            + scatter_pos.y * diff.y
+                            + scatter_pos.z * diff.z;
+                        let t_closest = -dot_sd / dist_sq;
+                        if t_closest > 0.0 && t_closest < 1.0 {
+                            let px = scatter_pos.x + t_closest * diff.x;
+                            let py = scatter_pos.y + t_closest * diff.y;
+                            let pz = scatter_pos.z + t_closest * diff.z;
+                            let r_min_sq = px * px + py * py + pz * pz;
+                            let chord_alt = bdpt_chord_min_alt(sza_deg_obs);
+                            let r_threshold = surface_radius + chord_alt;
+                            if r_min_sq < r_threshold * r_threshold {
+                                continue;
+                            }
+                        }
+
+                        let dist = libm::sqrt(dist_sq);
+                        let connection_dir = diff.scale(1.0 / dist);
+                        let g_term = 1.0 / dist_sq;
+
+                        let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
+                        let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
+
+                        let t_conn =
+                            transmittance_between_points_spectrum(atm, scatter_pos, lv.pos, num_wl);
+
+                        for w in 0..num_wl {
+                            let optics_eye = &atm.optics[shell_idx][w];
+                            let beta_scat_eye = optics_eye.extinction * optics_eye.ssa;
+                            if beta_scat_eye < 1e-30 || t_conn[w] < 1e-30 {
+                                continue;
+                            }
+
+                            let tau_obs_mid = tau_obs_bdpt[w] + optics_eye.extinction * ds * 0.5;
+                            let t_obs = libm::exp(-tau_obs_mid);
+                            if t_obs < 1e-30 {
+                                continue;
+                            }
+
+                            let phase_eye = scalar_phase_value(cos_theta_eye, optics_eye);
+                            let optics_light = &atm.optics[lv.shell_idx][w];
+                            let phase_light = scalar_phase_value(cos_theta_light, optics_light);
+
+                            let contrib = t_obs
+                                * beta_scat_eye
+                                * ds
+                                * lv.hero_weight
+                                * lv.weight_ratio[w]
+                                * phase_eye
+                                * INV_4PI
+                                * phase_light
+                                * INV_4PI
+                                * g_term
+                                * t_conn[w]
+                                * inv_num_light_subpaths;
+
+                            if contrib.is_finite() {
+                                radiance[w] += contrib;
+                            }
+                        }
+                    }
+                }
+
+                for w in 0..num_wl {
+                    tau_obs_bdpt[w] += atm.optics[shell_idx][w].extinction * ds;
+                }
+            }
         }
     }
 
