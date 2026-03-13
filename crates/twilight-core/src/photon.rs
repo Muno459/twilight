@@ -1349,11 +1349,11 @@ struct SplitParticleAlis {
 /// Maximum number of scatter vertices stored per light subpath.
 ///
 /// Set to 1 (single scatter at entry). After the first scatter near the
-/// terminator, subsequent bounces drift the photon toward the sunlit
-/// hemisphere via the entry direction (-sun_dir). The connection distance
-/// filter (3000 km) rejects these distant vertices, wasting compute.
-/// With 1 vertex per subpath, we maximize the number of independent
-/// terminator entry points (subpaths) for better angular coverage.
+/// terminator, subsequent bounces drift the photon deeper into the atmosphere
+/// where connection transmittance drops sharply, adding variance without
+/// proportional signal. With 1 vertex per subpath, we maximize the number
+/// of independent terminator entry points (subpaths) for better angular
+/// coverage. Tested with 2 vertices: regressed SZA 103-108 CV by 50-237%.
 const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 
 /// Number of independent light subpaths traced per call to
