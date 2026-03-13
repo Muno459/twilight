@@ -1362,9 +1362,9 @@ const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 
 /// Number of independent light subpaths traced per call to
 /// `hybrid_scatter_radiance_alis`. With BDPT_MAX_LIGHT_VERTICES=1, each
-/// subpath produces exactly 1 vertex. Testing 1024 subpaths to find
+/// subpath produces exactly 1 vertex. Testing 2048 subpaths to find
 /// diminishing returns point.
-const BDPT_NUM_LIGHT_SUBPATHS: usize = 1024;
+const BDPT_NUM_LIGHT_SUBPATHS: usize = 2048;
 
 /// Chord minimum altitude above surface at moderate twilight [m].
 ///
@@ -4109,9 +4109,9 @@ pub fn hybrid_scatter_radiance_alis(
     // backward chains struggle to find (lateral transport to sunlit atm).
 
     // Storage for all light vertices across all subpaths.
-    // Max total: BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES = 1024 * 1 = 1024 vertices.
-    // Each LightVertex is ~590 bytes, so 1024 * 590 = ~604 KB on the stack. Acceptable.
-    const MAX_TOTAL_LIGHT_VERTS: usize = 1024; // BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES
+    // Max total: BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES = 2048 * 1 = 2048 vertices.
+    // Each LightVertex is ~590 bytes, so 2048 * 590 = ~1.2 MB on the stack. Acceptable.
+    const MAX_TOTAL_LIGHT_VERTS: usize = 2048; // BDPT_NUM_LIGHT_SUBPATHS * BDPT_MAX_LIGHT_VERTICES
     let dummy_lv = LightVertex {
         pos: Vec3::new(0.0, 0.0, 0.0),
         dir_in: Vec3::new(0.0, 0.0, 1.0),
