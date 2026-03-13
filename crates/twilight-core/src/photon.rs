@@ -996,6 +996,8 @@ const DWIVEDI_BETA_MAX: f64 = 3.0;
 ///   SZA 103: d_frac = 17.5% (half-max)
 ///   SZA 105: d_frac = 25.6% (near-full)
 ///   SZA 107: d_frac = 30.8% (near-max)
+/// Tested center=101: no measurable CV change (MIS weight correction
+/// exactly compensates the shifted sampling distribution).
 const DWIVEDI_SZA_CENTER: f64 = 103.0;
 
 /// SZA width for Dwivedi ramp [degrees].
