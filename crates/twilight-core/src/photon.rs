@@ -3588,7 +3588,11 @@ fn trace_secondary_chain_alis(
     };
 
     // Initialize per-wavelength weight ratios: weight_ratio[w] = weight_w / hero_weight.
-    // Corrections for SSA and initial direction sampling (phase function ratio).
+    // Only the initial direction sampling (phase function ratio) differs across
+    // wavelengths here. SSA is handled correctly by:
+    //   - outer integrator: beta_scat = extinction * ssa (per-wavelength)
+    //   - chain: hero_weight *= ssa_hero at each scatter, wr[w] *= ssa_w/ssa_hero
+    // Including ssa_ratio here would double-count the start-shell SSA.
     let mut weight_ratio = [0.0f64; 64];
     let hero_phase_init = if is_phase_branch {
         scalar_phase_value(cos_theta_init, hero_optics)
@@ -3597,17 +3601,12 @@ fn trace_secondary_chain_alis(
     };
     for w in 0..num_wl {
         let optics_w = &atm.optics[start_shell][w];
-        let ssa_ratio = if hero_optics.ssa > 1e-30 {
-            optics_w.ssa / hero_optics.ssa
-        } else {
-            0.0
-        };
         let dir_ratio = if is_phase_branch && hero_phase_init > 1e-30 {
             scalar_phase_value(cos_theta_init, optics_w) / hero_phase_init
         } else {
             1.0
         };
-        weight_ratio[w] = ssa_ratio * dir_ratio;
+        weight_ratio[w] = dir_ratio;
     }
 
     let surface_radius = atm.surface_radius();
