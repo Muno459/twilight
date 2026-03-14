@@ -1413,8 +1413,13 @@ const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 ///   1024-> 2048: SZA 108 CV 1.25 -> 0.98 (-21%)
 ///   2048-> 4096: SZA 106 CV 0.641 -> 0.545 (-15%, batched processing)
 ///   8192: 50-seed SZA 106 0.370->0.262 (-29%) but +45% runtime, 1/sqrt(N)
-///         diminishing returns. Not worth the cost.
+///         diminishing returns. Now SZA-conditional: 8192 for SZA > 106.
 const BDPT_NUM_LIGHT_SUBPATHS: usize = 4096;
+
+/// Increased subpath count for extreme deep twilight (SZA > 106).
+/// At these SZAs, BDPT handles ~98% of the signal (w_bdpt near 1.0),
+/// so doubling subpaths directly reduces the dominant variance source.
+const BDPT_NUM_LIGHT_SUBPATHS_DEEP: usize = 8192;
 
 /// Batch size for BDPT vertex processing.
 ///
@@ -4252,10 +4257,17 @@ pub fn hybrid_scatter_radiance_alis(
         0.0
     };
     let w_back = 1.0 - w_bdpt;
-    // backward chains struggle to find (lateral transport to sunlit atm).
+
+    // SZA-conditional subpath count: double at extreme deep twilight
+    // where BDPT handles ~98% of the signal.
+    let num_light_subpaths = if bdpt_active && sza_deg_obs > VSPG_SZA_FULL {
+        BDPT_NUM_LIGHT_SUBPATHS_DEEP
+    } else {
+        BDPT_NUM_LIGHT_SUBPATHS
+    };
 
     let inv_num_light_subpaths = if bdpt_active {
-        1.0 / BDPT_NUM_LIGHT_SUBPATHS as f64
+        1.0 / num_light_subpaths as f64
     } else {
         0.0
     };
@@ -4286,7 +4298,7 @@ pub fn hybrid_scatter_radiance_alis(
         };
 
         // First pass: trace all light subpaths and train the guide.
-        for subpath_idx in 0..BDPT_NUM_LIGHT_SUBPATHS {
+        for subpath_idx in 0..num_light_subpaths {
             let hero_wl = subpath_idx % num_wl;
             let subpath_seed = splitmix64(light_base_seed.wrapping_add(subpath_idx as u64));
             let mut light_rng = McRng::from_seed(subpath_seed);
@@ -4301,7 +4313,7 @@ pub fn hybrid_scatter_radiance_alis(
                 &mut light_rng,
                 &mut subpath_verts,
                 subpath_idx,
-                BDPT_NUM_LIGHT_SUBPATHS,
+                num_light_subpaths,
             );
             for v in 0..n_verts {
                 let lv = &subpath_verts[v];
@@ -4499,11 +4511,11 @@ pub fn hybrid_scatter_radiance_alis(
         };
 
         // Process subpaths in batches to keep stack usage under ~600 KB.
-        let num_batches = BDPT_NUM_LIGHT_SUBPATHS.div_ceil(BDPT_BATCH_SIZE);
+        let num_batches = num_light_subpaths.div_ceil(BDPT_BATCH_SIZE);
 
         for batch_idx in 0..num_batches {
             let batch_start = batch_idx * BDPT_BATCH_SIZE;
-            let batch_end = (batch_start + BDPT_BATCH_SIZE).min(BDPT_NUM_LIGHT_SUBPATHS);
+            let batch_end = (batch_start + BDPT_BATCH_SIZE).min(num_light_subpaths);
             let _batch_count = batch_end - batch_start;
 
             // Trace this batch of light subpaths and collect vertices.
@@ -4528,7 +4540,7 @@ pub fn hybrid_scatter_radiance_alis(
                     &mut light_rng,
                     &mut subpath_verts,
                     subpath_idx,
-                    BDPT_NUM_LIGHT_SUBPATHS,
+                    num_light_subpaths,
                 );
                 for v in 0..n_verts {
                     if n_batch_verts < BATCH_VERT_CAP {
