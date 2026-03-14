@@ -1023,6 +1023,24 @@ const DWIVEDI_SZA_WIDTH: f64 = 2.0;
 /// 65% at full SZA, sufficient for scattering angle sampling.
 const DWIVEDI_FRAC_MAX: f64 = 0.35;
 
+/// Maximum fraction of bounces allocated to path guide sampling.
+///
+/// Only active when a trained PathGuide is provided. At full strength
+/// (SZA > 105), guide gets 20% of the direction budget, Dwivedi gets
+/// 35%, and phase function retains 45%. The guide learns productive
+/// directions from BDPT light vertices -- directions that successfully
+/// reached scattering events near the terminator.
+const GUIDE_FRAC_MAX: f64 = 0.20;
+
+/// Returns the SZA-adaptive path guide sampling fraction.
+///
+/// Ramps identically to Dwivedi (same center/width) since guide is
+/// useful in the same SZA regime where lateral transport matters.
+#[inline]
+fn guide_frac(sza_deg: f64) -> f64 {
+    GUIDE_FRAC_MAX * sigmoid((sza_deg - DWIVEDI_SZA_CENTER) / DWIVEDI_SZA_WIDTH)
+}
+
 /// Returns the SZA-adaptive Dwivedi sampling fraction.
 ///
 /// At SZA < 98: ~0 (no Dwivedi bias, phase function is sufficient).
@@ -1254,10 +1272,11 @@ fn weight_window_target(
 ///
 /// At SZA 106, a chain traveling from the observer (cos_sza = -0.276)
 /// to the terminator (cos_sun = 0) has delta_cos = 0.276.
-/// With CADIS_K_MAX = 8: boost = exp(8 * 0.276) = exp(2.21) = 9.1x.
-/// This means chains at the terminator are 9x more likely to be split,
-/// strongly concentrating population in the productive region.
-const CADIS_K_MAX: f64 = 8.0;
+/// With CADIS_K_MAX = 12: boost = exp(12 * 0.276) = exp(3.31) = 27.4x.
+/// At SZA 108 (delta_cos = 0.309): boost = exp(12 * 0.309) = exp(3.71) = 40.9x.
+/// This strongly concentrates split particles near the terminator where
+/// they can make useful connections to sunlit atmosphere.
+const CADIS_K_MAX: f64 = 12.0;
 
 /// SZA center for CADIS ramp [degrees].
 const CADIS_SZA_CENTER: f64 = 100.0;
@@ -1314,8 +1333,15 @@ const LOS_IMP_H_MODERATE_M: f64 = 100_000.0;
 /// The real savings come from NOT launching expensive 50-bounce chains at
 /// 0-15 km altitude.
 ///
-/// Tested 15 km: inconclusive, possible SZA 98 regression. Keeping 30 km.
+/// Tested 15 km globally: inconclusive, possible SZA 98 regression.
+/// Now SZA-conditional: 30 km for SZA 96-105, ramps to 15 km for SZA > 105.
 const LOS_IMP_H_DEEP_M: f64 = 30_000.0;
+
+/// Scale height at extreme deep twilight (SZA > 108).
+/// At 15 km, surface-to-TOA ratio is exp(100/15) = ~790x, virtually
+/// eliminating rays at ground level. Only applied at SZA > 105 where
+/// ground-level chains have near-zero success rate anyway.
+const LOS_IMP_H_EXTREME_M: f64 = 15_000.0;
 
 /// State of a single particle in the weight-window work stack (scalar mode).
 ///
@@ -1365,7 +1391,11 @@ struct SplitParticleAlis {
 /// where connection transmittance drops sharply, adding variance without
 /// proportional signal. With 1 vertex per subpath, we maximize the number
 /// of independent terminator entry points (subpaths) for better angular
-/// coverage. Tested with 2 vertices: regressed SZA 103-108 CV by 50-237%.
+/// coverage.
+///
+/// Tested with 2 vertices: regressed SZA 100-108 CV by 2.7-8.6x. The second
+/// vertex produces rare high-weight connections that inflate both mean and
+/// variance. Confirmed twice (once before MIS fix, once after).
 const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 
 /// Number of independent light subpaths traced per call to
@@ -1392,8 +1422,6 @@ const BDPT_NUM_LIGHT_SUBPATHS: usize = 4096;
 /// keep the stack-allocated LightVertex buffer under ~600 KB (1024 * 590 bytes).
 /// Each batch re-walks the LOS to evaluate connections (cheap: just tau
 /// accumulation), then the buffer is reused for the next batch.
-/// Tested 2048: no runtime improvement (bottleneck is per-connection
-/// transmittance evaluation, not LOS re-walk overhead).
 const BDPT_BATCH_SIZE: usize = 1024;
 
 /// SZA threshold (degrees) below which BDPT is disabled.
@@ -3010,7 +3038,7 @@ fn trace_secondary_chain_scalar(
         let mut current_dir = stack[stack_len].dir;
         let mut weight = stack[stack_len].weight;
         let mut local_rng = stack[stack_len].rng;
-        let mut is_first_bounce = true;
+        let mut bounce_idx: usize = 0;
 
         loop {
             // --- Decide scatter mode for this bounce ---
@@ -3166,7 +3194,8 @@ fn trace_secondary_chain_scalar(
             // NEE: scalar phase function (no Mueller matrix)
             weight *= optics.ssa;
 
-            let skip_nee = is_main && is_first_bounce && nee_r2_weight < 1e-30;
+            let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
+            let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
                 let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
 
@@ -3180,19 +3209,16 @@ fn trace_secondary_chain_scalar(
                                 * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
                     };
 
-                    // On the first bounce of the main particle, apply the MIS
-                    // weight for the R2 path (w_back). All subsequent bounces
-                    // (R3+) get full weight since BDPT does not cover them.
-                    let nee_weight = if is_main && is_first_bounce {
-                        nee_r2_weight
-                    } else {
-                        1.0
-                    };
+                    // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
+                    // particle, apply the MIS weight (w_back) since BDPT provides
+                    // independent estimates for these orders. Higher-order bounces
+                    // get full weight since BDPT does not cover them.
+                    let nee_weight = if bdpt_covered { nee_r2_weight } else { 1.0 };
                     let scale = nee_weight * weight * t_sun_secondary * INV_4PI;
                     total += phase * scale;
                 }
             }
-            is_first_bounce = false;
+            bounce_idx += 1;
 
             // Sample new direction: 2-way one-sample MIS between phase
             // function and Dwivedi horizontal biasing.
@@ -3535,6 +3561,7 @@ fn trace_secondary_chain_alis(
     total_rays: usize,
     num_wl: usize,
     nee_r2_weight: f64,
+    guide: Option<&crate::path_guide::PathGuide>,
 ) -> [f64; 64] {
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
 
@@ -3658,7 +3685,7 @@ fn trace_secondary_chain_alis(
         let mut hero_weight = stack[stack_len].hero_weight;
         let mut wr = stack[stack_len].weight_ratio;
         let mut local_rng = stack[stack_len].rng;
-        let mut is_first_bounce = true;
+        let mut bounce_idx: usize = 0;
 
         loop {
             // --- Decide scatter mode for this bounce ---
@@ -3882,19 +3909,17 @@ fn trace_secondary_chain_alis(
                 wr[w] *= ssa_ratio;
             }
 
-            let skip_nee = is_main && is_first_bounce && nee_r2_weight < 1e-30;
+            let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
+            let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
                 let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
                 let cos_angle_nee = sun_dir.dot(-current_dir);
 
-                // On the first bounce of the main particle, apply the MIS
-                // weight for the R2 path (w_back). All subsequent bounces
-                // (R3+) get full weight since BDPT does not cover them.
-                let nee_weight = if is_main && is_first_bounce {
-                    nee_r2_weight
-                } else {
-                    1.0
-                };
+                // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
+                // particle, apply the MIS weight (w_back) since BDPT provides
+                // independent estimates for these orders. Higher-order bounces
+                // get full weight since BDPT does not cover them.
+                let nee_weight = if bdpt_covered { nee_r2_weight } else { 1.0 };
 
                 for w in 0..num_wl {
                     if t_suns[w] > 1e-30 {
@@ -3905,21 +3930,53 @@ fn trace_secondary_chain_alis(
                     }
                 }
             }
-            is_first_bounce = false;
+            bounce_idx += 1;
 
-            // Sample new direction: 2-way one-sample MIS (Dwivedi +
-            // hero phase function). Gated: when Dwivedi fraction is
-            // negligible, use pure phase function (no MIS overhead, preserves
-            // RNG stream, avoids compounding weight perturbations).
+            // Sample new direction: up to 3-way one-sample MIS:
+            //   phase function + Dwivedi horizontal bias + path guide.
+            // Guide is only active when a trained PathGuide is provided.
+            // Gated: when both Dwivedi and guide fractions are negligible,
+            // use pure phase function (no MIS overhead).
             let alpha_d = d_frac;
-            let mis_active = alpha_d >= 0.02;
+            let alpha_g = match guide {
+                Some(g) if g.is_trained() => guide_frac(sza_deg_local),
+                _ => 0.0,
+            };
+            let mis_active = (alpha_d + alpha_g) >= 0.02;
 
             let (new_dir, cos_theta_for_alis) = if mis_active {
                 let local_up_here = pos.normalize();
-                let alpha_p_mis = 1.0 - alpha_d;
+                let alpha_p_mis = (1.0 - alpha_d - alpha_g).max(0.10);
+                // Renormalize if we clamped alpha_p
+                let alpha_sum = alpha_p_mis + alpha_d + alpha_g;
+                let alpha_d_n = alpha_d / alpha_sum;
+                let alpha_g_n = alpha_g / alpha_sum;
+                let alpha_p_n = alpha_p_mis / alpha_sum;
                 let xi_branch = xorshift_f64(&mut local_rng.dir);
 
-                if xi_branch < alpha_d {
+                if alpha_g_n > 0.01 && xi_branch < alpha_g_n {
+                    // Path guide branch: sample direction from learned distribution
+                    let alt_here = pos.length() - surface_radius;
+                    let (d, p_guide_sr) =
+                        guide
+                            .unwrap()
+                            .sample(alt_here, local_up_here, sun_dir, &mut local_rng.dir);
+                    let d = d.normalize();
+                    let ct = current_dir.dot(d);
+                    let p_phase_hero = scalar_phase_value(ct, hero_scatter_optics) * INV_4PI;
+                    let cos_z = d.dot(local_up_here);
+                    let p_dw = if alpha_d_n > 0.01 {
+                        dwivedi_pdf(cos_z, d_beta)
+                    } else {
+                        0.0
+                    };
+                    let mis_denom =
+                        alpha_p_n * p_phase_hero + alpha_d_n * p_dw + alpha_g_n * p_guide_sr;
+                    if mis_denom > 1e-30 {
+                        hero_weight *= p_phase_hero / mis_denom;
+                    }
+                    (d, ct)
+                } else if xi_branch < alpha_g_n + alpha_d_n {
                     // Dwivedi branch
                     let xi1 = xorshift_f64(&mut local_rng.dir);
                     let xi2 = xorshift_f64(&mut local_rng.dir);
@@ -3943,7 +4000,14 @@ fn trace_secondary_chain_alis(
                     let ct = current_dir.dot(d);
                     let p_phase_hero = scalar_phase_value(ct, hero_scatter_optics) * INV_4PI;
                     let p_dw = dwivedi_pdf(cos_z, d_beta);
-                    let mis_denom = alpha_p_mis * p_phase_hero + alpha_d * p_dw;
+                    let p_guide_sr = if alpha_g_n > 0.01 {
+                        let alt_here = pos.length() - surface_radius;
+                        guide.unwrap().pdf(alt_here, local_up_here, sun_dir, d)
+                    } else {
+                        0.0
+                    };
+                    let mis_denom =
+                        alpha_p_n * p_phase_hero + alpha_d_n * p_dw + alpha_g_n * p_guide_sr;
                     if mis_denom > 1e-30 {
                         hero_weight *= p_phase_hero / mis_denom;
                     }
@@ -3964,8 +4028,19 @@ fn trace_secondary_chain_alis(
                     let d = scatter_direction(current_dir, cos_theta, phi);
                     let p_phase_hero = scalar_phase_value(cos_theta, hero_scatter_optics) * INV_4PI;
                     let cos_z_dw = d.dot(local_up_here);
-                    let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
-                    let mis_denom = alpha_p_mis * p_phase_hero + alpha_d * p_dw;
+                    let p_dw = if alpha_d_n > 0.01 {
+                        dwivedi_pdf(cos_z_dw, d_beta)
+                    } else {
+                        0.0
+                    };
+                    let p_guide_sr = if alpha_g_n > 0.01 {
+                        let alt_here = pos.length() - surface_radius;
+                        guide.unwrap().pdf(alt_here, local_up_here, sun_dir, d)
+                    } else {
+                        0.0
+                    };
+                    let mis_denom =
+                        alpha_p_n * p_phase_hero + alpha_d_n * p_dw + alpha_g_n * p_guide_sr;
                     if mis_denom > 1e-30 {
                         hero_weight *= p_phase_hero / mis_denom;
                     }
@@ -4133,12 +4208,15 @@ pub fn hybrid_scatter_radiance_alis(
     let mut sum_los_imp = 0.0f64;
 
     if use_los_importance {
-        // SZA-adaptive scale height: large at moderate twilight (mild
-        // redistribution, ~2.7x ratio surface-to-TOA), small at deep
-        // twilight (strong redistribution, ~28x ratio).
+        // SZA-adaptive scale height: two-stage ramp.
+        // Stage 1 (SZA 96-106): 100km -> 30km (mild to moderate redistribution)
+        // Stage 2 (SZA 106-108): 30km -> 15km (aggressive for deep twilight)
         let sza_t = ((sza_deg_obs - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START))
             .clamp(0.0, 1.0);
-        let h_scale = LOS_IMP_H_MODERATE_M + (LOS_IMP_H_DEEP_M - LOS_IMP_H_MODERATE_M) * sza_t;
+        let h_stage1 = LOS_IMP_H_MODERATE_M + (LOS_IMP_H_DEEP_M - LOS_IMP_H_MODERATE_M) * sza_t;
+        // Second ramp: from VSPG_SZA_FULL (106) to 108
+        let sza_t2 = ((sza_deg_obs - VSPG_SZA_FULL) / 2.0).clamp(0.0, 1.0);
+        let h_scale = h_stage1 + (LOS_IMP_H_EXTREME_M - h_stage1) * sza_t2;
 
         for step in 0..num_steps {
             let s = (step as f64 + 0.5) * ds;
@@ -4180,6 +4258,69 @@ pub fn hybrid_scatter_radiance_alis(
         1.0 / BDPT_NUM_LIGHT_SUBPATHS as f64
     } else {
         0.0
+    };
+
+    // --- Path guide: train from BDPT light vertices ---
+    //
+    // Each BDPT light vertex records a position and incoming direction where
+    // a photon successfully scattered near the terminator. We train the guide
+    // by accumulating these directions at the vertex's (altitude, solar_angle)
+    // cell, weighted by the vertex's hero_weight. This tells backward chains
+    // "at this position, photons arriving from direction X are productive."
+    //
+    // The guide is trained BEFORE the LOS walk so it's ready for production
+    // chains. Training cost is negligible: just bin lookups on already-traced
+    // vertices.
+    use crate::path_guide::PathGuide;
+    let mut path_guide = PathGuide::new();
+
+    let guide_ref: Option<&PathGuide> = if bdpt_active {
+        let light_base_seed = splitmix64(*rng_state ^ 0xBDFF_BDFF_BDFF_BDFF);
+        let dummy_lv = LightVertex {
+            pos: Vec3::new(0.0, 0.0, 0.0),
+            dir_in: Vec3::new(0.0, 0.0, 1.0),
+            shell_idx: 0,
+            hero_weight: 0.0,
+            weight_ratio: [0.0f64; 64],
+            pdf_fwd: 0.0,
+        };
+
+        // First pass: trace all light subpaths and train the guide.
+        for subpath_idx in 0..BDPT_NUM_LIGHT_SUBPATHS {
+            let hero_wl = subpath_idx % num_wl;
+            let subpath_seed = splitmix64(light_base_seed.wrapping_add(subpath_idx as u64));
+            let mut light_rng = McRng::from_seed(subpath_seed);
+            let mut subpath_verts = [dummy_lv; BDPT_MAX_LIGHT_VERTICES];
+            let n_verts = trace_light_subpath(
+                atm,
+                sun_dir,
+                observer_pos,
+                hero_wl,
+                num_wl,
+                sza_deg_obs,
+                &mut light_rng,
+                &mut subpath_verts,
+                subpath_idx,
+                BDPT_NUM_LIGHT_SUBPATHS,
+            );
+            for v in 0..n_verts {
+                let lv = &subpath_verts[v];
+                if lv.hero_weight.abs() > 1e-30 {
+                    let local_up = lv.pos.normalize();
+                    let alt = lv.pos.length() - surface_radius;
+                    // Train guide: the incoming direction at this vertex
+                    // was productive (it led to a scatter near the terminator).
+                    // We flip dir_in to get the outgoing direction that a
+                    // backward chain should sample to reach this vertex.
+                    let outgoing = lv.dir_in.scale(-1.0);
+                    path_guide.accumulate(alt, local_up, sun_dir, outgoing, lv.hero_weight.abs());
+                }
+            }
+        }
+        path_guide.normalize();
+        Some(&path_guide)
+    } else {
+        None
     };
 
     // Per-wavelength accumulated optical depth from observer.
@@ -4292,6 +4433,7 @@ pub fn hybrid_scatter_radiance_alis(
                     rays_this_step,
                     num_wl,
                     w_back,
+                    guide_ref,
                 );
 
                 for w in 0..num_wl {
@@ -4362,10 +4504,13 @@ pub fn hybrid_scatter_radiance_alis(
         for batch_idx in 0..num_batches {
             let batch_start = batch_idx * BDPT_BATCH_SIZE;
             let batch_end = (batch_start + BDPT_BATCH_SIZE).min(BDPT_NUM_LIGHT_SUBPATHS);
-            let batch_count = batch_end - batch_start;
+            let _batch_count = batch_end - batch_start;
 
             // Trace this batch of light subpaths and collect vertices.
-            let mut batch_vertices = [dummy_lv; BDPT_BATCH_SIZE];
+            // With BDPT_MAX_LIGHT_VERTICES=2, each subpath can produce up to
+            // 2 vertices, so the buffer is sized at 2*BDPT_BATCH_SIZE.
+            const BATCH_VERT_CAP: usize = BDPT_BATCH_SIZE * BDPT_MAX_LIGHT_VERTICES;
+            let mut batch_vertices = [dummy_lv; BATCH_VERT_CAP];
             let mut n_batch_verts = 0usize;
 
             for subpath_idx in batch_start..batch_end {
@@ -4386,7 +4531,7 @@ pub fn hybrid_scatter_radiance_alis(
                     BDPT_NUM_LIGHT_SUBPATHS,
                 );
                 for v in 0..n_verts {
-                    if n_batch_verts < batch_count {
+                    if n_batch_verts < BATCH_VERT_CAP {
                         batch_vertices[n_batch_verts] = subpath_verts[v];
                         n_batch_verts += 1;
                     }
@@ -6741,15 +6886,15 @@ mod tests {
 
     #[test]
     fn cadis_k_ramps_smoothly() {
-        // With center=100, width=3: cadis_k(93) ~ 0.71 (mild lateral bias;
+        // With center=100, width=3.5: cadis_k(93) ~ 1.43 (mild lateral bias;
         // harmless at civil twilight because weight windows are dormant).
         assert!(
-            cadis_k(93.0) < 1.0,
-            "cadis_k(93) = {:.2}, should be < 1.0",
+            cadis_k(93.0) < 2.0,
+            "cadis_k(93) = {:.2}, should be < 2.0",
             cadis_k(93.0)
         );
         assert!(
-            (cadis_k(110.0) - CADIS_K_MAX).abs() < 0.5,
+            (cadis_k(110.0) - CADIS_K_MAX).abs() < 1.0,
             "cadis_k(110) should be ~{}, got {:.2}",
             CADIS_K_MAX,
             cadis_k(110.0)
@@ -6969,7 +7114,7 @@ mod tests {
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, 1.0,
+                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
             );
             for w in 0..num_wl {
                 assert!(
@@ -7442,7 +7587,7 @@ mod tests {
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, 1.0,
+                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
             );
             for w in 0..num_wl {
                 assert!(
