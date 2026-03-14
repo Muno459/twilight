@@ -1254,10 +1254,11 @@ fn weight_window_target(
 ///
 /// At SZA 106, a chain traveling from the observer (cos_sza = -0.276)
 /// to the terminator (cos_sun = 0) has delta_cos = 0.276.
-/// With CADIS_K_MAX = 8: boost = exp(8 * 0.276) = exp(2.21) = 9.1x.
-/// This means chains at the terminator are 9x more likely to be split,
-/// strongly concentrating population in the productive region.
-const CADIS_K_MAX: f64 = 8.0;
+/// With CADIS_K_MAX = 12: boost = exp(12 * 0.276) = exp(3.31) = 27.4x.
+/// At SZA 108 (delta_cos = 0.309): boost = exp(12 * 0.309) = exp(3.71) = 40.9x.
+/// This strongly concentrates split particles near the terminator where
+/// they can make useful connections to sunlit atmosphere.
+const CADIS_K_MAX: f64 = 12.0;
 
 /// SZA center for CADIS ramp [degrees].
 const CADIS_SZA_CENTER: f64 = 100.0;
@@ -6742,15 +6743,15 @@ mod tests {
 
     #[test]
     fn cadis_k_ramps_smoothly() {
-        // With center=100, width=3: cadis_k(93) ~ 0.71 (mild lateral bias;
+        // With center=100, width=3.5: cadis_k(93) ~ 1.43 (mild lateral bias;
         // harmless at civil twilight because weight windows are dormant).
         assert!(
-            cadis_k(93.0) < 1.0,
-            "cadis_k(93) = {:.2}, should be < 1.0",
+            cadis_k(93.0) < 2.0,
+            "cadis_k(93) = {:.2}, should be < 2.0",
             cadis_k(93.0)
         );
         assert!(
-            (cadis_k(110.0) - CADIS_K_MAX).abs() < 0.5,
+            (cadis_k(110.0) - CADIS_K_MAX).abs() < 1.0,
             "cadis_k(110) should be ~{}, got {:.2}",
             CADIS_K_MAX,
             cadis_k(110.0)
