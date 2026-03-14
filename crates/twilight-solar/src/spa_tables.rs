@@ -3,6 +3,10 @@
 //! These tables are from the NREL Solar Position Algorithm technical report
 //! (Reda & Andreas, 2003, NREL/TP-560-34302), which uses a subset of the
 //! VSOP87 theory by Bretagnon and Francou (1988).
+//!
+//! Values like 3.142 and 3.14 are VSOP87 phase coefficients (B terms),
+//! not approximations of PI.
+#![allow(clippy::approx_constant)]
 
 /// Each periodic term has three coefficients: (A, B, C)
 /// Used in the sum: A * cos(B + C * JCE) for longitude/latitude/radius

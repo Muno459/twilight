@@ -3,7 +3,7 @@ name = "twilight-solar"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "NREL Solar Position Algorithm (SPA) implementation"
+description = "Solar position: NREL SPA + JPL DE440 ephemeris backend"
 
 [dependencies]
 libm = { workspace = true }

@@ -6,6 +6,10 @@ members = [
     "crates/twilight-data",
     "crates/twilight-cpu",
     "crates/twilight-threshold",
+    "crates/twilight-weather",
+    "crates/twilight-terrain",
+    "crates/twilight-skyglow",
+    "crates/twilight-gpu",
     "crates/twilight-cli",
     "crates/twilight-ffi",
 ]
@@ -23,5 +27,15 @@ twilight-data = { path = "crates/twilight-data" }
 twilight-cpu = { path = "crates/twilight-cpu" }
 twilight-threshold = { path = "crates/twilight-threshold" }
 twilight-cli = { path = "crates/twilight-cli" }
+twilight-weather = { path = "crates/twilight-weather" }
+twilight-terrain = { path = "crates/twilight-terrain" }
+twilight-skyglow = { path = "crates/twilight-skyglow" }
+twilight-gpu = { path = "crates/twilight-gpu" }
 twilight-ffi = { path = "crates/twilight-ffi" }
 libm = "0.2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"

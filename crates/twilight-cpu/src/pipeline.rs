@@ -5,20 +5,31 @@
 //! the spectral threshold model.
 //!
 //! Pipeline:
-//! 1. SPA: compute solar position -> get declination, azimuth at sunset
-//! 2. SPA: find sunset/sunrise times via zenith crossing
-//! 3. SPA: check maximum SZA to detect persistent twilight
+//! 1. Solar engine: compute solar position -> get declination, azimuth at sunset
+//! 2. Solar engine: find sunset/sunrise times via zenith crossing
+//! 3. Solar engine: check maximum SZA to detect persistent twilight
 //! 4. MCRT Pass 1: coarse scan (2° steps) to locate threshold regions
 //! 5. MCRT Pass 2: fine scan (0.1° steps) around each crossing
 //! 6. Threshold: compute luminance, classify twilight, find crossings
-//! 7. SPA: convert threshold SZA -> clock time via binary search
+//! 7. Solar engine: convert threshold SZA -> clock time via binary search
+//!
+//! The solar engine uses JPL DE440 ephemeris when a BSP file path is provided,
+//! falling back to NREL SPA otherwise. DE440 provides ~1000x more precise
+//! solar positions but requires the ~114 MB data file.
 
+use twilight_data::aerosol::{self, AerosolProperties, AerosolType};
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
+use twilight_data::cloud::{self, CloudProperties, CloudType};
+
+use twilight_skyglow::SkyglowResult;
+use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
+use twilight_terrain::horizon;
+use twilight_terrain::HorizonProfile;
 use twilight_threshold::threshold::{self, ThresholdConfig, TwilightAnalysis};
 
-use crate::simulation::{self, SimulationConfig, SpectralResult};
+use crate::simulation::{self, ScatteringMode, SimulationConfig, SpectralResult};
 
 /// Input for the prayer time pipeline.
 #[derive(Debug, Clone)]
@@ -44,8 +55,42 @@ pub struct PrayerTimeInput {
     /// SZA scan resolution (degrees) for coarse pass.
     /// Default: 0.5
     pub sza_step: f64,
+    /// Aerosol type. None for clear sky.
+    pub aerosol_type: Option<AerosolType>,
+    /// Cloud type. None for clear sky.
+    pub cloud_type: Option<CloudType>,
+    /// Custom aerosol properties (overrides aerosol_type when set).
+    /// Used by the weather API integration to pass measured AOD values.
+    pub custom_aerosol: Option<AerosolProperties>,
+    /// Custom cloud properties (overrides cloud_type when set).
+    /// Used by the weather API integration to pass derived cloud params.
+    pub custom_cloud: Option<CloudProperties>,
     /// Threshold configuration
     pub threshold_config: ThresholdConfig,
+    /// Path to DE440 BSP file. When provided, the pipeline uses JPL DE440
+    /// as the primary solar position engine instead of SPA.
+    pub de440_path: Option<String>,
+    /// Scattering mode: single (deterministic) or multiple (Monte Carlo).
+    pub scattering_mode: ScatteringMode,
+    /// Number of photons per wavelength for MC mode. Ignored in single mode.
+    pub photons_per_wavelength: usize,
+    /// Horizon profile from terrain masking. When present, sunrise/sunset SZA
+    /// is adjusted based on terrain obstruction at the sun's azimuth.
+    pub horizon_profile: Option<HorizonProfile>,
+    /// Light pollution skyglow result. When present, the artificial spectral
+    /// radiance is added to the MCRT-computed natural twilight radiance before
+    /// threshold analysis, shifting Fajr/Isha times.
+    pub skyglow: Option<SkyglowResult>,
+    /// Override total column O3 (Dobson Units). When set, the standard
+    /// atmosphere O3 profile is scaled to match this total column.
+    /// Typical range: 220-450 DU.
+    pub o3_column_du: Option<f64>,
+    /// Override surface NO2 density (molecules/m^3). When set, the standard
+    /// atmosphere NO2 profile is scaled so the surface value matches.
+    pub no2_surface_density: Option<f64>,
+    /// Enable full Stokes [I,Q,U,V] polarization tracking (default: true).
+    /// When false (`--fast` mode), uses scalar phase function only.
+    pub polarized: bool,
 }
 
 impl Default for PrayerTimeInput {
@@ -61,9 +106,30 @@ impl Default for PrayerTimeInput {
             delta_t: 69.184,
             surface_albedo: 0.15,
             sza_step: 0.5,
+            aerosol_type: None,
+            cloud_type: None,
+            custom_aerosol: None,
+            custom_cloud: None,
             threshold_config: ThresholdConfig::default(),
+            de440_path: None,
+            scattering_mode: ScatteringMode::Single,
+            photons_per_wavelength: 10_000,
+            horizon_profile: None,
+            skyglow: None,
+            o3_column_du: None,
+            no2_surface_density: None,
+            polarized: true,
         }
     }
+}
+
+/// Which solar position engine was used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EphemerisUsed {
+    /// NREL Solar Position Algorithm (analytical, always available)
+    Spa,
+    /// JPL DE440 planetary ephemeris (requires BSP file)
+    De440,
 }
 
 /// Output of the prayer time pipeline.
@@ -101,7 +167,218 @@ pub struct PrayerTimeOutput {
     pub spectral_results: Vec<SpectralResult>,
     /// Computation time in milliseconds
     pub computation_time_ms: u64,
+    /// Which solar position engine was used
+    pub ephemeris: EphemerisUsed,
+    /// Horizon elevation angle at sunrise azimuth (degrees). None if no terrain.
+    pub sunrise_horizon_deg: Option<f64>,
+    /// Horizon elevation angle at sunset azimuth (degrees). None if no terrain.
+    pub sunset_horizon_deg: Option<f64>,
+    /// Effective sunrise SZA after terrain adjustment (degrees). None if no terrain.
+    pub sunrise_sza_effective: Option<f64>,
+    /// Effective sunset SZA after terrain adjustment (degrees). None if no terrain.
+    pub sunset_sza_effective: Option<f64>,
+    /// Terrain source name (e.g., "Copernicus DEM GLO-30 (30m)")
+    pub terrain_source: Option<String>,
+    /// Artificial sky brightness at zenith (mcd/m^2). None if no skyglow model.
+    pub skyglow_zenith_mcd: Option<f64>,
+    /// Effective Bortle class (1-9). None if no skyglow model.
+    pub skyglow_bortle: Option<u8>,
+    /// Estimated prayer time shift due to light pollution (minutes).
+    pub skyglow_shift_minutes: Option<f64>,
 }
+
+// ── Solar position engine abstraction ──────────────────────────────
+
+/// Internal solar engine that dispatches between DE440 and SPA.
+///
+/// DE440 is used when available (primary). SPA is the fallback.
+/// Both provide the same interface: zenith at a given hour, and
+/// bisection search for zenith crossings.
+struct SolarEngine {
+    de440: Option<De440>,
+    spa_input: SpaInput,
+}
+
+impl SolarEngine {
+    fn new(input: &PrayerTimeInput) -> (Self, EphemerisUsed) {
+        let spa_input = SpaInput {
+            year: input.year,
+            month: input.month,
+            day: input.day,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            timezone: input.timezone,
+            latitude: input.latitude,
+            longitude: input.longitude,
+            elevation: input.elevation,
+            pressure: 1013.25,
+            temperature: 15.0,
+            delta_t: input.delta_t,
+            slope: 0.0,
+            azm_rotation: 0.0,
+            atmos_refract: 0.5667,
+        };
+
+        // Try to open DE440 if path is provided
+        let (de440, ephemeris) = match &input.de440_path {
+            Some(path) => match De440::open(path) {
+                Ok(de) => (Some(de), EphemerisUsed::De440),
+                Err(_) => (None, EphemerisUsed::Spa),
+            },
+            None => (None, EphemerisUsed::Spa),
+        };
+
+        (SolarEngine { de440, spa_input }, ephemeris)
+    }
+
+    /// Get solar zenith angle at a fractional hour (local time).
+    fn zenith_at_hour(&mut self, fractional_hour: f64) -> Option<f64> {
+        if let Some(ref mut de) = self.de440 {
+            // Convert local fractional hour to UTC
+            let utc_hour = fractional_hour - self.spa_input.timezone;
+            de.zenith_at_hour(
+                self.spa_input.year,
+                self.spa_input.month,
+                self.spa_input.day,
+                utc_hour,
+                self.spa_input.delta_t,
+                self.spa_input.latitude,
+                self.spa_input.longitude,
+                self.spa_input.elevation,
+            )
+            .ok()
+        } else {
+            let mut input = self.spa_input.clone();
+            set_time_from_fractional_hour(&mut input, fractional_hour);
+            spa::solar_position(&input).ok().map(|o| o.zenith)
+        }
+    }
+
+    /// Get solar azimuth angle at a fractional hour (local time).
+    fn azimuth_at_hour(&mut self, fractional_hour: f64) -> Option<f64> {
+        if let Some(ref mut de) = self.de440 {
+            let utc_hour = fractional_hour - self.spa_input.timezone;
+            de.solar_position(
+                self.spa_input.year,
+                self.spa_input.month,
+                self.spa_input.day,
+                // Convert fractional UTC hour to h/m/s
+                (utc_hour as i32).max(0),
+                (((utc_hour - (utc_hour as i32) as f64) * 60.0) as i32).max(0),
+                0,
+                self.spa_input.delta_t,
+                self.spa_input.latitude,
+                self.spa_input.longitude,
+                self.spa_input.elevation,
+            )
+            .ok()
+            .map(|t| t.azimuth)
+        } else {
+            let mut input = self.spa_input.clone();
+            set_time_from_fractional_hour(&mut input, fractional_hour);
+            spa::solar_position(&input).ok().map(|o| o.azimuth)
+        }
+    }
+
+    /// Find the fractional hour when zenith angle crosses `target_zenith`.
+    /// Searches within `[start_hour, end_hour]` (local time).
+    fn find_zenith_crossing(
+        &mut self,
+        target_zenith: f64,
+        start_hour: f64,
+        end_hour: f64,
+        tolerance: f64,
+    ) -> Option<f64> {
+        if let Some(ref mut de) = self.de440 {
+            // Convert local hours to UTC for DE440
+            let utc_start = start_hour - self.spa_input.timezone;
+            let utc_end = end_hour - self.spa_input.timezone;
+
+            match de.find_zenith_crossing(
+                self.spa_input.year,
+                self.spa_input.month,
+                self.spa_input.day,
+                target_zenith,
+                utc_start,
+                utc_end,
+                tolerance,
+                self.spa_input.delta_t,
+                self.spa_input.latitude,
+                self.spa_input.longitude,
+                self.spa_input.elevation,
+            ) {
+                Ok(Some(utc_hour)) => {
+                    // Convert UTC result back to local
+                    Some(utc_hour + self.spa_input.timezone)
+                }
+                _ => None,
+            }
+        } else {
+            spa::find_zenith_crossing(
+                &self.spa_input,
+                target_zenith,
+                start_hour,
+                end_hour,
+                tolerance,
+            )
+        }
+    }
+
+    /// Compute the maximum solar zenith angle on this date.
+    fn compute_max_sza(&mut self) -> Option<f64> {
+        let mut max_sza = 0.0f64;
+        let mut hour = 0.0f64;
+        while hour < 24.0 {
+            if let Some(z) = self.zenith_at_hour(hour) {
+                if z > max_sza {
+                    max_sza = z;
+                }
+            }
+            hour += 0.5;
+        }
+        if max_sza > 0.0 {
+            Some(max_sza)
+        } else {
+            None
+        }
+    }
+}
+
+// ── Build helpers ──────────────────────────────────────────────────
+
+/// Build the atmosphere model from pipeline input.
+///
+/// Custom properties (from weather API) take priority over type-based defaults.
+/// Gas composition overrides (O3 column, NO2 density) are applied when present.
+fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::AtmosphereModel {
+    let aerosol_props = input
+        .custom_aerosol
+        .or_else(|| input.aerosol_type.map(aerosol::default_properties));
+    let cloud_props = input
+        .custom_cloud
+        .or_else(|| input.cloud_type.map(cloud::default_properties));
+
+    if input.o3_column_du.is_some() || input.no2_surface_density.is_some() {
+        builder::build_full_with_gas(
+            AtmosphereType::UsStandard,
+            input.surface_albedo,
+            aerosol_props.as_ref(),
+            cloud_props.as_ref(),
+            input.o3_column_du,
+            input.no2_surface_density,
+        )
+    } else {
+        builder::build_full(
+            AtmosphereType::UsStandard,
+            input.surface_albedo,
+            aerosol_props.as_ref(),
+            cloud_props.as_ref(),
+        )
+    }
+}
+
+// ── Main pipeline ──────────────────────────────────────────────────
 
 /// Run the full prayer time computation pipeline.
 ///
@@ -110,58 +387,148 @@ pub struct PrayerTimeOutput {
 /// 2. Fine scan at 0.1° around each crossing for sub-minute precision
 ///
 /// Also detects persistent twilight at high latitudes in summer.
+///
+/// When `de440_path` is set in the input, the pipeline uses JPL DE440
+/// for all solar position computations. Otherwise falls back to SPA.
 pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
+    let atm = build_atmosphere(input);
+    compute_prayer_times_inner(input, &atm, |atm, config, start, end, step| {
+        simulation::simulate_twilight_scan(atm, config, start, end, step)
+    })
+}
+
+/// Run the prayer time pipeline with GPU-accelerated MCRT simulation.
+///
+/// Uploads the atmosphere model to the GPU, then uses the GPU backend for
+/// both coarse and fine scan passes. If any GPU operation fails, falls back
+/// to the CPU pipeline automatically.
+///
+/// The caller must have already initialized the GPU backend via
+/// `twilight_gpu::try_init()`. The atmosphere is uploaded here.
+#[cfg(feature = "gpu")]
+pub fn compute_prayer_times_gpu(
+    input: &PrayerTimeInput,
+    gpu: &mut dyn twilight_gpu::GpuBackend,
+) -> PrayerTimeOutput {
+    use crate::gpu_dispatch;
+
+    let atm = build_atmosphere(input);
+
+    // Upload atmosphere to GPU. On failure, fall back to CPU entirely.
+    if let Err(e) = gpu.upload_atmosphere(&atm) {
+        eprintln!(
+            "Warning: GPU atmosphere upload failed ({}), falling back to CPU",
+            e
+        );
+        return compute_prayer_times_inner(input, &atm, |atm, config, start, end, step| {
+            simulation::simulate_twilight_scan(atm, config, start, end, step)
+        });
+    }
+
+    // Reborrow as shared for dispatch (upload is done, no more &mut needed).
+    let gpu_ref: &dyn twilight_gpu::GpuBackend = &*gpu;
+    compute_prayer_times_inner(input, &atm, |atm, config, start, end, step| {
+        gpu_dispatch::simulate_twilight_scan_gpu(gpu_ref, atm, config, start, end, step)
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "Warning: GPU dispatch error ({}), CPU fallback for this scan",
+                    e
+                );
+                simulation::simulate_twilight_scan(atm, config, start, end, step)
+            })
+    })
+}
+
+/// Inner pipeline implementation parameterized by scan function.
+///
+/// Both `compute_prayer_times` (CPU) and `compute_prayer_times_gpu` delegate
+/// to this function. The only difference is the `scan` closure that produces
+/// `Vec<SpectralResult>` for a given SZA range.
+fn compute_prayer_times_inner(
+    input: &PrayerTimeInput,
+    atm: &twilight_core::atmosphere::AtmosphereModel,
+    scan: impl Fn(
+        &twilight_core::atmosphere::AtmosphereModel,
+        &SimulationConfig,
+        f64,
+        f64,
+        f64,
+    ) -> Vec<SpectralResult>,
+) -> PrayerTimeOutput {
     let start = std::time::Instant::now();
 
-    // Step 1: Build atmosphere model
-    let atm = builder::build_clear_sky(AtmosphereType::UsStandard, input.surface_albedo);
+    // Step 2: Initialize solar engine (DE440 primary, SPA fallback)
+    let (mut engine, ephemeris) = SolarEngine::new(input);
 
-    // Step 2: Find sunrise/sunset times using SPA
-    let spa_input = SpaInput {
-        year: input.year,
-        month: input.month,
-        day: input.day,
-        hour: 0,
-        minute: 0,
-        second: 0,
-        timezone: input.timezone,
-        latitude: input.latitude,
-        longitude: input.longitude,
-        elevation: input.elevation,
-        pressure: 1013.25,
-        temperature: 15.0,
-        delta_t: input.delta_t,
-        slope: 0.0,
-        azm_rotation: 0.0,
-        atmos_refract: 0.5667,
+    // Step 3: Find sunrise/sunset times, adjusted for terrain if available
+    //
+    // Standard SZA for sunrise/sunset = 90.8333 degrees (refraction + semi-diameter).
+    // When terrain blocks the horizon, the sun must be higher to clear it,
+    // so the effective SZA is smaller (sun clears terrain later at sunrise, earlier at sunset).
+    //
+    // We first find approximate sunrise/sunset with standard SZA to determine
+    // the sun's azimuth, then look up terrain horizon angle at that azimuth,
+    // and re-find sunrise/sunset with the adjusted SZA.
+    let standard_sunrise = engine.find_zenith_crossing(90.8333, 0.0, 12.0, 0.0001);
+    let standard_sunset = engine.find_zenith_crossing(90.8333, 12.0, 24.0, 0.0001);
+
+    let (
+        sunrise_time,
+        sunset_time,
+        sunrise_horizon,
+        sunset_horizon,
+        sunrise_sza_eff,
+        sunset_sza_eff,
+    ) = if let Some(ref profile) = input.horizon_profile {
+        // Get sun's azimuth at standard sunrise/sunset to look up terrain angle
+        let (sr, sr_hz, sr_sza) = if let Some(sr_h) = standard_sunrise {
+            let az = engine.azimuth_at_hour(sr_h).unwrap_or(90.0);
+            let hz = profile.angle_at(az);
+            if hz > 0.01 {
+                let eff_sza = horizon::effective_sunrise_sza(hz);
+                let adjusted = engine.find_zenith_crossing(eff_sza, 0.0, 12.0, 0.0001);
+                (adjusted.or(standard_sunrise), Some(hz), Some(eff_sza))
+            } else {
+                (standard_sunrise, Some(hz), None)
+            }
+        } else {
+            (standard_sunrise, None, None)
+        };
+
+        let (ss, ss_hz, ss_sza) = if let Some(ss_h) = standard_sunset {
+            let az = engine.azimuth_at_hour(ss_h).unwrap_or(270.0);
+            let hz = profile.angle_at(az);
+            if hz > 0.01 {
+                let eff_sza = horizon::effective_sunrise_sza(hz);
+                let adjusted = engine.find_zenith_crossing(eff_sza, 12.0, 24.0, 0.0001);
+                (adjusted.or(standard_sunset), Some(hz), Some(eff_sza))
+            } else {
+                (standard_sunset, Some(hz), None)
+            }
+        } else {
+            (standard_sunset, None, None)
+        };
+
+        (sr, ss, sr_hz, ss_hz, sr_sza, ss_sza)
+    } else {
+        (standard_sunrise, standard_sunset, None, None, None, None)
     };
 
-    let sunrise_time = spa::find_zenith_crossing(&spa_input, 90.8333, 0.0, 12.0, 0.0001);
-    let sunset_time = spa::find_zenith_crossing(&spa_input, 90.8333, 12.0, 24.0, 0.0001);
+    // Step 4: Check maximum SZA to detect persistent twilight
+    let max_sza_deg = engine.compute_max_sza();
+    let persistent_twilight = max_sza_deg.map(|sza| sza < 106.0).unwrap_or(false);
 
-    // Step 3: Check maximum SZA to detect persistent twilight.
-    // At high latitudes in summer, the sun may never drop below the Fajr/Isha
-    // threshold angle. We check by finding the SZA at local midnight.
-    let max_sza_deg = compute_max_sza(&spa_input);
-    let persistent_twilight = max_sza_deg
-        .map(|sza| sza < 106.0) // If sun never reaches ~16° depression, twilight persists
-        .unwrap_or(false);
-
-    // Step 4: Determine solar azimuth at sunset for view direction
+    // Step 5: Determine solar azimuth at sunset for view direction
     let solar_azimuth_evening = if let Some(sunset_h) = sunset_time {
-        let mut spa_sunset = spa_input.clone();
-        set_time_from_fractional_hour(&mut spa_sunset, sunset_h);
-        spa::solar_position(&spa_sunset)
-            .map(|o| o.azimuth)
-            .unwrap_or(270.0)
+        engine.azimuth_at_hour(sunset_h).unwrap_or(270.0)
     } else {
         270.0
     };
 
-    // Step 5: Determine the upper bound of the scan based on max SZA
+    // Step 6: Determine the upper bound of the scan based on max SZA
     let sza_upper = max_sza_deg.map(|s| s.min(108.0)).unwrap_or(108.0);
 
-    // Step 6: MCRT Pass 1 — Coarse scan to locate threshold regions
+    // Step 7: MCRT Pass 1 -- Coarse scan to locate threshold regions
     let config = SimulationConfig {
         latitude: input.latitude,
         longitude: input.longitude,
@@ -169,10 +536,12 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
         solar_azimuth: solar_azimuth_evening,
         view_zenith: 85.0,
         apply_solar_irradiance: true,
+        scattering_mode: input.scattering_mode,
+        photons_per_wavelength: input.photons_per_wavelength,
+        polarized: input.polarized,
     };
 
-    let coarse_results =
-        simulation::simulate_twilight_scan(&atm, &config, 90.0, sza_upper, input.sza_step);
+    let coarse_results = scan(atm, &config, 90.0, sza_upper, input.sza_step);
 
     let coarse_analyses: Vec<TwilightAnalysis> = coarse_results
         .iter()
@@ -190,10 +559,9 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
     let coarse_prayer =
         threshold::determine_prayer_times(coarse_analyses.clone(), &input.threshold_config);
 
-    // Step 7: MCRT Pass 2 — Fine scan around each crossing
-    // Collect unique SZA regions that need refinement
+    // Step 8: MCRT Pass 2 -- Fine scan around each crossing
     let mut refine_regions: Vec<(f64, f64)> = Vec::new();
-    let margin = input.sza_step + 0.1; // Bracket around coarse crossing
+    let margin = input.sza_step + 0.1;
 
     if let Some(sza) = coarse_prayer.fajr_sza_deg {
         add_refine_region(&mut refine_regions, sza - margin, sza + margin, sza_upper);
@@ -205,12 +573,11 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
         add_refine_region(&mut refine_regions, sza - margin, sza + margin, sza_upper);
     }
 
-    // Run fine scan for each region
-    let fine_step = 0.1; // 0.1° ≈ 0.4 min time resolution
+    let fine_step = 0.1;
     let mut fine_results: Vec<SpectralResult> = Vec::new();
 
     for (lo, hi) in &refine_regions {
-        let region = simulation::simulate_twilight_scan(&atm, &config, *lo, *hi, fine_step);
+        let region = scan(atm, &config, *lo, *hi, fine_step);
         fine_results.extend(region);
     }
 
@@ -219,19 +586,29 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
     all_results.extend(fine_results);
     all_results.sort_by(|a, b| a.sza_deg.partial_cmp(&b.sza_deg).unwrap());
 
-    // Remove near-duplicates (keep the one from finer scan)
     let mut deduped_results: Vec<SpectralResult> = Vec::new();
     for r in all_results {
         if let Some(last) = deduped_results.last() {
             if (r.sza_deg - last.sza_deg).abs() < 0.05 {
-                // Replace with newer (finer) result
                 deduped_results.pop();
             }
         }
         deduped_results.push(r);
     }
 
-    // Step 8: Re-analyze with combined high-resolution data
+    // Step 9: Inject skyglow (light pollution) if configured.
+    // Add artificial spectral radiance to the MCRT-computed natural radiance.
+    // This shifts the threshold crossings to account for urban sky brightness.
+    if let Some(ref sg) = input.skyglow {
+        for sr in &mut deduped_results {
+            let n = sr.radiance.len().min(sg.num_wavelengths);
+            for i in 0..n {
+                sr.radiance[i] += sg.spectral_radiance[i];
+            }
+        }
+    }
+
+    // Re-analyze with combined high-resolution data (now including skyglow if set)
     let all_analyses: Vec<TwilightAnalysis> = deduped_results
         .iter()
         .map(|sr| {
@@ -246,18 +623,18 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
 
     let prayer_result = threshold::determine_prayer_times(all_analyses, &input.threshold_config);
 
-    // Step 9: Convert threshold SZAs to clock times using SPA binary search
+    // Step 10: Convert threshold SZAs to clock times
     let fajr_time = prayer_result
         .fajr_sza_deg
-        .and_then(|sza| spa::find_zenith_crossing(&spa_input, sza, 0.0, 12.0, 0.0001));
+        .and_then(|sza| engine.find_zenith_crossing(sza, 0.0, 12.0, 0.0001));
 
     let isha_abyad_time = prayer_result
         .isha_abyad_sza_deg
-        .and_then(|sza| spa::find_zenith_crossing(&spa_input, sza, 12.0, 24.0, 0.0001));
+        .and_then(|sza| engine.find_zenith_crossing(sza, 12.0, 24.0, 0.0001));
 
     let isha_ahmar_time = prayer_result
         .isha_ahmar_sza_deg
-        .and_then(|sza| spa::find_zenith_crossing(&spa_input, sza, 12.0, 24.0, 0.0001));
+        .and_then(|sza| engine.find_zenith_crossing(sza, 12.0, 24.0, 0.0001));
 
     let elapsed = start.elapsed();
 
@@ -278,19 +655,31 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
         twilight_analyses: prayer_result.analyses,
         spectral_results: deduped_results,
         computation_time_ms: elapsed.as_millis() as u64,
+        ephemeris,
+        sunrise_horizon_deg: sunrise_horizon,
+        sunset_horizon_deg: sunset_horizon,
+        sunrise_sza_effective: sunrise_sza_eff,
+        sunset_sza_effective: sunset_sza_eff,
+        terrain_source: input
+            .horizon_profile
+            .as_ref()
+            .map(|p| p.source_name.clone()),
+        skyglow_zenith_mcd: input.skyglow.as_ref().map(|sg| {
+            twilight_skyglow::bortle::radiance_to_zenith_luminance(sg.integrated_radiance)
+        }),
+        skyglow_bortle: input.skyglow.as_ref().map(|sg| sg.bortle_class),
+        skyglow_shift_minutes: input.skyglow.as_ref().map(|sg| {
+            let lum =
+                twilight_skyglow::bortle::radiance_to_zenith_luminance(sg.integrated_radiance);
+            twilight_skyglow::bortle::estimated_prayer_shift_minutes(lum)
+        }),
     }
 }
 
-/// Compute the maximum solar zenith angle on a given date.
-///
-/// This occurs at local midnight (anti-transit). For high-latitude locations
-/// in summer, this may be less than 108°, indicating persistent twilight.
+/// Compute the maximum solar zenith angle on a given date (SPA-only helper for tests).
+#[allow(dead_code)]
 fn compute_max_sza(spa_input: &SpaInput) -> Option<f64> {
-    // Check SZA at midnight (hour 0) and near-midnight (hour 23:59)
-    // The maximum SZA occurs at anti-transit (local midnight).
     let mut max_sza = 0.0f64;
-
-    // Sample every 30 minutes to find the maximum
     let mut hour = 0.0f64;
     while hour < 24.0 {
         let mut input = spa_input.clone();
@@ -302,7 +691,6 @@ fn compute_max_sza(spa_input: &SpaInput) -> Option<f64> {
         }
         hour += 0.5;
     }
-
     if max_sza > 0.0 {
         Some(max_sza)
     } else {
@@ -347,7 +735,7 @@ fn set_time_from_fractional_hour(input: &mut SpaInput, fractional_hour: f64) {
 /// Converts to total integer seconds (with rounding) first, then decomposes
 /// with integer arithmetic to avoid floating-point truncation errors.
 pub fn format_time(h: f64) -> String {
-    if h < 0.0 || h > 24.0 {
+    if !(0.0..=24.0).contains(&h) {
         return "N/A".to_string();
     }
     let total_seconds = (h * 3600.0).round() as u32;
