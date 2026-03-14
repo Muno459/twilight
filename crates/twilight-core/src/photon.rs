@@ -1333,8 +1333,15 @@ const LOS_IMP_H_MODERATE_M: f64 = 100_000.0;
 /// The real savings come from NOT launching expensive 50-bounce chains at
 /// 0-15 km altitude.
 ///
-/// Tested 15 km: inconclusive, possible SZA 98 regression. Keeping 30 km.
+/// Tested 15 km globally: inconclusive, possible SZA 98 regression.
+/// Now SZA-conditional: 30 km for SZA 96-105, ramps to 15 km for SZA > 105.
 const LOS_IMP_H_DEEP_M: f64 = 30_000.0;
+
+/// Scale height at extreme deep twilight (SZA > 108).
+/// At 15 km, surface-to-TOA ratio is exp(100/15) = ~790x, virtually
+/// eliminating rays at ground level. Only applied at SZA > 105 where
+/// ground-level chains have near-zero success rate anyway.
+const LOS_IMP_H_EXTREME_M: f64 = 15_000.0;
 
 /// State of a single particle in the weight-window work stack (scalar mode).
 ///
@@ -4201,12 +4208,15 @@ pub fn hybrid_scatter_radiance_alis(
     let mut sum_los_imp = 0.0f64;
 
     if use_los_importance {
-        // SZA-adaptive scale height: large at moderate twilight (mild
-        // redistribution, ~2.7x ratio surface-to-TOA), small at deep
-        // twilight (strong redistribution, ~28x ratio).
+        // SZA-adaptive scale height: two-stage ramp.
+        // Stage 1 (SZA 96-106): 100km -> 30km (mild to moderate redistribution)
+        // Stage 2 (SZA 106-108): 30km -> 15km (aggressive for deep twilight)
         let sza_t = ((sza_deg_obs - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START))
             .clamp(0.0, 1.0);
-        let h_scale = LOS_IMP_H_MODERATE_M + (LOS_IMP_H_DEEP_M - LOS_IMP_H_MODERATE_M) * sza_t;
+        let h_stage1 = LOS_IMP_H_MODERATE_M + (LOS_IMP_H_DEEP_M - LOS_IMP_H_MODERATE_M) * sza_t;
+        // Second ramp: from VSPG_SZA_FULL (106) to 108
+        let sza_t2 = ((sza_deg_obs - VSPG_SZA_FULL) / 2.0).clamp(0.0, 1.0);
+        let h_scale = h_stage1 + (LOS_IMP_H_EXTREME_M - h_stage1) * sza_t2;
 
         for step in 0..num_steps {
             let s = (step as f64 + 0.5) * ds;
