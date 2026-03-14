@@ -1365,7 +1365,11 @@ struct SplitParticleAlis {
 /// where connection transmittance drops sharply, adding variance without
 /// proportional signal. With 1 vertex per subpath, we maximize the number
 /// of independent terminator entry points (subpaths) for better angular
-/// coverage. Tested with 2 vertices: regressed SZA 103-108 CV by 50-237%.
+/// coverage.
+///
+/// Tested with 2 vertices: regressed SZA 100-108 CV by 2.7-8.6x. The second
+/// vertex produces rare high-weight connections that inflate both mean and
+/// variance. Confirmed twice (once before MIS fix, once after).
 const BDPT_MAX_LIGHT_VERTICES: usize = 1;
 
 /// Number of independent light subpaths traced per call to
@@ -1392,8 +1396,6 @@ const BDPT_NUM_LIGHT_SUBPATHS: usize = 4096;
 /// keep the stack-allocated LightVertex buffer under ~600 KB (1024 * 590 bytes).
 /// Each batch re-walks the LOS to evaluate connections (cheap: just tau
 /// accumulation), then the buffer is reused for the next batch.
-/// Tested 2048: no runtime improvement (bottleneck is per-connection
-/// transmittance evaluation, not LOS re-walk overhead).
 const BDPT_BATCH_SIZE: usize = 1024;
 
 /// SZA threshold (degrees) below which BDPT is disabled.
@@ -3010,7 +3012,7 @@ fn trace_secondary_chain_scalar(
         let mut current_dir = stack[stack_len].dir;
         let mut weight = stack[stack_len].weight;
         let mut local_rng = stack[stack_len].rng;
-        let mut is_first_bounce = true;
+        let mut bounce_idx: usize = 0;
 
         loop {
             // --- Decide scatter mode for this bounce ---
@@ -3166,7 +3168,8 @@ fn trace_secondary_chain_scalar(
             // NEE: scalar phase function (no Mueller matrix)
             weight *= optics.ssa;
 
-            let skip_nee = is_main && is_first_bounce && nee_r2_weight < 1e-30;
+            let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
+            let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
                 let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
 
@@ -3180,19 +3183,16 @@ fn trace_secondary_chain_scalar(
                                 * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
                     };
 
-                    // On the first bounce of the main particle, apply the MIS
-                    // weight for the R2 path (w_back). All subsequent bounces
-                    // (R3+) get full weight since BDPT does not cover them.
-                    let nee_weight = if is_main && is_first_bounce {
-                        nee_r2_weight
-                    } else {
-                        1.0
-                    };
+                    // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
+                    // particle, apply the MIS weight (w_back) since BDPT provides
+                    // independent estimates for these orders. Higher-order bounces
+                    // get full weight since BDPT does not cover them.
+                    let nee_weight = if bdpt_covered { nee_r2_weight } else { 1.0 };
                     let scale = nee_weight * weight * t_sun_secondary * INV_4PI;
                     total += phase * scale;
                 }
             }
-            is_first_bounce = false;
+            bounce_idx += 1;
 
             // Sample new direction: 2-way one-sample MIS between phase
             // function and Dwivedi horizontal biasing.
@@ -3658,7 +3658,7 @@ fn trace_secondary_chain_alis(
         let mut hero_weight = stack[stack_len].hero_weight;
         let mut wr = stack[stack_len].weight_ratio;
         let mut local_rng = stack[stack_len].rng;
-        let mut is_first_bounce = true;
+        let mut bounce_idx: usize = 0;
 
         loop {
             // --- Decide scatter mode for this bounce ---
@@ -3882,19 +3882,17 @@ fn trace_secondary_chain_alis(
                 wr[w] *= ssa_ratio;
             }
 
-            let skip_nee = is_main && is_first_bounce && nee_r2_weight < 1e-30;
+            let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
+            let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
                 let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
                 let cos_angle_nee = sun_dir.dot(-current_dir);
 
-                // On the first bounce of the main particle, apply the MIS
-                // weight for the R2 path (w_back). All subsequent bounces
-                // (R3+) get full weight since BDPT does not cover them.
-                let nee_weight = if is_main && is_first_bounce {
-                    nee_r2_weight
-                } else {
-                    1.0
-                };
+                // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
+                // particle, apply the MIS weight (w_back) since BDPT provides
+                // independent estimates for these orders. Higher-order bounces
+                // get full weight since BDPT does not cover them.
+                let nee_weight = if bdpt_covered { nee_r2_weight } else { 1.0 };
 
                 for w in 0..num_wl {
                     if t_suns[w] > 1e-30 {
@@ -3905,7 +3903,7 @@ fn trace_secondary_chain_alis(
                     }
                 }
             }
-            is_first_bounce = false;
+            bounce_idx += 1;
 
             // Sample new direction: 2-way one-sample MIS (Dwivedi +
             // hero phase function). Gated: when Dwivedi fraction is
@@ -4362,10 +4360,13 @@ pub fn hybrid_scatter_radiance_alis(
         for batch_idx in 0..num_batches {
             let batch_start = batch_idx * BDPT_BATCH_SIZE;
             let batch_end = (batch_start + BDPT_BATCH_SIZE).min(BDPT_NUM_LIGHT_SUBPATHS);
-            let batch_count = batch_end - batch_start;
+            let _batch_count = batch_end - batch_start;
 
             // Trace this batch of light subpaths and collect vertices.
-            let mut batch_vertices = [dummy_lv; BDPT_BATCH_SIZE];
+            // With BDPT_MAX_LIGHT_VERTICES=2, each subpath can produce up to
+            // 2 vertices, so the buffer is sized at 2*BDPT_BATCH_SIZE.
+            const BATCH_VERT_CAP: usize = BDPT_BATCH_SIZE * BDPT_MAX_LIGHT_VERTICES;
+            let mut batch_vertices = [dummy_lv; BATCH_VERT_CAP];
             let mut n_batch_verts = 0usize;
 
             for subpath_idx in batch_start..batch_end {
@@ -4386,7 +4387,7 @@ pub fn hybrid_scatter_radiance_alis(
                     BDPT_NUM_LIGHT_SUBPATHS,
                 );
                 for v in 0..n_verts {
-                    if n_batch_verts < batch_count {
+                    if n_batch_verts < BATCH_VERT_CAP {
                         batch_vertices[n_batch_verts] = subpath_verts[v];
                         n_batch_verts += 1;
                     }
