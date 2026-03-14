@@ -1030,6 +1030,11 @@ const DWIVEDI_FRAC_MAX: f64 = 0.35;
 /// 35%, and phase function retains 45%. The guide learns productive
 /// directions from BDPT light vertices -- directions that successfully
 /// reached scattering events near the terminator.
+///
+/// Tested 30%: regressed SZA 106 CV from 0.45 to 0.70. The 32-bin
+/// directional resolution is too coarse for higher guide fractions --
+/// MIS weight corrections blow up when the guide confidently sends
+/// chains to bins with low phase function density.
 const GUIDE_FRAC_MAX: f64 = 0.20;
 
 /// Returns the SZA-adaptive path guide sampling fraction.
