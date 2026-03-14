@@ -1519,6 +1519,7 @@ fn cmd_render(sza: f64, width: u32, height: u32, rays: usize, out: &str) {
             let mut sum_y = 0.0;
             let mut sum_z = 0.0;
 
+            #[allow(clippy::needless_range_loop)]
             for w in 0..num_wl {
                 let irrad = if w < twilight_data::solar_spectrum::SOLAR_IRRADIANCE.len() {
                     twilight_data::solar_spectrum::SOLAR_IRRADIANCE[w]
@@ -1543,7 +1544,7 @@ fn cmd_render(sza: f64, width: u32, height: u32, rays: usize, out: &str) {
             let (r, g, b) = xyz_to_rgb(sum_x, sum_y, sum_z);
 
             let count = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count > 0 && count % (width as usize * 10) == 0 {
+            if count > 0 && count.is_multiple_of(width as usize * 10) {
                 print!("\rRendered {} / {} pixels", count, width * height);
                 use std::io::Write;
                 std::io::stdout().flush().unwrap();

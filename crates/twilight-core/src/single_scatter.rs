@@ -322,7 +322,8 @@ pub fn shadow_ray_transmittance(
                 } else {
                     1.0
                 };
-                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
+                {
                     RefractResult::Refracted(d) => (d, true),
                     RefractResult::TotalReflection(d) => (d, false),
                 };
@@ -337,8 +338,8 @@ pub fn shadow_ray_transmittance(
                 // Exited atmosphere
                 if crossed {
                     if next_shell >= num_shells {
-                    break;
-                }
+                        break;
+                    }
                     shell_idx = next_shell;
                 }
             }
@@ -512,7 +513,8 @@ pub fn shadow_ray_transmittance_spectrum(
                 } else {
                     1.0
                 };
-                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
+                {
                     RefractResult::Refracted(d) => (d, true),
                     RefractResult::TotalReflection(d) => (d, false),
                 };
@@ -527,8 +529,8 @@ pub fn shadow_ray_transmittance_spectrum(
                 // Exited atmosphere
                 if crossed {
                     if next_shell >= num_shells {
-                    break;
-                }
+                        break;
+                    }
                     shell_idx = next_shell;
                 }
             }
@@ -1454,16 +1456,17 @@ mod tests {
             };
 
             // Refract
-            let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                RefractResult::Refracted(d) => d,
+            let (new_dir, _crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                RefractResult::Refracted(d) => (d, true),
                 RefractResult::TotalReflection(d) => (d, false), // shouldn't happen
             };
+            dir = new_dir;
             pos = boundary_pos + dir * 1e-3; // nudge past boundary
 
             // Check Bouger invariant
             let r_new = pos.length();
             let radial_new = pos.normalize();
-            let cos_alpha_new = dir.dot(radial_new);
+            let cos_alpha_new = new_dir.dot(radial_new);
             let sin_alpha_new = libm::sqrt(1.0 - cos_alpha_new * cos_alpha_new);
             let n_new = n_to;
             let bouger_new = n_new * r_new * sin_alpha_new;

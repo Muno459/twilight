@@ -2504,7 +2504,7 @@ pub fn hybrid_scatter_radiance(
                         &mut mc_rng,
                         ray,
                         secondary_rays,
-                        false,
+                        1.0,
                     );
                 }
                 let inv_rays = 1.0 / secondary_rays as f64;
@@ -2908,7 +2908,7 @@ fn trace_secondary_chain_scalar(
     rng: &mut McRng,
     ray_idx: usize,
     total_rays: usize,
-    bdpt_active: bool,
+    nee_r2_weight: f64,
 ) -> f64 {
     use crate::single_scatter::shadow_ray_transmittance;
 
@@ -3010,6 +3010,7 @@ fn trace_secondary_chain_scalar(
         let mut current_dir = stack[stack_len].dir;
         let mut weight = stack[stack_len].weight;
         let mut local_rng = stack[stack_len].rng;
+        let mut is_first_bounce = true;
 
         loop {
             // --- Decide scatter mode for this bounce ---
@@ -3165,7 +3166,7 @@ fn trace_secondary_chain_scalar(
             // NEE: scalar phase function (no Mueller matrix)
             weight *= optics.ssa;
 
-            let skip_nee = is_main && bdpt_active;
+            let skip_nee = is_main && is_first_bounce && nee_r2_weight < 1e-30;
             if !skip_nee {
                 let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
 
@@ -3179,10 +3180,19 @@ fn trace_secondary_chain_scalar(
                                 * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
                     };
 
-                    let scale = weight * t_sun_secondary * INV_4PI;
+                    // On the first bounce of the main particle, apply the MIS
+                    // weight for the R2 path (w_back). All subsequent bounces
+                    // (R3+) get full weight since BDPT does not cover them.
+                    let nee_weight = if is_main && is_first_bounce {
+                        nee_r2_weight
+                    } else {
+                        1.0
+                    };
+                    let scale = nee_weight * weight * t_sun_secondary * INV_4PI;
                     total += phase * scale;
                 }
             }
+            is_first_bounce = false;
 
             // Sample new direction: 2-way one-sample MIS between phase
             // function and Dwivedi horizontal biasing.
@@ -3524,7 +3534,7 @@ fn trace_secondary_chain_alis(
     ray_idx: usize,
     total_rays: usize,
     num_wl: usize,
-    bdpt_active: bool,
+    nee_r2_weight: f64,
 ) -> [f64; 64] {
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
 
@@ -3649,6 +3659,7 @@ fn trace_secondary_chain_alis(
         let mut hero_weight = stack[stack_len].hero_weight;
         let mut wr = stack[stack_len].weight_ratio;
         let mut local_rng = stack[stack_len].rng;
+        let mut is_first_bounce = true;
 
         loop {
             // --- Decide scatter mode for this bounce ---
@@ -3872,19 +3883,30 @@ fn trace_secondary_chain_alis(
                 wr[w] *= ssa_ratio;
             }
 
-            let skip_nee = is_main && bdpt_active;
+            let skip_nee = is_main && is_first_bounce && nee_r2_weight < 1e-30;
             if !skip_nee {
                 let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
                 let cos_angle_nee = sun_dir.dot(-current_dir);
+
+                // On the first bounce of the main particle, apply the MIS
+                // weight for the R2 path (w_back). All subsequent bounces
+                // (R3+) get full weight since BDPT does not cover them.
+                let nee_weight = if is_main && is_first_bounce {
+                    nee_r2_weight
+                } else {
+                    1.0
+                };
 
                 for w in 0..num_wl {
                     if t_suns[w] > 1e-30 {
                         let optics_w = &atm.optics[scatter_shell][w];
                         let phase_w = scalar_phase_value(cos_angle_nee, optics_w);
-                        total[w] += hero_weight * wr[w] * t_suns[w] * phase_w * INV_4PI;
+                        total[w] +=
+                            nee_weight * hero_weight * wr[w] * t_suns[w] * phase_w * INV_4PI;
                     }
                 }
             }
+            is_first_bounce = false;
 
             // Sample new direction: 2-way one-sample MIS (Dwivedi +
             // hero phase function). Gated: when Dwivedi fraction is
@@ -4270,7 +4292,7 @@ pub fn hybrid_scatter_radiance_alis(
                     ray,
                     rays_this_step,
                     num_wl,
-                    bdpt_active,
+                    w_back,
                 );
 
                 for w in 0..num_wl {
@@ -4290,7 +4312,7 @@ pub fn hybrid_scatter_radiance_alis(
                 if t_obs < 1e-30 {
                     continue;
                 }
-                radiance[w] += w_back * mc_totals[w] * inv_rays * beta_scat * t_obs * ds;
+                radiance[w] += mc_totals[w] * inv_rays * beta_scat * t_obs * ds;
             }
         }
 
@@ -6514,9 +6536,16 @@ mod tests {
     #[test]
     fn terminator_shape_weight_at_axis() {
         // When direction is exactly on the terminator axis AND that axis is at zenith,
-        // cos_z = cos_t = 1, weight = 2 / (m+1)
-        let w = terminator_shape_weight(1.0, 1.0, 8.0);
-        let expected = 2.0 / 9.0;
+        // cos_z = cos_t = 1. With truncated power-cosine, weight = 2 * trunc_norm / (m+1).
+        let m = 8.0;
+        let w = terminator_shape_weight(1.0, 1.0, m);
+        let cos_min = power_cos_min(m);
+        let trunc_norm = if cos_min > 1e-6 {
+            1.0 - libm::pow(cos_min, m + 1.0)
+        } else {
+            1.0
+        };
+        let expected = 2.0 * trunc_norm / (m + 1.0);
         assert!(
             (w - expected).abs() < 1e-12,
             "terminator_shape_weight(1,1,8) = {}, expected {}",
@@ -6842,6 +6871,7 @@ mod tests {
                 &mut mc,
                 ray,
                 n,
+                1.0,
             );
         }
         let mean = total / n as f64;
@@ -6888,6 +6918,7 @@ mod tests {
                 &mut mc,
                 ray,
                 n,
+                1.0,
             );
             assert!(
                 val >= 0.0,
@@ -6939,7 +6970,7 @@ mod tests {
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, false,
+                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, 1.0,
             );
             for w in 0..num_wl {
                 assert!(
@@ -7366,6 +7397,7 @@ mod tests {
                 &mut mc,
                 ray,
                 n,
+                1.0,
             );
             assert!(
                 result >= 0.0 && result.is_finite(),
@@ -7411,7 +7443,7 @@ mod tests {
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, false,
+                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, 1.0,
             );
             for w in 0..num_wl {
                 assert!(
