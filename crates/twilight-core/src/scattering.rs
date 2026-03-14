@@ -566,23 +566,27 @@ pub fn scatter_stokes_fast(
     let b = alpha * p12_r;
     let c = alpha * p33_r + one_minus_alpha * p11_h;
 
-    // Apply scattering matrix S(theta) to the input stokes
-    let i_scat = a * stokes.s[0] + b * stokes.s[1];
-    let q_scat = b * stokes.s[0] + a * stokes.s[1];
-    let u_scat = c * stokes.s[2];
-    let v_scat = c * stokes.s[3];
-
-    // Double-angle rotation (no trig) to rotate the scattered light
-    // from the local scattering plane into the target reference plane.
+    // Double-angle rotation (no trig) to rotate the input Stokes
+    // from the old scattering plane into the new scattering plane.
     let c2 = 2.0 * cos_phi * cos_phi - 1.0;
     let s2 = 2.0 * sin_phi * cos_phi;
 
-    // Rotate Q, U terms
-    let q_rot = c2 * q_scat - s2 * u_scat;
-    let u_rot = s2 * q_scat + c2 * u_scat;
+    // Rotated input Q, U: R(phi) * [Q, U]
+    let q_rot = c2 * stokes.s[1] + s2 * stokes.s[2];
+    let u_rot = c2 * stokes.s[2] - s2 * stokes.s[1];
 
+    // Apply scattering matrix M to (I, q_rot, u_rot, V):
+    //   I' = A*I + B*(c2*Q + s2*U)
+    //   Q' = B*I + A*(c2*Q + s2*U)
+    //   U' = C*(c2*U - s2*Q)
+    //   V' = C*V
     StokesVector {
-        s: [i_scat, q_rot, u_rot, v_scat],
+        s: [
+            a * stokes.s[0] + b * q_rot,
+            b * stokes.s[0] + a * q_rot,
+            c * u_rot,
+            c * stokes.s[3],
+        ],
     }
 }
 
