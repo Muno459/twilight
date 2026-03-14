@@ -1388,32 +1388,6 @@ const BDPT_NUM_LIGHT_SUBPATHS: usize = 4096;
 /// transmittance evaluation, not LOS re-walk overhead).
 const BDPT_BATCH_SIZE: usize = 1024;
 
-/// Chord minimum altitude above surface at moderate twilight [m].
-///
-/// At SZA 99-102, connections are short (<800 km) and the 20 km threshold
-/// rarely rejects valid connections. Keeps tropospheric noise out.
-const BDPT_CHORD_ALT_MODERATE_M: f64 = 20_000.0;
-
-/// Chord minimum altitude above surface at deep twilight [m].
-///
-/// At SZA 106+, the terminator is ~1800 km away. With h_min ≈ h - d²/(8R),
-/// a 20 km threshold rejects connections from LOS steps below ~82 km
-/// (d=1780 km gives d²/(8R)=62 km, so h must exceed 82 km).
-/// Lowering to 5 km allows connections from 67+ km LOS steps. The
-/// transmittance evaluation naturally handles attenuation through the
-/// lower stratosphere -- no signal is fabricated, just less discarded.
-const BDPT_CHORD_ALT_DEEP_M: f64 = 5_000.0;
-
-/// Returns the SZA-adaptive chord minimum altitude threshold [m].
-///
-/// Smoothly transitions from 20 km at SZA 99 to 5 km at SZA 106+.
-/// Uses linear interpolation clamped to [deep, moderate].
-#[inline]
-fn bdpt_chord_min_alt(sza_deg: f64) -> f64 {
-    let t = ((sza_deg - BDPT_SZA_START) / (BDPT_SZA_FULL - BDPT_SZA_START)).clamp(0.0, 1.0);
-    BDPT_CHORD_ALT_MODERATE_M + (BDPT_CHORD_ALT_DEEP_M - BDPT_CHORD_ALT_MODERATE_M) * t
-}
-
 /// SZA threshold (degrees) below which BDPT is disabled.
 ///
 /// At SZA < 98, backward chains already have high success rates and NEE
@@ -1882,7 +1856,7 @@ const VSPG_SZA_START: f64 = 93.0;
 ///
 /// By SZA 103, the shadow exceeds the TOA and purely lateral transport
 /// dominates. VSPG should be fully active before this point.
-const VSPG_SZA_FULL: f64 = 103.0;
+const VSPG_SZA_FULL: f64 = 106.0;
 
 /// Compute altitude-dependent importance for VSPG.
 ///
@@ -2510,6 +2484,7 @@ pub fn hybrid_scatter_radiance(
                         &mut mc_rng,
                         ray,
                         secondary_rays,
+                        false,
                     );
                 }
                 let inv_rays = 1.0 / secondary_rays as f64;
@@ -2913,6 +2888,7 @@ fn trace_secondary_chain_scalar(
     rng: &mut McRng,
     ray_idx: usize,
     total_rays: usize,
+    bdpt_active: bool,
 ) -> f64 {
     use crate::single_scatter::shadow_ray_transmittance;
 
@@ -3000,7 +2976,7 @@ fn trace_secondary_chain_scalar(
     stack[0] = SplitParticleScalar {
         pos: start_pos,
         dir,
-        weight: start_optics.ssa * initial_weight,
+        weight: initial_weight,
         rng: *rng,
     };
     let mut main_processed = false;
@@ -3008,7 +2984,7 @@ fn trace_secondary_chain_scalar(
     // Process all particles: main first, then split copies (LIFO order).
     while stack_len > 0 {
         stack_len -= 1;
-        let _is_main = !main_processed;
+        let is_main = !main_processed;
         main_processed = true;
         let mut pos = stack[stack_len].pos;
         let mut current_dir = stack[stack_len].dir;
@@ -3138,9 +3114,11 @@ fn trace_secondary_chain_scalar(
                                     let albedo = atm.surface_albedo[wavelength_idx];
                                     weight *= albedo;
                                     current_dir = sample_hemisphere(normal, &mut local_rng.dir);
-                                    continue;
+                                    scatter_found = false;
+                                    break;
                                 }
-                                continue;
+                                scatter_found = false;
+                                break;
                             }
                         }
                         None => break,
@@ -3165,23 +3143,26 @@ fn trace_secondary_chain_scalar(
             let optics = &atm.optics[scatter_shell][wavelength_idx];
 
             // NEE: scalar phase function (no Mueller matrix)
-            let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
-
-            if t_sun_secondary > 1e-30 {
-                let cos_angle_nee = sun_dir.dot(-current_dir);
-                let phase = if optics.rayleigh_fraction > 0.99 {
-                    rayleigh_phase(cos_angle_nee)
-                } else {
-                    optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
-                        + (1.0 - optics.rayleigh_fraction)
-                            * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
-                };
-
-                let scale = weight * t_sun_secondary * INV_4PI;
-                total += phase * scale;
-            }
-
             weight *= optics.ssa;
+            
+            let skip_nee = is_main && bdpt_active;
+            if !skip_nee {
+                let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
+
+                if t_sun_secondary > 1e-30 {
+                    let cos_angle_nee = sun_dir.dot(-current_dir);
+                    let phase = if optics.rayleigh_fraction > 0.99 {
+                        rayleigh_phase(cos_angle_nee)
+                    } else {
+                        optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
+                            + (1.0 - optics.rayleigh_fraction)
+                                * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
+                    };
+
+                    let scale = weight * t_sun_secondary * INV_4PI;
+                    total += phase * scale;
+                }
+            }
 
             // Sample new direction: 2-way one-sample MIS between phase
             // function and Dwivedi horizontal biasing.
@@ -3515,6 +3496,7 @@ fn trace_secondary_chain_alis(
     ray_idx: usize,
     total_rays: usize,
     num_wl: usize,
+    bdpt_active: bool,
 ) -> [f64; 64] {
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
 
@@ -3623,7 +3605,7 @@ fn trace_secondary_chain_alis(
     stack[0] = SplitParticleAlis {
         pos: start_pos,
         dir,
-        hero_weight: hero_optics.ssa * initial_weight,
+        hero_weight: initial_weight,
         weight_ratio,
         rng: *rng,
     };
@@ -3632,7 +3614,7 @@ fn trace_secondary_chain_alis(
     // Process all particles: main first, then split copies (LIFO order).
     while stack_len > 0 {
         stack_len -= 1;
-        let _is_main = !main_processed;
+        let is_main = !main_processed;
         main_processed = true;
         let mut pos = stack[stack_len].pos;
         let mut current_dir = stack[stack_len].dir;
@@ -3814,9 +3796,11 @@ fn trace_secondary_chain_alis(
                                         wr[w] *= albedo_ratio;
                                     }
                                     current_dir = sample_hemisphere(normal, &mut local_rng.dir);
-                                    continue;
+                                    scatter_found = false;
+                                    break;
                                 }
-                                continue;
+                                scatter_found = false;
+                                break;
                             }
                         }
                         None => break,
@@ -3845,19 +3829,7 @@ fn trace_secondary_chain_alis(
                 scatter_shell = found_shell;
             }
 
-            // NEE for ALL wavelengths using multi-wavelength shadow ray.
-            let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
-            let cos_angle_nee = sun_dir.dot(-current_dir);
-
-            for w in 0..num_wl {
-                if t_suns[w] > 1e-30 {
-                    let optics_w = &atm.optics[scatter_shell][w];
-                    let phase_w = scalar_phase_value(cos_angle_nee, optics_w);
-                    total[w] += hero_weight * wr[w] * t_suns[w] * phase_w * INV_4PI;
-                }
-            }
-
-            // Apply hero SSA.
+            // Apply hero SSA for this scatter event BEFORE calculating NEE.
             let hero_scatter_optics = &atm.optics[scatter_shell][hero_wl];
             hero_weight *= hero_scatter_optics.ssa;
 
@@ -3870,6 +3842,20 @@ fn trace_secondary_chain_alis(
                     0.0
                 };
                 wr[w] *= ssa_ratio;
+            }
+
+            let skip_nee = is_main && bdpt_active;
+            if !skip_nee {
+                let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
+                let cos_angle_nee = sun_dir.dot(-current_dir);
+
+                for w in 0..num_wl {
+                    if t_suns[w] > 1e-30 {
+                        let optics_w = &atm.optics[scatter_shell][w];
+                        let phase_w = scalar_phase_value(cos_angle_nee, optics_w);
+                        total[w] += hero_weight * wr[w] * t_suns[w] * phase_w * INV_4PI;
+                    }
+                }
             }
 
             // Sample new direction: 2-way one-sample MIS (Dwivedi +
@@ -4256,6 +4242,7 @@ pub fn hybrid_scatter_radiance_alis(
                     ray,
                     rays_this_step,
                     num_wl,
+                    bdpt_active,
                 );
 
                 for w in 0..num_wl {
@@ -4411,7 +4398,14 @@ pub fn hybrid_scatter_radiance_alis(
 
                     let dist = libm::sqrt(dist_sq);
                     let connection_dir = diff.scale(1.0 / dist);
-                    let g_term = 1.0 / dist_sq;
+
+                    let u = diff.dot(view_dir); 
+                    let d_sq = (dist_sq - u * u).max(100.0); 
+                    let d_perp = libm::sqrt(d_sq);
+                    let y1 = -0.5 * ds - u;
+                    let y2 = 0.5 * ds - u;
+                    let g_term_ds =
+                        (libm::atan2(y2, d_perp) - libm::atan2(y1, d_perp)) / d_perp;
 
                     let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
                     let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
@@ -4438,14 +4432,13 @@ pub fn hybrid_scatter_radiance_alis(
 
                         let contrib = t_obs
                             * beta_scat_eye
-                            * ds
                             * lv.hero_weight
                             * lv.weight_ratio[w]
                             * phase_eye
                             * INV_4PI
                             * phase_light
                             * INV_4PI
-                            * g_term
+                            * g_term_ds
                             * t_conn[w]
                             * inv_num_light_subpaths;
 
