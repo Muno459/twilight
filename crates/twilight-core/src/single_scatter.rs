@@ -322,9 +322,11 @@ pub fn shadow_ray_transmittance(
                 } else {
                     1.0
                 };
-                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) => (d, true),
+                    RefractResult::TotalReflection(d) => (d, false),
                 };
+                dir = new_dir;
                 pos = boundary_pos + dir * 1e-3;
 
                 // Hit ground -- fully opaque
@@ -333,11 +335,12 @@ pub fn shadow_ray_transmittance(
                 }
 
                 // Exited atmosphere
-                if next_shell >= num_shells {
+                if crossed {
+                    if next_shell >= num_shells {
                     break;
                 }
-
-                shell_idx = next_shell;
+                    shell_idx = next_shell;
+                }
             }
             None => break,
         }
@@ -509,9 +512,11 @@ pub fn shadow_ray_transmittance_spectrum(
                 } else {
                     1.0
                 };
-                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+                    RefractResult::Refracted(d) => (d, true),
+                    RefractResult::TotalReflection(d) => (d, false),
                 };
+                dir = new_dir;
                 pos = boundary_pos + dir * 1e-3;
 
                 // Hit ground -- fully opaque for ALL wavelengths
@@ -520,11 +525,12 @@ pub fn shadow_ray_transmittance_spectrum(
                 }
 
                 // Exited atmosphere
-                if next_shell >= num_shells {
+                if crossed {
+                    if next_shell >= num_shells {
                     break;
                 }
-
-                shell_idx = next_shell;
+                    shell_idx = next_shell;
+                }
             }
             None => break,
         }
@@ -1448,9 +1454,9 @@ mod tests {
             };
 
             // Refract
-            dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
+            let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
                 RefractResult::Refracted(d) => d,
-                RefractResult::TotalReflection(_) => break, // shouldn't happen
+                RefractResult::TotalReflection(d) => (d, false), // shouldn't happen
             };
             pos = boundary_pos + dir * 1e-3; // nudge past boundary
 

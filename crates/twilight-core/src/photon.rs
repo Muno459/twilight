@@ -105,9 +105,12 @@ fn scout_tau_to_boundary(
                 } else {
                     1.0
                 };
-                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
+                {
+                    RefractResult::Refracted(d) => (d, true),
+                    RefractResult::TotalReflection(d) => (d, false),
                 };
+                dir = new_dir;
                 pos = boundary_pos + dir * 1e-3;
 
                 // Hit ground -- path terminates here
@@ -116,11 +119,12 @@ fn scout_tau_to_boundary(
                 }
 
                 // Exited atmosphere
-                if next_shell >= num_shells {
-                    return (tau, false);
+                if crossed {
+                    if next_shell >= num_shells {
+                        return (tau, false);
+                    }
+                    shell_idx = next_shell;
                 }
-
-                shell_idx = next_shell;
             }
             None => return (tau, false),
         }
@@ -201,9 +205,12 @@ fn advance_to_optical_depth(
                 } else {
                     1.0
                 };
-                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
+                {
+                    RefractResult::Refracted(d) => (d, true),
+                    RefractResult::TotalReflection(d) => (d, false),
                 };
+                dir = new_dir;
                 pos = boundary_pos + dir * 1e-3;
 
                 // Hit ground -- place scatter here
@@ -212,11 +219,12 @@ fn advance_to_optical_depth(
                 }
 
                 // Exited atmosphere -- place scatter at exit
-                if next_shell >= num_shells {
-                    return (pos, dir, shell_idx);
+                if crossed {
+                    if next_shell >= num_shells {
+                        return (pos, dir, shell_idx);
+                    }
+                    shell_idx = next_shell;
                 }
-
-                shell_idx = next_shell;
             }
             None => return (pos, dir, shell_idx),
         }
@@ -1975,9 +1983,12 @@ fn vspg_sample_scatter_tau(
                 } else {
                     1.0
                 };
-                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
+                {
+                    RefractResult::Refracted(d) => (d, true),
+                    RefractResult::TotalReflection(d) => (d, false),
                 };
+                dir = new_dir;
                 pos = boundary_pos + dir * 1e-3;
 
                 // Hit ground.
@@ -1985,11 +1996,12 @@ fn vspg_sample_scatter_tau(
                     break;
                 }
                 // Exited atmosphere.
-                if next_shell >= num_shells {
-                    break;
+                if crossed {
+                    if next_shell >= num_shells {
+                        break;
+                    }
+                    shell_idx = next_shell;
                 }
-
-                shell_idx = next_shell;
             }
             None => break,
         }
@@ -2176,9 +2188,12 @@ fn scout_with_vspg_segments(
                 } else {
                     1.0
                 };
-                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
+                {
+                    RefractResult::Refracted(d) => (d, true),
+                    RefractResult::TotalReflection(d) => (d, false),
                 };
+                dir = new_dir;
                 pos = boundary_pos + dir * 1e-3;
 
                 // Hit ground.
@@ -2186,11 +2201,12 @@ fn scout_with_vspg_segments(
                     return (tau, true, num_seg);
                 }
                 // Exited atmosphere.
-                if next_shell >= num_shells {
-                    return (tau, false, num_seg);
+                if crossed {
+                    if next_shell >= num_shells {
+                        return (tau, false, num_seg);
+                    }
+                    shell_idx = next_shell;
                 }
-
-                shell_idx = next_shell;
             }
             None => return (tau, false, num_seg),
         }
@@ -2269,19 +2285,23 @@ fn scout_with_vspg_segments_alis(
                 } else {
                     1.0
                 };
-                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
+                {
+                    RefractResult::Refracted(d) => (d, true),
+                    RefractResult::TotalReflection(d) => (d, false),
                 };
+                dir = new_dir;
                 pos = boundary_pos + dir * 1e-3;
 
                 if !is_outward && pos.length() <= surface_radius + 1.0 {
                     return (tau, true, num_seg);
                 }
-                if next_shell >= num_shells {
-                    return (tau, false, num_seg);
+                if crossed {
+                    if next_shell >= num_shells {
+                        return (tau, false, num_seg);
+                    }
+                    shell_idx = next_shell;
                 }
-
-                shell_idx = next_shell;
             }
             None => return (tau, false, num_seg),
         }
@@ -3144,7 +3164,7 @@ fn trace_secondary_chain_scalar(
 
             // NEE: scalar phase function (no Mueller matrix)
             weight *= optics.ssa;
-            
+
             let skip_nee = is_main && bdpt_active;
             if !skip_nee {
                 let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
@@ -3359,19 +3379,23 @@ fn scout_tau_to_boundary_alis(
                 } else {
                     1.0
                 };
-                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
+                {
+                    RefractResult::Refracted(d) => (d, true),
+                    RefractResult::TotalReflection(d) => (d, false),
                 };
+                dir = new_dir;
                 pos = boundary_pos + dir * 1e-3;
 
                 if !is_outward && pos.length() <= surface_radius + 1.0 {
                     return (tau, true);
                 }
-                if next_shell >= num_shells {
-                    return (tau, false);
+                if crossed {
+                    if next_shell >= num_shells {
+                        return (tau, false);
+                    }
+                    shell_idx = next_shell;
                 }
-
-                shell_idx = next_shell;
             }
             None => return (tau, false),
         }
@@ -3450,19 +3474,23 @@ fn advance_to_optical_depth_alis(
                 } else {
                     1.0
                 };
-                dir = match refract_at_boundary(dir, boundary_pos, n_from, n_to) {
-                    RefractResult::Refracted(d) | RefractResult::TotalReflection(d) => d,
+                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
+                {
+                    RefractResult::Refracted(d) => (d, true),
+                    RefractResult::TotalReflection(d) => (d, false),
                 };
+                dir = new_dir;
                 pos = boundary_pos + dir * 1e-3;
 
                 if !is_outward && pos.length() <= surface_radius + 1.0 {
                     return (pos, dir, shell_idx, tau_accumulated);
                 }
-                if next_shell >= num_shells {
-                    return (pos, dir, shell_idx, tau_accumulated);
+                if crossed {
+                    if next_shell >= num_shells {
+                        return (pos, dir, shell_idx, tau_accumulated);
+                    }
+                    shell_idx = next_shell;
                 }
-
-                shell_idx = next_shell;
             }
             None => return (pos, dir, shell_idx, tau_accumulated),
         }
@@ -4399,13 +4427,12 @@ pub fn hybrid_scatter_radiance_alis(
                     let dist = libm::sqrt(dist_sq);
                     let connection_dir = diff.scale(1.0 / dist);
 
-                    let u = diff.dot(view_dir); 
-                    let d_sq = (dist_sq - u * u).max(100.0); 
+                    let u = diff.dot(view_dir);
+                    let d_sq = (dist_sq - u * u).max(100.0);
                     let d_perp = libm::sqrt(d_sq);
                     let y1 = -0.5 * ds - u;
                     let y2 = 0.5 * ds - u;
-                    let g_term_ds =
-                        (libm::atan2(y2, d_perp) - libm::atan2(y1, d_perp)) / d_perp;
+                    let g_term_ds = (libm::atan2(y2, d_perp) - libm::atan2(y1, d_perp)) / d_perp;
 
                     let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
                     let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
@@ -6912,7 +6939,7 @@ mod tests {
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl,
+                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, false,
             );
             for w in 0..num_wl {
                 assert!(
@@ -7384,7 +7411,7 @@ mod tests {
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl,
+                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, false,
             );
             for w in 0..num_wl {
                 assert!(

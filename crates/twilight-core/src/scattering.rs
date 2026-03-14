@@ -31,7 +31,7 @@ pub fn rayleigh_phase(cos_theta: f64) -> f64 {
 #[inline]
 pub fn henyey_greenstein_phase(cos_theta: f64, g: f64) -> f64 {
     let g2 = g * g;
-    let denom = 1.0 + g2 - 2.0 * g * cos_theta;
+    let denom = (1.0 - g) * (1.0 - g) + 2.0 * g * (1.0 - cos_theta);
     (1.0 - g2) / (denom * libm::sqrt(denom))
 }
 
@@ -73,8 +73,8 @@ pub fn sample_rayleigh_analytic(xi: f64) -> f64 {
     // Only one real root since discriminant > 0
     let disc = q * q / 4.0 + 1.0; // p^3/27 + q^2/4 = 1 + q^2/4
     let sqrt_disc = libm::sqrt(disc);
-    let u = cbrt(-q / 2.0 + sqrt_disc);
-    let v = cbrt(-q / 2.0 - sqrt_disc);
+    let u = cbrt(q / 2.0 + sqrt_disc);
+    let v = cbrt(q / 2.0 - sqrt_disc);
     let mu = u + v;
     // Clamp to [-1, 1]
     mu.clamp(-1.0, 1.0)
@@ -120,7 +120,7 @@ pub fn scatter_direction(
     use crate::geometry::Vec3;
     use libm::{fabs, sincos, sqrt};
 
-    let sin_theta = sqrt((1.0 - cos_theta * cos_theta).max(0.0));
+    let sin_theta = sqrt(((1.0 - cos_theta) * (1.0 + cos_theta)).max(0.0));
     let (sin_phi, cos_phi) = sincos(phi);
 
     // Build local coordinate system around incoming direction
@@ -566,21 +566,23 @@ pub fn scatter_stokes_fast(
     let b = alpha * p12_r;
     let c = alpha * p33_r + one_minus_alpha * p11_h;
 
-    // Double-angle rotation (no trig)
+    // Apply scattering matrix S(theta) to the input stokes
+    let i_scat = a * stokes.s[0] + b * stokes.s[1];
+    let q_scat = b * stokes.s[0] + a * stokes.s[1];
+    let u_scat = c * stokes.s[2];
+    let v_scat = c * stokes.s[3];
+
+    // Double-angle rotation (no trig) to rotate the scattered light
+    // from the local scattering plane into the target reference plane.
     let c2 = 2.0 * cos_phi * cos_phi - 1.0;
     let s2 = 2.0 * sin_phi * cos_phi;
 
-    // Rotated Q, U terms
-    let q_rot = c2 * stokes.s[1] + s2 * stokes.s[2];
-    let u_rot = c2 * stokes.s[2] - s2 * stokes.s[1];
+    // Rotate Q, U terms
+    let q_rot = c2 * q_scat - s2 * u_scat;
+    let u_rot = s2 * q_scat + c2 * u_scat;
 
     StokesVector {
-        s: [
-            a * stokes.s[0] + b * q_rot,
-            b * stokes.s[0] + a * q_rot, // D = A (Rayleigh symmetry)
-            c * u_rot,
-            c * stokes.s[3], // E = C (Rayleigh symmetry)
-        ],
+        s: [i_scat, q_rot, u_rot, v_scat],
     }
 }
 
