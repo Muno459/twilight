@@ -22,6 +22,24 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Show solar position and conventional twilight times
+    /// Render a sky map at a specific solar zenith angle
+    Render {
+        /// Solar Zenith Angle in degrees
+        #[arg(long, default_value = "96.0")]
+        sza: f64,
+        /// Image width
+        #[arg(long, default_value = "800")]
+        width: u32,
+        /// Image height
+        #[arg(long, default_value = "400")]
+        height: u32,
+        /// Number of rays per pixel per wavelength
+        #[arg(short, long, default_value = "50")]
+        rays: usize,
+        /// Output filename
+        #[arg(long, default_value = "sky_96.png")]
+        out: String,
+    },
     Solar {
         /// Latitude in degrees (north positive)
         #[arg(short, long)]
@@ -1415,6 +1433,164 @@ fn get_radiance_at_wl(result: &SpectralResult, target_nm: f64) -> f64 {
     result.radiance[closest_idx]
 }
 
+fn xyz_to_rgb(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+    let r = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
+    let g = -0.9692660 * x + 1.8760108 * y + 0.0415560 * z;
+    let b = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+    (r, g, b)
+}
+
+fn wyman_xyz(lambda: f64) -> (f64, f64, f64) {
+    let x = {
+        let t1 = (lambda - 442.0) * (if lambda < 442.0 { 0.0624 } else { 0.0374 });
+        let t2 = (lambda - 599.8) * (if lambda < 599.8 { 0.0264 } else { 0.0323 });
+        let t3 = (lambda - 501.1) * (if lambda < 501.1 { 0.0490 } else { 0.0382 });
+        0.362 * (-0.5 * t1 * t1).exp() + 1.056 * (-0.5 * t2 * t2).exp()
+            - 0.065 * (-0.5 * t3 * t3).exp()
+    };
+
+    let y = {
+        let t1 = (lambda - 568.8) * (if lambda < 568.8 { 0.0213 } else { 0.0247 });
+        let t2 = (lambda - 530.9) * (if lambda < 530.9 { 0.0613 } else { 0.0322 });
+        0.821 * (-0.5 * t1 * t1).exp() + 0.286 * (-0.5 * t2 * t2).exp()
+    };
+
+    let z = {
+        let t1 = (lambda - 437.0) * (if lambda < 437.0 { 0.0845 } else { 0.0278 });
+        let t2 = (lambda - 459.0) * (if lambda < 459.0 { 0.0385 } else { 0.0725 });
+        1.217 * (-0.5 * t1 * t1).exp() + 0.681 * (-0.5 * t2 * t2).exp()
+    };
+    (x, y, z)
+}
+
+fn cmd_render(sza: f64, width: u32, height: u32, rays: usize, out: &str) {
+    println!("Rendering Sky Map");
+    println!("SZA: {:.1} deg", sza);
+    println!("Resolution: {}x{}", width, height);
+    println!("Rays per pixel: {}", rays);
+    println!("Output: {}", out);
+
+    let lat = 0.0;
+    let lon = 0.0;
+    let elevation = 0.0;
+    let albedo = 0.15;
+
+    let atm = builder::build_full(AtmosphereType::UsStandard, albedo, None, None);
+
+    let observer_pos = twilight_core::geometry::geographic_to_ecef(lat, lon, elevation);
+    let sun_dir = twilight_core::geometry::solar_direction_ecef(sza, 180.0, lat, lon);
+
+    let start = std::time::Instant::now();
+    let num_wl = atm.num_wavelengths;
+    let completed = std::sync::atomic::AtomicUsize::new(0);
+
+    let mut pixels = Vec::with_capacity((width * height) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            pixels.push((x, y));
+        }
+    }
+
+    use rayon::prelude::*;
+    let result_pixels: Vec<(u32, u32, f64, f64, f64)> = pixels
+        .into_par_iter()
+        .map(|(x, y)| {
+            let view_azimuth = (x as f64 / width as f64) * 360.0;
+            let view_zenith = (y as f64 / height as f64) * 90.0;
+
+            let view_dir =
+                twilight_core::geometry::solar_direction_ecef(view_zenith, view_azimuth, lat, lon);
+
+            let sza_bits = sza.to_bits();
+            let mut rng = sza_bits
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add((y as u64 * width as u64 + x as u64) ^ 0x12345678);
+
+            let radiance_array = twilight_core::photon::hybrid_scatter_radiance_alis(
+                &atm,
+                observer_pos,
+                view_dir,
+                sun_dir,
+                rays,
+                &mut rng,
+            );
+
+            let mut sum_x = 0.0;
+            let mut sum_y = 0.0;
+            let mut sum_z = 0.0;
+
+            for w in 0..num_wl {
+                let irrad = if w < twilight_data::solar_spectrum::SOLAR_IRRADIANCE.len() {
+                    twilight_data::solar_spectrum::SOLAR_IRRADIANCE[w]
+                } else {
+                    1.0
+                };
+                let r = radiance_array[w] * irrad;
+                let wl_nm = atm.wavelengths_nm[w];
+                let (cx, cy, cz) = wyman_xyz(wl_nm);
+                let dw = if w < num_wl - 1 {
+                    atm.wavelengths_nm[w + 1] - wl_nm
+                } else if w > 0 {
+                    wl_nm - atm.wavelengths_nm[w - 1]
+                } else {
+                    10.0
+                };
+                sum_x += r * cx * dw;
+                sum_y += r * cy * dw;
+                sum_z += r * cz * dw;
+            }
+
+            let (r, g, b) = xyz_to_rgb(sum_x, sum_y, sum_z);
+
+            let count = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if count > 0 && count % (width as usize * 10) == 0 {
+                print!("\rRendered {} / {} pixels", count, width * height);
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+            }
+
+            (x, y, r, g, b)
+        })
+        .collect();
+
+    println!("\rRendered {} / {} pixels", width * height, width * height);
+
+    let mut max_val = 0.0f64;
+    for &(_, _, r, g, b) in &result_pixels {
+        max_val = max_val.max(r).max(g).max(b);
+    }
+
+    // Tonemap
+    // We want the max value to be scaled to something reasonable for Reinhard.
+    // If we scale by 2.0 / max_val, then max value becomes 2.0. Reinhard: 2.0 / 3.0 = 0.66.
+    // That means the brightest pixel will be gray (0.66).
+    // Let's scale by 5.0 / max_val so max is 5.0. Reinhard: 5.0 / 6.0 = 0.83 (bright).
+    let exposure = if max_val > 0.0 { 5.0 / max_val } else { 1.0 };
+
+    let mut img = image::ImageBuffer::new(width, height);
+    for (x, y, r, g, b) in result_pixels {
+        let mut r = (r * exposure).max(0.0);
+        let mut g = (g * exposure).max(0.0);
+        let mut b = (b * exposure).max(0.0);
+
+        // Reinhard
+        r = r / (1.0 + r);
+        g = g / (1.0 + g);
+        b = b / (1.0 + b);
+
+        // Gamma
+        let gamma = 1.0 / 2.2;
+        r = r.powf(gamma).clamp(0.0, 1.0);
+        g = g.powf(gamma).clamp(0.0, 1.0);
+        b = b.powf(gamma).clamp(0.0, 1.0);
+
+        let rgb_tuple = image::Rgb([(r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8]);
+        img.put_pixel(x, y, rgb_tuple);
+    }
+
+    img.save(out).expect("Failed to save image");
+    println!("Rendered in {:.2?}", start.elapsed());
+}
 fn main() {
     let cli = Cli::parse();
 
@@ -1466,6 +1642,15 @@ fn main() {
                 gpu_backend,
                 fast,
             );
+        }
+        Commands::Render {
+            sza,
+            width,
+            height,
+            rays,
+            out,
+        } => {
+            cmd_render(sza, width, height, rays, &out);
         }
         Commands::Pray {
             lat,
