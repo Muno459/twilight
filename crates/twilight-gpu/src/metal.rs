@@ -108,7 +108,8 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     let pso_single_scatter = make_pipeline(&device, &library, "single_scatter_spectrum")?;
     let pso_mcrt_trace = make_pipeline(&device, &library, "mcrt_trace_photon")?;
     let pso_hybrid = make_pipeline(&device, &library, "hybrid_scatter")?;
-    let pso_hybrid_v2 = make_pipeline(&device, &library, "hybrid_scatter_v2")?;
+    // v2 kernel is not yet in the shader; reuse v1 pipeline for now.
+    let pso_hybrid_v2 = make_pipeline(&device, &library, "hybrid_scatter")?;
     let pso_garstang = make_pipeline(&device, &library, "garstang_zenith")?;
 
     // 5. Pack and upload constant buffers (solar spectrum, vision LUTs)
@@ -255,66 +256,23 @@ impl GpuBackend for MetalBackend {
             .ok_or_else(|| GpuError::Dispatch("atmosphere not uploaded".into()))?;
 
         let nw = self.num_wavelengths as usize;
-        const MAX_LOS_STEPS: usize = 200;
-        let output_len = nw * MAX_LOS_STEPS;
+        let params =
+            PackedDispatchParams::new(observer_pos, view_dir, sun_dir, 0, secondary_rays, seed);
+        let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
+        let buf_output = create_empty_buffer(&self.device, nw)?;
 
-        // Split high ray counts across multiple command buffers to avoid
-        // Metal's GPU watchdog timeout (~2-5s per command buffer).
-        // Each dispatch handles RAYS_PER_DISPATCH rays; results are
-        // accumulated in f64 on CPU.
-        const RAYS_PER_DISPATCH: u32 = 5000;
-        let num_dispatches = (secondary_rays.div_ceil(RAYS_PER_DISPATCH)).max(1);
-        let buf_output = create_empty_buffer(&self.device, output_len)?;
-        let mut accum = vec![0.0f64; output_len];
+        // Use the step-parallel v1 kernel: one threadgroup per wavelength,
+        // 256 threads = 256 LOS steps, secondary rays run serially per thread.
+        // The forced_tau_min fix prevents weight death at high ray counts.
+        self.dispatch_hybrid(
+            &self.pso_hybrid,
+            &[buf_atm, &buf_params, &buf_output],
+            nw as u32,
+        )?;
 
-        for d in 0..num_dispatches {
-            let ray_start = d * RAYS_PER_DISPATCH;
-            let ray_end = ((d + 1) * RAYS_PER_DISPATCH).min(secondary_rays);
-            let rays_this = ray_end - ray_start;
-            if rays_this == 0 {
-                continue;
-            }
-
-            // Encode ray_start in upper 32 bits of seed for RNG offset.
-            // photons_per_wl carries the global total for stratification.
-            let ray_seed = (seed & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
-            let params = PackedDispatchParams::new(
-                observer_pos,
-                view_dir,
-                sun_dir,
-                secondary_rays, // global total for stratification
-                rays_this,      // per-dispatch ray count
-                ray_seed,
-            );
-            let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
-            zero_f32_buffer(&buf_output, output_len)?;
-
-            self.dispatch_hybrid_v2(
-                &self.pso_hybrid_v2,
-                &[buf_atm, &buf_params, &buf_output],
-                nw as u32,
-                MAX_LOS_STEPS as u32,
-            )?;
-
-            let raw = read_f32_buffer(&buf_output, output_len);
-            for (i, &v) in raw.iter().enumerate() {
-                if v.is_finite() {
-                    accum[i] += v as f64;
-                }
-            }
-        }
-
-        // Reduce across steps per-wavelength, average across dispatches
-        let inv_dispatches = 1.0 / num_dispatches as f64;
-        let mut radiance = Vec::with_capacity(nw);
-        for w in 0..nw {
-            let base = w * MAX_LOS_STEPS;
-            let sum: f64 = accum[base..base + MAX_LOS_STEPS].iter().sum();
-            radiance.push(sum * inv_dispatches);
-        }
-
+        let radiance = read_f32_buffer(&buf_output, nw);
         Ok(GpuSpectralResult {
-            radiance,
+            radiance: radiance.iter().map(|&v| v as f64).collect(),
             num_wavelengths: nw,
         })
     }
