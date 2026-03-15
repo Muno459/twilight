@@ -774,6 +774,18 @@ struct BranchParams {
     float tilt_rad;     // tilt angle of terminator axis from zenith
 };
 
+struct SecondarySetup {
+    float3 local_up;
+    float3 term_axis_dir;
+    float alpha_p;
+    float alpha_z;
+    float alpha_t;
+    float n_zenith;
+    float m_term;
+    float alpha_et;
+    uint use_forced;
+};
+
 inline BranchParams branch_params_for_sza(float sza_deg) {
     float sza_t = clamp((sza_deg - ZENITH_SZA_START_DEG)
                         / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
@@ -1214,21 +1226,10 @@ AdvanceResult advance_to_optical_depth(device const float* atm, float3 start_pos
 float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                              float3 sun_dir, uint wl_idx,
                              ShellOptics start_optics, float3 prev_dir_in,
+                             SecondarySetup setup,
                              uint ray_idx, uint total_rays,
                              thread ulong &rng) {
-    float3 local_up = normalize(start_pos);
     float surface_radius = EARTH_RADIUS_M;
-
-    // SZA-adaptive 3-branch parameters
-    float cos_sza = dot(sun_dir, local_up);
-    float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
-    BranchParams bp = branch_params_for_sza(sza_deg);
-
-    float alpha_p = 1.0f - bp.zenith_frac;
-    float alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
-    float alpha_t = bp.zenith_frac * bp.term_share;
-
-    float3 term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
 
     // Stratified 3-branch importance sampling with branch probability weights.
     float xi_jitter = xorshift_f32(rng);
@@ -1236,7 +1237,7 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     float3 dir;
     float cos_theta_init;
     float initial_weight;
-    if (xi_mix < alpha_p) {
+    if (xi_mix < setup.alpha_p) {
         // Phase function branch
         if (xorshift_f32(rng) < start_optics.rayleigh_fraction) {
             cos_theta_init = sample_rayleigh_analytic(xorshift_f32(rng));
@@ -1245,23 +1246,23 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         }
         float phi_init = 2.0f * PI * xorshift_f32(rng);
         dir = scatter_direction(sun_dir, cos_theta_init, phi_init);
-        initial_weight = 0.5f / alpha_p;
-    } else if (xi_mix < alpha_p + alpha_z || alpha_t < 1e-6f) {
+        initial_weight = 0.5f / setup.alpha_p;
+    } else if (xi_mix < setup.alpha_p + setup.alpha_z || setup.alpha_t < 1e-6f) {
         // Zenith-biased branch with shape + branch weight correction
-        ZenithSample zs = sample_zenith_biased(local_up, bp.n_zenith, rng);
+        ZenithSample zs = sample_zenith_biased(setup.local_up, setup.n_zenith, rng);
         dir = zs.dir;
         cos_theta_init = dot(sun_dir, dir);
-        float shape_w = zenith_importance_weight(zs.cos_theta, bp.n_zenith);
-        float branch_w = 0.5f / (alpha_z + alpha_t);
+        float shape_w = zenith_importance_weight(zs.cos_theta, setup.n_zenith);
+        float branch_w = 0.5f / (setup.alpha_z + setup.alpha_t);
         initial_weight = shape_w * branch_w;
     } else {
         // Terminator lobe branch
-        ZenithSample zs = sample_zenith_biased(term_axis_dir, bp.m_term, rng);
+        ZenithSample zs = sample_zenith_biased(setup.term_axis_dir, setup.m_term, rng);
         dir = zs.dir;
         cos_theta_init = dot(sun_dir, dir);
-        float cos_z = dot(dir, local_up);
-        float shape_w = terminator_shape_weight(cos_z, zs.cos_theta, bp.m_term);
-        float branch_w = 0.5f / alpha_t;
+        float cos_z = dot(dir, setup.local_up);
+        float shape_w = terminator_shape_weight(cos_z, zs.cos_theta, setup.m_term);
+        float branch_w = 0.5f / setup.alpha_t;
         initial_weight = shape_w * branch_w;
     }
 
@@ -1290,24 +1291,14 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     float3 prev_dir = sun_dir; // direction before current propagation segment
     float weight = start_optics.ssa * initial_weight;
 
-    // KBN accumulators for each Stokes component
     KahanAccum total_I, total_Q, total_U, total_V;
-
-    // Upfront forced scattering gate: only at deep twilight
-    // (cos_sza and sza_deg already computed above for zenith bias)
-    bool use_forced = (sza_deg >= ZENITH_SZA_START_DEG);
-
-    // Exponential transform bias parameter (ramps with SZA)
-    float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
-                           / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
-    float alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
     for (uint scatter_iter = 0; scatter_iter < HYBRID_MAX_BOUNCES; scatter_iter++) {
         // --- Decide scatter mode for this bounce ---
         bool forced_this_bounce = false;
         float tau_max = 0.0f;
 
-        if (use_forced) {
+        if (setup.use_forced != 0u) {
             ScoutResult scout = scout_tau_to_boundary(atm, pos, current_dir, wl_idx);
             tau_max = scout.tau;
             // Force scatter only when path exits to space AND is optically thin.
@@ -1355,9 +1346,9 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
                 // Exponential transform: modified extinction.
                 // Bias axis tilted toward terminator at deep twilight.
-                float cos_bias = dot(current_dir, term_axis_dir);
+                float cos_bias = dot(current_dir, setup.term_axis_dir);
                 float sigma = op.extinction;
-                float sigma_prime = sigma * (1.0f - alpha_et * cos_bias);
+                float sigma_prime = sigma * (1.0f - setup.alpha_et * cos_bias);
 
                 float xi = xorshift_f32(rng);
                 float free_path = -log(1.0f - xi + 1e-30f) / sigma_prime;
@@ -1367,8 +1358,23 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
                 if (free_path >= bnd.dist) {
                     // Boundary crossing weight correction
-                    if (alpha_et > 0.0f) {
-                        weight *= exp(-alpha_et * sigma * cos_bias * bnd.dist);
+                    if (setup.alpha_et > 0.0f) {
+                        weight *= exp(-setup.alpha_et * sigma * cos_bias * bnd.dist);
+                    }
+
+                    // Fast path: inward crossing from shell 0 is the ground boundary.
+                    if (!bnd.is_outward && us == 0u) {
+                        float3 boundary_pos = pos + current_dir * bnd.dist;
+                        boundary_pos = snap_to_radius(boundary_pos, sh.r_inner);
+                        float albedo = read_albedo(atm, wl_idx);
+                        weight *= albedo;
+                        if (weight < 1e-30f) break;
+                        float3 normal = normalize(boundary_pos);
+                        prev_dir = current_dir;
+                        current_dir = sample_hemisphere(normal, rng);
+                        pos = radial_nudge(boundary_pos, true);
+                        stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
+                        continue;
                     }
 
                     float3 boundary_pos = pos + current_dir * bnd.dist;
@@ -1400,8 +1406,8 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
                 // Scatter within this shell.
                 // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
-                if (alpha_et > 0.0f) {
-                    weight *= (sigma / sigma_prime) * exp(-alpha_et * sigma * cos_bias * free_path);
+                if (setup.alpha_et > 0.0f) {
+                    weight *= (sigma / sigma_prime) * exp(-setup.alpha_et * sigma * cos_bias * free_path);
                 }
                 pos = pos + current_dir * free_path;
                 scatter_shell = us;
@@ -1555,15 +1561,41 @@ kernel void hybrid_scatter(
     shared_ext_ds[step_idx] = my_ext_ds;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase 2: Compute tau_obs at this step via sequential scan ────────
-    // Each thread sums shared_ext_ds[0..step_idx-1]. This is O(N) per thread,
-    // O(N^2) total, but N=200 and the cost is negligible compared to the
-    // secondary chain tracing (thousands of operations per step).
+    // ── Phase 2: Compute exclusive prefix tau_obs via threadgroup scan ───
+    // This replaces the old O(N^2) per-thread summation with a Blelloch scan
+    // over shared_ext_ds. step_idx gets tau_obs = sum(shared_ext_ds[0..step_idx-1]).
 
-    float tau_obs = 0.0f;
-    for (uint i = 0; i < step_idx && i < num_steps; i++) {
-        tau_obs += shared_ext_ds[i];
+    threadgroup float shared_prefix[HYBRID_THREADGROUP_SIZE];
+    shared_prefix[step_idx] = shared_ext_ds[step_idx];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Upsweep (reduce) phase
+    for (uint offset = 1u; offset < HYBRID_THREADGROUP_SIZE; offset <<= 1u) {
+        uint idx = ((step_idx + 1u) * offset * 2u) - 1u;
+        if (idx < HYBRID_THREADGROUP_SIZE) {
+            shared_prefix[idx] += shared_prefix[idx - offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+
+    // Convert inclusive reduce tree to exclusive scan
+    if (step_idx == HYBRID_THREADGROUP_SIZE - 1u) {
+        shared_prefix[step_idx] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Downsweep phase
+    for (uint offset = HYBRID_THREADGROUP_SIZE >> 1u; offset > 0u; offset >>= 1u) {
+        uint idx = ((step_idx + 1u) * offset * 2u) - 1u;
+        if (idx < HYBRID_THREADGROUP_SIZE) {
+            float t = shared_prefix[idx - offset];
+            shared_prefix[idx - offset] = shared_prefix[idx];
+            shared_prefix[idx] += t;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float tau_obs = (step_idx < num_steps) ? shared_prefix[step_idx] : 0.0f;
     // exp(-(A+B)) = exp(-A)*exp(-B) avoids f32 precision loss
     float t_obs = exp(-tau_obs) * exp(-my_ext_ds * 0.5f);
 
@@ -1592,8 +1624,8 @@ kernel void hybrid_scatter(
 
             // Single-scatter from unpolarized sunlight: Mueller * [1,0,0,0]
             // I' = A, Q' = B, U' = 0, V' = 0
-            float4 ss_stokes = float4(A_1, B_1, 0.0f, 0.0f);
             float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;
+            float4 ss_stokes = float4(A_1, B_1, 0.0f, 0.0f);
             contribution += ss_stokes * scale_1;
         }
 
@@ -1603,10 +1635,28 @@ kernel void hybrid_scatter(
         // precision needed for f32 shadow rays to return correct results at
         // deep twilight without suppressing physics.
         if (secondary_rays > 0) {
+            float3 local_up = normalize(scatter_pos);
+            float cos_sza = dot(sun_dir, local_up);
+            float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
+            BranchParams bp = branch_params_for_sza(sza_deg);
+            float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
+                                   / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
+            SecondarySetup setup;
+            setup.local_up = local_up;
+            setup.term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
+            setup.alpha_p = 1.0f - bp.zenith_frac;
+            setup.alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
+            setup.alpha_t = bp.zenith_frac * bp.term_share;
+            setup.n_zenith = bp.n_zenith;
+            setup.m_term = bp.m_term;
+            setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+            setup.use_forced = (sza_deg >= ZENITH_SZA_START_DEG) ? 1u : 0u;
+
             KahanAccum mc_I, mc_Q, mc_U, mc_V;
             for (uint ray = 0; ray < secondary_rays; ray++) {
                 float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
-                                                      my_op, view_dir, ray, secondary_rays, rng);
+                                                      my_op, view_dir, setup,
+                                                      ray, secondary_rays, rng);
                 mc_I.add(chain.x);
                 mc_Q.add(chain.y);
                 mc_U.add(chain.z);
@@ -1625,8 +1675,6 @@ kernel void hybrid_scatter(
     // Level 1: SIMD reduction on float4 (hardware-accelerated)
     // Level 2: Threadgroup reduction (8 SIMD sums -> 1 final sum)
     //
-    // Metal's simd_sum operates on float4 natively (component-wise).
-
     float4 simd_total = simd_sum(contribution);
 
     threadgroup float4 shared_sums[NUM_SIMD_GROUPS];
@@ -1644,7 +1692,7 @@ kernel void hybrid_scatter(
         for (uint i = 0; i < NUM_SIMD_GROUPS; i++) {
             total += shared_sums[i];
         }
-        output[wl_idx] = total.x;  // Stokes I = total intensity
+        output[wl_idx] = total.x;
     }
 }
 
