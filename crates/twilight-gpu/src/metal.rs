@@ -55,6 +55,7 @@ pub struct MetalBackend {
     pso_single_scatter: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_mcrt_trace: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_hybrid: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pso_hybrid_v2: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_garstang: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 
     // Uploaded atmosphere + constant buffers (persisted between dispatches).
@@ -107,6 +108,7 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     let pso_single_scatter = make_pipeline(&device, &library, "single_scatter_spectrum")?;
     let pso_mcrt_trace = make_pipeline(&device, &library, "mcrt_trace_photon")?;
     let pso_hybrid = make_pipeline(&device, &library, "hybrid_scatter")?;
+    let pso_hybrid_v2 = make_pipeline(&device, &library, "hybrid_scatter_v2")?;
     let pso_garstang = make_pipeline(&device, &library, "garstang_zenith")?;
 
     // 5. Pack and upload constant buffers (solar spectrum, vision LUTs)
@@ -131,6 +133,7 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
         pso_single_scatter,
         pso_mcrt_trace,
         pso_hybrid,
+        pso_hybrid_v2,
         pso_garstang,
         buf_atm: None,
         buf_solar,
@@ -251,26 +254,67 @@ impl GpuBackend for MetalBackend {
             .as_ref()
             .ok_or_else(|| GpuError::Dispatch("atmosphere not uploaded".into()))?;
 
-        let params =
-            PackedDispatchParams::new(observer_pos, view_dir, sun_dir, 0, secondary_rays, seed);
-        let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
-
         let nw = self.num_wavelengths as usize;
-        let buf_output = create_empty_buffer(&self.device, nw)?;
+        const MAX_LOS_STEPS: usize = 200;
+        let output_len = nw * MAX_LOS_STEPS;
 
-        // Hybrid v2: dispatch nw threadgroups of HYBRID_THREADGROUP_SIZE threads.
-        // Each threadgroup handles one wavelength; threads within a threadgroup
-        // each handle one LOS step with secondary chain tracing, then reduce
-        // via simd_sum() + threadgroup shared memory.
-        self.dispatch_hybrid(
-            &self.pso_hybrid,
-            &[buf_atm, &buf_params, &buf_output],
-            nw as u32,
-        )?;
+        // Split high ray counts across multiple command buffers to avoid
+        // Metal's GPU watchdog timeout (~2-5s per command buffer).
+        // Each dispatch handles RAYS_PER_DISPATCH rays; results are
+        // accumulated in f64 on CPU.
+        const RAYS_PER_DISPATCH: u32 = 256;
+        let num_dispatches = (secondary_rays.div_ceil(RAYS_PER_DISPATCH)).max(1);
+        let buf_output = create_empty_buffer(&self.device, output_len)?;
+        let mut accum = vec![0.0f64; output_len];
 
-        let radiance = read_f32_buffer(&buf_output, nw);
+        for d in 0..num_dispatches {
+            let ray_start = d * RAYS_PER_DISPATCH;
+            let ray_end = ((d + 1) * RAYS_PER_DISPATCH).min(secondary_rays);
+            let rays_this = ray_end - ray_start;
+            if rays_this == 0 {
+                continue;
+            }
+
+            // Encode ray_start in upper 32 bits of seed for RNG offset.
+            // photons_per_wl carries the global total for stratification.
+            let ray_seed = (seed & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
+            let params = PackedDispatchParams::new(
+                observer_pos,
+                view_dir,
+                sun_dir,
+                secondary_rays, // global total for stratification
+                rays_this,      // per-dispatch ray count
+                ray_seed,
+            );
+            let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
+            zero_f32_buffer(&buf_output, output_len)?;
+
+            self.dispatch_hybrid_v2(
+                &self.pso_hybrid_v2,
+                &[buf_atm, &buf_params, &buf_output],
+                nw as u32,
+                MAX_LOS_STEPS as u32,
+            )?;
+
+            let raw = read_f32_buffer(&buf_output, output_len);
+            for (i, &v) in raw.iter().enumerate() {
+                if v.is_finite() {
+                    accum[i] += v as f64;
+                }
+            }
+        }
+
+        // Reduce across steps per-wavelength, average across dispatches
+        let inv_dispatches = 1.0 / num_dispatches as f64;
+        let mut radiance = Vec::with_capacity(nw);
+        for w in 0..nw {
+            let base = w * MAX_LOS_STEPS;
+            let sum: f64 = accum[base..base + MAX_LOS_STEPS].iter().sum();
+            radiance.push(sum * inv_dispatches);
+        }
+
         Ok(GpuSpectralResult {
-            radiance: radiance.iter().map(|&v| v as f64).collect(),
+            radiance,
             num_wavelengths: nw,
         })
     }
@@ -656,6 +700,67 @@ impl MetalBackend {
 
         Ok(())
     }
+
+    /// Dispatch the ray-parallel hybrid v2 kernel with 2D grid.
+    fn dispatch_hybrid_v2(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        buffers: &[&ProtocolObject<dyn MTLBuffer>],
+        num_wavelengths: u32,
+        num_steps: u32,
+    ) -> Result<(), GpuError> {
+        if num_wavelengths == 0 || num_steps == 0 {
+            return Ok(());
+        }
+
+        let cmd_buf = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| GpuError::Dispatch("failed to create command buffer".into()))?;
+
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| GpuError::Dispatch("failed to create compute encoder".into()))?;
+
+        encoder.setComputePipelineState(pipeline);
+        for (i, buf) in buffers.iter().enumerate() {
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(*buf), 0, i);
+            }
+        }
+
+        let threadgroup_size = MTLSize {
+            width: 64, // HYBRID_V2_THREADGROUP_SIZE
+            height: 1,
+            depth: 1,
+        };
+        let grid_size = MTLSize {
+            width: num_wavelengths as usize,
+            height: num_steps as usize,
+            depth: 1,
+        };
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+        Ok(())
+    }
+}
+
+/// Zero the first `n` f32 values in a shared Metal buffer.
+fn zero_f32_buffer(buffer: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Result<(), GpuError> {
+    let needed_bytes = n * std::mem::size_of::<f32>();
+    if buffer.length() < needed_bytes {
+        return Err(GpuError::BufferAllocation(
+            "buffer too small for zero".into(),
+        ));
+    }
+    let ptr = buffer.contents();
+    unsafe {
+        std::ptr::write_bytes(ptr.as_ptr() as *mut u8, 0, needed_bytes);
+    }
+    Ok(())
 }
 
 /// Load MSL shader source. In debug builds, try to load from disk first
