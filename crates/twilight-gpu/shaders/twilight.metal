@@ -213,6 +213,13 @@ struct KahanAccum {
 // xorshift64 RNG (Metal supports ulong natively on Apple Silicon)
 // ============================================================================
 
+inline ulong splitmix64(ulong state) {
+    ulong z = state + 0x9E3779B97F4A7C15ul;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ul;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBul;
+    return z ^ (z >> 31);
+}
+
 inline float xorshift_f32(thread ulong &state) {
     ulong x = state;
     x ^= x << 13;
@@ -1722,6 +1729,157 @@ kernel void hybrid_scatter(
             total += shared_sums[i];
         }
         output[wl_idx] = total.x;
+    }
+}
+
+// ============================================================================
+// Kernel 3b: hybrid_scatter_v2 (ray-parallel)
+//
+// Dispatch: (num_wavelengths, num_steps) threadgroups of 64 threads each.
+//   tg_pos.x = wavelength index
+//   tg_pos.y = LOS step index
+//   thread_in_tg.x = ray index within this step
+//
+// Each thread traces ceil(secondary_rays / 64) chains. Results are reduced
+// via Kahan accumulation in shared memory. Output layout:
+//   output[wl * HYBRID_LOS_STEPS + step] -- CPU sums across steps.
+// ============================================================================
+
+kernel void hybrid_scatter_v2(
+    device const float* atm       [[buffer(0)]],
+    device const float* params    [[buffer(1)]],
+    device float*       output    [[buffer(2)]],
+    uint3 tg_pos    [[threadgroup_position_in_grid]],
+    uint3 tid_in_tg [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_id    [[simdgroup_index_in_threadgroup]]
+) {
+    uint wl_idx = tg_pos.x;
+    uint step_idx = tg_pos.y;
+    uint ray_lane = tid_in_tg.x;
+    uint num_wl = atm_num_wavelengths(atm);
+    if (wl_idx >= num_wl) return;
+
+    float3 observer_pos = read_observer(params);
+    float3 view_dir     = read_view_dir(params);
+    float3 sun_dir      = read_sun_dir(params);
+    uint secondary_rays = read_secondary_rays(params);
+
+    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
+    float surface_radius = EARTH_RADIUS_M;
+
+    // LOS geometry
+    RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
+    if (!toa_hit.hit || toa_hit.t_far <= 0.0f) return;
+    float los_max = toa_hit.t_far;
+    RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+    bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
+    float los_end = hits_ground ? ground_hit.t_near : los_max;
+    if (los_end <= 0.0f) return;
+
+    uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
+    float ds = los_end / float(num_steps);
+    if (step_idx >= num_steps) return;
+
+    // Scatter position for this step
+    float s = (float(step_idx) + 0.5f) * ds;
+    float3 scatter_pos = observer_pos + view_dir * s;
+    float r = length(scatter_pos);
+    if (r > toa_radius || r < surface_radius) return;
+
+    int sidx = shell_index_binary(atm, r);
+    if (sidx < 0) return;
+    ShellOptics my_op = read_optics(atm, uint(sidx), wl_idx);
+    float my_beta_scat = my_op.extinction * my_op.ssa;
+    if (my_beta_scat < 1e-30f) return;
+
+    // LOS optical depth (thread 0 computes, broadcasts)
+    threadgroup float shared_tau_obs;
+    if (ray_lane == 0) {
+        float tau = 0.0f;
+        for (uint j = 0; j < step_idx; j++) {
+            float sj = (float(j) + 0.5f) * ds;
+            float3 pj = observer_pos + view_dir * sj;
+            float rj = length(pj);
+            if (rj <= toa_radius && rj >= surface_radius) {
+                int sj_idx = shell_index_binary(atm, rj);
+                if (sj_idx >= 0) {
+                    ShellOptics oj = read_optics(atm, uint(sj_idx), wl_idx);
+                    tau += oj.extinction * ds;
+                }
+            }
+        }
+        shared_tau_obs = tau;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tau_obs = shared_tau_obs;
+    float t_obs = exp(-tau_obs) * exp(-my_op.extinction * ds * 0.5f);
+    if (t_obs < 1e-30f) return;
+
+    float my_contribution = 0.0f;
+
+    // Single-scatter NEE (only thread 0)
+    if (ray_lane == 0) {
+        float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
+        if (t_sun > 1e-30f) {
+            float cos_theta_1 = dot(sun_dir, -view_dir);
+            float A_1, B_1, C_1;
+            stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
+            float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;
+            my_contribution += A_1 * scale_1;
+        }
+    }
+
+    // Secondary chains: each thread traces a subset of rays
+    if (secondary_rays > 0) {
+        float3 local_up = normalize(scatter_pos);
+        float cos_sza = dot(sun_dir, local_up);
+        float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
+        BranchParams bp = branch_params_for_sza(sza_deg);
+        float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
+                               / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
+        SecondarySetup setup;
+        setup.local_up = local_up;
+        setup.term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
+        setup.alpha_p = 1.0f - bp.zenith_frac;
+        setup.alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
+        setup.alpha_t = bp.zenith_frac * bp.term_share;
+        setup.n_zenith = bp.n_zenith;
+        setup.m_term = bp.m_term;
+        setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+        setup.use_forced = (sza_deg >= ZENITH_SZA_START_DEG) ? 1u : 0u;
+
+        // Strong seed derivation via splitmix64
+        ulong base_seed = read_rng_seed(params) & 0xFFFFFFFFul;
+        ulong seed_input = base_seed
+            ^ (ulong(wl_idx) * 0x9E3779B97F4A7C15ul)
+            ^ (ulong(step_idx) << 16)
+            ^ (ulong(ray_lane) << 32);
+        ulong rng = splitmix64(seed_input);
+
+        float inv_rays = 1.0f / float(secondary_rays);
+        float scale_m = my_beta_scat * t_obs * ds * inv_rays;
+        KahanAccum mc_I;
+        for (uint ray = ray_lane; ray < secondary_rays; ray += HYBRID_V2_THREADGROUP_SIZE) {
+            float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
+                                                  my_op, view_dir, setup,
+                                                  ray, secondary_rays, rng);
+            mc_I.add(chain.x * scale_m);
+        }
+        my_contribution += mc_I.result();
+    }
+
+    // Kahan threadgroup reduction
+    threadgroup float shared_vals[HYBRID_V2_THREADGROUP_SIZE];
+    shared_vals[ray_lane] = my_contribution;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (ray_lane == 0) {
+        KahanAccum final_sum;
+        for (uint i = 0; i < HYBRID_V2_THREADGROUP_SIZE; i++) {
+            final_sum.add(shared_vals[i]);
+        }
+        output[wl_idx * HYBRID_LOS_STEPS + step_idx] = final_sum.result();
     }
 }
 

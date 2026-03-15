@@ -259,20 +259,35 @@ impl GpuBackend for MetalBackend {
         let params =
             PackedDispatchParams::new(observer_pos, view_dir, sun_dir, 0, secondary_rays, seed);
         let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
-        let buf_output = create_empty_buffer(&self.device, nw)?;
 
-        // Use the step-parallel v1 kernel: one threadgroup per wavelength,
-        // 256 threads = 256 LOS steps, secondary rays run serially per thread.
-        // The forced_tau_min fix prevents weight death at high ray counts.
-        self.dispatch_hybrid(
-            &self.pso_hybrid,
+        // Use v2 ray-parallel kernel: (nw, num_steps) groups of 64 threads.
+        // Output is nw * MAX_LOS_STEPS floats; CPU sums across steps.
+        const MAX_LOS_STEPS: usize = 200;
+        let output_len = nw * MAX_LOS_STEPS;
+        let buf_output = create_empty_buffer(&self.device, output_len)?;
+        zero_f32_buffer(&buf_output, output_len)?;
+
+        self.dispatch_hybrid_v2(
+            &self.pso_hybrid_v2,
             &[buf_atm, &buf_params, &buf_output],
             nw as u32,
+            MAX_LOS_STEPS as u32,
         )?;
 
-        let radiance = read_f32_buffer(&buf_output, nw);
+        let raw = read_f32_buffer(&buf_output, output_len);
+        let mut radiance = Vec::with_capacity(nw);
+        for w in 0..nw {
+            let base = w * MAX_LOS_STEPS;
+            let sum: f64 = raw[base..base + MAX_LOS_STEPS]
+                .iter()
+                .filter(|v| v.is_finite())
+                .map(|&v| v as f64)
+                .sum();
+            radiance.push(sum);
+        }
+
         Ok(GpuSpectralResult {
-            radiance: radiance.iter().map(|&v| v as f64).collect(),
+            radiance,
             num_wavelengths: nw,
         })
     }
