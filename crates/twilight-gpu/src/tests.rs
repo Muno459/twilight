@@ -931,6 +931,136 @@ mod layer4_metal {
             }
         }
     }
+
+    #[test]
+    fn metal_single_hybrid_matches_one_item_batch() {
+        use crate::{BatchKernel, BatchRequest};
+        use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+
+        let Some(mut gpu) = try_metal() else { return };
+
+        let atm = twilight_data::builder::build_clear_sky(
+            twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+            0.15,
+        );
+        gpu.upload_atmosphere(&atm).unwrap();
+
+        let lat = 54.826;
+        let lon = 9.363;
+        let sza_deg: f64 = 96.0;
+        let solar_azimuth: f64 = 270.0;
+        let view_zenith: f64 = 85.0;
+        let rays = 5000u32;
+        let seed = sza_deg.to_bits();
+
+        let obs = geographic_to_ecef(lat, lon, 0.0);
+        let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+        let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+
+        let single = gpu
+            .hybrid_scatter(
+                [obs.x, obs.y, obs.z],
+                [view.x, view.y, view.z],
+                [sun.x, sun.y, sun.z],
+                rays,
+                seed,
+            )
+            .unwrap();
+
+        let batch = gpu
+            .scan_batch(&[BatchRequest {
+                observer_pos: [obs.x, obs.y, obs.z],
+                view_dir: [view.x, view.y, view.z],
+                sun_dir: [sun.x, sun.y, sun.z],
+                kernel: BatchKernel::Hybrid {
+                    secondary_rays: rays,
+                    seed,
+                },
+            }])
+            .unwrap();
+
+        let batched = &batch[0];
+        let single_sum: f64 = single.radiance.iter().sum();
+        let batch_sum: f64 = batched.radiance.iter().sum();
+        let rel = ((single_sum - batch_sum) / single_sum.max(1e-30)).abs();
+        assert!(
+            rel < 1e-5,
+            "single hybrid vs one-item batch mismatch: single={:.6e}, batch={:.6e}, rel={:.3e}",
+            single_sum,
+            batch_sum,
+            rel
+        );
+    }
+
+    #[test]
+    fn metal_multi_hybrid_matches_serial_chunk() {
+        use crate::{BatchKernel, BatchRequest};
+        use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+
+        let Some(mut gpu) = try_metal() else { return };
+
+        let atm = twilight_data::builder::build_clear_sky(
+            twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+            0.15,
+        );
+        gpu.upload_atmosphere(&atm).unwrap();
+
+        let lat = 54.826;
+        let lon = 9.363;
+        let solar_azimuth = 270.0;
+        let view_zenith = 85.0;
+        let rays = 5000u32;
+        let szas = [90.0f64, 96.0, 102.0, 108.0];
+
+        let mut requests = Vec::new();
+        let mut serial = Vec::new();
+
+        for &sza_deg in &szas {
+            let seed = sza_deg.to_bits();
+            let obs = geographic_to_ecef(lat, lon, 0.0);
+            let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+            let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+
+            serial.push(
+                gpu.hybrid_scatter(
+                    [obs.x, obs.y, obs.z],
+                    [view.x, view.y, view.z],
+                    [sun.x, sun.y, sun.z],
+                    rays,
+                    seed,
+                )
+                .unwrap(),
+            );
+
+            requests.push(BatchRequest {
+                observer_pos: [obs.x, obs.y, obs.z],
+                view_dir: [view.x, view.y, view.z],
+                sun_dir: [sun.x, sun.y, sun.z],
+                kernel: BatchKernel::Hybrid {
+                    secondary_rays: rays,
+                    seed,
+                },
+            });
+        }
+
+        let batched = gpu.scan_batch(&requests).unwrap();
+        assert_eq!(serial.len(), batched.len());
+
+        for i in 0..serial.len() {
+            let single_sum: f64 = serial[i].radiance.iter().sum();
+            let batch_sum: f64 = batched[i].radiance.iter().sum();
+            let rel = ((single_sum - batch_sum) / single_sum.max(1e-30)).abs();
+            assert!(
+                rel < 1e-5,
+                "multi hybrid batch mismatch at idx {} SZA {}: single={:.6e}, batch={:.6e}, rel={:.3e}",
+                i,
+                szas[i],
+                single_sum,
+                batch_sum,
+                rel
+            );
+        }
+    }
 }
 
 // ── Vulkan backend integration tests ────────────────────────────────────

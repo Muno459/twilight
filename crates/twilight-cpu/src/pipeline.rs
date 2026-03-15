@@ -392,9 +392,13 @@ fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::Atmos
 /// for all solar position computations. Otherwise falls back to SPA.
 pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
     let atm = build_atmosphere(input);
-    compute_prayer_times_inner(input, &atm, |atm, config, start, end, step| {
-        simulation::simulate_twilight_scan(atm, config, start, end, step)
-    })
+    let scan =
+        |atm: &twilight_core::atmosphere::AtmosphereModel,
+         config: &SimulationConfig,
+         start: f64,
+         end: f64,
+         step: f64| { simulation::simulate_twilight_scan(atm, config, start, end, step) };
+    compute_prayer_times_inner(input, &atm, &scan, None)
 }
 
 /// Run the prayer time pipeline with GPU-accelerated MCRT simulation.
@@ -420,14 +424,23 @@ pub fn compute_prayer_times_gpu(
             "Warning: GPU atmosphere upload failed ({}), falling back to CPU",
             e
         );
-        return compute_prayer_times_inner(input, &atm, |atm, config, start, end, step| {
+        let scan = |atm: &twilight_core::atmosphere::AtmosphereModel,
+                    config: &SimulationConfig,
+                    start: f64,
+                    end: f64,
+                    step: f64| {
             simulation::simulate_twilight_scan(atm, config, start, end, step)
-        });
+        };
+        return compute_prayer_times_inner(input, &atm, &scan, None);
     }
 
     // Reborrow as shared for dispatch (upload is done, no more &mut needed).
     let gpu_ref: &dyn twilight_gpu::GpuBackend = &*gpu;
-    compute_prayer_times_inner(input, &atm, |atm, config, start, end, step| {
+    let scan = |atm: &twilight_core::atmosphere::AtmosphereModel,
+                config: &SimulationConfig,
+                start: f64,
+                end: f64,
+                step: f64| {
         gpu_dispatch::simulate_twilight_scan_gpu(gpu_ref, atm, config, start, end, step)
             .unwrap_or_else(|e| {
                 eprintln!(
@@ -436,7 +449,24 @@ pub fn compute_prayer_times_gpu(
                 );
                 simulation::simulate_twilight_scan(atm, config, start, end, step)
             })
-    })
+    };
+    let scan_list = |atm: &twilight_core::atmosphere::AtmosphereModel,
+                     config: &SimulationConfig,
+                     sza_values: &[f64]| {
+        gpu_dispatch::simulate_twilight_szalist_gpu(gpu_ref, atm, config, sza_values)
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "Warning: GPU batch dispatch error ({}), CPU fallback for fine pass",
+                    e
+                );
+                let mut out = Vec::with_capacity(sza_values.len());
+                for &sza in sza_values {
+                    out.push(simulation::simulate_at_sza(atm, config, sza));
+                }
+                out
+            })
+    };
+    compute_prayer_times_inner(input, &atm, &scan, Some(&scan_list))
 }
 
 /// Inner pipeline implementation parameterized by scan function.
@@ -447,13 +477,20 @@ pub fn compute_prayer_times_gpu(
 fn compute_prayer_times_inner(
     input: &PrayerTimeInput,
     atm: &twilight_core::atmosphere::AtmosphereModel,
-    scan: impl Fn(
+    scan: &dyn Fn(
         &twilight_core::atmosphere::AtmosphereModel,
         &SimulationConfig,
         f64,
         f64,
         f64,
     ) -> Vec<SpectralResult>,
+    scan_list: Option<
+        &dyn Fn(
+            &twilight_core::atmosphere::AtmosphereModel,
+            &SimulationConfig,
+            &[f64],
+        ) -> Vec<SpectralResult>,
+    >,
 ) -> PrayerTimeOutput {
     let start = std::time::Instant::now();
 
@@ -541,7 +578,27 @@ fn compute_prayer_times_inner(
         polarized: input.polarized,
     };
 
-    let coarse_results = scan(atm, &config, 90.0, sza_upper, input.sza_step);
+    let coarse_t0 = std::time::Instant::now();
+    let coarse_results = if let Some(scan_list_fn) = scan_list {
+        // ONE batch for ALL coarse SZAs -- no chunking, no GPU idle gaps.
+        let mut coarse_szas = Vec::new();
+        let mut sza = 90.0;
+        while sza <= sza_upper + 1e-6 {
+            coarse_szas.push(sza);
+            sza += input.sza_step;
+        }
+        eprint!("Coarse scan: {} points ... ", coarse_szas.len());
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let r = scan_list_fn(atm, &config, &coarse_szas);
+        eprintln!("{:.1?}", coarse_t0.elapsed());
+        r
+    } else {
+        eprint!("Coarse scan ... ");
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let r = scan(atm, &config, 90.0, sza_upper, input.sza_step);
+        eprintln!("{:.1?}", coarse_t0.elapsed());
+        r
+    };
 
     let coarse_analyses: Vec<TwilightAnalysis> = coarse_results
         .iter()
@@ -576,9 +633,35 @@ fn compute_prayer_times_inner(
     let fine_step = 0.1;
     let mut fine_results: Vec<SpectralResult> = Vec::new();
 
-    for (lo, hi) in &refine_regions {
-        let region = scan(atm, &config, *lo, *hi, fine_step);
-        fine_results.extend(region);
+    if !refine_regions.is_empty() {
+        let mut fine_szas = Vec::new();
+        for (lo, hi) in &refine_regions {
+            let mut sza = *lo;
+            while sza <= *hi + 1e-6 {
+                fine_szas.push(sza);
+                sza += fine_step;
+            }
+        }
+
+        let fine_t0 = std::time::Instant::now();
+
+        // ONE batch for ALL fine SZAs -- no chunking.
+        fine_results = if let Some(scan_list_fn) = scan_list {
+            eprint!("Fine scan: {} points ... ", fine_szas.len());
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            let r = scan_list_fn(atm, &config, &fine_szas);
+            eprintln!("{:.1?}", fine_t0.elapsed());
+            r
+        } else {
+            eprint!("Fine scan: {} points ... ", fine_szas.len());
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+            for (lo, hi) in &refine_regions {
+                let region = scan(atm, &config, *lo, *hi, fine_step);
+                fine_results.extend(region);
+            }
+            eprintln!("{:.1?}", fine_t0.elapsed());
+            fine_results
+        };
     }
 
     // Combine coarse + fine results, sort by SZA, deduplicate

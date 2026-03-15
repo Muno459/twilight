@@ -126,6 +126,67 @@ pub fn simulate_twilight_scan_gpu(
     Ok(results)
 }
 
+/// Simulate an arbitrary set of SZA values using one batched GPU submission.
+///
+/// This is used by the prayer pipeline's fine pass so multiple merged refine
+/// regions can still be executed as a single GPU batch instead of one GPU scan
+/// per region.
+pub fn simulate_twilight_szalist_gpu(
+    gpu: &dyn GpuBackend,
+    atm: &AtmosphereModel,
+    config: &SimulationConfig,
+    sza_values: &[f64],
+) -> Result<Vec<SpectralResult>, GpuError> {
+    if sza_values.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Hybrid v2 kernel uses per-step output layout that doesn't compose
+    // in the shared-buffer batch path. Use individual dispatches instead.
+    // Each dispatch is still ray-parallel (256 threads x num_steps groups),
+    // so the GPU stays saturated at high ray counts.
+    if matches!(config.scattering_mode, ScatteringMode::Hybrid) {
+        let mut results = Vec::with_capacity(sza_values.len());
+        for &sza_deg in sza_values {
+            results.push(simulate_at_sza_gpu(gpu, atm, config, sza_deg)?);
+        }
+        return Ok(results);
+    }
+
+    let requests: Vec<BatchRequest> = sza_values
+        .iter()
+        .map(|&sza_deg| {
+            let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
+            let kernel = match config.scattering_mode {
+                ScatteringMode::Single => BatchKernel::SingleScatter,
+                ScatteringMode::Multiple => BatchKernel::McrtTrace {
+                    photons_per_wavelength: config.photons_per_wavelength as u32,
+                    seed: sza_deg.to_bits(),
+                },
+                ScatteringMode::Hybrid => unreachable!(),
+            };
+            BatchRequest {
+                observer_pos: [observer_pos.x, observer_pos.y, observer_pos.z],
+                view_dir: [view_dir.x, view_dir.y, view_dir.z],
+                sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z],
+                kernel,
+            }
+        })
+        .collect();
+
+    let gpu_results = gpu.scan_batch(&requests)?;
+
+    let results: Vec<SpectralResult> = gpu_results
+        .iter()
+        .zip(sza_values.iter())
+        .map(|(gr, &sza_deg)| {
+            gpu_result_to_spectral(atm, gr, sza_deg, config.apply_solar_irradiance)
+        })
+        .collect();
+
+    Ok(results)
+}
+
 /// Convert GPU spectral result to CPU-compatible `SpectralResult`.
 ///
 /// The GPU backend returns raw radiance in the same units as the core
