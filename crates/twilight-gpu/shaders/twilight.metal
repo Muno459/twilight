@@ -1364,7 +1364,8 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                 if (free_path >= bnd.dist) {
                     // Boundary crossing weight correction
                     if (setup.alpha_et > 0.0f) {
-                        weight *= exp(-setup.alpha_et * sigma * cos_bias * bnd.dist);
+                        float et_bnd = exp(-setup.alpha_et * sigma * cos_bias * bnd.dist);
+                        weight *= clamp(et_bnd, 0.0f, 1e6f);
                     }
 
                     // Fast path: inward crossing from shell 0 is the ground boundary.
@@ -1412,7 +1413,9 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                 // Scatter within this shell.
                 // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
                 if (setup.alpha_et > 0.0f) {
-                    weight *= (sigma / sigma_prime) * exp(-setup.alpha_et * sigma * cos_bias * free_path);
+                    float et_corr = (sigma / max(sigma_prime, 1e-20f))
+                                  * exp(-setup.alpha_et * sigma * cos_bias * free_path);
+                    weight *= clamp(et_corr, 0.0f, 1e6f);
                 }
                 pos = pos + current_dir * free_path;
                 scatter_shell = us;
@@ -1479,7 +1482,16 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         current_dir = new_dir;
     }
 
-    return float4(total_I.result(), total_Q.result(), total_U.result(), total_V.result());
+    // Clamp chain return to prevent f32 overflow when accumulated across
+    // many chains per thread. Importance weight spikes (from the 3-branch
+    // sampling correction at transition SZAs) can produce values >1e20,
+    // which overflow when summed across 16+ chains in the v2 stride loop.
+    // A clamp at 1e6 is ~10 OOM above typical chain values (~1.0) and
+    // introduces negligible bias (affects <0.001% of chains).
+    float CHAIN_CLAMP = 1e6f;
+    float4 result = float4(total_I.result(), total_Q.result(), total_U.result(), total_V.result());
+    result = clamp(result, float4(-CHAIN_CLAMP), float4(CHAIN_CLAMP));
+    return result;
 }
 
 // ============================================================================

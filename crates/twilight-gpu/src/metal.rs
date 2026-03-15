@@ -262,7 +262,7 @@ impl GpuBackend for MetalBackend {
         // Metal's GPU watchdog timeout (~2-5s per command buffer).
         // Each dispatch handles RAYS_PER_DISPATCH rays; results are
         // accumulated in f64 on CPU.
-        const RAYS_PER_DISPATCH: u32 = 256;
+        const RAYS_PER_DISPATCH: u32 = 1024;
         let num_dispatches = (secondary_rays.div_ceil(RAYS_PER_DISPATCH)).max(1);
         let buf_output = create_empty_buffer(&self.device, output_len)?;
         let mut accum = vec![0.0f64; output_len];
