@@ -1901,23 +1901,28 @@ kernel void hybrid_scatter_v2(
         setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
         setup.use_forced = (sza_deg >= ZENITH_SZA_START_DEG) ? 1u : 0u;
 
-        // Strong seed derivation via splitmix64
-        ulong base_seed = read_rng_seed(params) & 0xFFFFFFFFul;
+        // ray_offset from upper 32 bits of seed (for split-dispatch)
+        ulong raw_seed = read_rng_seed(params);
+        uint ray_offset = uint(raw_seed >> 32);
+        ulong base_seed = raw_seed & 0xFFFFFFFFul;
+        // global_total_rays for stratification (encoded in photons_per_wl)
+        uint global_total_rays = read_photons_per_wl(params);
+        if (global_total_rays == 0u) global_total_rays = secondary_rays;
+
         ulong seed_input = base_seed
             ^ (ulong(wl_idx) * 0x9E3779B97F4A7C15ul)
             ^ (ulong(step_idx) << 16)
-            ^ (ulong(ray_lane) << 32);
+            ^ (ulong(ray_lane + ray_offset) << 32);
         ulong rng = splitmix64(seed_input);
 
-        // Accumulate raw chain.x * scale_m WITHOUT dividing by secondary_rays.
-        // The division happens once after threadgroup reduction on the CPU
-        // side (in f64) to avoid f32 underflow at deep twilight.
+        // Raw sum without inv_rays -- CPU divides in f64 after reduction
         float scale_m = my_beta_scat * t_obs * ds;
         KahanAccum mc_I;
         for (uint ray = ray_lane; ray < secondary_rays; ray += HYBRID_V2_THREADGROUP_SIZE) {
+            uint global_ray = ray + ray_offset;
             float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
                                                   my_op, view_dir, setup,
-                                                  ray, secondary_rays, rng);
+                                                  global_ray, global_total_rays, rng);
             float val = chain.x * scale_m;
             if (isfinite(val)) {
                 mc_I.add(val);

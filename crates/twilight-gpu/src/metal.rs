@@ -255,41 +255,60 @@ impl GpuBackend for MetalBackend {
             .ok_or_else(|| GpuError::Dispatch("atmosphere not uploaded".into()))?;
 
         let nw = self.num_wavelengths as usize;
-        let params =
-            PackedDispatchParams::new(observer_pos, view_dir, sun_dir, 0, secondary_rays, seed);
-        let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
-
-        // v2 ray-parallel kernel with NaN filtering in output.
         const MAX_LOS_STEPS: usize = 200;
         let output_len = nw * MAX_LOS_STEPS;
+
+        // Split into multiple dispatches to stay under Metal GPU watchdog.
+        // Each dispatch traces RAYS_PER_DISPATCH rays (4 chains/thread at
+        // 64 threads). Results accumulated in f64 on CPU.
+        const RAYS_PER_DISPATCH: u32 = 256;
+        let num_dispatches = secondary_rays.div_ceil(RAYS_PER_DISPATCH).max(1);
         let buf_output = create_empty_buffer(&self.device, output_len)?;
-        zero_f32_buffer(&buf_output, output_len)?;
+        let mut accum = vec![0.0f64; output_len];
 
-        self.dispatch_hybrid_v2(
-            &self.pso_hybrid_v2,
-            &[buf_atm, &buf_params, &buf_output],
-            nw as u32,
-            MAX_LOS_STEPS as u32,
-        )?;
+        for d in 0..num_dispatches {
+            let ray_start = d * RAYS_PER_DISPATCH;
+            let rays_this = (secondary_rays - ray_start).min(RAYS_PER_DISPATCH);
+            if rays_this == 0 {
+                continue;
+            }
 
-        let raw = read_f32_buffer(&buf_output, output_len);
-        // The v2 kernel outputs raw sums (NOT divided by secondary_rays).
-        // Divide here in f64 to avoid f32 underflow at deep twilight.
-        let inv_rays = if secondary_rays > 0 {
-            1.0 / secondary_rays as f64
-        } else {
-            1.0
-        };
+            // Encode ray_start in upper 32 bits of seed so v2 kernel
+            // offsets its ray indices for proper stratification.
+            let ray_seed = (seed & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
+            let params = PackedDispatchParams::new(
+                observer_pos,
+                view_dir,
+                sun_dir,
+                secondary_rays, // global total (for stratification)
+                rays_this,      // per-dispatch count
+                ray_seed,
+            );
+            let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
+            zero_f32_buffer(&buf_output, output_len)?;
+
+            self.dispatch_hybrid_v2(
+                &self.pso_hybrid_v2,
+                &[buf_atm, &buf_params, &buf_output],
+                nw as u32,
+                MAX_LOS_STEPS as u32,
+            )?;
+
+            // Accumulate in f64 (v2 outputs raw sums, not divided by rays)
+            let raw = read_f32_buffer(&buf_output, output_len);
+            for (i, &v) in raw.iter().enumerate() {
+                if v.is_finite() {
+                    accum[i] += v as f64;
+                }
+            }
+        }
+
+        // Reduce: sum across steps per-wavelength, divide by total rays
+        let inv_rays = 1.0 / secondary_rays.max(1) as f64;
         let mut radiance = Vec::with_capacity(nw);
         for w in 0..nw {
             let base = w * MAX_LOS_STEPS;
-            let mut sum = 0.0f64;
-            for i in 0..MAX_LOS_STEPS {
-                let v = raw[base + i];
-                if v.is_finite() {
-                    sum += v as f64;
-                }
-            }
+            let sum: f64 = accum[base..base + MAX_LOS_STEPS].iter().sum();
             radiance.push(sum * inv_rays);
         }
 
@@ -724,6 +743,20 @@ impl MetalBackend {
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+
+        // Check for GPU timeout / error
+        let status = cmd_buf.status();
+        if status == objc2_metal::MTLCommandBufferStatus::Error {
+            let err_msg = cmd_buf
+                .error()
+                .map(|e| format!("{}", e))
+                .unwrap_or_else(|| "unknown GPU error".into());
+            return Err(GpuError::Dispatch(format!(
+                "Metal command buffer error in hybrid_scatter_v2: {}",
+                err_msg
+            )));
+        }
+
         Ok(())
     }
 }

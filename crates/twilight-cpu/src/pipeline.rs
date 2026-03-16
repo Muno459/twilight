@@ -603,12 +603,19 @@ fn compute_prayer_times_inner(
     let coarse_analyses: Vec<TwilightAnalysis> = coarse_results
         .iter()
         .map(|sr| {
-            threshold::analyze_twilight(
+            let analysis = threshold::analyze_twilight(
                 sr.sza_deg,
                 &sr.wavelengths_nm,
                 &sr.radiance,
                 &input.threshold_config,
-            )
+            );
+            eprintln!(
+                "  SZA {:.1}: mesopic={:.4e} total_rad={:.4e}",
+                sr.sza_deg,
+                analysis.luminance_mesopic,
+                sr.radiance.iter().sum::<f64>()
+            );
+            analysis
         })
         .collect();
 
