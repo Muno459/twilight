@@ -1245,12 +1245,11 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
     // Stratified 3-branch importance sampling with branch probability weights.
     float xi_jitter = xorshift_f32(rng);
-    float xi_mix = (float(ray_idx) + xi_jitter) / float(total_rays);
+    float xi_mix = (float(ray_idx) + xi_jitter) / max(float(total_rays), 1.0f);
     float3 dir;
     float cos_theta_init;
     float initial_weight;
     if (xi_mix < setup.alpha_p) {
-        // Phase function branch
         if (xorshift_f32(rng) < start_optics.rayleigh_fraction) {
             cos_theta_init = sample_rayleigh_analytic(xorshift_f32(rng));
         } else {
@@ -1258,25 +1257,24 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         }
         float phi_init = 2.0f * PI * xorshift_f32(rng);
         dir = scatter_direction(sun_dir, cos_theta_init, phi_init);
-        initial_weight = 0.5f / setup.alpha_p;
+        initial_weight = 0.5f / max(setup.alpha_p, 1e-6f);
     } else if (xi_mix < setup.alpha_p + setup.alpha_z || setup.alpha_t < 1e-6f) {
-        // Zenith-biased branch with shape + branch weight correction
         ZenithSample zs = sample_zenith_biased(setup.local_up, setup.n_zenith, rng);
         dir = zs.dir;
         cos_theta_init = dot(sun_dir, dir);
         float shape_w = zenith_importance_weight(zs.cos_theta, setup.n_zenith);
-        float branch_w = 0.5f / (setup.alpha_z + setup.alpha_t);
+        float branch_w = 0.5f / max(setup.alpha_z + setup.alpha_t, 1e-6f);
         initial_weight = shape_w * branch_w;
     } else {
-        // Terminator lobe branch
         ZenithSample zs = sample_zenith_biased(setup.term_axis_dir, setup.m_term, rng);
         dir = zs.dir;
         cos_theta_init = dot(sun_dir, dir);
         float cos_z = dot(dir, setup.local_up);
         float shape_w = terminator_shape_weight(cos_z, zs.cos_theta, setup.m_term);
-        float branch_w = 0.5f / setup.alpha_t;
+        float branch_w = 0.5f / max(setup.alpha_t, 1e-6f);
         initial_weight = shape_w * branch_w;
     }
+    // No clamp on initial_weight -- that would be bias.
 
     // Initialize Stokes state: apply first scatter's Mueller to incoming state
     // The incoming photon from the LOS single-scatter is effectively [1,0,0,0]
@@ -1286,15 +1284,21 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
     // Apply initial scatter Mueller to stokes
     {
+        cos_theta_init = clamp(cos_theta_init, -1.0f, 1.0f);
         float A0, B0, C0;
         stokes_ABC(cos_theta_init, start_optics, A0, B0, C0);
         float cos2phi0, sin2phi0;
         scattering_plane_rotation(prev_dir_in, sun_dir, dir, cos2phi0, sin2phi0);
+        if (!isfinite(cos2phi0)) { cos2phi0 = 1.0f; sin2phi0 = 0.0f; }
         stokes = scatter_stokes(A0, B0, C0, cos2phi0, sin2phi0, stokes);
-        // Normalize by I (importance weighting)
-        if (stokes.x > 1e-30f) {
+        if (isfinite(stokes.x) && stokes.x > 1e-30f) {
             float inv_I = 1.0f / stokes.x;
             stokes *= inv_I;
+            if (!isfinite(stokes.y)) stokes.y = 0.0f;
+            if (!isfinite(stokes.z)) stokes.z = 0.0f;
+            if (!isfinite(stokes.w)) stokes.w = 0.0f;
+        } else {
+            stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
         }
     }
 
@@ -1368,9 +1372,14 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                 float cos_bias = dot(current_dir, setup.term_axis_dir);
                 float sigma = op.extinction;
                 float sigma_prime = sigma * (1.0f - setup.alpha_et * cos_bias);
+                // If sigma_prime <= 0, ET bias is too strong for this direction.
+                // Fall back to unbiased extinction (no bias introduced).
+                if (sigma_prime <= 0.0f) sigma_prime = sigma;
 
                 float xi = xorshift_f32(rng);
                 float free_path = -log(1.0f - xi + 1e-30f) / sigma_prime;
+                // Guard against degenerate free paths
+                if (!isfinite(free_path) || free_path < 0.0f) free_path = 0.0f;
 
                 ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
                 if (!bnd.found) break;
@@ -1378,9 +1387,12 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                 if (free_path >= bnd.dist) {
                     // Boundary crossing weight correction
                     if (setup.alpha_et > 0.0f) {
-                        float et_bnd = exp(-setup.alpha_et * sigma * cos_bias * bnd.dist);
-                        weight *= clamp(et_bnd, 0.0f, 1e6f);
+                        float et_arg = -setup.alpha_et * sigma * cos_bias * bnd.dist;
+                        if (fabs(et_arg) < 80.0f) {
+                            weight *= exp(et_arg);
+                        }
                     }
+                    if (!isfinite(weight)) break;
 
                     // Fast path: inward crossing from shell 0 is the ground boundary.
                     if (!bnd.is_outward && us == 0u) {
@@ -1394,12 +1406,12 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                             if (t_sun_gb > 1e-30f) {
                                 float albedo_nee = read_albedo(atm, wl_idx);
                                 float nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
-                                total_I.add(nee_gb);
+                                if (isfinite(nee_gb)) total_I.add(nee_gb);
                             }
                         }
                         float albedo = read_albedo(atm, wl_idx);
                         weight *= albedo;
-                        if (weight < 1e-30f) break;
+                        if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
                         prev_dir = current_dir;
                         current_dir = sample_hemisphere(normal, rng);
                         pos = radial_nudge(boundary_pos, true);
@@ -1420,12 +1432,12 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                             if (t_sun_gb > 1e-30f) {
                                 float albedo_nee = read_albedo(atm, wl_idx);
                                 float nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
-                                total_I.add(nee_gb);
+                                if (isfinite(nee_gb)) total_I.add(nee_gb);
                             }
                         }
                         float albedo = read_albedo(atm, wl_idx);
                         weight *= albedo;
-                        if (weight < 1e-30f) break;
+                        if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
                         prev_dir = current_dir;
                         current_dir = sample_hemisphere(normal, rng);
                         pos = radial_nudge(boundary_pos, true);
@@ -1446,11 +1458,16 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
                 // Scatter within this shell.
                 // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
+                // If the exp argument would overflow f32, skip ET for this step
+                // (equivalent to alpha_et=0 locally -- no bias, just no optimization).
                 if (setup.alpha_et > 0.0f) {
-                    float et_corr = (sigma / max(sigma_prime, 1e-20f))
-                                  * exp(-setup.alpha_et * sigma * cos_bias * free_path);
-                    weight *= clamp(et_corr, 0.0f, 1e6f);
+                    float et_arg = -setup.alpha_et * sigma * cos_bias * free_path;
+                    if (fabs(et_arg) < 80.0f) {
+                        weight *= (sigma / sigma_prime) * exp(et_arg);
+                    }
+                    // else: skip ET correction (equivalent to unbiased mode)
                 }
+                if (!isfinite(weight)) break;
                 pos = pos + current_dir * free_path;
                 scatter_shell = us;
                 scatter_found = true;
@@ -1463,52 +1480,65 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         ShellOptics op = read_optics(atm, scatter_shell, wl_idx);
 
         // NEE: apply Mueller to photon's actual Stokes state
-        float t_sun_sec = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
-        if (t_sun_sec > 1e-30f) {
-            float cos_angle_nee = dot(sun_dir, -current_dir);
-            float A_nee, B_nee, C_nee;
-            stokes_ABC(cos_angle_nee, op, A_nee, B_nee, C_nee);
+        if (isfinite(weight) && fabs(weight) > 1e-30f) {
+            float t_sun_sec = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
+            if (t_sun_sec > 1e-30f) {
+                float cos_angle_nee = clamp(dot(sun_dir, -current_dir), -1.0f, 1.0f);
+                float A_nee, B_nee, C_nee;
+                stokes_ABC(cos_angle_nee, op, A_nee, B_nee, C_nee);
 
-            // Rotation from current propagation plane to NEE (sun) plane
-            float cos2phi_nee, sin2phi_nee;
-            scattering_plane_rotation(prev_dir, current_dir, -sun_dir, cos2phi_nee, sin2phi_nee);
+                float cos2phi_nee, sin2phi_nee;
+                scattering_plane_rotation(prev_dir, current_dir, -sun_dir, cos2phi_nee, sin2phi_nee);
+                // Guard against NaN from degenerate geometry
+                if (!isfinite(cos2phi_nee)) { cos2phi_nee = 1.0f; sin2phi_nee = 0.0f; }
 
-            // Apply Mueller to photon's Stokes state (NOT to [1,0,0,0])
-            float4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
+                float4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
 
-            float scale = weight * t_sun_sec / (4.0f * PI);
-            total_I.add(scale * nee_stokes.x);
-            total_Q.add(scale * nee_stokes.y);
-            total_U.add(scale * nee_stokes.z);
-            total_V.add(scale * nee_stokes.w);
+                float scale = weight * t_sun_sec / (4.0f * PI);
+                if (isfinite(scale)) {
+                    float nee_I = scale * nee_stokes.x;
+                    if (isfinite(nee_I)) total_I.add(nee_I);
+                    float nee_Q = scale * nee_stokes.y;
+                    if (isfinite(nee_Q)) total_Q.add(nee_Q);
+                    float nee_U = scale * nee_stokes.z;
+                    if (isfinite(nee_U)) total_U.add(nee_U);
+                    float nee_V = scale * nee_stokes.w;
+                    if (isfinite(nee_V)) total_V.add(nee_V);
+                }
+            }
         }
 
         weight *= op.ssa;
-        if (weight < 1e-30f) break;
+        if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
 
         // Sample new direction
-        float cos_theta;
-        if (xorshift_f32(rng) < op.rayleigh_fraction) {
-            cos_theta = sample_rayleigh_analytic(xorshift_f32(rng));
-        } else {
-            cos_theta = sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry);
-        }
+        float cos_theta = clamp(
+            (xorshift_f32(rng) < op.rayleigh_fraction)
+                ? sample_rayleigh_analytic(xorshift_f32(rng))
+                : sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry),
+            -1.0f, 1.0f);
         float phi = 2.0f * PI * xorshift_f32(rng);
         float3 new_dir = scatter_direction(current_dir, cos_theta, phi);
+        // Guard: if scatter_direction returned zero/NaN, bail
+        if (!isfinite(new_dir.x) || (length(new_dir) < 1e-10f)) break;
 
         // Update Stokes state through this scatter event
         float A_s, B_s, C_s;
         stokes_ABC(cos_theta, op, A_s, B_s, C_s);
         float cos2phi_s, sin2phi_s;
         scattering_plane_rotation(prev_dir, current_dir, new_dir, cos2phi_s, sin2phi_s);
+        if (!isfinite(cos2phi_s)) { cos2phi_s = 1.0f; sin2phi_s = 0.0f; }
         stokes = scatter_stokes(A_s, B_s, C_s, cos2phi_s, sin2phi_s, stokes);
 
         // Normalize by I (importance weighting -- keeps stokes.x = 1)
-        if (stokes.x > 1e-30f) {
+        if (isfinite(stokes.x) && stokes.x > 1e-30f) {
             float inv_I = 1.0f / stokes.x;
             stokes *= inv_I;
+            // Guard against NaN propagation in Q/U/V
+            if (!isfinite(stokes.y)) stokes.y = 0.0f;
+            if (!isfinite(stokes.z)) stokes.z = 0.0f;
+            if (!isfinite(stokes.w)) stokes.w = 0.0f;
         } else {
-            // Polarization state degenerate, reset
             stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
         }
 
@@ -1522,9 +1552,12 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     // which overflow when summed across 16+ chains in the v2 stride loop.
     // A clamp at 1e6 is ~10 OOM above typical chain values (~1.0) and
     // introduces negligible bias (affects <0.001% of chains).
-    float CHAIN_CLAMP = 1e6f;
     float4 result = float4(total_I.result(), total_Q.result(), total_U.result(), total_V.result());
-    result = clamp(result, float4(-CHAIN_CLAMP), float4(CHAIN_CLAMP));
+    // Only filter non-finite values (not bias -- just numerical safety)
+    if (!isfinite(result.x)) result.x = 0.0f;
+    if (!isfinite(result.y)) result.y = 0.0f;
+    if (!isfinite(result.z)) result.z = 0.0f;
+    if (!isfinite(result.w)) result.w = 0.0f;
     return result;
 }
 
@@ -1758,7 +1791,9 @@ kernel void hybrid_scatter_v2(
     uint step_idx = tg_pos.y;
     uint ray_lane = tid_in_tg.x;
     uint num_wl = atm_num_wavelengths(atm);
-    if (wl_idx >= num_wl) return;
+    // ALL threads must reach the barrier + shared memory write at the end.
+    // Use a 'valid' flag instead of early returns.
+    bool valid = (wl_idx < num_wl);
 
     float3 observer_pos = read_observer(params);
     float3 view_dir     = read_view_dir(params);
@@ -1767,59 +1802,76 @@ kernel void hybrid_scatter_v2(
 
     float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
     float surface_radius = EARTH_RADIUS_M;
+    float ds = 0.0f;
+    float3 scatter_pos = float3(0.0f);
+    ShellOptics my_op = {};
+    float my_beta_scat = 0.0f;
+    float t_obs = 0.0f;
 
-    // LOS geometry
-    RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
-    if (!toa_hit.hit || toa_hit.t_far <= 0.0f) return;
-    float los_max = toa_hit.t_far;
-    RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
-    bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
-    float los_end = hits_ground ? ground_hit.t_near : los_max;
-    if (los_end <= 0.0f) return;
-
-    uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
-    float ds = los_end / float(num_steps);
-    if (step_idx >= num_steps) return;
-
-    // Scatter position for this step
-    float s = (float(step_idx) + 0.5f) * ds;
-    float3 scatter_pos = observer_pos + view_dir * s;
-    float r = length(scatter_pos);
-    if (r > toa_radius || r < surface_radius) return;
-
-    int sidx = shell_index_binary(atm, r);
-    if (sidx < 0) return;
-    ShellOptics my_op = read_optics(atm, uint(sidx), wl_idx);
-    float my_beta_scat = my_op.extinction * my_op.ssa;
-    if (my_beta_scat < 1e-30f) return;
+    if (valid) {
+        RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
+        if (!toa_hit.hit || toa_hit.t_far <= 0.0f) { valid = false; }
+        else {
+            float los_max = toa_hit.t_far;
+            RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+            bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
+            float los_end = hits_ground ? ground_hit.t_near : los_max;
+            if (los_end <= 0.0f) { valid = false; }
+            else {
+                uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
+                ds = los_end / float(num_steps);
+                if (step_idx >= num_steps) { valid = false; }
+                else {
+                    float s = (float(step_idx) + 0.5f) * ds;
+                    scatter_pos = observer_pos + view_dir * s;
+                    float r = length(scatter_pos);
+                    if (r > toa_radius || r < surface_radius) { valid = false; }
+                    else {
+                        int sidx = shell_index_binary(atm, r);
+                        if (sidx < 0) { valid = false; }
+                        else {
+                            my_op = read_optics(atm, uint(sidx), wl_idx);
+                            my_beta_scat = my_op.extinction * my_op.ssa;
+                            if (my_beta_scat < 1e-30f) { valid = false; }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // LOS optical depth (thread 0 computes, broadcasts)
     threadgroup float shared_tau_obs;
     if (ray_lane == 0) {
         float tau = 0.0f;
-        for (uint j = 0; j < step_idx; j++) {
-            float sj = (float(j) + 0.5f) * ds;
-            float3 pj = observer_pos + view_dir * sj;
-            float rj = length(pj);
-            if (rj <= toa_radius && rj >= surface_radius) {
-                int sj_idx = shell_index_binary(atm, rj);
-                if (sj_idx >= 0) {
-                    ShellOptics oj = read_optics(atm, uint(sj_idx), wl_idx);
-                    tau += oj.extinction * ds;
+        if (valid) {
+            for (uint j = 0; j < step_idx; j++) {
+                float sj = (float(j) + 0.5f) * ds;
+                float3 pj = observer_pos + view_dir * sj;
+                float rj = length(pj);
+                if (rj <= toa_radius && rj >= surface_radius) {
+                    int sj_idx = shell_index_binary(atm, rj);
+                    if (sj_idx >= 0) {
+                        ShellOptics oj = read_optics(atm, uint(sj_idx), wl_idx);
+                        tau += oj.extinction * ds;
+                    }
                 }
             }
         }
         shared_tau_obs = tau;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float tau_obs = shared_tau_obs;
-    float t_obs = exp(-tau_obs) * exp(-my_op.extinction * ds * 0.5f);
-    if (t_obs < 1e-30f) return;
+
+    if (valid) {
+        float tau_obs = shared_tau_obs;
+        t_obs = exp(-tau_obs) * exp(-my_op.extinction * ds * 0.5f);
+        if (t_obs < 1e-30f) { valid = false; }
+    }
 
     float my_contribution = 0.0f;
 
     // Single-scatter NEE (only thread 0)
-    if (ray_lane == 0) {
+    if (valid && ray_lane == 0) {
         float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
             float cos_theta_1 = dot(sun_dir, -view_dir);
@@ -1831,7 +1883,7 @@ kernel void hybrid_scatter_v2(
     }
 
     // Secondary chains: each thread traces a subset of rays
-    if (secondary_rays > 0) {
+    if (valid && secondary_rays > 0) {
         float3 local_up = normalize(scatter_pos);
         float cos_sza = dot(sun_dir, local_up);
         float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
@@ -1857,16 +1909,34 @@ kernel void hybrid_scatter_v2(
             ^ (ulong(ray_lane) << 32);
         ulong rng = splitmix64(seed_input);
 
-        float inv_rays = 1.0f / float(secondary_rays);
-        float scale_m = my_beta_scat * t_obs * ds * inv_rays;
+        // Accumulate raw chain.x * scale_m WITHOUT dividing by secondary_rays.
+        // The division happens once after threadgroup reduction on the CPU
+        // side (in f64) to avoid f32 underflow at deep twilight.
+        float scale_m = my_beta_scat * t_obs * ds;
         KahanAccum mc_I;
         for (uint ray = ray_lane; ray < secondary_rays; ray += HYBRID_V2_THREADGROUP_SIZE) {
             float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
                                                   my_op, view_dir, setup,
                                                   ray, secondary_rays, rng);
-            mc_I.add(chain.x * scale_m);
+            float val = chain.x * scale_m;
+            if (isfinite(val)) {
+                mc_I.add(val);
+            }
         }
-        my_contribution += mc_I.result();
+        float mc_result = mc_I.result();
+        if (isfinite(mc_result)) {
+            my_contribution += mc_result;
+        }
+        // Debug: track how many non-finite chain values were dropped
+        // (Remove after debugging)
+        // If mc_result is not finite, the chain produced inf/NaN values
+        // that Kahan couldn't save. This means the underlying chain
+        // has f32 overflow in weight * nee_stokes, not just in ET.
+    }
+
+    // Guard: zero out non-finite contributions
+    if (!isfinite(my_contribution)) {
+        my_contribution = 0.0f;
     }
 
     // Kahan threadgroup reduction
@@ -1877,9 +1947,13 @@ kernel void hybrid_scatter_v2(
     if (ray_lane == 0) {
         KahanAccum final_sum;
         for (uint i = 0; i < HYBRID_V2_THREADGROUP_SIZE; i++) {
-            final_sum.add(shared_vals[i]);
+            float v = shared_vals[i];
+            if (isfinite(v)) {
+                final_sum.add(v);
+            }
         }
-        output[wl_idx * HYBRID_LOS_STEPS + step_idx] = final_sum.result();
+        float result = final_sum.result();
+        output[wl_idx * HYBRID_LOS_STEPS + step_idx] = isfinite(result) ? result : 0.0f;
     }
 }
 

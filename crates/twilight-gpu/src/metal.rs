@@ -108,8 +108,7 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     let pso_single_scatter = make_pipeline(&device, &library, "single_scatter_spectrum")?;
     let pso_mcrt_trace = make_pipeline(&device, &library, "mcrt_trace_photon")?;
     let pso_hybrid = make_pipeline(&device, &library, "hybrid_scatter")?;
-    // v2 kernel is not yet in the shader; reuse v1 pipeline for now.
-    let pso_hybrid_v2 = make_pipeline(&device, &library, "hybrid_scatter")?;
+    let pso_hybrid_v2 = make_pipeline(&device, &library, "hybrid_scatter_v2")?;
     let pso_garstang = make_pipeline(&device, &library, "garstang_zenith")?;
 
     // 5. Pack and upload constant buffers (solar spectrum, vision LUTs)
@@ -260,19 +259,42 @@ impl GpuBackend for MetalBackend {
             PackedDispatchParams::new(observer_pos, view_dir, sun_dir, 0, secondary_rays, seed);
         let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
 
-        // Use v1 step-parallel kernel for correctness. The v2 ray-parallel
-        // kernel is faster at high ray counts but produces NaN for some
-        // prayer-pipeline geometries (under investigation).
-        let buf_output = create_empty_buffer(&self.device, nw)?;
-        self.dispatch_hybrid(
-            &self.pso_hybrid,
+        // v2 ray-parallel kernel with NaN filtering in output.
+        const MAX_LOS_STEPS: usize = 200;
+        let output_len = nw * MAX_LOS_STEPS;
+        let buf_output = create_empty_buffer(&self.device, output_len)?;
+        zero_f32_buffer(&buf_output, output_len)?;
+
+        self.dispatch_hybrid_v2(
+            &self.pso_hybrid_v2,
             &[buf_atm, &buf_params, &buf_output],
             nw as u32,
+            MAX_LOS_STEPS as u32,
         )?;
 
-        let radiance = read_f32_buffer(&buf_output, nw);
+        let raw = read_f32_buffer(&buf_output, output_len);
+        // The v2 kernel outputs raw sums (NOT divided by secondary_rays).
+        // Divide here in f64 to avoid f32 underflow at deep twilight.
+        let inv_rays = if secondary_rays > 0 {
+            1.0 / secondary_rays as f64
+        } else {
+            1.0
+        };
+        let mut radiance = Vec::with_capacity(nw);
+        for w in 0..nw {
+            let base = w * MAX_LOS_STEPS;
+            let mut sum = 0.0f64;
+            for i in 0..MAX_LOS_STEPS {
+                let v = raw[base + i];
+                if v.is_finite() {
+                    sum += v as f64;
+                }
+            }
+            radiance.push(sum * inv_rays);
+        }
+
         Ok(GpuSpectralResult {
-            radiance: radiance.iter().map(|&v| v as f64).collect(),
+            radiance,
             num_wavelengths: nw,
         })
     }
