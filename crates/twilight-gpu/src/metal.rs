@@ -281,7 +281,19 @@ impl GpuBackend for MetalBackend {
                 let ray_start = d * RAYS_PER_DISPATCH;
                 let rays_this = (secondary_rays - ray_start).min(RAYS_PER_DISPATCH);
 
-                let ray_seed = (seed & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
+                // Fold the FULL 64-bit seed into the low 32 bits before
+                // packing (splitmix64 finalizer). The previous
+                // `seed & 0xFFFF_FFFF` discarded the high word — and
+                // `sza_deg.to_bits()` for SZAs on a 0.5-degree grid has
+                // all-zero low bits, so every SZA in a prayer scan ran
+                // with base_seed = 0 (identical RNG streams).
+                let folded = {
+                    let mut z = seed;
+                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                    z ^ (z >> 31)
+                };
+                let ray_seed = (folded & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
                 let params = PackedDispatchParams::new(
                     observer_pos,
                     view_dir,

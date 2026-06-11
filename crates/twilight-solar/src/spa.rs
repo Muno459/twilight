@@ -122,11 +122,11 @@ pub struct SpaOutput {
     pub elevation: f64,
     /// Equation of time (minutes)
     pub eot: f64,
-    /// Sunrise time (fractional hour, local)
+    /// Sunrise time (fractional hour, UTC)
     pub sunrise: f64,
-    /// Sunset time (fractional hour, local)
+    /// Sunset time (fractional hour, UTC)
     pub sunset: f64,
-    /// Solar noon (fractional hour, local)
+    /// Solar noon / transit (fractional hour, UTC)
     pub stn: f64,
 }
 
@@ -566,8 +566,12 @@ fn sun_rise_transit_set(
 
     let h0 = acos(cos_h0) * RAD_TO_DEG;
 
-    // Solar transit (solar noon)
-    let transit = 12.0 + eot / 60.0 - longitude / 15.0;
+    // Solar transit (solar noon), fractional hour UTC.
+    // Apparent solar noon = 12h - EoT - lon/15 (NREL Reda & Andreas
+    // convention, EoT in minutes = apparent minus mean solar time).
+    // The previous `+ eot/60` had the sign inverted: 2x EoT error,
+    // up to ±33 minutes (29 min late on the canonical NREL case).
+    let transit = 12.0 - eot / 60.0 - longitude / 15.0;
     // Note: This is a simplified calculation. The full SPA uses iteration.
     // For our purposes (finding twilight crossings), we use different methods.
 
@@ -774,6 +778,45 @@ pub fn format_time(fractional_hour: f64) -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Solar transit (apparent noon) for the NREL reference case.
+    ///
+    /// NREL Table A5: sun transit = 11:46:04.97 local standard time
+    /// (UTC-7) => 18.76805 h UTC. Regression for the inverted-EoT-sign
+    /// bug that put the transit 29 minutes late (19.256 h UTC).
+    /// The non-iterated approximation here is good to a minute or two.
+    #[test]
+    fn test_nrel_transit_time() {
+        let input = SpaInput {
+            year: 2003,
+            month: 10,
+            day: 17,
+            hour: 12,
+            minute: 30,
+            second: 30,
+            timezone: -7.0,
+            latitude: 39.742476,
+            longitude: -105.1786,
+            elevation: 1830.14,
+            pressure: 820.0,
+            temperature: 11.0,
+            delta_t: 67.0,
+            slope: 0.0,
+            azm_rotation: 0.0,
+            atmos_refract: 0.5667,
+        };
+        let output = solar_position(&input).unwrap();
+        let expected_utc = 18.76805; // 11:46:05 MST + 7h
+        assert!(
+            fabs(output.stn - expected_utc) < 2.0 / 60.0,
+            "transit: expected {:.4} h UTC, got {:.4} h UTC (off by {:.1} min)",
+            expected_utc,
+            output.stn,
+            fabs(output.stn - expected_utc) * 60.0
+        );
+        // sunrise/sunset bracket the transit symmetrically
+        assert!(output.sunrise < output.stn && output.stn < output.sunset);
+    }
 
     /// NREL SPA reference test case from the technical report.
     /// Date: October 17, 2003 at 12:30:30 TT (ΔT = 67s)

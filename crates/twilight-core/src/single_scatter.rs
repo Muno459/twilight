@@ -216,10 +216,12 @@ pub fn single_scatter_radiance(
             continue;
         }
 
-        // Scattering angle: angle between sun direction and viewing direction
-        // cos(θ) = sun_dir · (-view_dir) because we want the angle between
-        // the incoming solar ray and the scattered ray toward the observer
-        let cos_theta = sun_dir.dot(-view_dir);
+        // Scattering angle between the incoming solar ray (propagating along
+        // -sun_dir) and the scattered ray toward the observer (propagating
+        // along -view_dir): cos(θ) = (-sun_dir)·(-view_dir) = sun_dir·view_dir.
+        // θ = 0 (forward peak) when looking at the sun — the standard sky-
+        // radiance convention (Chandrasekhar; DISORT/libRadtran).
+        let cos_theta = sun_dir.dot(view_dir);
 
         // Phase function
         let phase = if optics.rayleigh_fraction > 0.99 {
@@ -405,7 +407,7 @@ pub fn single_scatter_spectrum(
         };
 
         // Scattering angle (same for all wavelengths)
-        let cos_theta = sun_dir.dot(-view_dir);
+        let cos_theta = sun_dir.dot(view_dir);
 
         // Shadow ray transmittance per wavelength
         // (compute once per step, reuse geometry)

@@ -9,9 +9,9 @@
 //! Cloud mapping uses the low/mid/high cloud cover breakdown to select
 //! the dominant cloud type, and scales optical depth by coverage fraction.
 //!
-//! Gas composition mapping converts surface O3 and NO2 concentrations
-//! from the CAMS-based air quality API into total column estimates for
-//! the MCRT gas absorption model.
+//! Gas composition mapping converts surface NO2 concentration from the
+//! CAMS-based air quality API into a boundary-layer number-density override.
+//! Surface O3 produces no override (it does not determine the column).
 
 use twilight_data::aerosol::{self, AerosolProperties, AerosolType};
 use twilight_data::cloud::{self, CloudProperties, CloudType};
@@ -171,30 +171,13 @@ const NO2_MOLAR_MASS: f64 = 46.0;
 /// Avogadro's number (molecules/mol).
 const AVOGADRO: f64 = 6.022e23;
 
-/// Empirical relationship between surface O3 concentration and total column.
-///
-/// The total column O3 is dominated by the stratospheric layer (peak at
-/// 20-25 km), not surface O3. However, surface O3 correlates loosely with
-/// the total column through large-scale atmospheric dynamics (tropopause
-/// folding, stratosphere-troposphere exchange).
-///
-/// Typical surface O3: 20-80 ug/m3 (rural), 40-200 ug/m3 (urban episodes).
-/// Typical total column: 220-450 DU (global range), ~300 DU (mid-latitude).
-///
-/// We use a conservative linear mapping with a floor of 250 DU and a
-/// ceiling of 450 DU. The baseline is 300 DU at 60 ug/m3 surface O3.
-fn estimate_o3_column_du(surface_o3_ug_m3: f64) -> f64 {
-    // Baseline: 300 DU corresponds to ~60 ug/m3 surface O3
-    // Sensitivity: ~0.5 DU per ug/m3 deviation (weak correlation)
-    let baseline_du = 300.0;
-    let baseline_surface = 60.0;
-    let sensitivity = 0.5; // DU per ug/m3
-
-    let du = baseline_du + (surface_o3_ug_m3 - baseline_surface) * sensitivity;
-
-    // Clamp to physically reasonable range
-    du.clamp(220.0, 450.0)
-}
+/// Surface O3 (a boundary-layer photochemical quantity) does NOT determine
+/// the total O3 column, which is dominated by the stratospheric reservoir
+/// and governed by latitude/season/dynamics. The previous code invented a
+/// linear surface-to-column proxy; it has been removed. Open-Meteo's air
+/// quality API provides surface O3 only, so no column override is produced
+/// — the engine keeps its standard-atmosphere column (345 DU) unless a
+/// real measured column is supplied by the caller.
 
 /// Convert NO2 surface concentration from ug/m3 to molecules/m3.
 ///
@@ -214,10 +197,9 @@ fn no2_ug_m3_to_molecules_m3(no2_ug_m3: f64) -> f64 {
 /// Converts surface O3 and NO2 concentrations from the CAMS-based air
 /// quality API into values usable by the MCRT gas absorption model:
 ///
-/// - **O3**: Surface concentration is used to estimate total column O3
-///   in Dobson Units via an empirical relationship. This adjusts the
-///   standard ~347 DU column to actual conditions (ozone holes, seasonal
-///   variation, latitude dependence).
+/// - **O3**: surface concentration is reported for display but produces
+///   NO column override — a surface reading does not determine the column
+///   (see note above). The engine keeps its standard 345 DU column.
 ///
 /// - **NO2**: Surface concentration is converted to number density
 ///   (molecules/m^3) to scale the tropospheric NO2 profile. This matters
@@ -229,15 +211,14 @@ pub fn map_gas_composition(conditions: &WeatherConditions) -> Option<GasComposit
     let has_o3 = conditions.ozone_ug_m3 > 0.0;
     let has_no2 = conditions.nitrogen_dioxide_ug_m3 > 0.0;
 
-    if !has_o3 && !has_no2 {
+    let _ = has_o3; // surface O3 is reported but produces no override
+    if !has_no2 {
         return None;
     }
 
-    let o3_column_du = if has_o3 {
-        Some(estimate_o3_column_du(conditions.ozone_ug_m3))
-    } else {
-        None
-    };
+    // Surface O3 cannot be converted to a column (see note above):
+    // no override. Surface NO2 IS a usable boundary-layer override.
+    let o3_column_du: Option<f64> = None;
 
     let no2_surface_density = if has_no2 {
         Some(no2_ug_m3_to_molecules_m3(conditions.nitrogen_dioxide_ug_m3))
@@ -575,13 +556,10 @@ mod tests {
     fn gas_composition_from_typical_conditions() {
         let c = base_conditions(); // O3=50, NO2=10
         let gc = map_gas_composition(&c).expect("Should produce gas composition");
-        assert!(gc.o3_column_du.is_some());
-        let du = gc.o3_column_du.unwrap();
-        assert!(
-            du >= 220.0 && du <= 450.0,
-            "O3 column should be in range: {} DU",
-            du
-        );
+        // Surface O3 must NOT be converted into a column override
+        // (a surface reading does not determine the stratospheric column).
+        assert!(gc.o3_column_du.is_none());
+        assert!(gc.no2_surface_density.is_some());
     }
 
     #[test]
@@ -593,35 +571,20 @@ mod tests {
     }
 
     #[test]
-    fn gas_composition_o3_column_scales_with_surface() {
-        let mut c1 = base_conditions();
-        c1.ozone_ug_m3 = 30.0;
-        let mut c2 = base_conditions();
-        c2.ozone_ug_m3 = 100.0;
-        let gc1 = map_gas_composition(&c1).unwrap();
-        let gc2 = map_gas_composition(&c2).unwrap();
-        assert!(
-            gc2.o3_column_du.unwrap() > gc1.o3_column_du.unwrap(),
-            "Higher surface O3 should give higher column estimate"
-        );
-    }
-
-    #[test]
-    fn gas_composition_o3_column_clamped() {
-        let mut c = base_conditions();
-        c.ozone_ug_m3 = 500.0; // extremely high
-        let gc = map_gas_composition(&c).unwrap();
-        assert!(
-            gc.o3_column_du.unwrap() <= 450.0,
-            "Should be clamped to 450 DU"
-        );
-
-        c.ozone_ug_m3 = 1.0; // extremely low
-        let gc = map_gas_composition(&c).unwrap();
-        assert!(
-            gc.o3_column_du.unwrap() >= 220.0,
-            "Should be clamped to 220 DU"
-        );
+    fn gas_composition_never_invents_o3_column() {
+        // Any surface O3 value — tiny or extreme — must produce no column
+        // override. The old code mapped these through an invented linear
+        // proxy clamped to [220, 450] DU.
+        for o3 in [1.0, 30.0, 100.0, 500.0] {
+            let mut c = base_conditions();
+            c.ozone_ug_m3 = o3;
+            let gc = map_gas_composition(&c).unwrap();
+            assert!(
+                gc.o3_column_du.is_none(),
+                "surface O3 {} ug/m3 must not become a column",
+                o3
+            );
+        }
     }
 
     #[test]
@@ -640,12 +603,11 @@ mod tests {
 
     #[test]
     fn gas_composition_o3_only() {
+        // O3-only input: no overrides at all -> None (nothing to apply).
         let mut c = base_conditions();
         c.ozone_ug_m3 = 60.0;
         c.nitrogen_dioxide_ug_m3 = 0.0;
-        let gc = map_gas_composition(&c).unwrap();
-        assert!(gc.o3_column_du.is_some());
-        assert!(gc.no2_surface_density.is_none());
+        assert!(map_gas_composition(&c).is_none());
     }
 
     #[test]

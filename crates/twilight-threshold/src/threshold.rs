@@ -180,6 +180,19 @@ pub fn determine_prayer_times(
     analyses: Vec<TwilightAnalysis>,
     config: &ThresholdConfig,
 ) -> PrayerTimeResult {
+    // Fewer than two samples: nothing to interpolate. This happens at
+    // midnight-sun latitudes where the coarse scan never starts (the sun
+    // never reaches SZA 90). Previously `0..(len - 1)` underflowed to
+    // 0..usize::MAX and panicked on `analyses[0]`.
+    if analyses.len() < 2 {
+        return PrayerTimeResult {
+            fajr_sza_deg: None,
+            isha_abyad_sza_deg: None,
+            isha_ahmar_sza_deg: None,
+            analyses,
+        };
+    }
+
     let mut fajr_sza = None;
     let mut isha_abyad_sza = None;
     let mut isha_ahmar_sza = None;
@@ -249,7 +262,15 @@ fn interpolate_crossing(sza0: f64, lum0: f64, sza1: f64, lum1: f64, threshold: f
     if (lum1 - lum0).abs() < 1e-30 {
         return (sza0 + sza1) / 2.0;
     }
-    // Use log-space interpolation since luminance drops exponentially
+    // Log-space interpolation (luminance drops ~exponentially with SZA) —
+    // but log() of a zero/negative sample (possible when the darker endpoint
+    // collapses to exactly 0, or an MC estimate goes non-positive) is
+    // undefined and previously pinned the crossing to sza0. Fall back to
+    // linear interpolation in that case.
+    if lum0 <= 0.0 || lum1 <= 0.0 || threshold <= 0.0 {
+        let frac = ((threshold - lum0) / (lum1 - lum0)).clamp(0.0, 1.0);
+        return sza0 + frac * (sza1 - sza0);
+    }
     let log_lum0 = libm::log(lum0);
     let log_lum1 = libm::log(lum1);
     let log_thresh = libm::log(threshold);

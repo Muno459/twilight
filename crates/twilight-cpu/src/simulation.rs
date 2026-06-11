@@ -379,6 +379,54 @@ mod tests {
         assert!(c.apply_solar_irradiance);
     }
 
+    // ── Phase-function orientation (regression for the supplement-angle bug) ──
+
+    /// With a forward-peaked aerosol phase function (HG, g≈0.7), the sky
+    /// toward the sun must be much brighter than the anti-solar sky. Before
+    /// the fix, cos(θ) was negated (the supplement), evaluating the forward
+    /// peak at the BACKWARD angle, and this test fails by ~2 orders of
+    /// magnitude.
+    #[test]
+    fn aerosol_forward_scatter_beats_backscatter() {
+        use twilight_data::aerosol::{default_properties, AerosolType};
+        let props = default_properties(AerosolType::Urban);
+        let atm = builder::build_with_aerosol_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &props,
+        );
+        // Sun well above horizon so both views are sunlit; observer looks
+        // 75° from zenith either toward the sun (rel az 0) or away (180).
+        let mut toward = SimulationConfig {
+            view_zenith: 75.0,
+            scattering_mode: ScatteringMode::Single,
+            ..SimulationConfig::default()
+        };
+        toward.view_azimuth = Some(toward.solar_azimuth); // rel az = 0
+        let mut away = toward.clone();
+        away.view_azimuth = Some(toward.solar_azimuth + 180.0);
+
+        let sza = 60.0;
+        let r_toward = simulate_at_sza(&atm, &toward, sza);
+        let r_away = simulate_at_sza(&atm, &away, sza);
+        // 550 nm bin (index 17 on the 380..780/10nm grid)
+        let i550 = r_toward
+            .wavelengths_nm
+            .iter()
+            .position(|&w| (w - 550.0).abs() < 1e-9)
+            .unwrap();
+        let t = r_toward.radiance[i550];
+        let a = r_away.radiance[i550];
+        assert!(
+            t > 2.0 * a,
+            "forward-scatter sky should be much brighter than anti-solar: \
+             toward={:.4e}, away={:.4e}, ratio={:.2}",
+            t,
+            a,
+            t / a
+        );
+    }
+
     // ── simulate_at_sza ──
 
     #[test]
@@ -950,6 +998,7 @@ mod tests {
     ///
     /// Run with: cargo test -p twilight-cpu --release -- cv_baseline --nocapture
     #[test]
+    #[ignore = "slow MC diagnostic (minutes); run: cargo test --release -- --ignored cv_baseline --nocapture"]
     fn cv_baseline() {
         use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
         use twilight_core::photon;
@@ -1028,6 +1077,7 @@ mod tests {
     ///
     /// Run with: cargo test -p twilight-cpu --release -- cv_deep_diag --nocapture
     #[test]
+    #[ignore = "slow MC diagnostic (minutes); run: cargo test --release -- --ignored cv_deep_diag --nocapture"]
     fn cv_deep_diag() {
         use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
         use twilight_core::photon;

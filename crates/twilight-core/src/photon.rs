@@ -366,15 +366,21 @@ pub fn trace_photon(
         // Scattering event at free_path distance
         pos = pos + dir * free_path;
 
+        // Apply single scattering albedo BEFORE next-event estimation: an
+        // NEE connection is a scattering interaction at this vertex, so its
+        // radiometric weight must carry the scattering (not just extinction)
+        // coefficient — the reference single-scatter integrand uses
+        // beta_scat = extinction * ssa. Applying SSA only after NEE
+        // overestimated each NEE contribution by 1/ssa (the hybrid secondary
+        // chains already apply SSA first).
+        weight *= optics.ssa;
+
         // --- Next-Event Estimation (NEE) ---
         // Compute direct contribution from sun at this scatter point.
         // Pass the current photon direction for correct phase function evaluation.
         let nee_contribution = compute_nee(atm, pos, dir, sun_dir, optics, wavelength_idx, weight);
         result.weight += nee_contribution;
         result.num_scatters += 1;
-
-        // Apply single scattering albedo (probability of scattering vs absorption)
-        weight *= optics.ssa;
 
         // Sample new direction based on phase function
         let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
@@ -422,7 +428,7 @@ fn compute_nee(
     // direction back toward the observer (-photon_dir).
     // This is the scattering angle for light coming from the sun being
     // scattered toward the observer.
-    let cos_angle = sun_dir.dot(-photon_dir);
+    let cos_angle = sun_dir.dot(photon_dir);
 
     let phase = if local_optics.rayleigh_fraction > 0.99 {
         rayleigh_phase(cos_angle)
@@ -676,6 +682,11 @@ pub fn trace_photon_polarized(
         // --- Polarized NEE ---
         // Compute the Mueller matrix for scattering sunlight (coming from
         // sun_dir) toward the observer (along -dir).
+        // Apply SSA BEFORE NEE (see scalar trace_photon note: an NEE
+        // connection is a scattering interaction; its weight must carry the
+        // scattering albedo).
+        weight *= optics.ssa;
+
         let nee_stokes = compute_nee_polarized(
             atm,
             pos,
@@ -688,9 +699,6 @@ pub fn trace_photon_polarized(
         );
         result.stokes = result.stokes.add(&nee_stokes);
         result.num_scatters += 1;
-
-        // Apply SSA
-        weight *= optics.ssa;
 
         // Sample new direction
         let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
@@ -727,7 +735,7 @@ fn compute_nee_polarized(
     }
 
     // Scattering angle for light from sun scattered toward observer (-photon_dir)
-    let cos_angle = sun_dir.dot(-photon_dir);
+    let cos_angle = sun_dir.dot(photon_dir);
 
     // Rotation angle: align reference frame from previous scattering plane
     // to the current one (prev_dir, photon_dir) -> (photon_dir, -sun_dir is
@@ -2465,7 +2473,7 @@ pub fn hybrid_scatter_radiance(
         // --- Order 1: deterministic single-scatter NEE ---
         let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
         if t_sun > 1e-30 {
-            let cos_theta_1 = sun_dir.dot(-view_dir);
+            let cos_theta_1 = sun_dir.dot(view_dir);
             let scale_1 = beta_scat * INV_4PI * t_sun * t_obs * ds;
 
             if polarized {
@@ -2537,6 +2545,7 @@ pub fn hybrid_scatter_radiance(
                         atm,
                         scatter_pos,
                         sun_dir,
+                        view_dir,
                         wavelength_idx,
                         optics,
                         &mut mc_rng,
@@ -2615,70 +2624,63 @@ fn trace_secondary_chain(
     let xi_jitter = xorshift_f64(&mut rng.dir);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
-    // 3-branch importance sampling with correct branch probability weights.
+    // 3-branch mixture sampling with the UNBIASED one-sample MIS weight.
     //
-    // The baseline estimator is:
-    //   E = 0.5 * E_phase + 0.5 * E_hemi
+    // The target is J = INTEGRAL P(omega.view)/4pi * L_{1+}(omega) d omega.
+    // We draw omega from the mixture q (see seed_mixture_pdf) and weight by
     //
-    // We sample with probabilities (alpha_p, alpha_z, alpha_t). Each branch
-    // carries weight (baseline_prob / actual_prob) * shape_correction:
-    //   phase:      0.5 / alpha_p
-    //   zenith:     0.5 / alpha_z * zenith_shape_weight
-    //   terminator: 0.5 / alpha_t * terminator_shape_weight
+    //   w0 = [P(omega.view)/4pi] / q(omega)
     //
-    // At SZA <= 96: alpha_p=0.5, alpha_z=0.5, alpha_t=0. Both active
-    // branch weights = 1.0 exactly (n=1 makes zenith_importance_weight=1).
-    let (dir, cos_theta_init, initial_weight) = if xi_mix < alpha_p {
-        // Phase function branch
-        let cos_theta_init = if xorshift_f64(&mut rng.dir) < start_optics.rayleigh_fraction {
+    // identically for every branch — the balance-heuristic estimator, which
+    // is unbiased for any q > 0 on the integrand's support. The samplers
+    // and RNG consumption order are unchanged; only the weights are fixed.
+    let dir = if xi_mix < alpha_p {
+        // Phase-component sample (sun-centric proposal)
+        let ct = if xorshift_f64(&mut rng.dir) < start_optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
             sample_henyey_greenstein(xorshift_f64(&mut rng.dir), start_optics.asymmetry)
         };
         let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
-        let d = scatter_direction(sun_dir, cos_theta_init, phi_init);
-        let branch_w = 0.5 / alpha_p;
-        (d, cos_theta_init, branch_w)
+        scatter_direction(sun_dir, ct, phi_init)
     } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
-        // Zenith-biased branch with shape + branch weight correction
-        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
-        let cos_theta_init = sun_dir.dot(d);
-        let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
-        let branch_w = 0.5 / (alpha_z + alpha_t); // fallback if alpha_t ~ 0
-        (d, cos_theta_init, shape_w * branch_w)
+        // Zenith-lobe sample
+        let (d, _cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
+        d
     } else {
-        // Terminator lobe branch
-        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
-        let cos_z = d.dot(local_up);
-        let cos_theta_init = sun_dir.dot(d);
-        let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
-        let branch_w = 0.5 / alpha_t;
-        (d, cos_theta_init, shape_w * branch_w)
+        // Terminator-lobe sample
+        let (d, _cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
+        d
     };
 
-    // Initialize Stokes state: apply first scatter to [1,0,0,0]
-    let mut stokes;
-    {
-        let (c0, s0) = scattering_plane_cos_sin(prev_dir_in, sun_dir, dir);
-        stokes = scatter_stokes_fast(
-            &StokesVector::unpolarized(1.0),
-            cos_theta_init,
-            start_optics.rayleigh_fraction,
-            start_optics.asymmetry,
-            c0,
-            s0,
-        );
-        // Normalize by I (importance weighting)
-        let i_val = stokes.intensity();
-        if i_val > 1e-30 {
-            stokes = stokes.scale(1.0 / i_val);
-        }
-    }
+    // Unbiased seed weight: evaluates the seed coupling to the OBSERVER
+    // (prev_dir_in is the LOS view direction; the physical scattering
+    // cosine at the seed vertex is omega . view).
+    let q_seed = seed_mixture_pdf(
+        dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, start_optics,
+    );
+    let w0 = if q_seed > 1e-300 {
+        scalar_phase_value(dir.dot(prev_dir_in), start_optics) * INV_4PI / q_seed
+    } else {
+        0.0
+    };
+
+    // Seed polarization state: unpolarized. The exact treatment would apply
+    // the Mueller matrix of the (omega -> view) seed scatter; multiply-
+    // scattered light is weakly polarized and the I-error of this
+    // approximation is sub-percent. (The previous code applied a Mueller
+    // scatter for the WRONG geometry — sun->omega — then normalized it away.)
+    let mut stokes = StokesVector::unpolarized(1.0);
 
     let mut pos = start_pos;
     let mut current_dir = dir;
     let mut prev_dir = sun_dir;
-    let mut weight = start_optics.ssa * initial_weight;
+    // NOTE: no `start_optics.ssa` factor here. The caller multiplies the
+    // chain average by beta_scat = extinction * ssa at the seed point, so
+    // applying SSA again here double-counted the seed-vertex albedo
+    // (invisible in Rayleigh tests where ssa = 1; underestimated MS for
+    // aerosol/cloud atmospheres).
+    let mut weight = w0;
     let mut total_stokes = StokesVector::unpolarized(0.0);
 
     // Upfront forced scattering at deep twilight (SZA >= 96).
@@ -2856,11 +2858,16 @@ fn trace_secondary_chain(
 
         let optics = &atm.optics[scatter_shell][wavelength_idx];
 
+        // Apply SSA BEFORE NEE: the NEE connection is a scattering
+        // interaction at this vertex, so its weight must carry the
+        // scattering albedo (matches the scalar and ALIS chains).
+        weight *= optics.ssa;
+
         // NEE: apply Mueller to photon's actual Stokes state
         let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
 
         if t_sun_secondary > 1e-30 {
-            let cos_angle_nee = sun_dir.dot(-current_dir);
+            let cos_angle_nee = sun_dir.dot(current_dir);
             let (cn, sn) = scattering_plane_cos_sin(prev_dir, current_dir, -sun_dir);
             let nee_stokes = scatter_stokes_fast(
                 &stokes,
@@ -2874,9 +2881,6 @@ fn trace_secondary_chain(
             let scale = weight * t_sun_secondary * INV_4PI;
             total_stokes = total_stokes.add(&nee_stokes.scale(scale));
         }
-
-        // Apply SSA
-        weight *= optics.ssa;
 
         // Sample new direction and update Stokes state
         let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
@@ -2941,6 +2945,7 @@ fn trace_secondary_chain_scalar(
     atm: &AtmosphereModel,
     start_pos: Vec3,
     sun_dir: Vec3,
+    view_dir: Vec3,
     wavelength_idx: usize,
     start_optics: &crate::atmosphere::ShellOptics,
     rng: &mut McRng,
@@ -2971,32 +2976,32 @@ fn trace_secondary_chain_scalar(
 
     // 3-branch importance sampling. See trace_secondary_chain for derivation.
     // At SZA <= 96: alpha_p=0.5, alpha_z=0.5, alpha_t=0. Both weights = 1.0.
-    let (dir, initial_weight) = if xi_mix < alpha_p {
-        // Phase function branch (toward sun_dir -- effective at civil twilight)
-        let _cos_theta_init = if xorshift_f64(&mut rng.dir) < start_optics.rayleigh_fraction {
+    // Unbiased one-sample MIS seed (see seed_mixture_pdf): sample omega
+    // from the 3-component mixture, weight by P(omega.view)/4pi / q(omega).
+    // Samplers and RNG consumption order unchanged from the old code.
+    let dir = if xi_mix < alpha_p {
+        // Phase-component sample (sun-centric proposal)
+        let ct = if xorshift_f64(&mut rng.dir) < start_optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
             sample_henyey_greenstein(xorshift_f64(&mut rng.dir), start_optics.asymmetry)
         };
         let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
-        let branch_w = 0.5 / alpha_p;
-        (
-            scatter_direction(sun_dir, _cos_theta_init, phi_init),
-            branch_w,
-        )
+        scatter_direction(sun_dir, ct, phi_init)
     } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
-        // Zenith-biased branch with shape + branch weight correction
-        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
-        let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
-        let branch_w = 0.5 / (alpha_z + alpha_t);
-        (d, shape_w * branch_w)
+        let (d, _cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
+        d
     } else {
-        // Terminator lobe branch
-        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
-        let cos_z = d.dot(local_up);
-        let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
-        let branch_w = 0.5 / alpha_t;
-        (d, shape_w * branch_w)
+        let (d, _cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
+        d
+    };
+    let q_seed = seed_mixture_pdf(
+        dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, start_optics,
+    );
+    let initial_weight = if q_seed > 1e-300 {
+        scalar_phase_value(dir.dot(view_dir), start_optics) * INV_4PI / q_seed
+    } else {
+        0.0
     };
 
     let surface_radius = atm.surface_radius();
@@ -3173,11 +3178,20 @@ fn trace_secondary_chain_scalar(
                                     let albedo = atm.surface_albedo[wavelength_idx];
                                     weight *= albedo;
                                     current_dir = sample_hemisphere(normal, &mut local_rng.dir);
-                                    scatter_found = false;
-                                    break;
+                                    // Continue the walk with the reflected
+                                    // direction (the Stokes chain does the
+                                    // same): a ground bounce is not chain
+                                    // death.
+                                    continue;
                                 }
-                                scatter_found = false;
-                                break;
+                                // Crossed into the next shell: resample the
+                                // free path there (memoryless exponential).
+                                // Previously `break` killed the ENTIRE chain
+                                // at the first shell crossing, so scalar/ALIS
+                                // photons could never traverse the atmosphere
+                                // (massive MS underestimate; broken cloudy
+                                // skies). The Stokes chain always continued.
+                                continue;
                             }
                         }
                         None => break,
@@ -3210,7 +3224,7 @@ fn trace_secondary_chain_scalar(
                 let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
 
                 if t_sun_secondary > 1e-30 {
-                    let cos_angle_nee = sun_dir.dot(-current_dir);
+                    let cos_angle_nee = sun_dir.dot(current_dir);
                     let phase = if optics.rayleigh_fraction > 0.99 {
                         rayleigh_phase(cos_angle_nee)
                     } else {
@@ -3564,6 +3578,7 @@ fn trace_secondary_chain_alis(
     atm: &AtmosphereModel,
     start_pos: Vec3,
     sun_dir: Vec3,
+    view_dir: Vec3,
     hero_wl: usize,
     start_shell: usize,
     rng: &mut McRng,
@@ -3595,55 +3610,54 @@ fn trace_secondary_chain_alis(
     let xi_jitter = xorshift_f64(&mut rng.dir);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
-    // Sample initial direction from hero's phase function (phase branch),
-    // zenith-biased distribution (zenith branch), or terminator lobe
-    // (terminator branch). Track cos_theta_init for phase function ratio
-    // correction on non-hero wavelengths.
-    let (dir, initial_weight, cos_theta_init, is_phase_branch) = if xi_mix < alpha_p {
-        // Phase function branch
+    // Unbiased one-sample MIS seed (see seed_mixture_pdf). Samplers and
+    // RNG consumption order unchanged; the weight is now the balance-
+    // heuristic estimator of the true integrand P(omega.view)/4pi * L.
+    let dir = if xi_mix < alpha_p {
+        // Phase-component sample at the hero wavelength (sun-centric)
         let ct = if xorshift_f64(&mut rng.dir) < hero_optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
             sample_henyey_greenstein(xorshift_f64(&mut rng.dir), hero_optics.asymmetry)
         };
         let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
-        let branch_w = 0.5 / alpha_p;
-        (scatter_direction(sun_dir, ct, phi_init), branch_w, ct, true)
+        scatter_direction(sun_dir, ct, phi_init)
     } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
-        // Zenith-biased branch (wavelength-independent)
-        let (d, cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
-        let shape_w = zenith_importance_weight(cos_z, bp.n_zenith);
-        let branch_w = 0.5 / (alpha_z + alpha_t);
-        (d, shape_w * branch_w, 0.0, false)
+        let (d, _cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
+        d
     } else {
-        // Terminator lobe branch (wavelength-independent)
-        let (d, cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
-        let cos_z = d.dot(local_up);
-        let shape_w = terminator_shape_weight(cos_z, cos_t, bp.m_term);
-        let branch_w = 0.5 / alpha_t;
-        (d, shape_w * branch_w, 0.0, false)
+        let (d, _cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
+        d
     };
 
-    // Initialize per-wavelength weight ratios: weight_ratio[w] = weight_w / hero_weight.
-    // Only the initial direction sampling (phase function ratio) differs across
-    // wavelengths here. SSA is handled correctly by:
-    //   - outer integrator: beta_scat = extinction * ssa (per-wavelength)
-    //   - chain: hero_weight *= ssa_hero at each scatter, wr[w] *= ssa_w/ssa_hero
-    // Including ssa_ratio here would double-count the start-shell SSA.
-    let mut weight_ratio = [0.0f64; 64];
-    let hero_phase_init = if is_phase_branch {
-        scalar_phase_value(cos_theta_init, hero_optics)
+    // Hero seed weight w0 = P_hero(omega.view)/4pi / q_hero(omega).
+    // NOTE: the ALIS mixture is sampled with the HERO wavelength's phase
+    // component, so q for every wavelength is q_hero (the proposal is one
+    // distribution regardless of which wavelength we score) — the per-
+    // wavelength ratio only carries the numerator P_w(omega.view)/P_hero.
+    let cos_seed_view = dir.dot(view_dir);
+    let q_seed = seed_mixture_pdf(
+        dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, hero_optics,
+    );
+    let hero_phase_view = scalar_phase_value(cos_seed_view, hero_optics);
+    let initial_weight = if q_seed > 1e-300 {
+        hero_phase_view * INV_4PI / q_seed
     } else {
-        1.0
+        0.0
     };
+
+    // Per-wavelength weight ratios: weight_ratio[w] = w0_w / w0_hero
+    //   = P_w(omega.view) / P_hero(omega.view)   (q cancels).
+    // SSA is handled by the outer integrator (beta_scat per wavelength) and
+    // the per-bounce ssa ratio; no start-shell SSA here (double-count).
+    let mut weight_ratio = [0.0f64; 64];
     for w in 0..num_wl {
         let optics_w = &atm.optics[start_shell][w];
-        let dir_ratio = if is_phase_branch && hero_phase_init > 1e-30 {
-            scalar_phase_value(cos_theta_init, optics_w) / hero_phase_init
+        weight_ratio[w] = if hero_phase_view > 1e-30 {
+            scalar_phase_value(cos_seed_view, optics_w) / hero_phase_view
         } else {
             1.0
         };
-        weight_ratio[w] = dir_ratio;
     }
 
     let surface_radius = atm.surface_radius();
@@ -3871,11 +3885,15 @@ fn trace_secondary_chain_alis(
                                         wr[w] *= albedo_ratio;
                                     }
                                     current_dir = sample_hemisphere(normal, &mut local_rng.dir);
-                                    scatter_found = false;
-                                    break;
+                                    // Ground bounce: continue the walk with
+                                    // the reflected direction (see scalar
+                                    // chain note).
+                                    continue;
                                 }
-                                scatter_found = false;
-                                break;
+                                // Shell crossing: continue and resample the
+                                // free path in the new shell. `break` here
+                                // killed the chain at the first boundary.
+                                continue;
                             }
                         }
                         None => break,
@@ -3923,7 +3941,7 @@ fn trace_secondary_chain_alis(
             let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
                 let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
-                let cos_angle_nee = sun_dir.dot(-current_dir);
+                let cos_angle_nee = sun_dir.dot(current_dir);
 
                 // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
                 // particle, apply the MIS weight (w_back) since BDPT provides
@@ -4372,7 +4390,7 @@ pub fn hybrid_scatter_radiance_alis(
 
         // --- Order 1: deterministic single-scatter NEE (all wavelengths) ---
         let t_suns = shadow_ray_transmittance_spectrum(atm, scatter_pos, sun_dir, num_wl);
-        let cos_theta_1 = sun_dir.dot(-view_dir);
+        let cos_theta_1 = sun_dir.dot(view_dir);
 
         for w in 0..num_wl {
             let optics = &atm.optics[shell_idx][w];
@@ -4443,6 +4461,7 @@ pub fn hybrid_scatter_radiance_alis(
                     atm,
                     scatter_pos,
                     sun_dir,
+                    view_dir,
                     hero_wl,
                     shell_idx,
                     &mut mc_rng,
@@ -4788,29 +4807,63 @@ fn sample_zenith_biased(normal: Vec3, n: f64, rng: &mut u64) -> (Vec3, f64) {
     (dir, cos_theta)
 }
 
-/// Importance weight correction for truncated zenith-biased sampling.
+/// PDF over solid angle of the truncated power-cosine lobe drawn by
+/// `sample_zenith_biased(axis, n, ..)`:
 ///
-/// When sampling from the truncated power-cosine(n) distribution over
-/// [cos_min, 1] instead of cosine-weighted (n=1) over [0, 1],
-/// the importance ratio is:
+///   p(omega) = (n+1) cos^n(theta) / (2 pi (1 - cos_min^{n+1}))
 ///
-///   w = p_cosine(theta) / p_trunc(theta)
-///     = [cos(theta) / pi] / [(n+1) / (2*pi*(1 - c^(n+1))) * cos^n(theta)]
-///     = 2*(1 - c^(n+1)) / ((n+1) * cos^(n-1)(theta))
-///
-/// where c = power_cos_min(n). The truncation normalization factor ensures
-/// the IS weight is exactly correct for the truncated proposal distribution.
-/// Maximum weight is bounded at ZENITH_MAX_IMPORTANCE_WEIGHT.
-#[inline]
-fn zenith_importance_weight(cos_theta: f64, n: f64) -> f64 {
-    let cos_nm1 = libm::pow(cos_theta, n - 1.0);
-    let cos_min = power_cos_min(n);
-    if cos_min > 1e-6 {
-        let trunc_norm = 1.0 - libm::pow(cos_min, n + 1.0);
-        2.0 * trunc_norm / ((n + 1.0) * cos_nm1)
-    } else {
-        2.0 / ((n + 1.0) * cos_nm1)
+/// for cos(theta) = omega . axis in [cos_min, 1], and 0 outside the
+/// truncated cap. At n = 1 this reduces to the cosine hemisphere cos/pi.
+fn truncated_power_cos_pdf(cos_theta: f64, n: f64) -> f64 {
+    let cm = power_cos_min(n);
+    if cos_theta <= 0.0 || cos_theta < cm {
+        return 0.0;
     }
+    let norm = 1.0 - libm::pow(cm, n + 1.0);
+    (n + 1.0) * libm::pow(cos_theta, n) / (2.0 * core::f64::consts::PI * norm)
+}
+
+/// Density [1/sr] of the 3-component seed-direction mixture at `omega`.
+///
+/// The seed direction for an orders-2+ secondary chain is drawn from
+///
+///   q(omega) = alpha_p * P(omega . sun)/4pi          (phase, sun-centric)
+///            + alpha_z * trunc_pow_cos(omega . up)    (zenith lobe)
+///            + alpha_t * trunc_pow_cos(omega . term)  (terminator lobe)
+///
+/// and the UNBIASED one-sample (balance-heuristic) weight for the target
+/// integrand integral P(omega . view)/4pi * L(omega) d omega is
+///
+///   w0 = [P(omega . view)/4pi] / q(omega)
+///
+/// regardless of which component produced the sample. alpha_p > 0
+/// guarantees q > 0 wherever the integrand is nonzero (phase functions are
+/// strictly positive), so the estimator has full coverage. This replaces
+/// the previous per-branch heuristic weights (0.5/alpha with shape
+/// corrections), which mixed estimators of DIFFERENT integrals (phase- vs
+/// cosine-hemisphere-referenced) and never evaluated the seed coupling
+/// P(omega . view) at all - a structural bias in the multiple-scattering
+/// term and a major firefly source.
+#[allow(clippy::too_many_arguments)]
+fn seed_mixture_pdf(
+    omega: Vec3,
+    sun_dir: Vec3,
+    local_up: Vec3,
+    term_axis: Vec3,
+    bp: &BranchParams,
+    alpha_p: f64,
+    alpha_z: f64,
+    alpha_t: f64,
+    optics: &crate::atmosphere::ShellOptics,
+) -> f64 {
+    let mut q = alpha_p * scalar_phase_value(omega.dot(sun_dir), optics) * INV_4PI;
+    if alpha_z > 1e-12 {
+        q += alpha_z * truncated_power_cos_pdf(omega.dot(local_up), bp.n_zenith);
+    }
+    if alpha_t > 1e-12 {
+        q += alpha_t * truncated_power_cos_pdf(omega.dot(term_axis), bp.m_term);
+    }
+    q
 }
 
 /// SZA-adaptive parameters for the 3-branch initial direction sampling.
@@ -4904,37 +4957,6 @@ fn terminator_axis(up: Vec3, sun_dir: Vec3, tilt_rad: f64) -> Vec3 {
     axis.normalize()
 }
 
-/// Shape weight for the terminator lobe: corrects the power-cosine PDF
-/// centered on the terminator axis back to the cosine-hemisphere reference.
-///
-/// `cos_z` = cos(angle from zenith), `cos_t` = cos(angle from terminator axis).
-///
-/// Weight = p_cosine(d) / p_term(d)
-///        = [cos(theta_z) / pi] / [(m+1) / (2*pi) * cos^m(theta_t)]
-///        = 2 * cos(theta_z) / ((m+1) * cos^m(theta_t))
-///
-/// If `cos_z <= 0` (below horizon), returns 0 -- the direction has zero
-/// probability in the cosine-hemisphere reference. Samples are not wasted
-/// in practice because the terminator axis tilt (max 50 deg) combined with
-/// the concentration (m=8) keeps 95%+ of samples above the horizon.
-#[inline]
-fn terminator_shape_weight(cos_z: f64, cos_t: f64, m: f64) -> f64 {
-    if cos_z <= 0.0 || cos_t <= 0.0 {
-        return 0.0;
-    }
-    let cos_t_m = libm::pow(cos_t, m);
-    if cos_t_m < 1e-30 {
-        return 0.0;
-    }
-    let cos_min = power_cos_min(m);
-    if cos_min > 1e-6 {
-        let trunc_norm = 1.0 - libm::pow(cos_min, m + 1.0);
-        2.0 * cos_z * trunc_norm / ((m + 1.0) * cos_t_m)
-    } else {
-        2.0 * cos_z / ((m + 1.0) * cos_t_m)
-    }
-}
-
 /// Simple xorshift64 PRNG suitable for no_std Monte Carlo.
 ///
 /// Not cryptographically secure, but good statistical properties
@@ -5008,6 +5030,97 @@ impl McRng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Seed-mixture pdf helpers ──
+
+    #[test]
+    fn truncated_power_cos_pdf_normalizes_to_one() {
+        // INTEGRAL over the sphere: 2*pi * INT_{cm}^{1} p(c) dc = 1.
+        for n in [1.0, 2.0, 3.5, 5.0, 8.0] {
+            let steps = 200_000;
+            let mut sum = 0.0;
+            for i in 0..steps {
+                let c = (i as f64 + 0.5) / steps as f64; // c in (0,1)
+                sum += truncated_power_cos_pdf(c, n) / steps as f64;
+            }
+            let integral = 2.0 * core::f64::consts::PI * sum;
+            assert!(
+                (integral - 1.0).abs() < 1e-3,
+                "trunc pow-cos pdf integral (n={}) = {}",
+                n,
+                integral
+            );
+        }
+    }
+
+    #[test]
+    fn seed_mixture_pdf_positive_everywhere_with_phase_component() {
+        // With alpha_p > 0 the mixture must be strictly positive in every
+        // direction (full estimator coverage; q=0 on the support would be
+        // an unbiasedness hole).
+        let optics = crate::atmosphere::ShellOptics {
+            extinction: 1e-5,
+            ssa: 1.0,
+            asymmetry: 0.0,
+            rayleigh_fraction: 1.0,
+        };
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let sun = Vec3::new(0.8, 0.0, -0.6).normalize();
+        let bp = branch_params_for_sza(libm::cos(100.0_f64.to_radians()));
+        let alpha_p = 1.0 - bp.zenith_frac;
+        let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
+        let alpha_t = bp.zenith_frac * bp.term_share;
+        let term_axis = terminator_axis(up, sun, bp.tilt_rad);
+        assert!(alpha_p > 0.0, "phase component must keep coverage");
+        let mut rng = 12345u64;
+        for _ in 0..2000 {
+            // random direction on the sphere
+            let z = 2.0 * xorshift_f64(&mut rng) - 1.0;
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng);
+            let r = libm::sqrt((1.0 - z * z).max(0.0));
+            let omega = Vec3::new(r * libm::cos(phi), r * libm::sin(phi), z);
+            let q = seed_mixture_pdf(
+                omega, sun, up, term_axis, &bp, alpha_p, alpha_z, alpha_t, &optics,
+            );
+            assert!(q > 0.0, "mixture pdf must be > 0 everywhere, got {}", q);
+        }
+    }
+
+    #[test]
+    fn seed_mixture_pdf_normalizes_to_one() {
+        // MC integral of q over the sphere = 1 (it is a probability density).
+        let optics = crate::atmosphere::ShellOptics {
+            extinction: 1e-5,
+            ssa: 1.0,
+            asymmetry: 0.7,
+            rayleigh_fraction: 0.4,
+        };
+        let up = Vec3::new(0.0, 0.0, 1.0);
+        let sun = Vec3::new(0.6, 0.0, -0.8).normalize();
+        let bp = branch_params_for_sza(libm::cos(104.0_f64.to_radians()));
+        let alpha_p = 1.0 - bp.zenith_frac;
+        let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
+        let alpha_t = bp.zenith_frac * bp.term_share;
+        let term_axis = terminator_axis(up, sun, bp.tilt_rad);
+        let mut rng = 777u64;
+        let n = 400_000;
+        let mut sum = 0.0;
+        for _ in 0..n {
+            let z = 2.0 * xorshift_f64(&mut rng) - 1.0;
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng);
+            let r = libm::sqrt((1.0 - z * z).max(0.0));
+            let omega = Vec3::new(r * libm::cos(phi), r * libm::sin(phi), z);
+            sum += seed_mixture_pdf(
+                omega, sun, up, term_axis, &bp, alpha_p, alpha_z, alpha_t, &optics,
+            );
+        }
+        let integral = 4.0 * core::f64::consts::PI * sum / n as f64;
+        assert!(
+            (integral - 1.0).abs() < 0.02,
+            "mixture pdf MC integral = {}, expected 1",
+            integral
+        );
+    }
 
     // ── xorshift_f64 RNG ──
 
@@ -6694,87 +6807,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminator_shape_weight_at_axis() {
-        // When direction is exactly on the terminator axis AND that axis is at zenith,
-        // cos_z = cos_t = 1. With truncated power-cosine, weight = 2 * trunc_norm / (m+1).
-        let m = 8.0;
-        let w = terminator_shape_weight(1.0, 1.0, m);
-        let cos_min = power_cos_min(m);
-        let trunc_norm = if cos_min > 1e-6 {
-            1.0 - libm::pow(cos_min, m + 1.0)
-        } else {
-            1.0
-        };
-        let expected = 2.0 * trunc_norm / (m + 1.0);
-        assert!(
-            (w - expected).abs() < 1e-12,
-            "terminator_shape_weight(1,1,8) = {}, expected {}",
-            w,
-            expected
-        );
-    }
-
-    #[test]
-    fn terminator_shape_weight_below_horizon_zero() {
-        // cos_z <= 0 should return 0
-        let w = terminator_shape_weight(-0.1, 0.9, 5.0);
-        assert!(
-            w == 0.0,
-            "terminator_shape_weight should be 0 for below-horizon, got {}",
-            w
-        );
-    }
-
-    #[test]
-    fn terminator_shape_weight_behind_axis_zero() {
-        // cos_t <= 0 should return 0 (direction is behind the terminator axis hemisphere)
-        let w = terminator_shape_weight(0.5, -0.1, 5.0);
-        assert!(
-            w == 0.0,
-            "terminator_shape_weight should be 0 for behind-axis, got {}",
-            w
-        );
-    }
-
-    #[test]
-    fn terminator_shape_weight_positive_in_overlap() {
-        // Both cos_z and cos_t positive: weight should be positive
-        let w = terminator_shape_weight(0.7, 0.8, 5.0);
-        assert!(
-            w > 0.0,
-            "terminator_shape_weight should be positive in overlap region, got {}",
-            w
-        );
-    }
-
-    #[test]
-    fn three_branch_backward_compatible_at_civil() {
-        // At SZA = 90, the 3-branch system should behave identically to the
-        // old 2-branch system: alpha_p = 0.5, alpha_z = 0.5, alpha_t = 0.
-        // Phase branch weight = 0.5/0.5 = 1.0.
-        // Zenith branch with n=1: zenith_importance_weight(cos, 1.0) = 1.0 for all cos.
-        let bp = branch_params_for_sza(0.0);
-        let alpha_p = 1.0 - bp.zenith_frac;
-        let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
-        let alpha_t = bp.zenith_frac * bp.term_share;
-
-        assert!((alpha_p - 0.5).abs() < 1e-14);
-        assert!((alpha_z - 0.5).abs() < 1e-14);
-        assert!(alpha_t < 1e-14);
-
-        // Zenith shape weight at n=1 should be 1.0 for any cos_theta
-        for cos_z in [0.1, 0.3, 0.5, 0.7, 0.9, 1.0] {
-            let w = zenith_importance_weight(cos_z, 1.0);
-            assert!(
-                (w - 1.0).abs() < 1e-10,
-                "zenith weight at n=1, cos={}: got {} expected 1.0",
-                cos_z,
-                w
-            );
-        }
-    }
-
     // ── Weight windows ──
 
     #[test]
@@ -7027,6 +7059,7 @@ mod tests {
                 &atm,
                 observer,
                 sun_dir,
+                observer.normalize(),
                 0,
                 start_optics,
                 &mut mc,
@@ -7074,6 +7107,7 @@ mod tests {
                 &atm,
                 observer,
                 sun_dir,
+                observer.normalize(),
                 0,
                 start_optics,
                 &mut mc,
@@ -7131,7 +7165,7 @@ mod tests {
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
+                &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
             );
             for w in 0..num_wl {
                 assert!(
@@ -7553,6 +7587,7 @@ mod tests {
                 &atm,
                 observer,
                 sun_dir,
+                observer.normalize(),
                 0,
                 start_optics,
                 &mut mc,
@@ -7604,7 +7639,7 @@ mod tests {
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
-                &atm, observer, sun_dir, hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
+                &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
             );
             for w in 0..num_wl {
                 assert!(

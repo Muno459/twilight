@@ -83,6 +83,14 @@ pub fn build_clear_sky(profile: AtmosphereType, surface_albedo: f64) -> Atmosphe
         }
     }
 
+    // Populate per-shell refractive indices from the (pure Rayleigh) density
+    // profile so Snell's-law refraction in the shadow-ray tracer is active.
+    // Every other builder (aerosol/cloud/gas) layers on top of this base, so
+    // this single call enables refraction for all production atmospheres.
+    // Previously this was only ever called from test code, leaving n = 1.0
+    // everywhere and refract_at_boundary on its identity fast path.
+    atm.compute_refractive_indices();
+
     atm
 }
 
@@ -418,7 +426,7 @@ pub fn build_full(
 ///
 /// # Arguments
 /// * `o3_column_du` - Target O3 total column in DU. `None` uses the standard
-///   atmosphere default (~347 DU).
+///   atmosphere default (345 DU).
 /// * `no2_surface_density` - Surface NO2 in molecules/m^3. `None` uses the
 ///   standard atmosphere default.
 pub fn build_full_with_gas(
@@ -453,6 +461,23 @@ pub fn build_full_with_gas(
 ///
 /// Builds a standard gas profile, optionally scales O3 to a target column
 /// and/or replaces the NO2 surface density, then applies gas absorption.
+/// Total O3 column the standard profile is normalized to [DU].
+///
+/// US Standard Atmosphere 1976 corresponds to ~345 DU. The embedded WMO-ish
+/// O3 profile in `gas_absorption_data` actually integrates to ~546 DU
+/// (verified by trapezoid integration), so without normalization every
+/// "standard" run carried ~58% too much ozone — and a real measured column
+/// of ~300 DU passed as an override would *reduce* absorption by 45%
+/// instead of roughly matching the default.
+pub const STANDARD_O3_COLUMN_DU: f64 = 345.0;
+
+/// Altitude below which a surface NO2 observation rescales the profile [m].
+///
+/// Surface NO2 is a boundary-layer quantity; scaling the entire column by
+/// the surface ratio inflated the column 16-130x and erased the profile
+/// shape. Only shells below this altitude are scaled.
+const NO2_BOUNDARY_LAYER_TOP_M: f64 = 3_000.0;
+
 fn apply_gas_absorption_standard(
     atm: &mut AtmosphereModel,
     o3_column_du: Option<f64>,
@@ -460,21 +485,23 @@ fn apply_gas_absorption_standard(
 ) {
     let mut gas_profile = standard_gas_profile(atm);
 
-    // Scale O3 column to target DU if provided
-    if let Some(target_du) = o3_column_du {
-        scale_o3_column(&mut gas_profile, atm, target_du);
-    }
+    // Normalize the O3 column: to the caller's measured value if provided,
+    // otherwise to the US Standard 1976 value (the raw embedded profile
+    // integrates to ~546 DU, which is not a standard atmosphere).
+    let target_du = o3_column_du.unwrap_or(STANDARD_O3_COLUMN_DU);
+    scale_o3_column(&mut gas_profile, atm, target_du);
 
-    // Scale NO2 profile if surface density override provided.
-    // We scale all shells proportionally so the shape is preserved
-    // but the surface value matches the observation.
+    // Scale NO2 in the boundary layer only if a surface observation is
+    // provided. The free-tropospheric/stratospheric profile is left alone.
     if let Some(target_surface) = no2_surface_density {
         if gas_profile.num_shells > 0 {
             let current_surface = gas_profile.shells[0].no2_density;
             if current_surface > 1e-30 {
                 let factor = target_surface / current_surface;
                 for s in 0..gas_profile.num_shells {
-                    gas_profile.shells[s].no2_density *= factor;
+                    if atm.shells[s].altitude_mid <= NO2_BOUNDARY_LAYER_TOP_M {
+                        gas_profile.shells[s].no2_density *= factor;
+                    }
                 }
             }
         }
@@ -1632,7 +1659,7 @@ mod tests {
 
     #[test]
     fn build_full_with_gas_o3_override_changes_extinction() {
-        // Doubling O3 column (standard is ~347 DU) should increase extinction
+        // Doubling O3 column (standard is 345 DU) should increase extinction
         // in the Chappuis band (~600 nm) in the ozone layer (20-25 km).
         let standard =
             build_full_with_gas(AtmosphereType::UsStandard, 0.15, None, None, None, None);
@@ -1668,14 +1695,14 @@ mod tests {
         }
         assert!(
             found_increase,
-            "600 DU O3 column should increase Chappuis extinction over default ~347 DU"
+            "600 DU O3 column should increase Chappuis extinction over default 345 DU"
         );
     }
 
     #[test]
     fn build_full_with_gas_low_o3_reduces_extinction() {
         // A low O3 column (220 DU, ozone hole) should reduce extinction
-        // relative to the default ~347 DU.
+        // relative to the default 345 DU.
         let standard =
             build_full_with_gas(AtmosphereType::UsStandard, 0.15, None, None, None, None);
         let low_o3 = build_full_with_gas(
@@ -1706,7 +1733,7 @@ mod tests {
         }
         assert!(
             found_decrease,
-            "220 DU O3 column should reduce Chappuis extinction below default ~347 DU"
+            "220 DU O3 column should reduce Chappuis extinction below default 345 DU"
         );
     }
 
@@ -1801,4 +1828,21 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn clear_sky_populates_refractive_indices() {
+        // Refraction must be ACTIVE in production atmospheres: surface
+        // refractivity of dry air is n - 1 = 0.000293 (Edlen 1966), decaying
+        // with density. Previously every production build left n = 1.0.
+        let atm = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let n0 = atm.refractive_index[0];
+        assert!(
+            (n0 - 1.000293).abs() < 2e-5,
+            "surface refractive index = {}, expected ~1.000293",
+            n0
+        );
+        // monotonically decreasing toward space
+        let n_top = atm.refractive_index[atm.num_shells - 1];
+        assert!(n_top < n0 && n_top >= 1.0);
+    }
+
 }

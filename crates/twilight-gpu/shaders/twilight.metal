@@ -943,7 +943,7 @@ kernel void single_scatter_spectrum(
     KahanAccum radiance;
     KahanAccum tau_obs;
 
-    float cos_theta = dot(sun_dir, -view_dir);
+    float cos_theta = dot(sun_dir, view_dir);
 
     for (uint step = 0; step < num_steps; step++) {
         float s = (float(step) + 0.5f) * ds;
@@ -1112,7 +1112,7 @@ kernel void mcrt_trace_photon(
         // NEE: apply Mueller to photon's current Stokes state
         float t_sun = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
-            float cos_angle = dot(sun_dir, -dir);
+            float cos_angle = dot(sun_dir, dir);
             float A_nee, B_nee, C_nee;
             stokes_ABC(cos_angle, op, A_nee, B_nee, C_nee);
             float cos2phi_nee, sin2phi_nee;
@@ -1559,7 +1559,7 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         if (isfinite(weight) && fabs(weight) > 1e-30f) {
             float t_sun_sec = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
             if (t_sun_sec > 1e-30f) {
-                float cos_angle_nee = clamp(dot(sun_dir, -current_dir), -1.0f, 1.0f);
+                float cos_angle_nee = clamp(dot(sun_dir, current_dir), -1.0f, 1.0f);
                 float A_nee, B_nee, C_nee;
                 stokes_ABC(cos_angle_nee, op, A_nee, B_nee, C_nee);
 
@@ -1777,7 +1777,7 @@ kernel void hybrid_scatter(
         // Order 1: deterministic single-scatter NEE (Stokes)
         float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
-            float cos_theta_1 = dot(sun_dir, -view_dir);
+            float cos_theta_1 = dot(sun_dir, view_dir);
             float A_1, B_1, C_1;
             stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
             float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;
@@ -2070,7 +2070,7 @@ kernel void hybrid_scatter_v2(
     if (valid && ray_lane == 0) {
         float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
-            float cos_theta_1 = dot(sun_dir, -view_dir);
+            float cos_theta_1 = dot(sun_dir, view_dir);
             float A_1, B_1, C_1;
             stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
             float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;

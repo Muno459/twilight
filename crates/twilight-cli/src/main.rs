@@ -750,7 +750,9 @@ fn cmd_mcrt(
         #[cfg(feature = "gpu")]
         {
             if gpu_backend.is_some() {
-                "GPU"
+                // Honest label: a backend initialized, but individual
+                // kernels may still fall back to CPU on dispatch failure.
+                "GPU (Metal; per-kernel CPU fallback)"
             } else {
                 "CPU (rayon)"
             }
@@ -1214,7 +1216,9 @@ fn cmd_pray(
         #[cfg(feature = "gpu")]
         {
             if gpu_backend.is_some() {
-                "GPU"
+                // Honest label: a backend initialized, but individual
+                // kernels may still fall back to CPU on dispatch failure.
+                "GPU (Metal; per-kernel CPU fallback)"
             } else {
                 "CPU (rayon)"
             }

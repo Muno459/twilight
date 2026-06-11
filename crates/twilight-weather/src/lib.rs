@@ -71,7 +71,7 @@ pub struct WeatherConditions {
 #[derive(Debug, Clone, Copy)]
 pub struct GasComposition {
     /// Total column O3 in Dobson Units. `None` means use the standard
-    /// atmosphere default (~347 DU for US Standard 1976).
+    /// atmosphere default (345 DU, US Standard 1976).
     pub o3_column_du: Option<f64>,
     /// Surface NO2 number density in molecules/m^3. `None` means use the
     /// standard atmosphere default.

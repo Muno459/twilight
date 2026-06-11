@@ -857,6 +857,38 @@ mod tests {
         assert!((input.sza_step - 0.5).abs() < 0.01);
     }
 
+    // ── Polar day (midnight sun) — regression for the empty-scan panic ──
+
+    /// Tromsø (69.6°N) at the June solstice: the sun never sets, the coarse
+    /// scan never starts, and the pipeline previously panicked with
+    /// `index out of bounds: the len is 0` in determine_prayer_times.
+    /// It must instead return Fajr/Isha = None with persistent_twilight set.
+    #[test]
+    fn polar_day_returns_none_instead_of_panicking() {
+        let input = PrayerTimeInput {
+            latitude: 69.6492,
+            longitude: 18.9553,
+            year: 2024,
+            month: 6,
+            day: 21,
+            timezone: 2.0,
+            scattering_mode: ScatteringMode::Single,
+            ..PrayerTimeInput::default()
+        };
+        let out = compute_prayer_times(&input);
+        assert!(out.fajr_time.is_none(), "no Fajr under the midnight sun");
+        assert!(
+            out.isha_abyad_time.is_none(),
+            "no Isha under the midnight sun"
+        );
+        assert!(
+            out.persistent_twilight || out.max_sza_deg.map(|s| s < 90.0).unwrap_or(true),
+            "polar day should be flagged: persistent_twilight={} max_sza={:?}",
+            out.persistent_twilight,
+            out.max_sza_deg
+        );
+    }
+
     // ── format_time ──
 
     #[test]
