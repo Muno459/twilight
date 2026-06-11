@@ -201,6 +201,59 @@ enum Commands {
         #[arg(long)]
         fast: bool,
     },
+    /// Emit machine-readable spectral radiance for external RT comparison
+    /// (e.g. libRadtran/uvspec). CSV to stdout:
+    /// sza_deg,view_zenith_deg,rel_azimuth_deg,wavelength_nm,radiance_w_m2_sr_nm
+    Compare {
+        /// Latitude in degrees (north positive)
+        #[arg(short, long, default_value = "21.4225")]
+        lat: f64,
+        /// Longitude in degrees (east positive)
+        #[arg(short = 'n', long, default_value = "39.8262")]
+        lon: f64,
+        /// Observer elevation above sea level (meters)
+        #[arg(short, long, default_value = "0")]
+        elevation: f64,
+        /// Solar zenith angles in degrees (comma-separated)
+        #[arg(long, value_delimiter = ',', default_value = "90,92,94,96,98,100,102,104,106,108")]
+        sza: Vec<f64>,
+        /// View zenith angles in degrees from straight up (comma-separated)
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        view_zenith: Vec<f64>,
+        /// Relative azimuth view-minus-sun in degrees (comma-separated;
+        /// 0 = principal plane toward the sun, 180 = anti-solar)
+        #[arg(long, value_delimiter = ',', default_value = "0")]
+        rel_azimuth: Vec<f64>,
+        /// Solar azimuth angle (degrees, 0=north, clockwise)
+        #[arg(long, default_value = "270")]
+        solar_azimuth: f64,
+        /// Surface albedo (0-1)
+        #[arg(long, default_value = "0.15")]
+        albedo: f64,
+        /// Pure Rayleigh atmosphere (no gas absorption, no aerosol, no cloud).
+        /// This is the Tier-1 geometry/phase/optics check vs DISORT.
+        #[arg(long)]
+        rayleigh_only: bool,
+        /// Aerosol type (ignored with --rayleigh-only)
+        #[arg(long, value_enum, default_value = "none")]
+        aerosol: CliAerosol,
+        /// Cloud type (ignored with --rayleigh-only)
+        #[arg(long, value_enum, default_value = "none")]
+        cloud: CliCloud,
+        /// Override O3 total column in Dobson Units (matched to mol_modify O3)
+        #[arg(long)]
+        o3_du: Option<f64>,
+        /// Scattering mode (default: single — deterministic, f64, the
+        /// apples-to-apples baseline vs DISORT single-scattering output)
+        #[arg(long, value_enum, default_value = "single")]
+        scattering: CliScattering,
+        /// Secondary rays per LOS step (hybrid/MC modes)
+        #[arg(short, long, default_value = "10000")]
+        photons: usize,
+        /// Scalar radiance mode (skip Stokes polarization)
+        #[arg(long)]
+        fast: bool,
+    },
 }
 
 /// CLI aerosol type selector.
@@ -675,6 +728,7 @@ fn cmd_mcrt(
         elevation: 0.0,
         solar_azimuth,
         view_zenith,
+        view_azimuth: None,
         apply_solar_irradiance: true,
         scattering_mode,
         photons_per_wavelength: photons,
@@ -825,6 +879,81 @@ fn cmd_mcrt(
         "Throughput: {:.1}M photons/sec",
         total_photons as f64 / elapsed.as_secs_f64() / 1e6
     );
+}
+
+/// Emit machine-readable spectral radiance for external RT comparison.
+///
+/// Runs the CPU engine (f64) at each (sza, view_zenith, rel_azimuth) grid
+/// point and prints CSV rows in physical units [W/m^2/sr/nm]. Designed to be
+/// consumed by tools/validate_libradtran.py, which generates matched uvspec
+/// decks and compares the two codes per wavelength.
+#[allow(clippy::too_many_arguments)] // CLI dispatch: all params come from parsed command-line args
+fn cmd_compare(
+    lat: f64,
+    lon: f64,
+    elevation: f64,
+    szas: &[f64],
+    view_zeniths: &[f64],
+    rel_azimuths: &[f64],
+    solar_azimuth: f64,
+    albedo: f64,
+    rayleigh_only: bool,
+    aerosol: CliAerosol,
+    cloud: CliCloud,
+    o3_du: Option<f64>,
+    scattering: CliScattering,
+    photons: usize,
+    fast: bool,
+) {
+    // Build the atmosphere once.
+    let atm = if rayleigh_only {
+        builder::build_clear_sky(AtmosphereType::UsStandard, albedo)
+    } else {
+        let ap = aerosol
+            .to_aerosol_type()
+            .map(twilight_data::aerosol::default_properties);
+        let cp = cloud
+            .to_cloud_type()
+            .map(twilight_data::cloud::default_properties);
+        builder::build_full_with_gas(
+            AtmosphereType::UsStandard,
+            albedo,
+            ap.as_ref(),
+            cp.as_ref(),
+            o3_du,
+            None,
+        )
+    };
+
+    // Header with enough metadata to reproduce the run.
+    println!(
+        "# twilight compare: lat={} lon={} elev={} albedo={} rayleigh_only={} o3_du={:?} scattering={:?} photons={} polarized={}",
+        lat, lon, elevation, albedo, rayleigh_only, o3_du, scattering.to_scattering_mode(), photons, !fast
+    );
+    println!("sza_deg,view_zenith_deg,rel_azimuth_deg,wavelength_nm,radiance_w_m2_sr_nm");
+
+    for &vz in view_zeniths {
+        for &ra in rel_azimuths {
+            let config = SimulationConfig {
+                latitude: lat,
+                longitude: lon,
+                elevation,
+                solar_azimuth,
+                view_zenith: vz,
+                view_azimuth: Some(solar_azimuth + ra),
+                apply_solar_irradiance: true,
+                scattering_mode: scattering.to_scattering_mode(),
+                photons_per_wavelength: photons,
+                polarized: !fast,
+            };
+            for &sza in szas {
+                let result = simulation::simulate_at_sza(&atm, &config, sza);
+                for (wl, rad) in result.wavelengths_nm.iter().zip(result.radiance.iter()) {
+                    println!("{},{},{},{},{:e}", sza, vz, ra, wl, rad);
+                }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // CLI dispatch: all params come from parsed command-line args
@@ -1690,6 +1819,41 @@ fn main() {
                 led_fraction,
                 cpu,
                 gpu_backend,
+                fast,
+            );
+        }
+        Commands::Compare {
+            lat,
+            lon,
+            elevation,
+            sza,
+            view_zenith,
+            rel_azimuth,
+            solar_azimuth,
+            albedo,
+            rayleigh_only,
+            aerosol,
+            cloud,
+            o3_du,
+            scattering,
+            photons,
+            fast,
+        } => {
+            cmd_compare(
+                lat,
+                lon,
+                elevation,
+                &sza,
+                &view_zenith,
+                &rel_azimuth,
+                solar_azimuth,
+                albedo,
+                rayleigh_only,
+                aerosol,
+                cloud,
+                o3_du,
+                scattering,
+                photons,
                 fast,
             );
         }

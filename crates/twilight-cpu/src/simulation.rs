@@ -64,6 +64,11 @@ pub struct SimulationConfig {
     /// Zenith viewing direction (degrees from straight up).
     /// ~70-80° toward the sun azimuth captures the brightest twilight sky.
     pub view_zenith: f64,
+    /// View azimuth (degrees, 0=north, clockwise). `None` means "look toward
+    /// the solar azimuth" (relative azimuth 0), the historical behavior.
+    /// Set explicitly for off-principal-plane geometry (e.g. libRadtran
+    /// comparison grids).
+    pub view_azimuth: Option<f64>,
     /// Whether to weight radiance by solar spectrum (true = physical units).
     /// When false, radiance is in relative units (useful for debugging).
     pub apply_solar_irradiance: bool,
@@ -92,6 +97,7 @@ impl Default for SimulationConfig {
             elevation: 0.0,
             solar_azimuth: 270.0, // West (Isha/sunset direction)
             view_zenith: 75.0,    // Look toward horizon
+            view_azimuth: None,   // default: toward the solar azimuth
             apply_solar_irradiance: true,
             scattering_mode: ScatteringMode::Single,
             photons_per_wavelength: 10_000,
@@ -134,7 +140,7 @@ pub(crate) fn compute_geometry(config: &SimulationConfig, sza_deg: f64) -> (Vec3
     );
     let view_dir = solar_direction_ecef(
         config.view_zenith,
-        config.solar_azimuth,
+        config.view_azimuth.unwrap_or(config.solar_azimuth),
         config.latitude,
         config.longitude,
     );

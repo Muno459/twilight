@@ -572,6 +572,7 @@ fn compute_prayer_times_inner(
         elevation: input.elevation,
         solar_azimuth: solar_azimuth_evening,
         view_zenith: 85.0,
+        view_azimuth: None,
         apply_solar_irradiance: true,
         scattering_mode: input.scattering_mode,
         photons_per_wavelength: input.photons_per_wavelength,
