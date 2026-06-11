@@ -1601,6 +1601,94 @@ fn cross_backend_single_scatter_parity() {
     }
 }
 
+#[cfg(feature = "metal")]
+#[test]
+fn metal_hybrid_split_dispatch_boundaries_match_cpu_statistics() {
+    use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+
+    let config = crate::GpuConfig {
+        preferred_backend: Some(crate::BackendKind::Metal),
+        ..Default::default()
+    };
+    let Ok(mut gpu) = crate::try_init(&config) else {
+        return;
+    };
+
+    let atm = twilight_data::builder::build_clear_sky(
+        twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+        0.15,
+    );
+    gpu.upload_atmosphere(&atm).unwrap();
+
+    let lat = 54.826;
+    let lon = 9.363;
+    let sza_deg = 96.0f64;
+    let solar_azimuth = 270.0;
+    let view_zenith = 85.0;
+    let num_wl = atm.num_wavelengths;
+    let obs = geographic_to_ecef(lat, lon, 0.0);
+    let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+    let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+    let obs_arr = [obs.x, obs.y, obs.z];
+    let view_arr = [view.x, view.y, view.z];
+    let sun_arr = [sun.x, sun.y, sun.z];
+
+    for &secondary_rays in &[0usize, 1, 255, 256, 257, 1023, 1024, 1025] {
+        let seed = sza_deg.to_bits() ^ secondary_rays as u64;
+
+        let gpu_result = gpu
+            .hybrid_scatter(obs_arr, view_arr, sun_arr, secondary_rays as u32, seed)
+            .unwrap();
+
+        let mut cpu_total = 0.0f64;
+        for w in 0..num_wl {
+            let mut rng = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(w as u64)
+                .wrapping_add(1);
+            cpu_total += twilight_core::photon::hybrid_scatter_radiance(
+                &atm,
+                obs,
+                view,
+                sun,
+                w,
+                secondary_rays,
+                &mut rng,
+                true,
+            );
+        }
+
+        let gpu_total: f64 = gpu_result.radiance.iter().sum();
+
+        if secondary_rays == 0 {
+            assert!(
+                approx_eq(cpu_total, gpu_total, 0.05, F32_ATOL),
+                "split boundary rays=0 mismatch: cpu={:.6e}, gpu={:.6e}",
+                cpu_total,
+                gpu_total,
+            );
+            continue;
+        }
+
+        let ratio = if cpu_total.abs() > 1e-30 {
+            gpu_total / cpu_total
+        } else if gpu_total.abs() > 1e-30 {
+            f64::INFINITY
+        } else {
+            1.0
+        };
+
+        assert!(
+            ratio.is_finite() && (0.05..=20.0).contains(&ratio),
+            "split boundary rays={} ratio out of range: cpu={:.6e}, gpu={:.6e}, ratio={:.4}",
+            secondary_rays,
+            cpu_total,
+            gpu_total,
+            ratio,
+        );
+    }
+}
+
 #[test]
 fn cross_backend_mcrt_sign_agreement() {
     use twilight_core::atmosphere::EARTH_RADIUS_M;

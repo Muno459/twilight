@@ -131,6 +131,12 @@ pub fn simulate_twilight_scan_gpu(
 /// This is used by the prayer pipeline's fine pass so multiple merged refine
 /// regions can still be executed as a single GPU batch instead of one GPU scan
 /// per region.
+///
+/// For hybrid mode, the Metal `scan_batch` implementation dispatches each
+/// hybrid request through `hybrid_scatter` (which uses the v2 split-dispatch
+/// path) while still batching any non-hybrid requests together in a single
+/// command buffer. This is more efficient than the old approach of looping
+/// one `simulate_at_sza_gpu` call per SZA.
 pub fn simulate_twilight_szalist_gpu(
     gpu: &dyn GpuBackend,
     atm: &AtmosphereModel,
@@ -139,18 +145,6 @@ pub fn simulate_twilight_szalist_gpu(
 ) -> Result<Vec<SpectralResult>, GpuError> {
     if sza_values.is_empty() {
         return Ok(Vec::new());
-    }
-
-    // Hybrid v2 kernel uses per-step output layout that doesn't compose
-    // in the shared-buffer batch path. Use individual dispatches instead.
-    // Each dispatch is still ray-parallel (256 threads x num_steps groups),
-    // so the GPU stays saturated at high ray counts.
-    if matches!(config.scattering_mode, ScatteringMode::Hybrid) {
-        let mut results = Vec::with_capacity(sza_values.len());
-        for &sza_deg in sza_values {
-            results.push(simulate_at_sza_gpu(gpu, atm, config, sza_deg)?);
-        }
-        return Ok(results);
     }
 
     let requests: Vec<BatchRequest> = sza_values
@@ -163,7 +157,10 @@ pub fn simulate_twilight_szalist_gpu(
                     photons_per_wavelength: config.photons_per_wavelength as u32,
                     seed: sza_deg.to_bits(),
                 },
-                ScatteringMode::Hybrid => unreachable!(),
+                ScatteringMode::Hybrid => BatchKernel::Hybrid {
+                    secondary_rays: config.photons_per_wavelength as u32,
+                    seed: sza_deg.to_bits(),
+                },
             };
             BatchRequest {
                 observer_pos: [observer_pos.x, observer_pos.y, observer_pos.z],

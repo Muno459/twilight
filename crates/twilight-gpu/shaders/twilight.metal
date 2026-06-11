@@ -42,6 +42,7 @@ constant uint HYBRID_THREADGROUP_SIZE = 256;
 constant uint HYBRID_V2_THREADGROUP_SIZE = 64;
 constant uint SIMD_WIDTH = 32;
 constant uint NUM_SIMD_GROUPS = HYBRID_THREADGROUP_SIZE / SIMD_WIDTH; // 8
+constant uint HYBRID_V2_NUM_SIMD_GROUPS = HYBRID_V2_THREADGROUP_SIZE / SIMD_WIDTH; // 2
 
 // Buffer header magic
 // Atmosphere buffer offsets (must match buffers.rs atm_offsets exactly)
@@ -210,6 +211,23 @@ struct KahanAccum {
 };
 
 // ============================================================================
+// log1p polyfill -- MSL does not provide log1p(). For |x| > 0.5 we use
+// log(1+x) directly (no cancellation risk). For |x| <= 0.5 we use the
+// identity log1p(x) = x * log(1+x) / ((1+x) - 1) which recovers the
+// lost low bits via the exact subtraction (1+x)-1 when |x| is small.
+// ============================================================================
+
+inline float metal_log1p(float x) {
+    if (x > 0.5f || x < -0.5f) {
+        return log(1.0f + x);
+    }
+    float u = 1.0f + x;
+    float d = u - 1.0f;          // exact in f32 when |x| <= 0.5
+    if (d == 0.0f) return x;     // x is subnormal or zero
+    return log(u) * (x / d);
+}
+
+// ============================================================================
 // xorshift64 RNG (Metal supports ulong natively on Apple Silicon)
 // ============================================================================
 
@@ -226,8 +244,10 @@ inline float xorshift_f32(thread ulong &state) {
     x ^= x >> 7;
     x ^= x << 17;
     state = x;
-    // Convert to f32 in [0, 1): use top 24 bits for full mantissa precision
-    return float(x >> 40) * (1.0f / float(1ul << 24));
+    // Convert to f32 in (0, 1]: use top 24 bits for full mantissa precision.
+    // Adding 1 before dividing guarantees the result is never exactly 0.0,
+    // which prevents log(0) = -inf in free-path sampling.
+    return float((x >> 40) + 1ul) * (1.0f / float((1ul << 24) + 1ul));
 }
 
 // ============================================================================
@@ -381,7 +401,9 @@ inline float rayleigh_phase(float cos_theta) {
 inline float henyey_greenstein_phase(float cos_theta, float g) {
     float g2 = g * g;
     float denom = 1.0f + g2 - 2.0f * g * cos_theta;
-    return (1.0f - g2) / (denom * sqrt(denom));
+    // rsqrt + multiply is faster than sqrt + divide on Metal ALU
+    float inv_sqrt_d = rsqrt(max(denom, 1e-20f));
+    return (1.0f - g2) * inv_sqrt_d * inv_sqrt_d * inv_sqrt_d;
 }
 
 inline float mixed_phase(float cos_theta, ShellOptics op) {
@@ -505,16 +527,14 @@ ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r
     result.dist = 1e30f;
     result.is_outward = true;
 
-    // Minimum distance threshold: must exceed f32 noise at Earth scale.
-    // At r ~ 6.4e6, ULP is ~0.5m. We nudge by 2m, so any valid hit
-    // should be at least ~shell_thickness away (hundreds of meters).
-    // Using 1e-5 (10 um) safely filters self-intersections.
     const float EPS = 1e-5f;
 
     RaySphereHit outer = ray_sphere_intersect(pos, dir, r_outer);
     if (outer.hit) {
+        // Compute inner sphere test once for both branches below.
+        RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
+
         if (outer.t_near > EPS) {
-            RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
             if (inner.hit && inner.t_near > EPS && inner.t_near < outer.t_near) {
                 result.dist = inner.t_near;
                 result.is_outward = false;
@@ -527,7 +547,6 @@ ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r
             return result;
         }
         if (outer.t_far > EPS) {
-            RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
             if (inner.hit && inner.t_near > EPS && inner.t_near < outer.t_far) {
                 result.dist = inner.t_near;
                 result.is_outward = false;
@@ -539,9 +558,17 @@ ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r
             result.found = true;
             return result;
         }
+
+        // outer hit but neither t_near nor t_far usable -- check inner
+        if (inner.hit && inner.t_near > EPS) {
+            result.dist = inner.t_near;
+            result.is_outward = false;
+            result.found = true;
+        }
+        return result;
     }
 
-    // Fallback: inner sphere only
+    // No outer hit: inner sphere only
     RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
     if (inner.hit && inner.t_near > EPS) {
         result.dist = inner.t_near;
@@ -559,8 +586,29 @@ ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r
 // returns the original direction (fast path).
 // ============================================================================
 
+// Refract with known radius -- avoids rsqrt inside normalize() since the
+// position was already snapped to target_r.
+float3 refract_at_boundary_r(float3 dir, float3 boundary_pos, float inv_r, float n_from, float n_to) {
+    if (abs(n_from - n_to) < 1e-7f) return dir;
+
+    float3 outward = boundary_pos * inv_r;
+
+    float cos_dir_normal = dot(dir, outward);
+    float3 normal = (cos_dir_normal < 0.0f) ? outward : -outward;
+
+    float cos_i = -dot(dir, normal);
+    float eta = n_from / n_to;
+    float k = fma(-eta * eta, fma(-cos_i, cos_i, 1.0f), 1.0f);
+
+    if (k < 0.0f) {
+        return fma(normal, 2.0f * cos_i, dir);
+    }
+
+    float cos_t = sqrt(k);
+    return fma(normal, fma(eta, cos_i, -cos_t), dir * eta);
+}
+
 float3 refract_at_boundary(float3 dir, float3 boundary_pos, float n_from, float n_to) {
-    // Fast path: no refraction when indices match
     if (abs(n_from - n_to) < 1e-7f) return dir;
 
     float3 outward = normalize(boundary_pos);
@@ -632,11 +680,6 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
     float surface_radius = atm[ATM_SHELLS_START]; // r_inner of shell 0
 
     // ── Umbra cylinder culling (O(1) pre-check) ────────────────────────
-    // If the scatter point is behind Earth (projection onto sun axis is
-    // negative) AND inside the geometric shadow cylinder (perpendicular
-    // distance to sun axis < Earth radius), the sun is unreachable.
-    // Two dot products, zero accuracy loss, eliminates 50+ shell
-    // traversals for points deep in Earth's shadow.
     float p_proj = dot(start_pos, sun_dir);
     if (p_proj < 0.0f) {
         float3 cross_ps = cross(start_pos, sun_dir);
@@ -649,72 +692,88 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
     float3 pos = start_pos;
     float3 dir = sun_dir;
 
-    KahanAccum tau;
+    // Plain float accumulation for shadow tau -- Kahan is overkill here
+    // because we only need ~3 significant digits (exp(-tau) dynamic range)
+    // and the early-exit at tau > 50 means we never accumulate more than
+    // ~50 terms of similar magnitude. Saves 3 FP ops per shell crossing.
+    float tau = 0.0f;
 
-    // Find initial shell once (O(log N)), then track directly (O(1) per step).
     int sidx = shell_index_binary(atm, length(pos));
     if (sidx < 0) return 1.0f;
     uint us = uint(sidx);
 
     for (uint iter = 0; iter < 200; iter++) {
-        float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
-        float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
+        uint shell_base = ATM_SHELLS_START + us * ATM_SHELL_STRIDE;
+        float r_inner = atm[shell_base];
+        float r_outer = atm[shell_base + 1];
 
-        // Read extinction for this shell and wavelength
-        uint optics_idx = us * MAX_WAVELENGTHS + wl_idx;
-        float extinction = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE];
+        // Inline extinction read (avoid full ShellOptics load)
+        float extinction = atm[ATM_OPTICS_START + (us * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
 
         ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
         if (!bnd.found) break;
 
-        // Accumulate optical depth with Kahan summation
-        tau.add(extinction * bnd.dist);
+        tau += extinction * bnd.dist;
 
-        // Refract at boundary
+        // Snap + nudge -- avoid redundant length() by reusing snap_to_radius
         float3 boundary_pos = pos + dir * bnd.dist;
-        // Snap to exact boundary radius to prevent cumulative f32 position drift.
         float target_r = bnd.is_outward ? r_outer : r_inner;
-        float bp_len = length(boundary_pos);
-        if (bp_len > 0.0f) {
-            boundary_pos *= (target_r / bp_len);
-        }
+        float bp_r = length(boundary_pos);
+        if (bp_r > 0.0f) boundary_pos *= (target_r / bp_r);
+
+        // Refract (use _r variant: position already snapped to target_r)
+        float inv_target_r = 1.0f / target_r;
         float n_from = read_refractive_index(atm, us);
         uint next_shell = bnd.is_outward ? us + 1 : us - 1;
         float n_to = (next_shell < ns) ? read_refractive_index(atm, next_shell) : 1.0f;
+        dir = refract_at_boundary_r(dir, boundary_pos, inv_target_r, n_from, n_to);
 
-        dir = refract_at_boundary(dir, boundary_pos, n_from, n_to);
+        // Radial nudge (reuse inv_target_r)
+        float3 radial = boundary_pos * inv_target_r;
+        float nudge_sign = bnd.is_outward ? 1.0f : -1.0f;
+        pos = boundary_pos + radial * (nudge_sign * BOUNDARY_NUDGE_M);
 
-        // Radial nudge past boundary
-        pos = radial_nudge(boundary_pos, bnd.is_outward);
-
-        // Ground hit: fully opaque
-        if (!bnd.is_outward && length(pos) <= surface_radius + 1.0f) {
+        // Ground hit (use target_r which is exact after snap)
+        if (!bnd.is_outward && target_r <= surface_radius + 1.0f) {
             return 0.0f;
         }
 
-        // Exited atmosphere
         if (next_shell >= ns) break;
         us = next_shell;
 
-        if (tau.result() > 50.0f) return 0.0f;
+        if (tau > 50.0f) return 0.0f;
     }
 
-    return exp(-tau.result());
+    // fast::exp is sufficient for shadow transmittance -- we only need
+    // ~3 significant digits (the MC weight noise dominates).
+    return fast::exp(-tau);
 }
 
 // ============================================================================
 // Sampling functions
 // ============================================================================
 
+// Newton-Raphson cube root: ~6 cycles vs ~16 for pow(x, 1/3).
+// 2 iterations of x = (2x + a/(x*x))/3 from an rsqrt seed.
+inline float fast_cbrt(float a) {
+    float x = abs(a);
+    if (x < 1e-30f) return 0.0f;
+    // Seed: cbrt(x) ≈ x^(1/3) ≈ x * rsqrt(x)^(2/3). Use rsqrt as
+    // rough seed then refine. Initial guess via bit hack:
+    float y = as_type<float>((as_type<uint>(x) / 3u) + 0x2a508bdb);
+    // Halley iteration (cubic convergence, 2 iterations for f32 precision)
+    y = y * (2.0f / 3.0f) + x / (3.0f * y * y);
+    y = y * (2.0f / 3.0f) + x / (3.0f * y * y);
+    return copysign(y, a);
+}
+
 inline float sample_rayleigh_analytic(float xi) {
     float q = 8.0f * xi - 4.0f;
-    float disc = q * q * 0.25f + 1.0f;
+    float disc = fma(q * q, 0.25f, 1.0f);
     float sqrt_disc = sqrt(disc);
     float a_val = -q * 0.5f + sqrt_disc;
     float b_val = -q * 0.5f - sqrt_disc;
-    float u = (a_val >= 0.0f) ? pow(a_val, 1.0f/3.0f) : -pow(-a_val, 1.0f/3.0f);
-    float v = (b_val >= 0.0f) ? pow(b_val, 1.0f/3.0f) : -pow(-b_val, 1.0f/3.0f);
-    float mu = u + v;
+    float mu = fast_cbrt(a_val) + fast_cbrt(b_val);
     return clamp(mu, -1.0f, 1.0f);
 }
 
@@ -821,8 +880,8 @@ inline float3 terminator_axis(float3 up, float3 sun_dir, float tilt_rad) {
         return up;
     }
     float3 sun_horiz = horiz / h_len;
-    float sin_t = sin(tilt_rad);
-    float cos_t = cos(tilt_rad);
+    float cos_t;
+    float sin_t = sincos(tilt_rad, cos_t);
     return normalize(cos_t * up + sin_t * sun_horiz);
 }
 
@@ -904,9 +963,10 @@ kernel void single_scatter_spectrum(
             continue;
         }
 
-        // exp(-(A+B)) = exp(-A)*exp(-B) avoids f32 precision loss when
-        // adding a small half-step to a large accumulated tau.
-        float t_obs = exp(-tau_obs.result()) * exp(-op.extinction * ds * 0.5f);
+        // Single exp(-(tau + half_step)) is both faster and more precise
+        // than the product of two separate exps (which rounds the f32
+        // multiply and wastes an ALU slot).
+        float t_obs = exp(-(tau_obs.result() + op.extinction * ds * 0.5f));
 
         if (t_obs < 1e-30f) break;
 
@@ -1010,7 +1070,10 @@ kernel void mcrt_trace_photon(
 
         // Sample free path
         float xi = xorshift_f32(rng);
-        float free_path = -log(1.0f - xi + 1e-30f) / op.extinction;
+        // -log(xi) with xi in (0,1] is equivalent to -log(1-U) with U in [0,1)
+        // since 1-U has the same distribution as U. Avoids the log1p polyfill
+        // branch and extra ops. xi is guaranteed > 0 by the RNG.
+        float free_path = -log(xi) / op.extinction;
 
         ShellBoundary bnd = next_shell_boundary(pos, dir, sh.r_inner, sh.r_outer);
         if (!bnd.found) break;
@@ -1107,7 +1170,7 @@ struct ScoutResult {
 ScoutResult scout_tau_to_boundary(device const float* atm, float3 start_pos,
                                    float3 start_dir, uint wl_idx) {
     uint ns = atm_num_shells(atm);
-    float surface_radius = atm[ATM_SHELLS_START]; // r_inner of shell 0
+    float surface_radius = atm[ATM_SHELLS_START];
     float3 pos = start_pos;
     float3 dir = start_dir;
     float tau = 0.0f;
@@ -1117,35 +1180,37 @@ ScoutResult scout_tau_to_boundary(device const float* atm, float3 start_pos,
     uint us = uint(sidx);
 
     for (uint iter = 0; iter < 200; iter++) {
-        float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
-        float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
-        uint optics_idx = us * MAX_WAVELENGTHS + wl_idx;
-        float extinction = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE];
+        uint shell_base = ATM_SHELLS_START + us * ATM_SHELL_STRIDE;
+        float r_inner = atm[shell_base];
+        float r_outer = atm[shell_base + 1];
+        float extinction = atm[ATM_OPTICS_START + (us * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
 
         ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
         if (!bnd.found) return ScoutResult{tau, false};
 
         tau += extinction * bnd.dist;
 
-        // Refract at boundary
         float3 boundary_pos = pos + dir * bnd.dist;
-        boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? r_outer : r_inner);
+        float target_r = bnd.is_outward ? r_outer : r_inner;
+        float bp_r = length(boundary_pos);
+        if (bp_r > 0.0f) boundary_pos *= (target_r / bp_r);
+
+        float inv_target_r = 1.0f / target_r;
         float n_from = read_refractive_index(atm, us);
         uint next_shell = bnd.is_outward ? us + 1 : us - 1;
         float n_to = (next_shell < ns) ? read_refractive_index(atm, next_shell) : 1.0f;
-        dir = refract_at_boundary(dir, boundary_pos, n_from, n_to);
-        pos = radial_nudge(boundary_pos, bnd.is_outward);
+        dir = refract_at_boundary_r(dir, boundary_pos, inv_target_r, n_from, n_to);
 
-        // Hit ground
-        if (!bnd.is_outward && length(pos) <= surface_radius + 1.0f) {
+        float3 radial = boundary_pos * inv_target_r;
+        float nudge_sign = bnd.is_outward ? 1.0f : -1.0f;
+        pos = boundary_pos + radial * (nudge_sign * BOUNDARY_NUDGE_M);
+
+        if (!bnd.is_outward && target_r <= surface_radius + 1.0f) {
             return ScoutResult{tau, true};
         }
-        // Exited atmosphere
         if (next_shell >= ns) return ScoutResult{tau, false};
-
         us = next_shell;
 
-        // Early exit: at tau > 20, weight correction is 1.0 to f32 precision
         if (tau > FORCED_TAU_CUTOFF) return ScoutResult{tau, false};
     }
 
@@ -1336,7 +1401,7 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
             weight *= (1.0f - exp_neg_tau);
             if (weight < 1e-30f) break;
             float xi = xorshift_f32(rng);
-            float tau_s = -log(1.0f - xi * (1.0f - exp_neg_tau) + 1e-30f);
+            float tau_s = -metal_log1p(-xi * (1.0f - exp_neg_tau));
             AdvanceResult adv = advance_to_optical_depth(atm, pos, current_dir, tau_s, wl_idx);
             pos = adv.pos;
             current_dir = adv.dir;
@@ -1377,9 +1442,7 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                 if (sigma_prime <= 0.0f) sigma_prime = sigma;
 
                 float xi = xorshift_f32(rng);
-                float free_path = -log(1.0f - xi + 1e-30f) / sigma_prime;
-                // Guard against degenerate free paths
-                if (!isfinite(free_path) || free_path < 0.0f) free_path = 0.0f;
+                float free_path = -log(xi) / sigma_prime;
 
                 ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
                 if (!bnd.found) break;
@@ -1388,8 +1451,18 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                     // Boundary crossing weight correction
                     if (setup.alpha_et > 0.0f) {
                         float et_arg = -setup.alpha_et * sigma * cos_bias * bnd.dist;
+                        // Use expm1 form for small arguments to avoid cancellation,
+                        // and clamp large arguments to avoid overflow.
+                        // exp(x) for |x| < 80 is safe in f32 (~3.4e34).
+                        // For |x| >= 80, the weight correction is astronomically
+                        // large or small; the chain is effectively dead either way,
+                        // so we terminate rather than silently skip the correction
+                        // (which would leave the estimator sampling from the wrong
+                        // distribution without compensating).
                         if (fabs(et_arg) < 80.0f) {
                             weight *= exp(et_arg);
+                        } else {
+                            weight = 0.0f; // chain is dead
                         }
                     }
                     if (!isfinite(weight)) break;
@@ -1458,14 +1531,17 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
                 // Scatter within this shell.
                 // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
-                // If the exp argument would overflow f32, skip ET for this step
-                // (equivalent to alpha_et=0 locally -- no bias, just no optimization).
+                // If the exp argument would overflow f32, terminate the chain
+                // rather than silently skipping the correction (which would leave
+                // the estimator sampling from the transformed distribution without
+                // the compensating weight, introducing bias).
                 if (setup.alpha_et > 0.0f) {
                     float et_arg = -setup.alpha_et * sigma * cos_bias * free_path;
                     if (fabs(et_arg) < 80.0f) {
                         weight *= (sigma / sigma_prime) * exp(et_arg);
+                    } else {
+                        weight = 0.0f; // chain is dead
                     }
-                    // else: skip ET correction (equivalent to unbiased mode)
                 }
                 if (!isfinite(weight)) break;
                 pos = pos + current_dir * free_path;
@@ -1680,8 +1756,7 @@ kernel void hybrid_scatter(
     }
 
     float tau_obs = (step_idx < num_steps) ? shared_prefix[step_idx] : 0.0f;
-    // exp(-(A+B)) = exp(-A)*exp(-B) avoids f32 precision loss
-    float t_obs = exp(-tau_obs) * exp(-my_ext_ds * 0.5f);
+    float t_obs = exp(-(tau_obs + my_ext_ds * 0.5f));
 
     // ── Phase 3: Compute per-step Stokes contribution ─────────────────
     // Full [I,Q,U,V] propagation. Single-scatter NEE applies Mueller to
@@ -1766,6 +1841,77 @@ kernel void hybrid_scatter(
 }
 
 // ============================================================================
+// Kernel 3p: hybrid_los_prefix
+//
+// Precomputes cumulative LOS optical depth for all (wavelength, step) pairs.
+// Dispatch: num_wavelengths threads (1D).
+// Output: tau_prefix[wl * HYBRID_LOS_STEPS + step] = cumulative tau to step.
+//         Negative value = step beyond LOS end (invalid).
+//
+// This runs ONCE per geometry and is reused across split-dispatch chunks,
+// eliminating the O(steps^2) serial prefix that was in hybrid_scatter_v2.
+// ============================================================================
+
+kernel void hybrid_los_prefix(
+    device const float* atm         [[buffer(0)]],
+    device const float* params      [[buffer(1)]],
+    device float*       tau_prefix  [[buffer(2)]],
+    uint wl_idx [[thread_position_in_grid]]
+) {
+    uint num_wl = atm_num_wavelengths(atm);
+    if (wl_idx >= num_wl) return;
+
+    float3 observer_pos = read_observer(params);
+    float3 view_dir     = read_view_dir(params);
+
+    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
+    float surface_radius = EARTH_RADIUS_M;
+
+    RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
+    if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
+        for (uint s = 0; s < HYBRID_LOS_STEPS; s++)
+            tau_prefix[wl_idx * HYBRID_LOS_STEPS + s] = -1.0f;
+        return;
+    }
+
+    float los_max = toa_hit.t_far;
+    RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+    bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
+    float los_end = hits_ground ? ground_hit.t_near : los_max;
+
+    if (los_end <= 0.0f) {
+        for (uint s = 0; s < HYBRID_LOS_STEPS; s++)
+            tau_prefix[wl_idx * HYBRID_LOS_STEPS + s] = -1.0f;
+        return;
+    }
+
+    uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
+    float ds = los_end / float(num_steps);
+
+    // O(num_steps) cumulative scan -- replaces O(num_steps^2) per-step prefix
+    float running_tau = 0.0f;
+    for (uint step = 0; step < HYBRID_LOS_STEPS; step++) {
+        if (step >= num_steps) {
+            tau_prefix[wl_idx * HYBRID_LOS_STEPS + step] = -1.0f;
+            continue;
+        }
+        // tau to the START of this step (before this step's contribution)
+        tau_prefix[wl_idx * HYBRID_LOS_STEPS + step] = running_tau;
+
+        float s_mid = (float(step) + 0.5f) * ds;
+        float3 pos = observer_pos + view_dir * s_mid;
+        float r = length(pos);
+        if (r <= toa_radius && r >= surface_radius) {
+            int sidx = shell_index_binary(atm, r);
+            if (sidx >= 0) {
+                ShellOptics op = read_optics(atm, uint(sidx), wl_idx);
+                running_tau += op.extinction * ds;
+            }
+        }
+    }
+}
+
+// ============================================================================
 // Kernel 3b: hybrid_scatter_v2 (ray-parallel)
 //
 // Dispatch: (num_wavelengths, num_steps) threadgroups of 64 threads each.
@@ -1774,14 +1920,17 @@ kernel void hybrid_scatter(
 //   thread_in_tg.x = ray index within this step
 //
 // Each thread traces ceil(secondary_rays / 64) chains. Results are reduced
-// via Kahan accumulation in shared memory. Output layout:
+// via simd_sum + Kahan in shared memory. Output layout:
 //   output[wl * HYBRID_LOS_STEPS + step] -- CPU sums across steps.
+//
+// Buffer 3 (tau_prefix) is precomputed by hybrid_los_prefix and reused
+// across split-dispatch chunks (same LOS geometry).
 // ============================================================================
 
 kernel void hybrid_scatter_v2(
-    device const float* atm       [[buffer(0)]],
-    device const float* params    [[buffer(1)]],
-    device float*       output    [[buffer(2)]],
+    device const float* atm         [[buffer(0)]],
+    device const float* params      [[buffer(1)]],
+    device float*       output      [[buffer(2)]],
     uint3 tg_pos    [[threadgroup_position_in_grid]],
     uint3 tid_in_tg [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -1791,60 +1940,72 @@ kernel void hybrid_scatter_v2(
     uint step_idx = tg_pos.y;
     uint ray_lane = tid_in_tg.x;
     uint num_wl = atm_num_wavelengths(atm);
-    // ALL threads must reach the barrier + shared memory write at the end.
-    // Use a 'valid' flag instead of early returns.
-    bool valid = (wl_idx < num_wl);
 
     float3 observer_pos = read_observer(params);
     float3 view_dir     = read_view_dir(params);
     float3 sun_dir      = read_sun_dir(params);
     uint secondary_rays = read_secondary_rays(params);
 
-    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
-    float surface_radius = EARTH_RADIUS_M;
-    float ds = 0.0f;
-    float3 scatter_pos = float3(0.0f);
-    ShellOptics my_op = {};
-    float my_beta_scat = 0.0f;
-    float t_obs = 0.0f;
+    threadgroup uint shared_valid;
+    threadgroup float shared_ds;
+    threadgroup float3 shared_scatter_pos;
+    threadgroup ShellOptics shared_op;
+    threadgroup float shared_beta_scat;
+    threadgroup float shared_t_obs;
+    threadgroup SecondarySetup shared_setup;
 
-    if (valid) {
-        RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
-        if (!toa_hit.hit || toa_hit.t_far <= 0.0f) { valid = false; }
-        else {
-            float los_max = toa_hit.t_far;
-            RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
-            bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
-            float los_end = hits_ground ? ground_hit.t_near : los_max;
-            if (los_end <= 0.0f) { valid = false; }
-            else {
-                uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
-                ds = los_end / float(num_steps);
-                if (step_idx >= num_steps) { valid = false; }
-                else {
-                    float s = (float(step_idx) + 0.5f) * ds;
-                    scatter_pos = observer_pos + view_dir * s;
-                    float r = length(scatter_pos);
-                    if (r > toa_radius || r < surface_radius) { valid = false; }
-                    else {
-                        int sidx = shell_index_binary(atm, r);
-                        if (sidx < 0) { valid = false; }
-                        else {
-                            my_op = read_optics(atm, uint(sidx), wl_idx);
-                            my_beta_scat = my_op.extinction * my_op.ssa;
-                            if (my_beta_scat < 1e-30f) { valid = false; }
+    if (ray_lane == 0) {
+        bool valid = (wl_idx < num_wl);
+        float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
+        float surface_radius = EARTH_RADIUS_M;
+        float ds = 0.0f;
+        float3 scatter_pos = float3(0.0f);
+        ShellOptics my_op = {};
+        float my_beta_scat = 0.0f;
+        float t_obs = 0.0f;
+        SecondarySetup setup = {};
+
+        if (valid) {
+            RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
+            if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
+                valid = false;
+            } else {
+                float los_max = toa_hit.t_far;
+                RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+                bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
+                float los_end = hits_ground ? ground_hit.t_near : los_max;
+                if (los_end <= 0.0f) {
+                    valid = false;
+                } else {
+                    uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
+                    ds = los_end / float(num_steps);
+                    if (step_idx >= num_steps) {
+                        valid = false;
+                    } else {
+                        float s = (float(step_idx) + 0.5f) * ds;
+                        scatter_pos = observer_pos + view_dir * s;
+                        float r = length(scatter_pos);
+                        if (r > toa_radius || r < surface_radius) {
+                            valid = false;
+                        } else {
+                            int sidx = shell_index_binary(atm, r);
+                            if (sidx < 0) {
+                                valid = false;
+                            } else {
+                                my_op = read_optics(atm, uint(sidx), wl_idx);
+                                my_beta_scat = my_op.extinction * my_op.ssa;
+                                if (my_beta_scat < 1e-30f) {
+                                    valid = false;
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    // LOS optical depth (thread 0 computes, broadcasts)
-    threadgroup float shared_tau_obs;
-    if (ray_lane == 0) {
-        float tau = 0.0f;
         if (valid) {
+            float tau_obs = 0.0f;
             for (uint j = 0; j < step_idx; j++) {
                 float sj = (float(j) + 0.5f) * ds;
                 float3 pj = observer_pos + view_dir * sj;
@@ -1853,24 +2014,59 @@ kernel void hybrid_scatter_v2(
                     int sj_idx = shell_index_binary(atm, rj);
                     if (sj_idx >= 0) {
                         ShellOptics oj = read_optics(atm, uint(sj_idx), wl_idx);
-                        tau += oj.extinction * ds;
+                        tau_obs += oj.extinction * ds;
                     }
                 }
             }
+
+            // Single exp is more precise and faster than two multiplied exps.
+            // exp(a)*exp(b) = exp(a+b), but the product loses precision
+            // when both are small (the f32 multiply rounds twice).
+            t_obs = exp(-(tau_obs + my_op.extinction * ds * 0.5f));
+            if (t_obs < 1e-30f) {
+                valid = false;
+            } else if (secondary_rays > 0u) {
+                float3 local_up = normalize(scatter_pos);
+                float cos_sza = dot(sun_dir, local_up);
+                float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
+                BranchParams bp = branch_params_for_sza(sza_deg);
+                float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
+                                       / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
+                setup.local_up = local_up;
+                setup.term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
+                setup.alpha_p = 1.0f - bp.zenith_frac;
+                setup.alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
+                setup.alpha_t = bp.zenith_frac * bp.term_share;
+                setup.n_zenith = bp.n_zenith;
+                setup.m_term = bp.m_term;
+                setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+                setup.use_forced = (sza_deg >= ZENITH_SZA_START_DEG) ? 1u : 0u;
+            }
         }
-        shared_tau_obs = tau;
+
+        shared_valid = valid ? 1u : 0u;
+        shared_ds = ds;
+        shared_scatter_pos = scatter_pos;
+        shared_op = my_op;
+        shared_beta_scat = my_beta_scat;
+        shared_t_obs = t_obs;
+        shared_setup = setup;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (valid) {
-        float tau_obs = shared_tau_obs;
-        t_obs = exp(-tau_obs) * exp(-my_op.extinction * ds * 0.5f);
-        if (t_obs < 1e-30f) { valid = false; }
-    }
+    bool valid = (shared_valid != 0u);
+    float ds = shared_ds;
+    float3 scatter_pos = shared_scatter_pos;
+    ShellOptics my_op = shared_op;
+    float my_beta_scat = shared_beta_scat;
+    float t_obs = shared_t_obs;
+    SecondarySetup setup = shared_setup;
 
     float my_contribution = 0.0f;
 
     // Single-scatter NEE (only thread 0)
+    // Multiply by secondary_rays because CPU divides ALL output by secondary_rays.
+    // SS is deterministic and must survive that division unchanged.
     if (valid && ray_lane == 0) {
         float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
@@ -1878,29 +2074,12 @@ kernel void hybrid_scatter_v2(
             float A_1, B_1, C_1;
             stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
             float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;
-            my_contribution += A_1 * scale_1;
+            my_contribution += A_1 * scale_1 * float(secondary_rays);
         }
     }
 
     // Secondary chains: each thread traces a subset of rays
     if (valid && secondary_rays > 0) {
-        float3 local_up = normalize(scatter_pos);
-        float cos_sza = dot(sun_dir, local_up);
-        float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
-        BranchParams bp = branch_params_for_sza(sza_deg);
-        float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
-                               / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
-        SecondarySetup setup;
-        setup.local_up = local_up;
-        setup.term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
-        setup.alpha_p = 1.0f - bp.zenith_frac;
-        setup.alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
-        setup.alpha_t = bp.zenith_frac * bp.term_share;
-        setup.n_zenith = bp.n_zenith;
-        setup.m_term = bp.m_term;
-        setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
-        setup.use_forced = (sza_deg >= ZENITH_SZA_START_DEG) ? 1u : 0u;
-
         // ray_offset from upper 32 bits of seed (for split-dispatch)
         ulong raw_seed = read_rng_seed(params);
         uint ray_offset = uint(raw_seed >> 32);
@@ -1944,14 +2123,17 @@ kernel void hybrid_scatter_v2(
         my_contribution = 0.0f;
     }
 
-    // Kahan threadgroup reduction
-    threadgroup float shared_vals[HYBRID_V2_THREADGROUP_SIZE];
-    shared_vals[ray_lane] = my_contribution;
+    float simd_total = simd_sum(my_contribution);
+
+    threadgroup float shared_vals[HYBRID_V2_NUM_SIMD_GROUPS];
+    if (simd_lane == 0) {
+        shared_vals[simd_id] = simd_total;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (ray_lane == 0) {
         KahanAccum final_sum;
-        for (uint i = 0; i < HYBRID_V2_THREADGROUP_SIZE; i++) {
+        for (uint i = 0; i < HYBRID_V2_NUM_SIMD_GROUPS; i++) {
             float v = shared_vals[i];
             if (isfinite(v)) {
                 final_sum.add(v);

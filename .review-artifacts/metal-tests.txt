@@ -1,0 +1,46 @@
+##### METAL TESTS #####
+test tests::layer4_metal::metal_multi_hybrid_matches_serial_chunk ... FAILED
+test tests::diagnostic_hybrid_gpu_vs_cpu_deep_twilight ... ok
+test tests::statistical_hybrid_gpu_vs_cpu_deep_twilight ... FAILED
+test tests::metal_hybrid_split_dispatch_boundaries_match_cpu_statistics ... ok
+test tests::cpu_convergence_at_deep_twilight has been running for over 60 seconds
+test tests::cpu_convergence_at_deep_twilight ... ok
+
+failures:
+
+---- tests::benchmark_batch_vs_serial_hybrid stdout ----
+  [benchmark] Metal 20-SZA hybrid scan: serial 233.687959ms vs batch 313.209625ms (0.7x speedup)
+
+thread 'tests::benchmark_batch_vs_serial_hybrid' (41841739) panicked at crates/twilight-gpu/src/tests.rs:2374:9:
+Metal: batch (313.209625ms) should not be slower than serial (233.687959ms), got 0.7x
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::layer4_metal::metal_single_hybrid_matches_one_item_batch stdout ----
+
+thread 'tests::layer4_metal::metal_single_hybrid_matches_one_item_batch' (41841822) panicked at crates/twilight-gpu/src/tests.rs:968:14:
+called `Result::unwrap()` on an `Err` value: Dispatch("Metal command buffer error in hybrid_scatter_v2 chunk: Impacting Interactivity (0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)")
+
+---- tests::layer4_metal::metal_multi_hybrid_matches_serial_chunk stdout ----
+
+thread 'tests::layer4_metal::metal_multi_hybrid_matches_serial_chunk' (41841821) panicked at crates/twilight-gpu/src/tests.rs:1032:18:
+called `Result::unwrap()` on an `Err` value: Dispatch("Metal command buffer error in hybrid_scatter_v2 chunk: Impacting Interactivity (0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)")
+
+---- tests::statistical_hybrid_gpu_vs_cpu_deep_twilight stdout ----
+STAT [Metal] SZA=96.0: CPU_mean=2.0664e-2 (std=1.5779e-4), GPU_mean=2.0719e-2 (std=1.0630e-4), ratio=1.0026
+STAT [Metal] SZA=100.0: CPU_mean=5.6937e-4 (std=8.2435e-6), GPU_mean=7.5379e-4 (std=5.5443e-4), ratio=1.3239
+
+thread 'tests::statistical_hybrid_gpu_vs_cpu_deep_twilight' (41841840) panicked at crates/twilight-gpu/src/tests.rs:3521:13:
+[Metal] SZA=100: GPU/CPU broadband ratio 1.3239 outside [0.8, 1.3]
+CPU seeds: [0.0005798550620417116, 0.0005587226384811642, 0.000575873587918046, 0.0005818435054961117, 0.0005636693773592168, 0.0005693158902140169, 0.0005651130091109376, 0.0005666890414324655, 0.0005587530961923609, 0.0005738296027681492]
+GPU seeds: [0.0005564417250040848, 0.0006322808815580921, 0.0005673552244617644, 0.002329935985274366, 0.0005644999900688725, 0.0005708844001883691, 0.0005515501296381906, 0.0006103249672602727, 0.000597047852011632, 0.000557542051814797]
+
+
+failures:
+    tests::benchmark_batch_vs_serial_hybrid
+    tests::layer4_metal::metal_multi_hybrid_matches_serial_chunk
+    tests::layer4_metal::metal_single_hybrid_matches_one_item_batch
+    tests::statistical_hybrid_gpu_vs_cpu_deep_twilight
+
+test result: FAILED. 130 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 359.82s
+
+error: test failed, to rerun pass `-p twilight-gpu --lib`

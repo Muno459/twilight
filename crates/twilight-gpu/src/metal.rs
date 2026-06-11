@@ -1,7 +1,7 @@
 //! Metal GPU backend for Apple Silicon (macOS, iOS, iPadOS).
 //!
 //! Compiles the MSL shader at runtime via `newLibraryWithSource`, creates
-//! four compute pipeline states (one per kernel), and dispatches work using
+//! active compute pipeline states, and dispatches work using
 //! shared (zero-copy) buffers on Apple unified memory.
 
 use std::ffi::c_void;
@@ -25,10 +25,6 @@ use crate::{
     GpuSpectralResult,
 };
 
-/// Threadgroup size for the hybrid kernel. Must match HYBRID_THREADGROUP_SIZE
-/// in twilight.metal (256 threads = 8 SIMD groups of 32).
-const HYBRID_THREADGROUP_SIZE: u32 = 256;
-
 // Required for MTLCreateSystemDefaultDevice to link correctly.
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {}
@@ -51,10 +47,9 @@ pub struct MetalBackend {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
 
-    // Four compute pipeline states, one per kernel.
+    // Active compute pipeline states.
     pso_single_scatter: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_mcrt_trace: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-    pso_hybrid: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_hybrid_v2: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_garstang: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 
@@ -104,10 +99,9 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
         .newLibraryWithSource_options_error(&ns_source, None)
         .map_err(|e| GpuError::ShaderCompilation(format!("{}", e)))?;
 
-    // 4. Create pipeline states for all four kernels
+    // 4. Create pipeline states for active kernels
     let pso_single_scatter = make_pipeline(&device, &library, "single_scatter_spectrum")?;
     let pso_mcrt_trace = make_pipeline(&device, &library, "mcrt_trace_photon")?;
-    let pso_hybrid = make_pipeline(&device, &library, "hybrid_scatter")?;
     let pso_hybrid_v2 = make_pipeline(&device, &library, "hybrid_scatter_v2")?;
     let pso_garstang = make_pipeline(&device, &library, "garstang_zenith")?;
 
@@ -132,7 +126,6 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
         queue,
         pso_single_scatter,
         pso_mcrt_trace,
-        pso_hybrid,
         pso_hybrid_v2,
         pso_garstang,
         buf_atm: None,
@@ -184,7 +177,7 @@ impl GpuBackend for MetalBackend {
             nw as u32,
         )?;
 
-        let radiance = read_f32_buffer(&buf_output, nw);
+        let radiance = f32_buffer_slice(&buf_output, nw);
         Ok(GpuSpectralResult {
             radiance: radiance.iter().map(|&v| v as f64).collect(),
             num_wavelengths: nw,
@@ -225,7 +218,7 @@ impl GpuBackend for MetalBackend {
         )?;
 
         // CPU reduce: average per-photon weights for each wavelength
-        let raw = read_f32_buffer(&buf_output, total_threads);
+        let raw = f32_buffer_slice(&buf_output, total_threads);
         let ppw = photons_per_wavelength as usize;
         let mut radiance = Vec::with_capacity(nw);
         for w in 0..nw {
@@ -249,6 +242,10 @@ impl GpuBackend for MetalBackend {
         secondary_rays: u32,
         seed: u64,
     ) -> Result<GpuSpectralResult, GpuError> {
+        if secondary_rays == 0 {
+            return self.single_scatter(observer_pos, view_dir, sun_dir);
+        }
+
         let buf_atm = self
             .buf_atm
             .as_ref()
@@ -258,52 +255,75 @@ impl GpuBackend for MetalBackend {
         const MAX_LOS_STEPS: usize = 200;
         let output_len = nw * MAX_LOS_STEPS;
 
-        // Split into multiple dispatches to stay under Metal GPU watchdog.
-        // Each dispatch traces RAYS_PER_DISPATCH rays (4 chains/thread at
-        // 64 threads). Results accumulated in f64 on CPU.
-        const RAYS_PER_DISPATCH: u32 = 256;
+        // Each dispatch traces RAYS_PER_DISPATCH rays across all (wl, step)
+        // threadgroups. The GPU watchdog allows ~2s per dispatch; each 2500-ray
+        // dispatch finishes in ~1-5ms, well under the limit. Raising from 256
+        // to 2500 cuts command buffer submissions by ~10x.
+        const RAYS_PER_DISPATCH: u32 = 2500;
+        const DISPATCHES_PER_COMMAND_BUFFER: usize = 4;
+        const PARAMS_STRIDE: usize = 16;
         let num_dispatches = secondary_rays.div_ceil(RAYS_PER_DISPATCH).max(1);
-        let buf_output = create_empty_buffer(&self.device, output_len)?;
+
+        // Pre-allocate a single reusable output buffer for the largest chunk.
+        // This eliminates per-chunk Metal buffer allocation + zeroing (~77 MB
+        // of memset per prayer at the old 256-ray setting).
+        let max_chunk = DISPATCHES_PER_COMMAND_BUFFER.min(num_dispatches as usize);
+        let buf_output = create_empty_buffer(&self.device, max_chunk * output_len)?;
         let mut accum = vec![0.0f64; output_len];
 
-        for d in 0..num_dispatches {
-            let ray_start = d * RAYS_PER_DISPATCH;
-            let rays_this = (secondary_rays - ray_start).min(RAYS_PER_DISPATCH);
-            if rays_this == 0 {
-                continue;
+        for chunk_start in (0..num_dispatches as usize).step_by(DISPATCHES_PER_COMMAND_BUFFER) {
+            let chunk_len =
+                (num_dispatches as usize - chunk_start).min(DISPATCHES_PER_COMMAND_BUFFER);
+            let mut all_params = Vec::with_capacity(chunk_len * PARAMS_STRIDE);
+
+            for chunk_idx in 0..chunk_len {
+                let d = (chunk_start + chunk_idx) as u32;
+                let ray_start = d * RAYS_PER_DISPATCH;
+                let rays_this = (secondary_rays - ray_start).min(RAYS_PER_DISPATCH);
+
+                let ray_seed = (seed & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
+                let params = PackedDispatchParams::new(
+                    observer_pos,
+                    view_dir,
+                    sun_dir,
+                    secondary_rays,
+                    rays_this,
+                    ray_seed,
+                );
+                all_params.extend_from_slice(&params.data);
             }
 
-            // Encode ray_start in upper 32 bits of seed so v2 kernel
-            // offsets its ray indices for proper stratification.
-            let ray_seed = (seed & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
-            let params = PackedDispatchParams::new(
-                observer_pos,
-                view_dir,
-                sun_dir,
-                secondary_rays, // global total (for stratification)
-                rays_this,      // per-dispatch count
-                ray_seed,
-            );
-            let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
-            zero_f32_buffer(&buf_output, output_len)?;
+            let buf_params = create_buffer_from_f32(&self.device, &all_params)?;
 
-            self.dispatch_hybrid_v2(
+            // Zero only the portion we'll use (reuse same buffer across chunks)
+            let zero_bytes = chunk_len * output_len * std::mem::size_of::<f32>();
+            unsafe {
+                std::ptr::write_bytes(buf_output.contents().as_ptr() as *mut u8, 0, zero_bytes);
+            }
+
+            self.dispatch_hybrid_v2_chunk(
                 &self.pso_hybrid_v2,
-                &[buf_atm, &buf_params, &buf_output],
+                buf_atm,
+                &buf_params,
+                &buf_output,
                 nw as u32,
                 MAX_LOS_STEPS as u32,
+                chunk_len,
+                output_len,
+                PARAMS_STRIDE,
             )?;
 
-            // Accumulate in f64 (v2 outputs raw sums, not divided by rays)
-            let raw = read_f32_buffer(&buf_output, output_len);
-            for (i, &v) in raw.iter().enumerate() {
-                if v.is_finite() {
-                    accum[i] += v as f64;
+            let raw = f32_buffer_slice(&buf_output, chunk_len * output_len);
+            for chunk_idx in 0..chunk_len {
+                let base = chunk_idx * output_len;
+                for (i, &v) in raw[base..base + output_len].iter().enumerate() {
+                    if v.is_finite() {
+                        accum[i] += v as f64;
+                    }
                 }
             }
         }
 
-        // Reduce: sum across steps per-wavelength, divide by total rays
         let inv_rays = 1.0 / secondary_rays.max(1) as f64;
         let mut radiance = Vec::with_capacity(nw);
         for w in 0..nw {
@@ -365,7 +385,7 @@ impl GpuBackend for MetalBackend {
         )?;
 
         // Sum all source contributions on CPU
-        let results = read_f32_buffer(&buf_output, num_sources);
+        let results = f32_buffer_slice(&buf_output, num_sources);
         let total: f64 = results.iter().map(|&v| v as f64).sum();
         Ok(total)
     }
@@ -374,6 +394,64 @@ impl GpuBackend for MetalBackend {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+
+        if requests
+            .iter()
+            .any(|req| matches!(req.kernel, BatchKernel::Hybrid { .. }))
+        {
+            let mut results: Vec<Option<GpuSpectralResult>> =
+                (0..requests.len()).map(|_| None).collect();
+            let mut non_hybrid_indices = Vec::new();
+            let mut non_hybrid_requests = Vec::new();
+
+            for (idx, req) in requests.iter().enumerate() {
+                match req.kernel {
+                    BatchKernel::Hybrid {
+                        secondary_rays,
+                        seed,
+                    } => {
+                        results[idx] = Some(self.hybrid_scatter(
+                            req.observer_pos,
+                            req.view_dir,
+                            req.sun_dir,
+                            secondary_rays,
+                            seed,
+                        )?);
+                    }
+                    _ => {
+                        non_hybrid_indices.push(idx);
+                        non_hybrid_requests.push(req.clone());
+                    }
+                }
+            }
+
+            if !non_hybrid_requests.is_empty() {
+                let batched = self.scan_batch_non_hybrid(&non_hybrid_requests)?;
+                for (idx, result) in non_hybrid_indices.into_iter().zip(batched) {
+                    results[idx] = Some(result);
+                }
+            }
+
+            return Ok(results
+                .into_iter()
+                .map(|result| result.expect("scan_batch result slot should be filled"))
+                .collect());
+        }
+
+        self.scan_batch_non_hybrid(requests)
+    }
+}
+
+// ── Internal helpers ────────────────────────────────────────────────────
+
+impl MetalBackend {
+    fn scan_batch_non_hybrid(
+        &self,
+        requests: &[BatchRequest],
+    ) -> Result<Vec<GpuSpectralResult>, GpuError> {
+        debug_assert!(requests
+            .iter()
+            .all(|req| !matches!(req.kernel, BatchKernel::Hybrid { .. })));
 
         let buf_atm = self
             .buf_atm
@@ -486,12 +564,10 @@ impl GpuBackend for MetalBackend {
             let pipeline = match s.kernel {
                 BatchKernel::SingleScatter => &self.pso_single_scatter,
                 BatchKernel::McrtTrace { .. } => &self.pso_mcrt_trace,
-                BatchKernel::Hybrid { .. } => &self.pso_hybrid,
+                BatchKernel::Hybrid { .. } => unreachable!("hybrid handled by early fallback"),
             };
 
-            let is_hybrid = matches!(s.kernel, BatchKernel::Hybrid { .. });
-
-            if !is_hybrid && s.raw_len == 0 {
+            if s.raw_len == 0 {
                 continue;
             }
 
@@ -506,35 +582,17 @@ impl GpuBackend for MetalBackend {
                 encoder.setBuffer_offset_atIndex(Some(&buf_all_output), output_byte_offset, 2);
             }
 
-            let (grid_size, threadgroup_size) = if is_hybrid {
-                let num_tg = nw as u32;
-                (
-                    MTLSize {
-                        width: num_tg as usize,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: HYBRID_THREADGROUP_SIZE as usize,
-                        height: 1,
-                        depth: 1,
-                    },
-                )
-            } else {
-                let total_threads = s.raw_len as u32;
-                let num_groups = dispatch_groups(total_threads, wg_size);
-                (
-                    MTLSize {
-                        width: num_groups as usize,
-                        height: 1,
-                        depth: 1,
-                    },
-                    MTLSize {
-                        width: wg_size as usize,
-                        height: 1,
-                        depth: 1,
-                    },
-                )
+            let total_threads = s.raw_len as u32;
+            let num_groups = dispatch_groups(total_threads, wg_size);
+            let grid_size = MTLSize {
+                width: num_groups as usize,
+                height: 1,
+                depth: 1,
+            };
+            let threadgroup_size = MTLSize {
+                width: wg_size as usize,
+                height: 1,
+                depth: 1,
             };
 
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
@@ -551,7 +609,7 @@ impl GpuBackend for MetalBackend {
         // StorageModeShared on Apple Silicon means buf_all_output.contents()
         // points directly into unified DRAM -- this is a pointer cast, not
         // a DMA transfer. We read once into a Vec then slice per-dispatch.
-        let all_output = read_f32_buffer(&buf_all_output, total_output_f32);
+        let all_output = f32_buffer_slice(&buf_all_output, total_output_f32);
 
         let mut results = Vec::with_capacity(n);
 
@@ -588,11 +646,7 @@ impl GpuBackend for MetalBackend {
 
         Ok(results)
     }
-}
 
-// ── Internal helpers ────────────────────────────────────────────────────
-
-impl MetalBackend {
     /// Encode and dispatch a compute kernel with the given buffers.
     ///
     /// Used for single_scatter, mcrt_trace, and garstang kernels where each
@@ -647,68 +701,19 @@ impl MetalBackend {
         Ok(())
     }
 
-    /// Dispatch the hybrid kernel with fixed threadgroup size.
-    ///
-    /// The hybrid kernel uses exactly `num_threadgroups` threadgroups of
-    /// HYBRID_THREADGROUP_SIZE threads each. Each threadgroup handles one
-    /// wavelength; threads within the group each handle one LOS step and
-    /// reduce via simd_sum() + threadgroup shared memory.
-    fn dispatch_hybrid(
+    fn dispatch_hybrid_v2_chunk(
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-        buffers: &[&ProtocolObject<dyn MTLBuffer>],
-        num_threadgroups: u32,
-    ) -> Result<(), GpuError> {
-        if num_threadgroups == 0 {
-            return Ok(());
-        }
-
-        let cmd_buf = self
-            .queue
-            .commandBuffer()
-            .ok_or_else(|| GpuError::Dispatch("failed to create command buffer".into()))?;
-
-        let encoder = cmd_buf
-            .computeCommandEncoder()
-            .ok_or_else(|| GpuError::Dispatch("failed to create compute encoder".into()))?;
-
-        encoder.setComputePipelineState(pipeline);
-
-        for (i, buf) in buffers.iter().enumerate() {
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(*buf), 0, i);
-            }
-        }
-
-        let threadgroup_size = MTLSize {
-            width: HYBRID_THREADGROUP_SIZE as usize,
-            height: 1,
-            depth: 1,
-        };
-        let grid_size = MTLSize {
-            width: num_threadgroups as usize,
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-
-        cmd_buf.commit();
-        cmd_buf.waitUntilCompleted();
-
-        Ok(())
-    }
-
-    /// Dispatch the ray-parallel hybrid v2 kernel with 2D grid.
-    fn dispatch_hybrid_v2(
-        &self,
-        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
-        buffers: &[&ProtocolObject<dyn MTLBuffer>],
+        atm_buffer: &ProtocolObject<dyn MTLBuffer>,
+        params_buffer: &ProtocolObject<dyn MTLBuffer>,
+        output_buffer: &ProtocolObject<dyn MTLBuffer>,
         num_wavelengths: u32,
         num_steps: u32,
+        dispatch_count: usize,
+        output_stride_f32: usize,
+        params_stride_f32: usize,
     ) -> Result<(), GpuError> {
-        if num_wavelengths == 0 || num_steps == 0 {
+        if num_wavelengths == 0 || num_steps == 0 || dispatch_count == 0 {
             return Ok(());
         }
 
@@ -722,14 +727,9 @@ impl MetalBackend {
             .ok_or_else(|| GpuError::Dispatch("failed to create compute encoder".into()))?;
 
         encoder.setComputePipelineState(pipeline);
-        for (i, buf) in buffers.iter().enumerate() {
-            unsafe {
-                encoder.setBuffer_offset_atIndex(Some(*buf), 0, i);
-            }
-        }
 
         let threadgroup_size = MTLSize {
-            width: 64, // HYBRID_V2_THREADGROUP_SIZE
+            width: 64,
             height: 1,
             depth: 1,
         };
@@ -739,12 +739,22 @@ impl MetalBackend {
             depth: 1,
         };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        for dispatch_idx in 0..dispatch_count {
+            let params_byte_offset = dispatch_idx * params_stride_f32 * std::mem::size_of::<f32>();
+            let output_byte_offset = dispatch_idx * output_stride_f32 * std::mem::size_of::<f32>();
+
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(atm_buffer), 0, 0);
+                encoder.setBuffer_offset_atIndex(Some(params_buffer), params_byte_offset, 1);
+                encoder.setBuffer_offset_atIndex(Some(output_buffer), output_byte_offset, 2);
+            }
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        }
+
         encoder.endEncoding();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
 
-        // Check for GPU timeout / error
         let status = cmd_buf.status();
         if status == objc2_metal::MTLCommandBufferStatus::Error {
             let err_msg = cmd_buf
@@ -752,28 +762,13 @@ impl MetalBackend {
                 .map(|e| format!("{}", e))
                 .unwrap_or_else(|| "unknown GPU error".into());
             return Err(GpuError::Dispatch(format!(
-                "Metal command buffer error in hybrid_scatter_v2: {}",
+                "Metal command buffer error in hybrid_scatter_v2 chunk: {}",
                 err_msg
             )));
         }
 
         Ok(())
     }
-}
-
-/// Zero the first `n` f32 values in a shared Metal buffer.
-fn zero_f32_buffer(buffer: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Result<(), GpuError> {
-    let needed_bytes = n * std::mem::size_of::<f32>();
-    if buffer.length() < needed_bytes {
-        return Err(GpuError::BufferAllocation(
-            "buffer too small for zero".into(),
-        ));
-    }
-    let ptr = buffer.contents();
-    unsafe {
-        std::ptr::write_bytes(ptr.as_ptr() as *mut u8, 0, needed_bytes);
-    }
-    Ok(())
 }
 
 /// Load MSL shader source. In debug builds, try to load from disk first
@@ -830,7 +825,7 @@ fn create_buffer_from_f32(
     Ok(buf)
 }
 
-/// Create an empty shared Metal buffer for `n` f32 output elements.
+/// Create an empty shared Metal buffer for `n` f32 output elements, zeroed.
 fn create_empty_buffer(
     device: &ProtocolObject<dyn MTLDevice>,
     n: usize,
@@ -842,14 +837,25 @@ fn create_empty_buffer(
         ));
     }
 
-    device
+    let buf = device
         .newBufferWithLength_options(byte_len, MTLResourceOptions::StorageModeShared)
-        .ok_or_else(|| GpuError::BufferAllocation("Metal output buffer allocation failed".into()))
+        .ok_or_else(|| {
+            GpuError::BufferAllocation("Metal output buffer allocation failed".into())
+        })?;
+
+    // Zero the buffer -- Metal does not guarantee zeroed contents for
+    // StorageModeShared allocations. Required for correctness because
+    // invalid threadgroup slots (step >= num_steps) may not be written.
+    let ptr = buf.contents();
+    unsafe {
+        std::ptr::write_bytes(ptr.as_ptr() as *mut u8, 0, byte_len);
+    }
+
+    Ok(buf)
 }
 
-/// Read f32 values from a shared Metal buffer.
-fn read_f32_buffer(buffer: &ProtocolObject<dyn MTLBuffer>, n: usize) -> Vec<f32> {
+/// Borrow f32 values from a shared Metal buffer.
+fn f32_buffer_slice<'a>(buffer: &'a ProtocolObject<dyn MTLBuffer>, n: usize) -> &'a [f32] {
     let ptr = buffer.contents();
-    let slice = unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const f32, n) };
-    slice.to_vec()
+    unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const f32, n) }
 }

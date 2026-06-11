@@ -1,0 +1,27 @@
+##### METAL build #####
+   Compiling twilight-gpu v0.1.0 (/Users/mostafamahdi/twilight/crates/twilight-gpu)
+    Finished `release` profile [optimized] target(s) in 1.37s
+metal build exit: 
+
+##### CUDA check (expect missing twilight.cu) #####
+error: couldn't read `crates/twilight-gpu/src/../shaders/twilight.cu`: No such file or directory (os error 2)
+25 | const CUDA_SOURCE: &str = include_str!("../shaders/twilight.cu");
+error: could not compile `twilight-gpu` (lib) due to 1 previous error
+cuda check exit: 
+
+##### VULKAN check (expect missing .spv) #####
+    Checking thiserror v2.0.18
+error: couldn't read `crates/twilight-gpu/src/../shaders/single_scatter.spv`: No such file or directory (os error 2)
+50 | const SPV_SINGLE_SCATTER: &[u8] = include_bytes!("../shaders/single_scatter.spv");
+error: couldn't read `crates/twilight-gpu/src/../shaders/mcrt_trace.spv`: No such file or directory (os error 2)
+51 | const SPV_MCRT_TRACE: &[u8] = include_bytes!("../shaders/mcrt_trace.spv");
+error: couldn't read `crates/twilight-gpu/src/../shaders/hybrid_scatter.spv`: No such file or directory (os error 2)
+52 | const SPV_HYBRID: &[u8] = include_bytes!("../shaders/hybrid_scatter.spv");
+error: couldn't read `crates/twilight-gpu/src/../shaders/garstang_zenith.spv`: No such file or directory (os error 2)
+vulkan check exit: 
+
+##### WEBGPU check (expect missing twilight.wgsl) #####
+error: couldn't read `crates/twilight-gpu/src/../shaders/twilight.wgsl`: No such file or directory (os error 2)
+16 | const WGSL_SOURCE: &str = include_str!("../shaders/twilight.wgsl");
+error: could not compile `twilight-gpu` (lib) due to 1 previous error
+webgpu check exit: 
