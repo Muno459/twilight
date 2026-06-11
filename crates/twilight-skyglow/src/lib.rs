@@ -7,24 +7,17 @@
 //! - **Fajr**: Dawn must outshine the artificial background, so true dawn is
 //!   perceived later.
 //!
-//! # Architecture
+//! # Architecture (current reality)
 //!
-//! Two complementary models compute the artificial sky brightness:
+//! The only implemented input path is **manual**: the caller supplies either
+//! a Bortle class (1-9) or a VIIRS-style radiance value (nW/cm^2/sr) for the
+//! observer's location. There is no embedded VIIRS lookup, no remote tile
+//! fetch, and no ground-source photon tracer.
 //!
-//! 1. **Garstang analytical model** (distant sources, >30km): Single-scatter
-//!    radiative transfer integration using the same atmosphere/aerosol parameters
-//!    as the MCRT engine. Fast and accurate for distant cities.
-//!
-//! 2. **MCRT ground-source tracer** (nearby sources, <30km): Full photon tracing
-//!    from ground-level light sources through the atmosphere. Captures cloud
-//!    reflection, terrain blocking, and multiple scattering effects.
-//!
-//! # Data Sources
-//!
-//! Light source intensities come from VIIRS satellite nighttime radiance data:
-//! - **Embedded lookup** (~10km resolution, always available offline)
-//! - **World Bank S3** (~750m COG tiles, free, no auth)
-//! - **Manual input** (Bortle class or direct radiance value)
+//! A Garstang (1986)-style single-scatter integration exists in [`garstang`]
+//! but is NOT currently wired into the prayer-time pipeline; the pipeline
+//! uses the simpler zenith-luminance estimate from [`spectrum`]. Wiring the
+//! Garstang propagation in (and validating its magnitudes) is an open task.
 //!
 //! # Spectral Model
 //!
@@ -138,7 +131,8 @@ impl RadianceSource for ConstantRadiance {
 /// This is the quick-estimate function for when you just have a Bortle class
 /// or a single VIIRS radiance reading at the observer's location.
 ///
-/// For the full spatially-resolved computation, use [`garstang::compute_skyglow`].
+/// The spatially-resolved Garstang integration lives in [`garstang`] but is
+/// not yet wired into the prayer pipeline.
 pub fn quick_estimate(radiance_nw: f64, led_fraction: f64) -> SkyglowResult {
     let zenith_lum = bortle::radiance_to_zenith_luminance(radiance_nw);
     let bortle = bortle::luminance_to_bortle(zenith_lum);

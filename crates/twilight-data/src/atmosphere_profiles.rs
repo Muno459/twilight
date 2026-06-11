@@ -1,17 +1,19 @@
-//! Standard atmosphere profiles (Anderson/AFGL 1986).
+//! Standard atmosphere profile: US Standard Atmosphere 1976.
 //!
-//! Provides temperature, pressure, and number density at standard altitude levels
-//! for 6 reference atmospheres.
+//! Provides temperature, pressure, and number density at standard altitude
+//! levels. Only the US Standard 1976 profile is implemented. The AFGL
+//! (Anderson 1986) seasonal/latitudinal profiles are not available; the
+//! [`AtmosphereType`] enum has a single variant so that selecting an
+//! unimplemented profile is impossible rather than silently falling back.
 
-/// Standard altitude grid in km (50 levels from 0 to 100 km).
-pub const ALTITUDE_GRID_KM: [f64; 51] = [
+/// Standard altitude grid in km (41 levels from 0 to 100 km).
+pub const ALTITUDE_GRID_KM: [f64; 41] = [
     0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
     17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0,
-    65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0, // Padding to fill 51 entries
-    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+    65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0,
 ];
 
-/// Number of actual altitude levels in the grid.
+/// Number of altitude levels in the grid.
 pub const NUM_LEVELS: usize = 41;
 
 /// US Standard Atmosphere 1976 — temperature profile [K]
@@ -48,20 +50,14 @@ pub const US_STD_OZONE_DENSITY: [f64; 41] = [
 ];
 
 /// Atmosphere profile type.
+///
+/// Only US Standard 1976 is implemented. AFGL seasonal/latitudinal
+/// profiles (tropical, mid-latitude, subarctic) would require their own
+/// data tables; add variants here only together with real data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtmosphereType {
     /// US Standard 1976
     UsStandard,
-    /// Tropical
-    Tropical,
-    /// Mid-latitude summer
-    MidLatSummer,
-    /// Mid-latitude winter
-    MidLatWinter,
-    /// Subarctic summer
-    SubarcticSummer,
-    /// Subarctic winter
-    SubarcticWinter,
 }
 
 /// Get temperature at a given altitude by linear interpolation.
@@ -71,8 +67,6 @@ pub enum AtmosphereType {
 pub fn temperature_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
     let temps = match profile {
         AtmosphereType::UsStandard => &US_STD_TEMPERATURE_K,
-        // TODO: add other profiles
-        _ => &US_STD_TEMPERATURE_K,
     };
     interpolate_profile(&ALTITUDE_GRID_KM[..NUM_LEVELS], temps, altitude_km)
 }
@@ -81,7 +75,6 @@ pub fn temperature_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
 pub fn pressure_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
     let pressures = match profile {
         AtmosphereType::UsStandard => &US_STD_PRESSURE_HPA,
-        _ => &US_STD_PRESSURE_HPA,
     };
     // Log-linear interpolation for pressure
     let log_pressures: [f64; 41] = {
@@ -101,7 +94,6 @@ pub fn pressure_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
 pub fn number_density_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
     let densities = match profile {
         AtmosphereType::UsStandard => &US_STD_NUMBER_DENSITY,
-        _ => &US_STD_NUMBER_DENSITY,
     };
     let log_densities: [f64; 41] = {
         let mut ld = [0.0; 41];
@@ -126,7 +118,6 @@ pub fn number_density_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
 pub fn ozone_density_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
     let densities = match profile {
         AtmosphereType::UsStandard => &US_STD_OZONE_DENSITY,
-        _ => &US_STD_OZONE_DENSITY,
     };
     let log_densities: [f64; 41] = {
         let mut ld = [0.0; 41];
@@ -392,26 +383,6 @@ mod tests {
         let t = temperature_at(200.0, AtmosphereType::UsStandard);
         let t_top = US_STD_TEMPERATURE_K[NUM_LEVELS - 1];
         assert!((t - t_top).abs() < 0.01);
-    }
-
-    #[test]
-    fn all_profiles_fall_back_to_us_standard() {
-        // Until other profiles are implemented, all should return US Std values
-        let profiles = [
-            AtmosphereType::Tropical,
-            AtmosphereType::MidLatSummer,
-            AtmosphereType::MidLatWinter,
-            AtmosphereType::SubarcticSummer,
-            AtmosphereType::SubarcticWinter,
-        ];
-        for profile in &profiles {
-            let t = temperature_at(0.0, *profile);
-            assert!(
-                (t - 288.15).abs() < 0.01,
-                "Profile {:?} should fallback to US Std",
-                profile
-            );
-        }
     }
 
     #[test]

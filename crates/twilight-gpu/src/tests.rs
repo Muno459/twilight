@@ -1063,427 +1063,6 @@ mod layer4_metal {
     }
 }
 
-// ── Vulkan backend integration tests ────────────────────────────────────
-
-#[cfg(feature = "vulkan")]
-mod layer4_vulkan {
-    use super::*;
-    use crate::{BackendKind, GpuConfig};
-
-    fn try_vulkan() -> Option<Box<dyn crate::GpuBackend>> {
-        let config = GpuConfig {
-            preferred_backend: Some(BackendKind::Vulkan),
-            ..Default::default()
-        };
-        crate::try_init(&config).ok()
-    }
-
-    #[test]
-    fn vulkan_init_and_device_info() {
-        let Some(gpu) = try_vulkan() else { return };
-        let info = gpu.device_info();
-        assert_eq!(info.backend, BackendKind::Vulkan);
-        assert!(
-            !info.name.is_empty(),
-            "Vulkan device name should not be empty"
-        );
-        assert!(
-            info.max_workgroup_size >= 256,
-            "Vulkan max_workgroup_size={} should be >= 256",
-            info.max_workgroup_size,
-        );
-    }
-
-    #[test]
-    fn vulkan_upload_atmosphere() {
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm)
-            .expect("Vulkan upload_atmosphere should succeed");
-    }
-
-    #[test]
-    fn vulkan_single_scatter_vs_cpu_oracle() {
-        let Some(mut gpu) = try_vulkan() else { return };
-        let checked = run_single_scatter_parity(gpu.as_mut(), "Vulkan");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn vulkan_mcrt_vs_single_scatter() {
-        let Some(mut gpu) = try_vulkan() else { return };
-        let checked = run_mcrt_vs_single_scatter(gpu.as_mut(), "Vulkan");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn vulkan_hybrid_sanity() {
-        let Some(mut gpu) = try_vulkan() else { return };
-        let checked = run_hybrid_sanity(gpu.as_mut(), "Vulkan");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn vulkan_single_scatter_radiance_non_negative() {
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-
-        for &sza in &[80.0, 90.0, 96.0, 100.0, 108.0, 120.0] {
-            let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-            let result = gpu
-                .single_scatter(obs, view, [sun.x, sun.y, sun.z])
-                .unwrap();
-            for (w, &rad) in result.radiance.iter().enumerate() {
-                assert!(
-                    rad >= 0.0,
-                    "Vulkan SZA={} wl={}: negative radiance {:.6e}",
-                    sza,
-                    w,
-                    rad,
-                );
-                assert!(
-                    rad.is_finite(),
-                    "Vulkan SZA={} wl={}: non-finite radiance {:.6e}",
-                    sza,
-                    w,
-                    rad,
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn vulkan_single_scatter_decreases_with_sza() {
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-
-        let szas = [80.0, 90.0, 96.0, 100.0, 108.0];
-        let mut prev_rad = f64::MAX;
-        for &sza in &szas {
-            let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-            let result = gpu
-                .single_scatter(obs, view, [sun.x, sun.y, sun.z])
-                .unwrap();
-            let rad = result.radiance[1];
-            assert!(
-                rad <= prev_rad + 1e-20,
-                "Vulkan SZA={}: radiance {:.6e} should <= previous {:.6e}",
-                sza,
-                rad,
-                prev_rad,
-            );
-            prev_rad = rad;
-        }
-    }
-
-    #[test]
-    fn vulkan_deep_night_negligible() {
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-        let sun = solar_direction_ecef(120.0, 180.0, 0.0, 0.0);
-
-        let result = gpu
-            .single_scatter(obs, view, [sun.x, sun.y, sun.z])
-            .unwrap();
-        for (w, &rad) in result.radiance.iter().enumerate() {
-            assert!(
-                rad < 1e-15,
-                "Vulkan SZA=120 wl={}: radiance {:.6e} should be negligible",
-                w,
-                rad,
-            );
-        }
-    }
-
-    /// Verify Vulkan scan_batch matches serial single_scatter calls.
-    #[test]
-    fn vulkan_batch_matches_serial() {
-        use crate::{BatchKernel, BatchRequest};
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-        let szas = [80.0, 90.0, 96.0, 100.0, 108.0];
-
-        let serial: Vec<_> = szas
-            .iter()
-            .map(|&sza| {
-                let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                gpu.single_scatter(obs, view, [sun.x, sun.y, sun.z])
-                    .unwrap()
-            })
-            .collect();
-
-        let requests: Vec<BatchRequest> = szas
-            .iter()
-            .map(|&sza| {
-                let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
-                    observer_pos: obs,
-                    view_dir: view,
-                    sun_dir: [sun.x, sun.y, sun.z],
-                    kernel: BatchKernel::SingleScatter,
-                }
-            })
-            .collect();
-        let batched = gpu.scan_batch(&requests).unwrap();
-
-        assert_eq!(serial.len(), batched.len());
-        for (i, (s, b)) in serial.iter().zip(batched.iter()).enumerate() {
-            for w in 0..s.num_wavelengths {
-                assert!(
-                    approx_eq(s.radiance[w], b.radiance[w], 1e-6, F32_ATOL),
-                    "Vulkan batch SZA={} wl={}: serial {:.6e} vs batch {:.6e}",
-                    szas[i],
-                    w,
-                    s.radiance[w],
-                    b.radiance[w],
-                );
-            }
-        }
-    }
-
-    /// Benchmark Vulkan batch vs serial for 50-SZA scan.
-    #[test]
-    fn vulkan_batch_speedup() {
-        use crate::{BatchKernel, BatchRequest};
-        use std::time::Instant;
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-        let szas: Vec<f64> = (0..50).map(|i| 90.0 + i as f64 * 0.4).collect();
-
-        let requests: Vec<BatchRequest> = szas
-            .iter()
-            .map(|&sza| {
-                let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
-                    observer_pos: obs,
-                    view_dir: view,
-                    sun_dir: [sun.x, sun.y, sun.z],
-                    kernel: BatchKernel::SingleScatter,
-                }
-            })
-            .collect();
-
-        // Warmup
-        let _ = gpu.scan_batch(&requests);
-
-        let serial_start = Instant::now();
-        for req in &requests {
-            let _ = gpu
-                .single_scatter(req.observer_pos, req.view_dir, req.sun_dir)
-                .unwrap();
-        }
-        let serial_elapsed = serial_start.elapsed();
-
-        let batch_start = Instant::now();
-        let _ = gpu.scan_batch(&requests).unwrap();
-        let batch_elapsed = batch_start.elapsed();
-
-        let speedup = serial_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64().max(1e-9);
-
-        eprintln!(
-            "  [Vulkan batch] 50-SZA: serial {:?} vs batch {:?} ({:.1}x speedup)",
-            serial_elapsed, batch_elapsed, speedup,
-        );
-
-        // Vulkan has per-dispatch descriptor set overhead, so the speedup
-        // is smaller than Metal's (which uses buffer offsets). Still faster
-        // than serial due to eliminating per-dispatch fence waits.
-        assert!(
-            speedup > 1.3,
-            "Vulkan batch ({:?}) should be >1.3x faster than serial ({:?}), got {:.1}x",
-            batch_elapsed,
-            serial_elapsed,
-            speedup,
-        );
-    }
-
-    /// Verify Vulkan hybrid batch produces valid results.
-    #[test]
-    fn vulkan_batch_hybrid_valid() {
-        use crate::{BatchKernel, BatchRequest};
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-        let szas = [93.0, 96.0, 100.0, 105.0, 108.0];
-
-        let requests: Vec<BatchRequest> = szas
-            .iter()
-            .map(|&sza| {
-                let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
-                    observer_pos: obs,
-                    view_dir: view,
-                    sun_dir: [sun.x, sun.y, sun.z],
-                    kernel: BatchKernel::Hybrid {
-                        secondary_rays: 50,
-                        seed: sza.to_bits(),
-                    },
-                }
-            })
-            .collect();
-
-        let results = gpu.scan_batch(&requests).unwrap();
-        assert_eq!(results.len(), szas.len());
-
-        for (i, r) in results.iter().enumerate() {
-            for (w, &v) in r.radiance.iter().enumerate() {
-                assert!(
-                    v >= 0.0 && v.is_finite(),
-                    "Vulkan hybrid batch SZA={} wl={}: invalid {:.4e}",
-                    szas[i],
-                    w,
-                    v,
-                );
-            }
-        }
-    }
-}
-
-// ── CUDA backend integration tests ──────────────────────────────────────
-
-#[cfg(feature = "cuda")]
-mod layer4_cuda {
-    use super::*;
-    use crate::{BackendKind, GpuConfig};
-
-    fn try_cuda() -> Option<Box<dyn crate::GpuBackend>> {
-        let config = GpuConfig {
-            preferred_backend: Some(BackendKind::Cuda),
-            ..Default::default()
-        };
-        crate::try_init(&config).ok()
-    }
-
-    #[test]
-    fn cuda_init_and_device_info() {
-        let Some(gpu) = try_cuda() else { return };
-        let info = gpu.device_info();
-        assert_eq!(info.backend, BackendKind::Cuda);
-        assert!(
-            !info.name.is_empty(),
-            "CUDA device name should not be empty"
-        );
-    }
-
-    #[test]
-    fn cuda_single_scatter_vs_cpu_oracle() {
-        let Some(mut gpu) = try_cuda() else { return };
-        let checked = run_single_scatter_parity(gpu.as_mut(), "CUDA");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn cuda_mcrt_vs_single_scatter() {
-        let Some(mut gpu) = try_cuda() else { return };
-        let checked = run_mcrt_vs_single_scatter(gpu.as_mut(), "CUDA");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn cuda_hybrid_sanity() {
-        let Some(mut gpu) = try_cuda() else { return };
-        let checked = run_hybrid_sanity(gpu.as_mut(), "CUDA");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-}
-
-// ── wgpu backend integration tests ──────────────────────────────────────
-
-#[cfg(feature = "webgpu")]
-mod layer4_wgpu {
-    use super::*;
-    use crate::{BackendKind, GpuConfig};
-
-    fn try_wgpu() -> Option<Box<dyn crate::GpuBackend>> {
-        let config = GpuConfig {
-            preferred_backend: Some(BackendKind::Wgpu),
-            ..Default::default()
-        };
-        crate::try_init(&config).ok()
-    }
-
-    #[test]
-    fn wgpu_init_and_device_info() {
-        let Some(gpu) = try_wgpu() else { return };
-        let info = gpu.device_info();
-        assert_eq!(info.backend, BackendKind::Wgpu);
-        assert!(
-            !info.name.is_empty(),
-            "wgpu device name should not be empty"
-        );
-    }
-
-    #[test]
-    fn wgpu_single_scatter_vs_cpu_oracle() {
-        let Some(mut gpu) = try_wgpu() else { return };
-        let checked = run_single_scatter_parity(gpu.as_mut(), "wgpu");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn wgpu_mcrt_vs_single_scatter() {
-        let Some(mut gpu) = try_wgpu() else { return };
-        let checked = run_mcrt_vs_single_scatter(gpu.as_mut(), "wgpu");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn wgpu_hybrid_sanity() {
-        let Some(mut gpu) = try_wgpu() else { return };
-        let checked = run_hybrid_sanity(gpu.as_mut(), "wgpu");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Layer 5: Cross-backend parity tests
-// ═══════════════════════════════════════════════════════════════════════
-//
-// When multiple GPU backends are available on the same machine, their
-// results must agree within f32 tolerance. These tests initialize all
-// available backends and compare their single_scatter / mcrt outputs.
-
 /// Cross-backend parity tolerance. Backends use the same f32 arithmetic
 /// but may differ in instruction ordering, FMA usage, etc.
 const CROSS_BACKEND_RTOL: f64 = 1e-4;
@@ -1504,38 +1083,6 @@ fn init_all_backends() -> Vec<(crate::BackendKind, Box<dyn crate::GpuBackend>)> 
         }
     }
 
-    #[cfg(feature = "vulkan")]
-    {
-        let config = crate::GpuConfig {
-            preferred_backend: Some(crate::BackendKind::Vulkan),
-            ..Default::default()
-        };
-        if let Ok(gpu) = crate::try_init(&config) {
-            backends.push((crate::BackendKind::Vulkan, gpu));
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    {
-        let config = crate::GpuConfig {
-            preferred_backend: Some(crate::BackendKind::Cuda),
-            ..Default::default()
-        };
-        if let Ok(gpu) = crate::try_init(&config) {
-            backends.push((crate::BackendKind::Cuda, gpu));
-        }
-    }
-
-    #[cfg(feature = "webgpu")]
-    {
-        let config = crate::GpuConfig {
-            preferred_backend: Some(crate::BackendKind::Wgpu),
-            ..Default::default()
-        };
-        if let Ok(gpu) = crate::try_init(&config) {
-            backends.push((crate::BackendKind::Wgpu, gpu));
-        }
-    }
 
     backends
 }
@@ -3057,9 +2604,6 @@ fn test_parity_coverage_report() {
         }
         for backend in &[
             crate::BackendKind::Metal,
-            crate::BackendKind::Vulkan,
-            crate::BackendKind::Cuda,
-            crate::BackendKind::Wgpu,
         ] {
             cov.record(
                 *backend,
@@ -3079,9 +2623,6 @@ fn test_parity_coverage_report() {
         let valid = header.validate();
         for backend in &[
             crate::BackendKind::Metal,
-            crate::BackendKind::Vulkan,
-            crate::BackendKind::Cuda,
-            crate::BackendKind::Wgpu,
         ] {
             cov.record(
                 *backend,
@@ -3107,9 +2648,6 @@ fn test_parity_coverage_report() {
         let ok = (truth - kahan).abs() < 1e-10;
         for backend in &[
             crate::BackendKind::Metal,
-            crate::BackendKind::Vulkan,
-            crate::BackendKind::Cuda,
-            crate::BackendKind::Wgpu,
         ] {
             cov.record(
                 *backend,
@@ -3138,9 +2676,6 @@ fn test_parity_coverage_report() {
         }
         for backend in &[
             crate::BackendKind::Metal,
-            crate::BackendKind::Vulkan,
-            crate::BackendKind::Cuda,
-            crate::BackendKind::Wgpu,
         ] {
             cov.record(
                 *backend,
@@ -3157,9 +2692,6 @@ fn test_parity_coverage_report() {
     // --- Geometry features ---
     for backend in &[
         crate::BackendKind::Metal,
-        crate::BackendKind::Vulkan,
-        crate::BackendKind::Cuda,
-        crate::BackendKind::Wgpu,
     ] {
         cov.record(
             *backend,
@@ -3177,9 +2709,6 @@ fn test_parity_coverage_report() {
     // --- Scattering features ---
     for backend in &[
         crate::BackendKind::Metal,
-        crate::BackendKind::Vulkan,
-        crate::BackendKind::Cuda,
-        crate::BackendKind::Wgpu,
     ] {
         cov.record(*backend, ParityFeature::RayleighPhase, ParityStatus::Pass);
         cov.record(*backend, ParityFeature::HgPhase, ParityStatus::Pass);
@@ -3196,9 +2725,6 @@ fn test_parity_coverage_report() {
     // --- Shadow Ray features ---
     for backend in &[
         crate::BackendKind::Metal,
-        crate::BackendKind::Vulkan,
-        crate::BackendKind::Cuda,
-        crate::BackendKind::Wgpu,
     ] {
         cov.record(
             *backend,
@@ -3221,9 +2747,6 @@ fn test_parity_coverage_report() {
     // --- Hybrid engine features: untested until GPU shaders are rewritten ---
     for backend in &[
         crate::BackendKind::Metal,
-        crate::BackendKind::Vulkan,
-        crate::BackendKind::Cuda,
-        crate::BackendKind::Wgpu,
     ] {
         cov.record(*backend, ParityFeature::LosSteping, ParityStatus::Untested);
         cov.record(*backend, ParityFeature::Nee, ParityStatus::Untested);

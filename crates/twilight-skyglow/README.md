@@ -2,6 +2,14 @@
 
 Light pollution skyglow model. Estimates how artificial lighting adds to the natural twilight sky brightness, shifting the apparent onset and end of twilight.
 
+## Status
+
+The Garstang-style RT integration in `garstang` is implemented but NOT yet
+wired into the prayer-time pipeline, and its absolute magnitudes have not
+been validated against published skyglow measurements. The pipeline currently
+uses the simpler zenith-luminance estimate (`quick_estimate_at_angle`). Treat
+skyglow output as indicative, not calibrated.
+
 ## Approach
 
 The model follows Garstang (1986, 1989) radiative transfer for skyglow. Light emitted upward from ground sources scatters off atmospheric molecules (Rayleigh) and aerosols (Mie/HG) back toward the observer. The scattered radiance depends on source distance, emission angle, aerosol optical depth, and wavelength.
@@ -16,7 +24,7 @@ The spectral dimension matters: LED streetlights (strong blue peak at 450nm) sca
 
 **`angular`**. Directional skyglow variation. Azimuthal enhancement near bright sources (city centers), zenith-to-horizon brightness gradient, and twilight observation geometry factors. The enhancement decays with angular distance from the source and increases toward the horizon.
 
-**`bortle`**. Bortle Dark-Sky Scale (1-9) mapping. Converts between Bortle class, zenith luminance (mcd/m2), sky quality meter readings (mag/arcsec2), naked-eye limiting magnitude, and VIIRS nighttime radiance (nW/cm2/sr). Estimates the prayer time shift in minutes from zenith luminance: negligible at dark sites (Bortle 1-3), several minutes in suburban areas (Bortle 5-6), significant in city centers (Bortle 8-9).
+**`bortle`**. Bortle Dark-Sky Scale (1-9) mapping. Converts between Bortle class, zenith luminance (mcd/m2), sky quality meter readings (mag/arcsec2), naked-eye limiting magnitude, and VIIRS nighttime radiance (nW/cm2/sr). Includes a rough heuristic for the prayer-time shift from zenith luminance; this heuristic is uncalibrated and disconnected from the RT pipeline — use the full pipeline (skyglow radiance added before threshold crossing) for any real estimate.
 
 ## Usage
 
@@ -26,4 +34,4 @@ The CLI exposes this via `--bortle <class>` or `--skyglow` (with `--radiance` fo
 
 ## Tests
 
-69 tests. Garstang RT (zenith brightness vs distance, source additivity, flux scaling, AOD dependence, empty/zero cases), spectral profiles (LED blue peak, HPS sodium peak, mixed interpolation, Rayleigh effectiveness, blue fraction bounds), angular model (azimuthal decay, horizon enhancement, twilight factor), Bortle mapping (monotonicity, luminance/SQM/NELM conversions, roundtrips, prayer shift estimation).
+Garstang RT (zenith brightness vs distance, source additivity, flux scaling, AOD dependence, empty/zero cases), spectral profiles (LED blue peak, HPS sodium peak, mixed interpolation, Rayleigh effectiveness, blue fraction bounds), angular model (azimuthal decay, horizon enhancement, twilight factor), Bortle mapping (monotonicity, luminance/SQM/NELM conversions, roundtrips, prayer shift estimation).

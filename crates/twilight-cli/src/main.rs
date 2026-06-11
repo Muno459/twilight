@@ -21,7 +21,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Show solar position and conventional twilight times
     /// Render a sky map at a specific solar zenith angle
     Render {
         /// Solar Zenith Angle in degrees
@@ -40,6 +39,7 @@ enum Commands {
         #[arg(long, default_value = "sky_96.png")]
         out: String,
     },
+    /// Show solar position and conventional twilight times
     Solar {
         /// Latitude in degrees (north positive)
         #[arg(short, long)]
@@ -107,7 +107,7 @@ enum Commands {
         /// Force CPU-only computation (skip GPU)
         #[arg(long)]
         cpu: bool,
-        /// Preferred GPU backend: cuda, metal, vulkan, wgpu (auto-detect if omitted)
+        /// Preferred GPU backend: metal (auto-detect if omitted)
         #[arg(long, value_enum)]
         gpu_backend: Option<CliGpuBackend>,
         /// Scalar radiance mode (skip Stokes polarization tracking).
@@ -164,8 +164,7 @@ enum Commands {
         #[arg(long)]
         weather: bool,
         /// Enable terrain masking using digital elevation data.
-        /// Downloads Copernicus GLO-30 (30m) tiles on first use. Uses national
-        /// LiDAR when available (requires --dk-api-key for Denmark).
+        /// Downloads Copernicus GLO-30 (30m) tiles on first use.
         #[arg(long)]
         terrain: bool,
         /// Cache directory for DEM tiles (default: data/dem)
@@ -174,10 +173,6 @@ enum Commands {
         /// Horizon scan radius in km (default: 30)
         #[arg(long, default_value = "30")]
         horizon_radius: f64,
-        /// Dataforsyningen API key for Danish LiDAR (0.4m).
-        /// Register free at https://datafordeler.dk
-        #[arg(long, env = "TWILIGHT_DK_API_KEY")]
-        dk_api_key: Option<String>,
         /// Enable light pollution skyglow model.
         /// Adds artificial sky brightness to MCRT luminance, shifting prayer times.
         #[arg(long)]
@@ -197,7 +192,7 @@ enum Commands {
         /// Force CPU-only computation (skip GPU)
         #[arg(long)]
         cpu: bool,
-        /// Preferred GPU backend: cuda, metal, vulkan, wgpu (auto-detect if omitted)
+        /// Preferred GPU backend: metal (auto-detect if omitted)
         #[arg(long, value_enum)]
         gpu_backend: Option<CliGpuBackend>,
         /// Scalar radiance mode (skip Stokes polarization tracking).
@@ -298,14 +293,8 @@ impl CliScattering {
 /// CLI GPU backend selector.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliGpuBackend {
-    /// NVIDIA CUDA (requires NVIDIA GPU + driver)
-    Cuda,
-    /// Apple Metal (macOS / iOS)
+    /// Apple Metal (macOS / iOS) — the only implemented GPU backend
     Metal,
-    /// Vulkan (cross-platform: AMD, Intel, NVIDIA, MoltenVK on macOS)
-    Vulkan,
-    /// wgpu/WebGPU (WASM browsers, native fallback)
-    Wgpu,
 }
 
 /// Try to initialize a GPU backend. Returns the backend or prints a
@@ -316,10 +305,7 @@ fn try_init_gpu(
     photons: usize,
 ) -> Option<Box<dyn twilight_gpu::GpuBackend>> {
     let preferred_backend = preferred.map(|b| match b {
-        CliGpuBackend::Cuda => twilight_gpu::BackendKind::Cuda,
         CliGpuBackend::Metal => twilight_gpu::BackendKind::Metal,
-        CliGpuBackend::Vulkan => twilight_gpu::BackendKind::Vulkan,
-        CliGpuBackend::Wgpu => twilight_gpu::BackendKind::Wgpu,
     });
 
     let config = twilight_gpu::GpuConfig {
@@ -861,7 +847,6 @@ fn cmd_pray(
     use_terrain: bool,
     dem_dir: &str,
     horizon_radius: f64,
-    dk_api_key: Option<&str>,
     use_skyglow: bool,
     bortle: Option<u8>,
     radiance_nw: Option<f64>,
@@ -971,7 +956,7 @@ fn cmd_pray(
     // Terrain masking
     let horizon_profile = if use_terrain {
         let dem_path = std::path::Path::new(dem_dir);
-        let mut source = twilight_terrain::resolve_source(lat, lon, dem_path, dk_api_key);
+        let mut source = twilight_terrain::resolve_source(lat, lon, dem_path);
 
         // Compute bounding box for the horizon scan radius
         let radius_deg = horizon_radius / 111.0; // approximate degrees for bbox
@@ -1672,7 +1657,6 @@ fn main() {
             terrain,
             dem_dir,
             horizon_radius,
-            dk_api_key,
             skyglow,
             bortle,
             radiance,
@@ -1700,7 +1684,6 @@ fn main() {
                 terrain,
                 &dem_dir,
                 horizon_radius,
-                dk_api_key.as_deref(),
                 skyglow,
                 bortle,
                 radiance,

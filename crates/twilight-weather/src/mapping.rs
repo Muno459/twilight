@@ -196,12 +196,6 @@ fn estimate_o3_column_du(surface_o3_ug_m3: f64) -> f64 {
     du.clamp(220.0, 450.0)
 }
 
-/// Convert surface NO2 in ug/m3 to number density in molecules/m3.
-///
-/// n [molecules/m3] = (concentration [ug/m3] * 1e-6 [g/ug]) / M [g/mol] * N_A [molecules/mol] * 1e6 [cm3/m3... wait]
-///
-/// Actually: n [molecules/m3] = (C [ug/m3] * 1e-6 [g/ug] * N_A [molecules/mol]) / (M [g/mol] * 1e-3 [kg/g] * 1e3 [L/m3] * 22.4 [L/mol at STP])
-///
 /// Convert NO2 surface concentration from ug/m3 to molecules/m3.
 ///
 /// The concentration C [ug/m3] is already a mass per unit volume, so the
@@ -227,7 +221,8 @@ fn no2_ug_m3_to_molecules_m3(no2_ug_m3: f64) -> f64 {
 ///
 /// - **NO2**: Surface concentration is converted to number density
 ///   (molecules/m^3) to scale the tropospheric NO2 profile. This matters
-///   for Huggins/Chappuis band absorption, especially in polluted urban areas.
+///   for NO2's visible absorption band (~400-500 nm), especially in
+///   polluted urban areas.
 ///
 /// Returns `None` if both O3 and NO2 are zero or missing (no data from API).
 pub fn map_gas_composition(conditions: &WeatherConditions) -> Option<GasComposition> {
