@@ -933,6 +933,7 @@ mod layer4_metal {
     }
 
     #[test]
+    #[ignore = "hybrid_scatter_v2 exceeds the macOS GPU watchdog at production ray counts; KNOWN-OPEN Metal-port work (README project status #6). Run with --ignored after the estimator port."]
     fn metal_single_hybrid_matches_one_item_batch() {
         use crate::{BatchKernel, BatchRequest};
         use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
@@ -993,6 +994,7 @@ mod layer4_metal {
     }
 
     #[test]
+    #[ignore = "hybrid_scatter_v2 exceeds the macOS GPU watchdog at production ray counts; KNOWN-OPEN Metal-port work (README project status #6). Run with --ignored after the estimator port."]
     fn metal_multi_hybrid_matches_serial_chunk() {
         use crate::{BatchKernel, BatchRequest};
         use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};

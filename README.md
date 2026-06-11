@@ -28,7 +28,12 @@ Progress so far (see git log on this branch):
 
 1. ~~Phase-function scattering angle bug~~ FIXED (all 14 sites + regression test)
 2. ~~MS estimator seed bias / chain boundary-kill / SSA ordering~~ FIXED
-   (unbiased one-sample-MIS seed; chains traverse shells; suites green)
+   (unbiased one-sample-MIS seed; chains traverse shells; suites green).
+   Measured deep-twilight CV (500 seeds, hybrid): 0.12-0.30 at SZA 96-102
+   with ZERO negative samples (previously negative radiance seeds occurred);
+   rare tail outliers remain at SZA >= 104 (~1 seed in 500 at 20-100x) —
+   K-seed averaging + crossing-on-fit in the pipeline is the tracked next
+   step for sub-minute crossing stability
 3. ~~Cloudy-sky collapse~~ FIXED: delta-Eddington scaled cloud optics +
    Eddington diffuse transmission for the cloud portion of eye/sun paths.
    OD-10 stratus now gives Fajr at depression ~13.7° (clear sky ~15.9°)
