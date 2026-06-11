@@ -2440,6 +2440,8 @@ pub fn hybrid_scatter_radiance(
     let mut stokes_total = StokesVector::unpolarized(0.0);
     let mut scalar_total = 0.0_f64;
     let mut tau_obs = 0.0; // optical depth from observer
+    // Cloud portion of the eye path -> Eddington diffuse transmission.
+    let mut tau_cloud_obs = 0.0;
 
     for step in 0..num_steps {
         let s = (step as f64 + 0.5) * ds;
@@ -2460,11 +2462,14 @@ pub fn hybrid_scatter_radiance(
 
         if beta_scat < 1e-30 {
             tau_obs += optics.extinction * ds;
+            tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds;
             continue;
         }
 
         let tau_obs_mid = tau_obs + optics.extinction * ds * 0.5;
-        let t_obs = libm::exp(-tau_obs_mid);
+        let tau_cloud_mid = tau_cloud_obs + atm.cloud_extinction[shell_idx] * ds * 0.5;
+        let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid))
+            * atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
         if t_obs < 1e-30 {
             break;
@@ -2561,6 +2566,7 @@ pub fn hybrid_scatter_radiance(
         }
 
         tau_obs += optics.extinction * ds;
+        tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds;
     }
 
     if polarized {
@@ -4360,6 +4366,8 @@ pub fn hybrid_scatter_radiance_alis(
 
     // Per-wavelength accumulated optical depth from observer.
     let mut tau_obs = [0.0f64; 64];
+    // Cloud portion (broadband) -> Eddington diffuse transmission.
+    let mut tau_cloud_obs = 0.0f64;
 
     for step in 0..num_steps {
         let s = (step as f64 + 0.5) * ds;
@@ -4375,11 +4383,15 @@ pub fn hybrid_scatter_radiance_alis(
             None => continue,
         };
 
+        let cloud_ext_step = atm.cloud_extinction[shell_idx];
+        let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
+        let t_cloud_mid = atm.cloud_diffuse_transmittance(tau_cloud_mid);
+
         // Check if any wavelength still has observable transmittance.
         let mut any_visible = false;
         for w in 0..num_wl {
             let tau_mid = tau_obs[w] + atm.optics[shell_idx][w].extinction * ds * 0.5;
-            if libm::exp(-tau_mid) > 1e-30 {
+            if libm::exp(-(tau_mid - tau_cloud_mid)) * t_cloud_mid > 1e-30 {
                 any_visible = true;
                 break;
             }
@@ -4400,7 +4412,7 @@ pub fn hybrid_scatter_radiance_alis(
             }
 
             let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
-            let t_obs = libm::exp(-tau_obs_mid);
+            let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid)) * t_cloud_mid;
             if t_obs < 1e-30 || t_suns[w] < 1e-30 {
                 continue;
             }
@@ -4485,7 +4497,7 @@ pub fn hybrid_scatter_radiance_alis(
                     continue;
                 }
                 let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
-                let t_obs = libm::exp(-tau_obs_mid);
+                let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid)) * t_cloud_mid;
                 if t_obs < 1e-30 {
                     continue;
                 }
@@ -4498,6 +4510,7 @@ pub fn hybrid_scatter_radiance_alis(
         for w in 0..num_wl {
             tau_obs[w] += atm.optics[shell_idx][w].extinction * ds;
         }
+        tau_cloud_obs += cloud_ext_step * ds;
     }
 
     // --- BDPT connections: batched post-processing pass ---
@@ -4581,6 +4594,7 @@ pub fn hybrid_scatter_radiance_alis(
             // Re-walk the LOS to evaluate connections for this batch's vertices.
             // This is cheap: just extinction accumulation + connection evaluation.
             let mut tau_obs_bdpt = [0.0f64; 64];
+            let mut tau_cloud_bdpt = 0.0f64;
 
             for step in 0..num_steps {
                 let s = (step as f64 + 0.5) * ds;
@@ -4596,11 +4610,15 @@ pub fn hybrid_scatter_radiance_alis(
                     None => continue,
                 };
 
+                let cloud_ext_step = atm.cloud_extinction[shell_idx];
+                let tau_cloud_mid = tau_cloud_bdpt + cloud_ext_step * ds * 0.5;
+                let t_cloud_mid = atm.cloud_diffuse_transmittance(tau_cloud_mid);
+
                 // Check if any wavelength still has observable transmittance.
                 let mut any_visible = false;
                 for w in 0..num_wl {
                     let tau_mid = tau_obs_bdpt[w] + atm.optics[shell_idx][w].extinction * ds * 0.5;
-                    if libm::exp(-tau_mid) > 1e-30 {
+                    if libm::exp(-(tau_mid - tau_cloud_mid)) * t_cloud_mid > 1e-30 {
                         any_visible = true;
                         break;
                     }
@@ -4650,7 +4668,7 @@ pub fn hybrid_scatter_radiance_alis(
                         }
 
                         let tau_obs_mid = tau_obs_bdpt[w] + optics_eye.extinction * ds * 0.5;
-                        let t_obs = libm::exp(-tau_obs_mid);
+                        let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid)) * t_cloud_mid;
                         if t_obs < 1e-30 {
                             continue;
                         }
@@ -4680,6 +4698,7 @@ pub fn hybrid_scatter_radiance_alis(
                 for w in 0..num_wl {
                     tau_obs_bdpt[w] += atm.optics[shell_idx][w].extinction * ds;
                 }
+                tau_cloud_bdpt += cloud_ext_step * ds;
             }
         }
     }

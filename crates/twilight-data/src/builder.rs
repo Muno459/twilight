@@ -117,77 +117,23 @@ pub fn build_with_cloud_layer(
 ) -> AtmosphereModel {
     let mut atm = build_clear_sky(profile, surface_albedo);
 
-    // Distribute cloud optical depth uniformly across shells that overlap the cloud
     let cloud_thickness_m = (cloud_top_km - cloud_base_km) * 1000.0;
     if cloud_thickness_m <= 0.0 || cloud_od <= 0.0 {
         return atm;
     }
 
-    // Cloud extinction coefficient (uniform within cloud)
-    // At 550nm: extinction = OD / thickness
-    let cloud_ext_550 = cloud_od / cloud_thickness_m;
-
-    let num_shells = atm.num_shells;
-    for s in 0..num_shells {
-        let shell_base_km =
-            (atm.shells[s].r_inner - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
-        let shell_top_km =
-            (atm.shells[s].r_outer - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
-
-        // Check if this shell overlaps the cloud layer
-        let overlap_base = shell_base_km.max(cloud_base_km);
-        let overlap_top = shell_top_km.min(cloud_top_km);
-        if overlap_top <= overlap_base {
-            continue; // No overlap
-        }
-
-        // Fraction of this shell occupied by cloud
-        let shell_thickness_km = shell_top_km - shell_base_km;
-        let overlap_fraction = (overlap_top - overlap_base) / shell_thickness_km;
-
-        for w in 0..atm.num_wavelengths {
-            let existing = &atm.optics[s][w];
-
-            // Cloud extinction (approximate: assume wavelength-independent for now)
-            // In reality, cloud extinction is nearly wavelength-independent in the visible
-            let cloud_ext = cloud_ext_550 * overlap_fraction;
-            let cloud_scat = cloud_ext * cloud_ssa;
-            let cloud_abs = cloud_ext * (1.0 - cloud_ssa);
-
-            let rayleigh_scat = existing.extinction * existing.ssa;
-            let gas_abs = existing.extinction * (1.0 - existing.ssa);
-
-            let total_scat = rayleigh_scat + cloud_scat;
-            let total_ext = total_scat + gas_abs + cloud_abs;
-
-            let new_ssa = if total_ext > 1e-30 {
-                total_scat / total_ext
-            } else {
-                1.0
-            };
-
-            // Weighted asymmetry parameter
-            let new_g = if total_scat > 1e-30 {
-                (rayleigh_scat * 0.0 + cloud_scat * cloud_g) / total_scat
-            } else {
-                0.0
-            };
-
-            // Rayleigh fraction of total scattering
-            let ray_frac = if total_scat > 1e-30 {
-                rayleigh_scat / total_scat
-            } else {
-                1.0
-            };
-
-            atm.optics[s][w] = ShellOptics {
-                extinction: total_ext,
-                ssa: new_ssa,
-                asymmetry: new_g,
-                rayleigh_fraction: ray_frac,
-            };
-        }
-    }
+    // Delegate to the single cloud mixer (which applies delta-Eddington
+    // scaling); this replaces a near-duplicate inline mixer that used a
+    // degenerate mixing rule discarding non-Rayleigh scatterers.
+    let props = crate::cloud::CloudProperties {
+        base_km: cloud_base_km,
+        top_km: cloud_top_km,
+        optical_depth: cloud_od,
+        ssa: cloud_ssa,
+        asymmetry: cloud_g,
+    };
+    let cloud_ext = cloud_od / cloud_thickness_m;
+    add_cloud_layer(&mut atm, &props, cloud_ext);
 
     atm
 }
@@ -531,12 +477,45 @@ fn add_cloud_layer(atm: &mut AtmosphereModel, cloud_props: &CloudProperties, clo
         let shell_thickness_km = shell_top_km - shell_base_km;
         let overlap_fraction = (overlap_top - overlap_base) / shell_thickness_km;
 
+        // ── Delta-Eddington similarity scaling of the cloud contribution ──
+        //
+        // Cloud droplet phase functions are extremely forward-peaked
+        // (HG g ~ 0.85). Light scattered into the forward peak is nearly
+        // indistinguishable from unscattered light, so the standard
+        // delta-Eddington transform (Joseph, Wiscombe & Weinman 1976)
+        // removes a forward delta of fraction f = g^2 analytically:
+        //
+        //   ext* = (1 - ssa*f) * ext
+        //   ssa* = (1 - f) * ssa / (1 - ssa*f)
+        //   g*   = g / (1 + g)
+        //
+        // Absorption is preserved exactly: (1-ssa*)ext* = (1-ssa)ext.
+        // For OD-10 stratus this gives an effective OD of ~2.8 with
+        // g* ~ 0.46 — physically equivalent transport that (a) lets the
+        // backward-MC chains actually diffuse through the layer instead
+        // of dying in a 10000-step forward-peak walk, and (b) makes the
+        // direct-beam transmittances (T_sun, t_obs) represent
+        // direct + forward-scattered light, which is what the eye sees.
+        // Without this, cloudy-sky radiance collapsed to e^-tau/mu ~ 1e-15
+        // and prayer times degenerated to sunrise.
+        let g_c = cloud_props.asymmetry;
+        let f_peak = g_c * g_c;
+        let de_scale = 1.0 - cloud_props.ssa * f_peak;
+        let ssa_c = ((1.0 - f_peak) * cloud_props.ssa / de_scale).clamp(0.0, 1.0);
+        let g_c_scaled = g_c / (1.0 + g_c);
+
+        // Record the delta-scaled cloud-only extinction for this shell and
+        // the scaled asymmetry so the LOS/shadow integrators can treat the
+        // cloud portion of a path with Eddington diffuse transmission.
+        atm.cloud_extinction[s] += cloud_ext * overlap_fraction * de_scale;
+        atm.cloud_g_scaled = g_c_scaled;
+
         for w in 0..atm.num_wavelengths {
             let existing = &atm.optics[s][w];
 
-            let c_ext = cloud_ext * overlap_fraction;
-            let c_scat = c_ext * cloud_props.ssa;
-            let c_abs = c_ext * (1.0 - cloud_props.ssa);
+            let c_ext = cloud_ext * overlap_fraction * de_scale;
+            let c_scat = c_ext * ssa_c;
+            let c_abs = c_ext * (1.0 - ssa_c);
 
             let existing_scat = existing.extinction * existing.ssa;
             let existing_ray_scat = existing_scat * existing.rayleigh_fraction;
@@ -554,8 +533,7 @@ fn add_cloud_layer(atm: &mut AtmosphereModel, cloud_props: &CloudProperties, clo
             };
 
             let new_g = if total_scat > 1e-30 {
-                (existing_nonray_scat * existing.asymmetry + c_scat * cloud_props.asymmetry)
-                    / total_scat
+                (existing_nonray_scat * existing.asymmetry + c_scat * g_c_scaled) / total_scat
             } else {
                 0.0
             };
@@ -1828,6 +1806,81 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn cloud_delta_eddington_preserves_absorption() {
+        // The delta-Eddington transform must preserve the absorption
+        // coefficient exactly: (1 - ssa*) ext* = (1 - ssa) ext.
+        // Compare a cloudy shell's absorption against clear sky + the
+        // unscaled cloud absorption.
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let props = twilight_data_cloud_props();
+        let cloudy = build_with_cloud_properties(AtmosphereType::UsStandard, 0.15, &props);
+        // find a shell fully inside the cloud (base 0.5 - top 1.5 km)
+        let mut checked = 0;
+        for s in 0..cloudy.num_shells {
+            let base_km =
+                (cloudy.shells[s].r_inner - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
+            let top_km =
+                (cloudy.shells[s].r_outer - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
+            if base_km >= props.base_km && top_km <= props.top_km {
+                let w = 17; // 550nm
+                let abs_cloudy = cloudy.optics[s][w].extinction * (1.0 - cloudy.optics[s][w].ssa);
+                let abs_clear = clear.optics[s][w].extinction * (1.0 - clear.optics[s][w].ssa);
+                let cloud_ext =
+                    props.optical_depth / ((props.top_km - props.base_km) * 1000.0);
+                let abs_cloud_unscaled = cloud_ext * (1.0 - props.ssa);
+                let expected = abs_clear + abs_cloud_unscaled;
+                assert!(
+                    (abs_cloudy - expected).abs() / expected < 1e-9,
+                    "absorption not preserved: shell {} got {:.6e}, expected {:.6e}",
+                    s,
+                    abs_cloudy,
+                    expected
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no shell fully inside the cloud layer");
+    }
+
+    #[test]
+    fn cloud_delta_eddington_reduces_effective_od() {
+        // For stratus (OD 10, ssa 0.999, g 0.85): scale = 1 - 0.999*0.7225
+        // ~ 0.278, so the in-cloud extinction added must be ~27.8% of the
+        // unscaled value, and the mixed g must be well below 0.85.
+        let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let props = twilight_data_cloud_props();
+        let cloudy = build_with_cloud_properties(AtmosphereType::UsStandard, 0.15, &props);
+        for s in 0..cloudy.num_shells {
+            let base_km =
+                (cloudy.shells[s].r_inner - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
+            let top_km =
+                (cloudy.shells[s].r_outer - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
+            if base_km >= props.base_km && top_km <= props.top_km {
+                let w = 17;
+                let added_ext = cloudy.optics[s][w].extinction - clear.optics[s][w].extinction;
+                let cloud_ext_unscaled =
+                    props.optical_depth / ((props.top_km - props.base_km) * 1000.0);
+                let ratio = added_ext / cloud_ext_unscaled;
+                assert!(
+                    (ratio - 0.278).abs() < 0.01,
+                    "delta-scaled extinction ratio = {:.3}, expected ~0.278",
+                    ratio
+                );
+                let g = cloudy.optics[s][w].asymmetry;
+                assert!(
+                    g < 0.5,
+                    "mixed asymmetry should use scaled g* ~ 0.46, got {}",
+                    g
+                );
+            }
+        }
+    }
+
+    fn twilight_data_cloud_props() -> crate::cloud::CloudProperties {
+        crate::cloud::default_properties(crate::cloud::CloudType::Stratus)
+    }
+
     #[test]
     fn clear_sky_populates_refractive_indices() {
         // Refraction must be ACTIVE in production atmospheres: surface

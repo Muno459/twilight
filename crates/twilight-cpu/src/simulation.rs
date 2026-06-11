@@ -379,6 +379,52 @@ mod tests {
         assert!(c.apply_solar_irradiance);
     }
 
+    // ── Cloud transport (regression for the OD-10 collapse) ──
+
+    /// Through an OD-10 stratus deck the twilight sky must remain visible:
+    /// the cloud portion of the eye/sun paths uses Eddington diffuse
+    /// transmission (delta-Eddington scaled), not Beer-Lambert. Before this,
+    /// radiance collapsed to ~e^-38 ~ 1e-15 and Fajr degenerated to sunrise.
+    #[test]
+    fn stratus_twilight_remains_visible_and_below_clear_sky() {
+        use twilight_data::cloud::{default_properties, CloudType};
+        let clear = make_clear_sky_atm();
+        let props = default_properties(CloudType::Stratus);
+        let cloudy = builder::build_with_cloud_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &props,
+        );
+        let config = SimulationConfig {
+            view_zenith: 85.0,
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 50,
+            polarized: false,
+            ..SimulationConfig::default()
+        };
+        let sza = 100.0;
+        let r_clear: f64 = simulate_at_sza(&clear, &config, sza).radiance.iter().sum();
+        let r_cloudy: f64 = simulate_at_sza(&cloudy, &config, sza).radiance.iter().sum();
+        assert!(
+            r_cloudy > 1e-9,
+            "cloudy twilight collapsed again: {:.3e} (was 1e-15 before the fix)",
+            r_cloudy
+        );
+        assert!(
+            r_cloudy < r_clear,
+            "an OD-10 deck must dim the sky: cloudy={:.3e} clear={:.3e}",
+            r_cloudy,
+            r_clear
+        );
+        // and the dimming should be a sane diffuse factor, not orders of magnitude
+        assert!(
+            r_cloudy > r_clear * 1e-4,
+            "dimming too extreme: cloudy={:.3e} clear={:.3e}",
+            r_cloudy,
+            r_clear
+        );
+    }
+
     // ── Phase-function orientation (regression for the supplement-angle bug) ──
 
     /// With a forward-peaked aerosol phase function (HG, g≈0.7), the sky

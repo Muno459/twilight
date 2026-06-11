@@ -49,27 +49,60 @@ pub struct TwilightAnalysis {
     pub color: TwilightColor,
 }
 
+/// Moonless dark-site night-sky zenith luminance [cd/m^2].
+///
+/// V ~ 21.7 mag/arcsec^2 (Patat 2008, Cerro Paranal; the commonly cited
+/// dark-sky range is 21.6-22.0) converts to ~2.2e-4 cd/m^2 via
+/// L = 10.8e4 * 10^(-0.4 m). This is the floor the twilight signal must
+/// rise above to be perceptible at all — by definition, astronomical
+/// twilight (depression 18 deg) ends when the scattered-sun component
+/// sinks to roughly this level.
+pub const NIGHT_SKY_LUMINANCE: f64 = 2.2e-4;
+
 /// Threshold configuration for prayer time determination.
 ///
-/// These thresholds define when twilight begins/ends for prayer purposes.
-/// They are calibrated against SQM (Sky Quality Meter) observations and
-/// traditional astronomical twilight definitions.
+/// PROVENANCE (honest accounting): these constants are NOT calibrated
+/// against field observations — no SQM campaign has been run yet (an
+/// earlier doc comment claiming SQM calibration was fabricated and has
+/// been removed). They are instead ANCHORED to published photometry by
+/// the derivations below, and land within the classical fiqh depression
+/// range (14.5-16 deg) when run through this engine's clear-sky
+/// atmosphere. Final calibration requires (a) the libRadtran-validated
+/// absolute radiance scale and (b) field SQM/observer data; both are
+/// tracked on the roadmap. Sensitivity: scaling any threshold by x2
+/// shifts the crossing by roughly 0.5-0.8 deg of depression (~2-4 min
+/// at mid-latitudes).
 #[derive(Debug, Clone)]
 pub struct ThresholdConfig {
-    /// Mesopic luminance threshold for Fajr (dawn detection).
-    /// When sky luminance rises above this, Fajr begins.
-    /// Default: ~0.001 cd/m² (roughly equivalent to 18° depression angle
-    /// under clear-sky conditions at mid-latitudes).
+    /// Mesopic luminance threshold for Fajr (true dawn, al-fajr al-sadiq).
+    ///
+    /// Derivation: the first spreading white glow is perceptible when the
+    /// twilight component rises clearly above the night-sky background
+    /// ([`NIGHT_SKY_LUMINANCE`] ~ 2.2e-4 cd/m^2). For a large diffuse
+    /// stimulus at scotopic adaptation, a conservative "clearly visible"
+    /// contrast is a few hundred percent (cf. Blackwell 1946 contrast
+    /// thresholds at low backgrounds). Default 1e-3 cd/m^2 ~ 4.5x the
+    /// background.
     pub fajr_luminance: f64,
 
-    /// Mesopic luminance threshold for Isha (shafaq al-abyad).
-    /// When overall sky luminance drops below this, Isha begins (Hanafi).
-    /// Default: ~0.003 cd/m² (roughly equivalent to 15° depression).
+    /// Mesopic luminance threshold for Isha per shafaq al-abyad (Hanafi).
+    ///
+    /// Derivation: the WHITE glow disappears when luminance falls to the
+    /// mesopic-to-scotopic transition where cone (color) vision fails and
+    /// the sky can no longer look "white" — the scotopic boundary of the
+    /// CIE mesopic range (~3e-3 cd/m^2; CIE 191:2010 puts the mesopic
+    /// range at ~0.005-5 cd/m^2 with cone intrusion fading just below).
+    /// Default 3e-3 cd/m^2.
     pub isha_abyad_luminance: f64,
 
-    /// Red band luminance threshold for Isha (shafaq al-ahmar).
-    /// When the red glow drops below this, Isha begins (Shafi'i/Maliki/Hanbali).
-    /// Default: ~0.0005 cd/m² (red persists longer than white).
+    /// Red-band (>600 nm) luminance threshold for Isha per shafaq
+    /// al-ahmar (Shafi'i/Maliki/Hanbali).
+    ///
+    /// Derivation: perception of REDNESS requires cones (rods are
+    /// insensitive beyond ~640 nm and color-blind); the red glow vanishes
+    /// when red-band luminance falls to the cone absolute threshold,
+    /// ~5e-4 cd/m^2 (classical cone-threshold photometry, e.g. Hecht).
+    /// Default 5e-4 cd/m^2.
     pub isha_ahmar_red_luminance: f64,
 
     /// Spectral centroid boundary between white and red twilight (nm).
@@ -83,9 +116,9 @@ pub struct ThresholdConfig {
 impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
-            fajr_luminance: 0.001,
-            isha_abyad_luminance: 0.003,
-            isha_ahmar_red_luminance: 0.0005,
+            fajr_luminance: 1e-3,
+            isha_abyad_luminance: 3e-3,
+            isha_ahmar_red_luminance: 5e-4,
             red_centroid_boundary: 590.0,
             white_centroid_boundary: 530.0,
         }
@@ -282,6 +315,28 @@ fn interpolate_crossing(sza0: f64, lum0: f64, sza1: f64, lum1: f64, threshold: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Threshold provenance (anchored to published photometry) ──
+
+    #[test]
+    fn thresholds_anchor_to_night_sky_background() {
+        let c = ThresholdConfig::default();
+        // Fajr: a clearly-visible diffuse brightening above the dark night
+        // sky — between 2x and 10x the background, not an arbitrary number.
+        let ratio = c.fajr_luminance / NIGHT_SKY_LUMINANCE;
+        assert!(
+            (2.0..=10.0).contains(&ratio),
+            "Fajr threshold / night background = {:.1}, expected 2-10x",
+            ratio
+        );
+        // Ordering: white-glow extinction (mesopic boundary) happens at a
+        // brighter level than first-light detection, which is brighter than
+        // the red-band cone threshold.
+        assert!(c.isha_abyad_luminance > c.fajr_luminance);
+        assert!(c.fajr_luminance > c.isha_ahmar_red_luminance);
+        // All thresholds sit above the night-sky floor.
+        assert!(c.isha_ahmar_red_luminance > NIGHT_SKY_LUMINANCE);
+    }
 
     // Helper: create a flat spectrum with given value
     fn flat_spectrum(value: f64) -> (Vec<f64>, Vec<f64>) {

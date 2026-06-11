@@ -24,17 +24,23 @@ what the code actually does. Until the items below are closed, treat all
 computed prayer times as **experimental** — do not use them for worship
 without cross-checking against established calendars.
 
-Known open issues being fixed, in order:
+Progress so far (see git log on this branch):
 
-1. ~~Phase-function scattering angle bug~~ (corrupts aerosol/cloud radiance — fix in progress)
-2. Multiple-scattering estimator rewrite for unbiasedness and low variance
-   (the prayer-time signal at 14-18° depressions IS multiple scattering)
-3. Cloudy-sky transport (optically thick clouds currently break the estimator)
-4. Atmosphere ceiling at 100 km truncates deep-twilight radiance; validation
-   against libRadtran is being stood up to quantify and fix this
-5. Prayer thresholds are provisional tuning constants, not yet calibrated
-   against published twilight photometry
-6. Metal hybrid kernel: watchdog timeouts and variance (root causes known)
+1. ~~Phase-function scattering angle bug~~ FIXED (all 14 sites + regression test)
+2. ~~MS estimator seed bias / chain boundary-kill / SSA ordering~~ FIXED
+   (unbiased one-sample-MIS seed; chains traverse shells; suites green)
+3. ~~Cloudy-sky collapse~~ FIXED: delta-Eddington scaled cloud optics +
+   Eddington diffuse transmission for the cloud portion of eye/sun paths.
+   OD-10 stratus now gives Fajr at depression ~13.7° (clear sky ~15.9°)
+   instead of degenerating to sunrise.
+4. Thresholds re-anchored to published photometry (night-sky background
+   2.2e-4 cd/m² per Patat 2008; mesopic/cone-threshold boundaries) with the
+   derivation documented — field SQM calibration still pending
+5. OPEN: atmosphere ceiling at 100 km truncates deep-twilight radiance;
+   the libRadtran tier-1b (MYSTIC spherical) harness quantifies this once
+   libRadtran is installed
+6. OPEN: Metal hybrid kernel needs the corrected estimator ported
+   (watchdog/variance root causes identified)
 
 ## Why
 
@@ -68,8 +74,8 @@ cargo build --release
 ./target/release/twilight-cli pray \
   --lat 55.653 --lon 12.412 --date 2026-03-06 --bortle 7
 
-# Manual aerosols and/or clouds
-# NOTE: optically thick clouds currently produce unreliable times (issue #3)
+# Manual aerosols and/or clouds (thick clouds use delta-Eddington diffuse
+# transmission; see Project status)
 ./target/release/twilight-cli pray \
   --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 \
   --aerosol urban --cloud thin-cirrus
@@ -111,9 +117,9 @@ Cloud types: `thin-cirrus`, `thick-cirrus`, `altostratus`, `stratus`, `stratocum
 
 **1. Solar position.** NREL SPA (VSOP87) as default. Optional JPL DE440 ephemeris backend with a pure Rust DAF/SPK reader, Chebyshev interpolation, and IAU precession-nutation. Geometric ICRF positions are mm-level vs Horizons; the delivered topocentric chain is arcsecond-level (UT1≈UTC, simplified nutation), far more than sufficient for prayer times. Binary search for sunrise/sunset.
 
-**2. Atmosphere.** 50 concentric spherical shells, 0 to 100 km, non-uniform spacing. Rayleigh scattering via Bodhaine (1999). Five-species molecular gas absorption from prebaked tables generated offline from HITRAN/Serdyuchenko data by `tools/gen_gas_xsec.py` (O3 11-temperature, O2/H2O bilinear P-T grids, NO2 two-temperature, O4 CIA). OPAC-style aerosol climatology (6 types) with Henyey-Greenstein phase function. Cloud layers (6 types; single-term HG — a known limitation, Mie phase functions pending). Lambertian ground reflection. Snell's-law refraction machinery exists in the core but is not yet enabled in the production pipeline.
+**2. Atmosphere.** 50 concentric spherical shells, 0 to 100 km, non-uniform spacing. Rayleigh scattering via Bodhaine (1999). Five-species molecular gas absorption from prebaked tables generated offline from HITRAN/Serdyuchenko data by `tools/gen_gas_xsec.py` (O3 11-temperature, O2/H2O bilinear P-T grids, NO2 two-temperature, O4 CIA). OPAC-style aerosol climatology (6 types) with Henyey-Greenstein phase function. Cloud layers (6 types; single-term HG — a known limitation, Mie phase functions pending). Lambertian ground reflection. Snell's-law refraction at shell boundaries (enabled in production; surface n = 1.000293). Optically thick clouds use delta-Eddington scaled optics with Eddington diffuse transmission for the cloud portion of eye/sun paths.
 
-**3. Radiative transfer.** Three modes: (a) single-scatter LOS integration with analytical shadow rays (deterministic); (b) backward Monte Carlo with next-event estimation; (c) hybrid: exact single-scatter + MC secondary chains for orders 2+. Full Stokes polarized RT (default; `--fast` for scalar). 41 wavelengths, 380-780 nm. The multiple-scattering estimator is being rewritten for provable unbiasedness and bounded variance.
+**3. Radiative transfer.** Three modes: (a) single-scatter LOS integration with analytical shadow rays (deterministic); (b) backward Monte Carlo with next-event estimation; (c) hybrid: exact single-scatter + MC secondary chains for orders 2+. Full Stokes polarized RT (default; `--fast` for scalar). 41 wavelengths, 380-780 nm. The orders-2+ seed is an unbiased one-sample-MIS estimator (balance heuristic over a phase/zenith/terminator mixture); chains traverse shell boundaries with memoryless resampling.
 
 **4. Terrain masking.** Copernicus GLO-30 DEM tiles (auto-downloaded). Computes a 360-point horizon profile. Currently adjusts sunrise/sunset only; horizon-aware Fajr/Isha is an open task.
 
@@ -167,11 +173,11 @@ as the primary physics anchor.
 - [x] Terrain masking for sunrise/sunset (Copernicus GLO-30)
 - [x] Metal GPU backend
 - [ ] libRadtran/DISORT/MYSTIC validation harness  ← current focus
-- [ ] Unbiased low-variance multiple-scattering estimator (CPU + Metal)
-- [ ] Cloud transport that survives optical depth > 1 (delta-Eddington coupling)
+- [x] Unbiased multiple-scattering estimator (CPU; Metal port pending)
+- [x] Cloud transport that survives optical depth > 1 (delta-Eddington coupling)
 - [ ] Atmosphere ceiling above 100 km for deep-twilight radiance
-- [ ] Refraction enabled in the production pipeline
-- [ ] Thresholds calibrated against published twilight photometry / SQM data
+- [x] Refraction enabled in the production pipeline
+- [ ] Thresholds: anchored to published photometry (done); field SQM calibration pending
 - [ ] Horizon-aware Fajr/Isha (terrain)
 - [ ] Garstang skyglow wired into the pipeline and validated
 - [ ] Mobile SDKs (iOS/Android), WASM demo

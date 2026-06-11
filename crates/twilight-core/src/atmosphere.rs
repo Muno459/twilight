@@ -80,6 +80,16 @@ pub struct AtmosphereModel {
     /// to the identity (no direction change), preserving backward
     /// compatibility with straight-line transport.
     pub refractive_index: [f64; MAX_SHELLS],
+    /// Cloud-only extinction per shell [1/m], delta-Eddington scaled,
+    /// broadband (cloud droplet extinction is nearly wavelength-independent
+    /// in the visible). Zero for shells without cloud. Used by the LOS and
+    /// shadow-ray integrators to treat the cloud portion of a path with
+    /// Eddington DIFFUSE transmission instead of Beer-Lambert direct
+    /// extinction — a diffusing layer transmits ~20-50%, not e^{-tau}.
+    pub cloud_extinction: [f64; MAX_SHELLS],
+    /// Delta-Eddington scaled asymmetry parameter g* of the cloud phase
+    /// function (g* = g/(1+g)); 0.0 when no cloud is present.
+    pub cloud_g_scaled: f64,
 }
 
 impl AtmosphereModel {
@@ -95,6 +105,8 @@ impl AtmosphereModel {
                 thickness: 0.0,
             }; MAX_SHELLS],
             optics: [[ShellOptics::default(); MAX_WAVELENGTHS]; MAX_SHELLS],
+            cloud_extinction: [0.0; MAX_SHELLS],
+            cloud_g_scaled: 0.0,
             num_shells: 0,
             wavelengths_nm: [0.0; MAX_WAVELENGTHS],
             num_wavelengths: 0,
@@ -169,6 +181,30 @@ impl AtmosphereModel {
             let h = self.shells[s].altitude_mid;
             self.refractive_index[s] = 1.0 + 0.000293 * libm::exp(-h / 8500.0);
         }
+    }
+
+    /// Eddington diffuse transmittance of an accumulated cloud optical
+    /// depth along a path:
+    ///
+    ///   T_diff = 1 / (1 + (3/4) * tau_cloud * (1 - g*))
+    ///
+    /// (two-stream/Eddington solution for a conservatively scattering
+    /// layer; van de Hulst 1980). `tau_cloud` must be the DELTA-SCALED
+    /// cloud optical depth accumulated along the (slant) path. Returns 1.0
+    /// when no cloud was crossed.
+    ///
+    /// Used to replace Beer-Lambert e^{-tau} for the cloud portion of LOS
+    /// and shadow-ray transmittances: through a diffusing layer the eye
+    /// (and the twilight sky illumination) receives multiply-forward-
+    /// scattered light, which exponential extinction misrepresents by
+    /// orders of magnitude (OD-10 stratus: e^{-10.8} ~ 2e-5 vs the
+    /// physical ~0.19).
+    #[inline]
+    pub fn cloud_diffuse_transmittance(&self, tau_cloud: f64) -> f64 {
+        if tau_cloud <= 0.0 {
+            return 1.0;
+        }
+        1.0 / (1.0 + 0.75 * tau_cloud * (1.0 - self.cloud_g_scaled))
     }
 
     /// Get shell index for a given radius from Earth center.
