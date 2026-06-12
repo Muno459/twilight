@@ -262,21 +262,22 @@ Treat computed times as **experimental for worship**; cross-check against
 established local calendars. Known limits, stated plainly:
 
 - **No field calibration of this engine's own output yet.** The criterion
-  is calibrated against published campaigns; an SQM and observer campaign
-  validating this engine end-to-end at its own sites is the most important
-  open task.
+  is calibrated against published campaigns. The measurement apparatus now
+  ships with the engine (`twilight-cli sqm predict|compare` and the
+  campaign protocol in docs/SQM_CAMPAIGN.md); what remains is a meter on a
+  roof and clear nights.
 - **Transport is 1D-spherical.** The 3D cloud field is measured in 3D but
   transported as horizontally uniform layers sampled along the sunlight's
   path. Cloud internal scattering is closed-form two-stream, not
   path-traced.
-- **Absolute radiance is validated shape-only**, and external validation
-  stops at SZA 95° while the events live at 99 to 108°. The khayt criterion
-  is a ratio and cancels most of this; the legacy absolute method does not.
+- **External transport validation reaches SZA ~98-100** (the absolute
+  radiometric scale is proven to 1-2.5% at SZA 60-85; MYSTIC backward-mode
+  agreement extends to ~100°), while the events live at 99 to 108°. The
+  khayt criterion is a ratio and cancels most residual scale risk; deeper
+  reference comparison is compute-limited on the reference side.
 - **Shafaq al-ahmar** rests on the weakest observational dataset (no
   color-resolved modern campaign exists); the evening calibration leans on
   instrumental rather than panel data.
-- Terrain masking applies to sunrise and sunset, not yet to the dawn
-  band itself.
 
 ## Reproduce the validation
 
