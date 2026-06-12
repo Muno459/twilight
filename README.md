@@ -275,10 +275,6 @@ established local calendars. Known limits, stated plainly:
 - **Shafaq al-ahmar** rests on the weakest observational dataset (no
   color-resolved modern campaign exists); the evening calibration leans on
   instrumental rather than panel data.
-- **Fiqh semantics are the user's.** Under clouds the engine reports what
-  is detectable tonight; most fiqh defines the times by what would be
-  visible absent obstruction (clear-sky runs give that). Rulings belong to
-  the people of knowledge, not to this engine.
 - Terrain masking applies to sunrise and sunset, not yet to the dawn
   band itself.
 
