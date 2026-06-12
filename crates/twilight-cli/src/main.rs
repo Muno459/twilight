@@ -1275,7 +1275,25 @@ fn cmd_pray(
             };
             match twilight_weather::cloud3d::load(&json_path) {
                 Ok(p) => {
-                    let layers = p.to_cloud_layers(None);
+                    // cloud3d gives the vertical STRUCTURE; the NRT MODIS
+                    // COT (when the satellite measured one here, cached
+                    // from the weather step) gives the AMPLITUDE.
+                    let measured_cot = {
+                        let cache = std::path::Path::new(&dem_dir)
+                            .parent()
+                            .map(|p| p.join("satellite"))
+                            .unwrap_or_else(|| std::path::PathBuf::from("data/satellite"));
+                        twilight_weather::satellite::sample_cloud(&cache, &date_iso, lat, lon)
+                            .map(|s| s.cot)
+                            .filter(|&c| c > 0.5)
+                    };
+                    let layers = p.to_cloud_layers(measured_cot);
+                    if measured_cot.is_some() && !layers.is_empty() {
+                        println!(
+                            "Cloud3D:    amplitude rescaled to measured MODIS COT {:.1}",
+                            measured_cot.unwrap()
+                        );
+                    }
                     if layers.is_empty() {
                         println!(
                             "Cloud3D:    {} {} — clear column (window cloud fraction {:.0}%)",
@@ -1390,26 +1408,101 @@ fn cmd_pray(
         } else if let Some(b) = bortle {
             twilight_skyglow::bortle::bortle_to_radiance(b)
         } else {
-            // SATELLITE AUTO MODE: look up the VIIRS-derived Lorenz light-
-            // pollution atlas (propagated artificial zenith brightness) for
-            // this exact location — measured data instead of a guess.
+            // SATELLITE AUTO MODE — two independent satellite feeds:
+            //  1. Lorenz atlas: PROPAGATED artificial zenith brightness
+            //     (the right observable), frozen at its 2024 epoch.
+            //  2. VIIRS Black Marble (GIBS, daily): CURRENT upward
+            //     nighttime-lights radiance, moonlight-removed and
+            //     BRDF-corrected. Same sensor at both epochs gives a
+            //     temporal ratio that brings the atlas to today; where
+            //     the atlas has no data, the live DNB stands alone.
             let cache = std::path::Path::new(&dem_dir)
                 .parent()
                 .map(|p| p.join("skyglow"))
                 .unwrap_or_else(|| std::path::PathBuf::from("data/skyglow"));
-            match twilight_skyglow::atlas::artificial_zenith(&cache, lat, lon) {
+            let atlas = twilight_skyglow::atlas::artificial_zenith(&cache, lat, lon);
+            let today = (year, month as u32, day as u32);
+            match atlas {
                 Some(a) => {
-                    println!(
-                        "Skyglow:    satellite atlas {} -> artificial zenith {:.3} mcd/m^2",
-                        a.year, a.zenith_mcd
-                    );
-                    twilight_skyglow::bortle::zenith_luminance_to_radiance(a.zenith_mcd)
+                    let mut mcd = a.zenith_mcd;
+                    match twilight_skyglow::dnb::epoch_ratio(&cache, lat, lon, today, a.year as i32)
+                    {
+                        Some((ratio, now, epoch_nw)) => {
+                            mcd *= ratio;
+                            println!(
+                                "Skyglow:    satellite atlas {} {:.3} mcd/m^2 x DNB trend {:.2} \
+                                 ({:.1} nW now vs {:.1} nW {}) -> {:.3} mcd/m^2",
+                                a.year, a.zenith_mcd, ratio, now.radiance_nw, epoch_nw, a.year, mcd
+                            );
+                        }
+                        None => {
+                            // No same-sensor data at the atlas epoch (the
+                            // GapFilled layers reach back ~1 year). Fall
+                            // back to a ONE-SIDED live cross-check: a
+                            // bright local pixel proves new lights the
+                            // 2024 atlas missed (raise to the DNB-implied
+                            // floor) — but a dim local pixel proves
+                            // nothing, because the atlas value is
+                            // PROPAGATED sky brightness that may come
+                            // from a metro tens of km away (Brondby's sky
+                            // is lit by central Copenhagen, not its own
+                            // pixel). Never darken from a point sample.
+                            let atlas_nw =
+                                twilight_skyglow::bortle::zenith_luminance_to_radiance(mcd);
+                            match twilight_skyglow::dnb::measure(&cache, lat, lon, today, 1) {
+                                Some(s) if s.radiance_nw > 0.05 => {
+                                    let r = s.radiance_nw / atlas_nw.max(1e-6);
+                                    if r > 3.0 {
+                                        mcd = twilight_skyglow::bortle::radiance_to_zenith_luminance(
+                                            s.radiance_nw,
+                                        );
+                                        println!(
+                                            "Skyglow:    atlas {} {:.3} mcd/m^2 raised by live \
+                                             DNB {:.1} nW ({:.1}x brighter than atlas-implied) \
+                                             -> {:.3} mcd/m^2",
+                                            a.year, a.zenith_mcd, s.radiance_nw, r, mcd
+                                        );
+                                    } else {
+                                        println!(
+                                            "Skyglow:    satellite atlas {} {:.3} mcd/m^2 \
+                                             (live DNB cross-check: {:.1} nW local vs {:.1} nW \
+                                             implied — consistent)",
+                                            a.year, a.zenith_mcd, s.radiance_nw, atlas_nw
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    println!(
+                                        "Skyglow:    satellite atlas {} -> artificial zenith \
+                                         {:.3} mcd/m^2 (no live DNB here)",
+                                        a.year, a.zenith_mcd
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    twilight_skyglow::bortle::zenith_luminance_to_radiance(mcd)
                 }
                 None => {
-                    eprintln!(
-                        "Note: light-pollution atlas unavailable here; using Bortle 5 default."
-                    );
-                    twilight_skyglow::bortle::bortle_to_radiance(5)
+                    // Atlas gap: live Black Marble alone.
+                    match twilight_skyglow::dnb::measure(&cache, lat, lon, today, 1) {
+                        Some(s) => {
+                            println!(
+                                "Skyglow:    live VIIRS Black Marble {:.1} nW/cm^2/sr \
+                                 (median of {} nights, {})",
+                                s.radiance_nw,
+                                s.dates_used.len(),
+                                s.layer
+                            );
+                            s.radiance_nw
+                        }
+                        None => {
+                            eprintln!(
+                                "Note: no satellite skyglow data here; using Bortle 5 default."
+                            );
+                            twilight_skyglow::bortle::bortle_to_radiance(5)
+                        }
+                    }
                 }
             }
         };

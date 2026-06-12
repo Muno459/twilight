@@ -22,6 +22,7 @@ pub mod cloud3d;
 pub mod f107;
 pub mod mapping;
 pub mod satellite;
+pub mod satellite_colormaps;
 
 use twilight_data::aerosol::AerosolProperties;
 use twilight_data::cloud::CloudProperties;

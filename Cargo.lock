@@ -1298,6 +1298,7 @@ name = "twilight-skyglow"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "png 0.17.16",
  "twilight-core",
  "twilight-data",
  "ureq",

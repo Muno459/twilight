@@ -8,6 +8,7 @@ description = "Light pollution skyglow model for twilight prayer times"
 
 [dependencies]
 ureq = "3"
+png = "0.17"
 flate2 = "1"
 twilight-core = { workspace = true }
 twilight-data = { workspace = true }

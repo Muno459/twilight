@@ -219,13 +219,30 @@ pub fn map_cloud_satellite(
     let top_km = (top_m / 1000.0).clamp(0.4, 14.0);
     let base_km = (top_km - thickness_m / 1000.0).max(0.15);
 
-    // Droplet properties by measured top height (phase proxy).
-    let (ssa, g) = if top_km > 6.0 {
-        (0.9995, 0.77) // ice cirrus-like
-    } else if top_km > 2.5 {
-        (0.999, 0.82) // mixed/alto
-    } else {
-        (0.999, 0.85) // warm stratiform
+    // Particle optics: MEASURED effective radius (MODIS microphysics
+    // feed) decides phase when available — droplets retrieve at
+    // ~5-20 um, ice crystals at ~20-60 um (Platnick et al. 2017) —
+    // with the measured top height as fallback proxy.
+    let r_eff = sat.observer.and_then(|s| s.r_eff_um);
+    let (ssa, g) = match r_eff {
+        Some(re) if re >= 25.0 => (0.9995, 0.77), // large crystals: ice
+        Some(re) if re <= 18.0 => {
+            if top_km > 2.5 {
+                (0.999, 0.82) // small droplets aloft: alto/mixed optics
+            } else {
+                (0.999, 0.85) // warm stratiform droplets
+            }
+        }
+        _ => {
+            // No/ambiguous microphysics: height proxy as before.
+            if top_km > 6.0 {
+                (0.9995, 0.77)
+            } else if top_km > 2.5 {
+                (0.999, 0.82)
+            } else {
+                (0.999, 0.85)
+            }
+        }
     };
 
     Some(CloudProperties {
@@ -399,6 +416,8 @@ mod tests {
             observer: Some(SatelliteCloud {
                 cot: 12.0,
                 cloud_top_m: Some(1800.0),
+                cwp_g_m2: None,
+                r_eff_um: None,
                 age_days: 0,
             }),
             path_mean_cot: 10.0,
@@ -414,12 +433,51 @@ mod tests {
     }
 
     #[test]
+    fn measured_r_eff_overrides_height_proxy() {
+        use crate::satellite::{SatelliteCloud, SatelliteCloudPath};
+        // Large crystals at LOW altitude (e.g. glaciated deck remnant):
+        // the measured microphysics must win over the height proxy.
+        let sat = SatelliteCloudPath {
+            observer: Some(SatelliteCloud {
+                cot: 5.0,
+                cloud_top_m: Some(2000.0),
+                cwp_g_m2: Some(100.0),
+                r_eff_um: Some(30.0),
+                age_days: 0,
+            }),
+            path_mean_cot: 0.0,
+            path_cloud_fraction: 0.0,
+            n_path_samples: 4,
+        };
+        let c = map_cloud_satellite(&sat).unwrap();
+        assert!((c.asymmetry - 0.77).abs() < 1e-9, "measured ice r_eff -> ice g");
+    }
+
+    #[test]
+    fn microphysics_tau_from_cwp_and_reff() {
+        use crate::satellite::SatelliteCloud;
+        let s = SatelliteCloud {
+            cot: 0.0,
+            cloud_top_m: None,
+            cwp_g_m2: Some(100.0),
+            r_eff_um: Some(10.0),
+            age_days: 0,
+        };
+        // tau = 1.5 * 100 / 10 = 15 (classic LWP-100 stratus)
+        assert!((s.microphysics_tau().unwrap() - 15.0).abs() < 1e-9);
+        let none = SatelliteCloud { r_eff_um: None, ..s };
+        assert!(none.microphysics_tau().is_none());
+    }
+
+    #[test]
     fn satellite_high_cloud_gets_ice_properties() {
         use crate::satellite::{SatelliteCloud, SatelliteCloudPath};
         let sat = SatelliteCloudPath {
             observer: Some(SatelliteCloud {
                 cot: 2.0,
                 cloud_top_m: Some(9500.0),
+                cwp_g_m2: None,
+                r_eff_um: None,
                 age_days: 0,
             }),
             path_mean_cot: 0.0,

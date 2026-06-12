@@ -29,6 +29,8 @@
 pub mod angular;
 pub mod atlas;
 pub mod bortle;
+pub mod dnb;
+pub mod dnb_colormap;
 pub mod garstang;
 pub mod spectrum;
 

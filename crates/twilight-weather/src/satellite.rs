@@ -22,8 +22,19 @@ use std::path::{Path, PathBuf};
 const GIBS_BASE: &str = "https://gibs.earthdata.nasa.gov/wmts/epsg4326/best";
 const COT_LAYER: &str = "MODIS_Aqua_Cloud_Optical_Thickness";
 const CTH_LAYER: &str = "MODIS_Aqua_Cloud_Top_Height_Day";
+/// Cloud water path [g/m^2] and particle effective radius [um] — the
+/// MICROPHYSICS feeds (current through today on GIBS). r_eff types the
+/// cloud (droplets ~5-20 um = water; large crystals 20-60 um = ice) and
+/// CWP/r_eff yields an independent optical depth (tau = 3 CWP / 2 rho
+/// r_eff) that fills pixels where the COT retrieval is missing.
+const CWP_LAYER: &str = "MODIS_Aqua_Cloud_Water_Path";
+const REFF_LAYER: &str = "MODIS_Aqua_Cloud_Effective_Radius";
 const TILE_LEVEL: u32 = 5;
 const TILE_DEG: f64 = 9.0;
+/// The microphysics layers publish on the finer "1km" TileMatrixSet
+/// (level 6: 80x40 tiles, 4.5 deg/tile).
+const TILE_LEVEL_1KM: u32 = 6;
+const TILE_DEG_1KM: f64 = 4.5;
 const TILE_PX: u32 = 512;
 const REQUEST_TIMEOUT_MS: u64 = 15_000;
 
@@ -537,8 +548,25 @@ pub struct SatelliteCloud {
     pub cot: f64,
     /// Cloud top height [m], when the CTH product has data here.
     pub cloud_top_m: Option<f64>,
+    /// Cloud water path [g/m^2] (liquid or ice, per the retrieval phase).
+    pub cwp_g_m2: Option<f64>,
+    /// Particle effective radius [um] — measured microphysics: ~5-20 um
+    /// means liquid droplets, larger means ice crystals.
+    pub r_eff_um: Option<f64>,
     /// Age of the product in days (0 = today's overpass).
     pub age_days: u32,
+}
+
+impl SatelliteCloud {
+    /// Optical depth derived from the microphysics pair:
+    /// tau = 3 CWP / (2 rho_w r_eff) = 1.5 CWP[g/m^2] / r_eff[um]
+    /// (geometric-optics extinction efficiency ~2; rho_w = 1e6 g/m^3).
+    pub fn microphysics_tau(&self) -> Option<f64> {
+        match (self.cwp_g_m2, self.r_eff_um) {
+            (Some(cwp), Some(re)) if re > 1.0 => Some(1.5 * cwp / re),
+            _ => None,
+        }
+    }
 }
 
 /// Observer + sunward-path composite (the "2.5D" sample).
@@ -555,13 +583,19 @@ pub struct SatelliteCloudPath {
 }
 
 fn tile_for(lat: f64, lon: f64) -> (u32, u32, u32, u32) {
+    tile_for_grid(lat, lon, TILE_DEG)
+}
+
+fn tile_for_grid(lat: f64, lon: f64, tile_deg: f64) -> (u32, u32, u32, u32) {
     let lon = lon.rem_euclid(360.0);
     let lon = if lon > 180.0 { lon - 360.0 } else { lon };
-    let col = (((lon + 180.0) / TILE_DEG).floor() as i64).clamp(0, 39) as u32;
-    let row = (((90.0 - lat) / TILE_DEG).floor() as i64).clamp(0, 19) as u32;
-    let px = ((((lon + 180.0) % TILE_DEG) / TILE_DEG * TILE_PX as f64) as i64)
+    let max_col = (360.0 / tile_deg) as i64 - 1;
+    let max_row = (180.0 / tile_deg) as i64 - 1;
+    let col = (((lon + 180.0) / tile_deg).floor() as i64).clamp(0, max_col) as u32;
+    let row = (((90.0 - lat) / tile_deg).floor() as i64).clamp(0, max_row) as u32;
+    let px = ((((lon + 180.0) % tile_deg) / tile_deg * TILE_PX as f64) as i64)
         .clamp(0, TILE_PX as i64 - 1) as u32;
-    let py = ((((90.0 - lat) % TILE_DEG) / TILE_DEG * TILE_PX as f64) as i64)
+    let py = ((((90.0 - lat) % tile_deg) / tile_deg * TILE_PX as f64) as i64)
         .clamp(0, TILE_PX as i64 - 1) as u32;
     (row, col, px, py)
 }
@@ -583,9 +617,13 @@ fn fetch_tile(
             return Ok(bytes);
         }
     }
-    let url = format!(
-        "{GIBS_BASE}/{layer}/default/{date}/2km/{TILE_LEVEL}/{row}/{col}.png"
-    );
+    // The microphysics layers live on the finer 1km TileMatrixSet.
+    let (tms, level) = if layer == CWP_LAYER || layer == REFF_LAYER {
+        ("1km", TILE_LEVEL_1KM)
+    } else {
+        ("2km", TILE_LEVEL)
+    };
+    let url = format!("{GIBS_BASE}/{layer}/default/{date}/{tms}/{level}/{row}/{col}.png");
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)))
         .build()
@@ -643,6 +681,16 @@ fn lut_lookup(lut: &[(u8, u8, u8, f32)], r: u8, g: u8, b: u8) -> Option<f64> {
     best.and_then(|(d, v)| if d <= 12 { Some(v as f64) } else { None })
 }
 
+/// Outcome of sampling one layer pixel — distinguishes "this pixel is
+/// clear" from "this date's tile has no data at all" (GIBS serves a fully
+/// transparent tile before the daily product is ingested; conflating the
+/// two froze the date-fallback loop on the empty tile).
+enum LayerSample {
+    Value(f64),
+    ClearPixel,
+    EmptyTile,
+}
+
 fn sample_layer(
     cache_dir: &Path,
     layer: &str,
@@ -650,19 +698,50 @@ fn sample_layer(
     date: &str,
     lat: f64,
     lon: f64,
-) -> Result<Option<f64>, String> {
-    let (row, col, px, py) = tile_for(lat, lon);
+) -> Result<LayerSample, String> {
+    let tile_deg = if layer == CWP_LAYER || layer == REFF_LAYER {
+        TILE_DEG_1KM
+    } else {
+        TILE_DEG
+    };
+    let (row, col, px, py) = tile_for_grid(lat, lon, tile_deg);
     let bytes = fetch_tile(cache_dir, layer, date, row, col)?;
     let (rgba, w, _h) = decode_png(&bytes)?;
     let idx = ((py * w + px) * 4) as usize;
     if idx + 3 >= rgba.len() {
-        return Ok(None);
+        return Ok(LayerSample::EmptyTile);
     }
     let (r, g, b, a) = (rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]);
     if a == 0 {
-        return Ok(None); // transparent = no cloud / no data
+        // Transparent at our pixel: clear sky only if the tile carries
+        // data SOMEWHERE; a tile with no opaque pixel at all has simply
+        // not been ingested for this date yet.
+        let any_data = rgba.chunks_exact(4).any(|c| c[3] != 0);
+        return Ok(if any_data {
+            LayerSample::ClearPixel
+        } else {
+            LayerSample::EmptyTile
+        });
     }
-    Ok(lut_lookup(lut, r, g, b))
+    Ok(match lut_lookup(lut, r, g, b) {
+        Some(v) => LayerSample::Value(v),
+        None => LayerSample::ClearPixel,
+    })
+}
+
+/// Convenience: value-or-None for secondary layers (CTH, CWP, r_eff).
+fn sample_value(
+    cache_dir: &Path,
+    layer: &str,
+    lut: &[(u8, u8, u8, f32)],
+    date: &str,
+    lat: f64,
+    lon: f64,
+) -> Option<f64> {
+    match sample_layer(cache_dir, layer, lut, date, lat, lon) {
+        Ok(LayerSample::Value(v)) => Some(v),
+        _ => None,
+    }
 }
 
 fn date_minus(date: &str, days: u32) -> Option<String> {
@@ -711,19 +790,34 @@ pub fn sample_cloud(
         } else {
             date_minus(date, age)?
         };
-        match sample_layer(cache_dir, COT_LAYER, &COT_COLORMAP, &d, lat, lon) {
-            Ok(Some(cot)) => {
-                let cth = sample_layer(cache_dir, CTH_LAYER, &CTH_COLORMAP_M, &d, lat, lon)
-                    .ok()
-                    .flatten();
-                return Some(SatelliteCloud {
-                    cot,
-                    cloud_top_m: cth,
-                    age_days: age,
-                });
+        let attach = |cot: f64| -> SatelliteCloud {
+            use crate::satellite_colormaps::{CWP_COLORMAP, REFF_COLORMAP};
+            let cth = sample_value(cache_dir, CTH_LAYER, &CTH_COLORMAP_M, &d, lat, lon);
+            let cwp = sample_value(cache_dir, CWP_LAYER, &CWP_COLORMAP, &d, lat, lon);
+            let reff = sample_value(cache_dir, REFF_LAYER, &REFF_COLORMAP, &d, lat, lon);
+            SatelliteCloud {
+                cot,
+                cloud_top_m: cth,
+                cwp_g_m2: cwp,
+                r_eff_um: reff,
+                age_days: age,
             }
-            Ok(None) => return None, // valid tile, clear sky here
-            Err(_) => continue,      // tile missing for this date; try older
+        };
+        match sample_layer(cache_dir, COT_LAYER, &COT_COLORMAP, &d, lat, lon) {
+            Ok(LayerSample::Value(cot)) => return Some(attach(cot)),
+            Ok(LayerSample::ClearPixel) => {
+                // COT clear/missing at this pixel — the microphysics pair
+                // can still measure the cloud (PCL pixels have CWP+r_eff
+                // but no COT). Derive tau from them before declaring clear.
+                let s = attach(0.0);
+                if let Some(tau) = s.microphysics_tau() {
+                    if tau > 0.1 {
+                        return Some(SatelliteCloud { cot: tau, ..s });
+                    }
+                }
+                return None; // genuinely clear at this pixel
+            }
+            Ok(LayerSample::EmptyTile) | Err(_) => continue, // not ingested; try older
         }
     }
     None
