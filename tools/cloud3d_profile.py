@@ -161,14 +161,17 @@ def iwc_from_output(y):
 
 
 def render_3d(png_path, iwc, heights, km_e, km_s, jc_w, ic_w,
-              texture=None, place="", scan_label="", azimuth=None):
+              texture=None, place="", scan_label="", azimuth=None,
+              figsize=(18, 11)):
     """True 3D view of the reconstructed cloud volume: marching-cubes
-    isosurfaces of IWC (outer envelope + dense core) standing on the
-    actual satellite image as the ground plane. Z axis = altitude.
+    isosurfaces of IWC standing on the actual satellite image as the
+    ground plane. Z axis = altitude. The cloud envelope is colored by
+    altitude; the dense core is drawn solid white.
 
-    texture: 2D grayscale [0,1] in the window's row/col orientation
-    (rows north->south), e.g. visible reflectance by day, inverted
-    IR brightness temperature by night.
+    texture: in the window's row/col orientation (rows north->south,
+    the GOES convention — SEVIRI callers must pre-flip): either
+    grayscale [H,W] in [0,1] or RGB [H,W,3] (e.g. the SEVIRI natural
+    color composite by day).
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -176,8 +179,9 @@ def render_3d(png_path, iwc, heights, km_e, km_s, jc_w, ic_w,
     from scipy.ndimage import gaussian_filter
     from skimage.measure import marching_cubes
 
-    # Orient volume to (z up, y north, x east); index 0 of iwc is the TOP.
-    vol = iwc[::-1, ::-1, :]  # z ascending, rows ascending northward
+    # Orient volume to (z up, y north, x east); index 0 of iwc is the TOP
+    # and rows run north->south, so flip both.
+    vol = iwc[::-1, ::-1, :]
     vol = gaussian_filter(vol, sigma=0.7)
     nz, ny, nx = vol.shape
     dz_km = (heights[0] - heights[-1]) / (len(heights) - 1) / 1000.0
@@ -188,51 +192,74 @@ def render_3d(png_path, iwc, heights, km_e, km_s, jc_w, ic_w,
     x_obs = ic_w * km_e
     x_ext, y_ext = nx * km_e, ny * km_s
 
-    fig = plt.figure(figsize=(13, 9))
-    ax = fig.add_subplot(111, projection="3d")
+    fig = plt.figure(figsize=figsize)
+    # computed_zorder=False: mplot3d sorts whole collections by mean
+    # depth, which paints the huge ground plane OVER the cloud meshes.
+    # Explicit paint order (ground -> dense core -> translucent envelope
+    # -> markers) is geometrically correct: clouds are above z=0
+    # everywhere and the camera looks down from elev ~26 deg.
+    ax = fig.add_subplot(111, projection="3d", computed_zorder=False)
     ax.set_facecolor("white")
 
     # ── Ground plane: the real satellite image ──
     if texture is not None:
-        tex = np.clip(texture[::-1, :], 0.0, 1.0)  # rows -> north ascending
-        step = 2  # 64x64 quads is plenty for a backdrop
+        tex = np.asarray(texture, dtype=float)[::-1]
+        # Beyond-the-limb / missing pixels: blend to paper white, not black.
+        tex = np.where(np.isfinite(tex), tex, 0.97)
+        tex = np.clip(tex, 0.0, 1.0)
+        step = max(1, ny // 110)  # cap backdrop mesh at ~110x110 quads
         t = tex[::step, ::step]
         yy = (np.arange(0, ny, step) * km_s) - y_obs
         xx = (np.arange(0, nx, step) * km_e) - x_obs
         xg, yg = np.meshgrid(xx, yy)
-        rgb = plt.cm.gray(0.15 + 0.75 * t)
-        ax.plot_surface(xg, yg, np.zeros_like(xg), facecolors=rgb,
+        if t.ndim == 3:
+            rgba = np.concatenate([t, np.ones((*t.shape[:2], 1))], axis=-1)
+        else:
+            rgba = plt.cm.gray(0.15 + 0.75 * t)
+        ax.plot_surface(xg, yg, np.zeros_like(xg), facecolors=rgba,
                         rstride=1, cstride=1, shade=False,
                         linewidth=0, antialiased=False, zorder=1)
 
-    # ── Cloud isosurfaces ──
-    levels = [
-        (max(8e-4, 0.01 * vmax), "#e3ecf5", 0.35),  # envelope (thin ice)
-        (max(1.0e-2, 0.20 * vmax), "#9fb4cd", 0.90),  # dense core
-    ]
+    # ── Cloud isosurfaces (dense core first, translucent envelope over) ──
     drew = 0
-    for level, color, alpha in levels:
-        if level >= vmax:
-            continue
+    env_level = max(8e-4, 0.01 * vmax)
+    core_level = max(1.0e-2, 0.20 * vmax)
+    if core_level < vmax:
         verts, faces, _, _ = marching_cubes(
-            vol, level=level, spacing=(dz_km, km_s, km_e), step_size=1)
+            vol, level=core_level, spacing=(dz_km, km_s, km_e), step_size=1)
         ax.plot_trisurf(verts[:, 2] - x_obs, verts[:, 1] - y_obs, faces,
-                        verts[:, 0], color=color, alpha=alpha,
-                        linewidth=0, antialiased=False, shade=True)
+                        verts[:, 0], color="white", alpha=0.95,
+                        linewidth=0, antialiased=False, shade=True,
+                        zorder=4)
+        drew += 1
+    if env_level < vmax:
+        verts, faces, _, _ = marching_cubes(
+            vol, level=env_level, spacing=(dz_km, km_s, km_e), step_size=1)
+        # Envelope colored by ALTITUDE (the Z information, visibly).
+        surf = ax.plot_trisurf(verts[:, 2] - x_obs, verts[:, 1] - y_obs,
+                               faces, verts[:, 0], cmap="cool",
+                               alpha=0.45, linewidth=0, antialiased=False,
+                               zorder=5)
+        surf.set_clim(0.0, 14.0)
+        cb = fig.colorbar(surf, ax=ax, shrink=0.45, pad=0.02)
+        cb.set_label("cloud altitude [km]")
+        cb.solids.set_alpha(1.0)
         drew += 1
 
     # Observer + sun direction on the ground.
-    ax.scatter([0], [0], [0.3], color="red", marker="*", s=180,
-               depthshade=False, zorder=10)
+    ax.scatter([0], [0], [0.4], color="red", marker="*", s=320,
+               edgecolor="white", depthshade=False, zorder=11)
+    ax.text(0, -0.03 * y_ext, 0.8, place.split(",")[0], color="red",
+            fontsize=13, fontweight="bold", zorder=11)
     if azimuth is not None:
         az = math.radians(azimuth)
-        L = 0.35 * max(x_ext, y_ext) / 2
-        ax.plot([0, L * math.sin(az)], [0, L * math.cos(az)], [0.3, 0.3],
-                color="orangered", linewidth=2.5)
-        ax.text(L * math.sin(az), L * math.cos(az), 8.0, "to sun",
-                color="orangered", fontsize=11)
+        L = 0.30 * max(x_ext, y_ext) / 2
+        ax.plot([0, L * math.sin(az)], [0, L * math.cos(az)], [0.4, 0.4],
+                color="orangered", linewidth=3, zorder=10)
+        ax.text(L * math.sin(az), L * math.cos(az), 6.0, "to sun",
+                color="orangered", fontsize=12, zorder=10)
 
-    z_disp = 0.33 * max(x_ext, y_ext)
+    z_disp = 0.30 * max(x_ext, y_ext)
     ax.set_box_aspect((x_ext, y_ext, z_disp))
     ax.set_zlim(0, 16)
     ax.set_xlim(0 - x_obs, nx * km_e - x_obs)
@@ -244,11 +271,11 @@ def render_3d(png_path, iwc, heights, km_e, km_s, jc_w, ic_w,
     vexag = z_disp / 16.0
     ax.set_title(
         f"cloud3d — 3D cloud reconstruction over {place}\n"
-        f"{scan_label} · isosurfaces of ice water content · "
+        f"{scan_label} · isosurface envelope colored by altitude, dense core white · "
         f"ground = actual satellite image · vertical ~{vexag:.0f}x exaggerated",
-        fontsize=12)
-    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=0.93)
-    fig.savefig(png_path, dpi=150, bbox_inches="tight", facecolor="white")
+        fontsize=13)
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=0.94)
+    fig.savefig(png_path, dpi=185, bbox_inches="tight", facecolor="white")
     plt.close(fig)
     print(f"cloud3d: 3D figure -> {png_path} ({drew} isosurfaces)",
           file=sys.stderr)

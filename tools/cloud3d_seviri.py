@@ -147,6 +147,10 @@ def main():
     ap.add_argument("--place", default=None)
     ap.add_argument("--model", default="data/cloud3d/iwc.jit.pt")
     ap.add_argument("--window", type=int, default=128)
+    ap.add_argument("--window-x", type=int, default=0,
+                    help="east-west window in px (default: --window)")
+    ap.add_argument("--window-y", type=int, default=0,
+                    help="north-south window in px (default: --window)")
     args = ap.parse_args()
 
     token = get_token()
@@ -168,14 +172,33 @@ def main():
                           "detail": f"{args.lat},{args.lon} not visible from {SAT_LON}E"}))
         return 2
     jc, ic = rc
-    half = args.window // 2
+    half_x = (args.window_x or args.window) // 2
+    half_y = (args.window_y or args.window) // 2
     shape = scn[CHANNELS[8]].shape
-    j0, j1 = max(0, jc - half), min(shape[0], jc + half)
-    i0, i1 = max(0, ic - half), min(shape[1], ic + half)
+    j0, j1 = max(0, jc - half_y), min(shape[0], jc + half_y)
+    i0, i1 = max(0, ic - half_x), min(shape[1], ic + half_x)
+
+    # Grid orientation + ground sampling at the observer. satpy's native
+    # SEVIRI grid is SOUTH-UP (row index increases northward) — the
+    # opposite of the GOES convention all the renderers use, so the
+    # window is flipped to rows-north-to-south right after extraction.
+    # One grid step moves in both lon and lat this far off-nadir; take
+    # the Euclidean ground distance.
+    lon_0, lat_0 = area.get_lonlat(jc, ic)
+    lon_e, lat_e = area.get_lonlat(jc, ic + 1)
+    lon_n, lat_n = area.get_lonlat(jc + 1, ic)
+    rows_north_up = lat_n > lat_0
+    coslat = math.cos(math.radians(lat_0))
+    km_e = math.hypot(111.32 * coslat * (lon_e - lon_0),
+                      110.57 * (lat_e - lat_0))
+    km_s = math.hypot(111.32 * coslat * (lon_n - lon_0),
+                      110.57 * (lat_n - lat_0))
 
     raw = np.empty((11, j1 - j0, i1 - i0), dtype=np.float32)
     for n, ch in enumerate(CHANNELS):
         raw[n] = scn[ch][j0:j1, i0:i1].values.astype(np.float32)
+    if rows_north_up:
+        raw = raw[:, ::-1, :].copy()
 
     x_in = normalize(raw)
 
@@ -187,6 +210,8 @@ def main():
     # ── Aggregate (mirrors the GOES sidecar) ──
     h_, w_ = iwc.shape[1], iwc.shape[2]
     jc_w, ic_w = jc - j0, ic - i0
+    if rows_north_up:
+        jc_w = (h_ - 1) - jc_w
 
     def col_mean(jj, ii, r):
         ja, jb = max(0, jj - r), min(h_, jj + r + 1)
@@ -205,6 +230,8 @@ def main():
         if rc2 is None:
             return None
         jj, ii = rc2[0] - j0, rc2[1] - i0
+        if rows_north_up:
+            jj = (h_ - 1) - jj
         if 0 <= jj < h_ and 0 <= ii < w_:
             return jj, ii
         return None
@@ -239,18 +266,6 @@ def main():
     with open(args.out, "w") as f:
         json.dump(result, f)
 
-    # Ground sampling at the observer from the area's neighbor pixels
-    # (Euclidean ground distance of one grid step; the grid axes are
-    # rotated vs north this far off-nadir, so each step moves in both
-    # lon and lat).
-    lon_e, lat_e = area.get_lonlat(jc, ic + 1)
-    lon_s, lat_s = area.get_lonlat(jc + 1, ic)
-    lon_0, lat_0 = area.get_lonlat(jc, ic)
-    coslat = math.cos(math.radians(lat_0))
-    km_e = math.hypot(111.32 * coslat * (lon_e - lon_0),
-                      110.57 * (lat_e - lat_0))
-    km_s = math.hypot(111.32 * coslat * (lon_s - lon_0),
-                      110.57 * (lat_s - lat_0))
     # synthesize the fields render_png expects from the GOES namespace
     args.date = scan_time[:10]
     args.hour = int(scan_time[11:13]) + int(scan_time[14:16]) / 60.0
@@ -263,11 +278,14 @@ def main():
 
     if args.png3d:
         from cloud3d_profile import render_3d
-        # Ground texture: visible reflectance by day, inverted 10.8 um
-        # brightness temperature by night (cold cloud tops bright).
-        vis = raw[0]
-        if np.nanmax(vis) > 8.0:
-            tex = np.clip(vis / 80.0, 0.0, 1.0)
+        # Ground texture: the standard SEVIRI NATURAL COLOR composite by
+        # day (R = IR_016, G = VIS008, B = VIS006, 0-90% reflectance,
+        # gamma-brightened) — land green, sea dark, water cloud white,
+        # ice cloud cyan. Inverted 10.8 um BT by night.
+        if np.nanmax(raw[0]) > 8.0:
+            tex = np.stack([np.clip(raw[2] / 90.0, 0, 1),
+                            np.clip(raw[1] / 90.0, 0, 1),
+                            np.clip(raw[0] / 90.0, 0, 1)], axis=-1) ** (1 / 1.8)
         else:
             tex = np.clip((300.0 - raw[8]) / 110.0, 0.0, 1.0)
         render_3d(args.png3d, iwc, heights, km_e, km_s, jc_w, ic_w,
