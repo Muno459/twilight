@@ -155,6 +155,101 @@ def iwc_from_output(y):
     return iwc
 
 
+def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
+               xs_win, ys_win, jc_w, ic_w, curtain, curtain_km):
+    """Figure: column-IWP map + vertical curtain along the sun azimuth +
+    observer profile. Approximate orientation: rows ~ N->S, cols ~ W->E
+    (ABI fixed grid is slightly rotated away from nadir)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LogNorm
+
+    dz = heights[0] / (len(heights) - 1)
+    iwp = iwc.sum(axis=0) * dz  # g/m^2
+    h_, w_ = iwp.shape
+    extent_km = [-(ic_w) * 2.0, (w_ - ic_w) * 2.0,
+                 -(h_ - jc_w) * 2.0, (jc_w) * 2.0]  # 2 km/px, observer at 0,0
+
+    fig = plt.figure(figsize=(14, 9))
+    gs = fig.add_gridspec(2, 2, height_ratios=[1.15, 1.0], hspace=0.32, wspace=0.25)
+
+    # ── Panel 1: ice water path map ──
+    ax1 = fig.add_subplot(gs[0, 0])
+    iwp_show = np.where(iwp > 0.5, iwp, np.nan)
+    im1 = ax1.imshow(iwp_show, extent=extent_km, cmap="viridis",
+                     norm=LogNorm(vmin=1.0, vmax=max(iwp.max(), 10.0)),
+                     interpolation="nearest")
+    ax1.set_facecolor("#1a1a2e")
+    ax1.plot(0, 0, "r*", markersize=16, markeredgecolor="white", label="observer")
+    if args.azimuth is not None:
+        az = math.radians(args.azimuth)
+        ax1.annotate("", xy=(120 * math.sin(az), 120 * math.cos(az)),
+                     xytext=(0, 0),
+                     arrowprops=dict(color="orangered", width=2, headwidth=10))
+        ax1.text(130 * math.sin(az), 130 * math.cos(az), "to sun",
+                 color="orangered", fontsize=10, ha="center")
+    ax1.set_xlabel("km east")
+    ax1.set_ylabel("km north")
+    ax1.set_title("Ice water path (cloud3d reconstruction)")
+    fig.colorbar(im1, ax=ax1, label="IWP [g/m$^2$]", shrink=0.85)
+
+    # ── Panel 2: vertical curtain along the sun azimuth ──
+    ax2 = fig.add_subplot(gs[0, 1])
+    cshow = np.where(curtain > 1e-4, curtain, np.nan)
+    im2 = ax2.pcolormesh(curtain_km, heights / 1000.0, cshow,
+                         cmap="magma", norm=LogNorm(vmin=1e-3, vmax=0.5))
+    ax2.set_facecolor("#10101c")
+    ax2.set_xlabel("distance toward the sun [km]")
+    ax2.set_ylabel("altitude [km]")
+    ax2.set_ylim(0, 16)
+    ax2.set_title("3D cloud curtain along the twilight light path")
+    fig.colorbar(im2, ax=ax2, label="IWC [g/m$^3$]", shrink=0.85)
+
+    # ── Panel 3: observer + window-mean profiles ──
+    ax3 = fig.add_subplot(gs[1, 0])
+    r = 1
+    ja, jb = max(0, jc_w - r), min(h_, jc_w + r + 1)
+    ia, ib = max(0, ic_w - r), min(w_, ic_w + r + 1)
+    center = iwc[:, ja:jb, ia:ib].mean(axis=(1, 2))
+    wmean = iwc.mean(axis=(1, 2))
+    ax3.plot(center, heights / 1000.0, "-", color="tab:red", label="observer column")
+    ax3.plot(wmean, heights / 1000.0, "-", color="tab:blue", label="window mean")
+    ax3.set_xlabel("IWC [g/m$^3$]")
+    ax3.set_ylabel("altitude [km]")
+    ax3.set_xscale("symlog", linthresh=1e-4)
+    ax3.set_ylim(0, 16)
+    ax3.grid(alpha=0.3)
+    ax3.legend()
+    ax3.set_title("Vertical ice-water profile (80 CloudSat levels)")
+
+    # ── Panel 4: provenance ──
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.axis("off")
+    dzkm = dz / 1000.0
+    txt = (
+        f"model     csaybar/cloud3d iwc.jit (SegFormer,\n"
+        f"          trained on CloudSat radar profiles)\n"
+        f"input     11-channel {bucket} full-disk scan\n"
+        f"scan      {scan_time}\n"
+        f"requested {args.date} {args.hour:.2f}h UTC\n"
+        f"window    {iwc.shape[2]}x{iwc.shape[1]} px @ 2 km\n"
+        f"vertical  80 levels x {dzkm * 1000:.0f} m (0-18.9 km)\n"
+        f"cloudy    {100.0 * float((iwp > 1.0).mean()):.0f}% of columns (IWP > 1 g/m$^2$)\n"
+        f"max IWC   {float(iwc.max()):.3f} g/m$^3$"
+    )
+    ax4.text(0.02, 0.95, txt, family="monospace", fontsize=10.5,
+             va="top", transform=ax4.transAxes)
+
+    place = args.place or f"{args.lat:.2f}N {args.lon:.2f}E"
+    fig.suptitle(f"cloud3d — satellite 3D cloud reconstruction over {place}",
+                 fontsize=15, y=0.99)
+    fig.savefig(png_path, dpi=140, bbox_inches="tight",
+                facecolor="white")
+    plt.close(fig)
+    print(f"cloud3d: figure -> {png_path}", file=sys.stderr)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--lat", type=float, required=True)
@@ -166,6 +261,9 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--model", default="data/cloud3d/iwc.jit.pt")
     ap.add_argument("--window", type=int, default=128)
+    ap.add_argument("--png", default=None,
+                    help="also render a figure (IWP map + sunward curtain + profiles)")
+    ap.add_argument("--place", default=None, help="location label for the figure title")
     args = ap.parse_args()
 
     from datetime import date as date_cls
@@ -278,6 +376,22 @@ def main():
             if 0 <= ii < w_ and 0 <= jj < h_:
                 path.append({"km": km, "iwc_g_m3": col_mean(jj, ii, 2).tolist()})
 
+    if args.png:
+        # Vertical curtain along the sun azimuth (8 km sampling, 0-320 km).
+        az = args.azimuth if args.azimuth is not None else 270.0
+        cols, kms = [], []
+        for km in np.arange(0.0, 321.0, 8.0):
+            la, lo = destination(args.lat, args.lon, az, float(km))
+            s = latlon_to_scan(la, lo, sat_lon)
+            if s is None:
+                continue
+            px, py = s
+            ii = int(np.argmin(np.abs(xs[i0:i1] - px)))
+            jj = int(np.argmin(np.abs(ys[j0:j1] - py)))
+            if 0 <= ii < w_ and 0 <= jj < h_:
+                cols.append(iwc[:, jj, ii])
+                kms.append(km)
+
     # The ACTUAL scan time from the granule name (_sYYYYDDDHHMMSSt) — the
     # requested twilight hour is usually in the future; never label model
     # output with a time the satellite did not observe.
@@ -306,6 +420,12 @@ def main():
     }
     with open(args.out, "w") as f:
         json.dump(result, f)
+
+    if args.png and cols:
+        render_png(args.png, iwc, heights, args, scan_time, bucket, sat_lon,
+                   None, None, jc_w, ic_w,
+                   np.stack(cols, axis=1), np.array(kms))
+
     print(f"cloud3d: {bucket} {key.split('/')[-1]}", file=sys.stderr)
     print(f"cloud3d: cloud fraction {cloud_fraction:.2f}, "
           f"max IWC {float(iwc.max()):.4f} g/m^3, path samples {len(path)}", file=sys.stderr)
