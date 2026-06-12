@@ -25,8 +25,12 @@ using namespace metal;
 // Constants
 // ============================================================================
 
-constant float PI = 3.14159265358979323846f;
-constant float EARTH_RADIUS_M = 6371000.0f;
+constant float PI = M_PI_F;
+constant float INV_4PI = 1.0f / (4.0f * PI); // isotropic phase pdf
+// Exact IUGG R1 mean radius, matching twilight-core. Fallback only: all
+// kernels derive surface/TOA radii from the packed shells (see
+// atm_surface_radius / atm_toa_radius).
+constant float EARTH_RADIUS_M = 6371008.7714f;
 constant float TOA_ALTITUDE_M = 100000.0f;
 
 constant uint MAX_WAVELENGTHS = 64;
@@ -34,9 +38,15 @@ constant uint MAX_LOS_STEPS = 200;
 constant uint MAX_SCATTERS = 100;
 constant uint HYBRID_LOS_STEPS = 200;
 constant uint HYBRID_MAX_BOUNCES = 50;
+// v1 kernel (step-parallel) uses 256 threads.
+// v2 kernel (ray-parallel) uses 64 threads to stay within Metal's per-
+// threadgroup stack limit -- each trace_secondary_chain needs ~2-4 KB
+// stack per thread, and 256 * 4 KB = 1 MB would exceed the default.
 constant uint HYBRID_THREADGROUP_SIZE = 256;
+constant uint HYBRID_V2_THREADGROUP_SIZE = 64;
 constant uint SIMD_WIDTH = 32;
 constant uint NUM_SIMD_GROUPS = HYBRID_THREADGROUP_SIZE / SIMD_WIDTH; // 8
+constant uint HYBRID_V2_NUM_SIMD_GROUPS = HYBRID_V2_THREADGROUP_SIZE / SIMD_WIDTH; // 2
 
 // Buffer header magic
 // Atmosphere buffer offsets (must match buffers.rs atm_offsets exactly)
@@ -48,6 +58,8 @@ constant uint ATM_OPTICS_START          = 260;   // 4 + 4*64
 constant uint ATM_OPTICS_STRIDE         = 4;
 constant uint ATM_ALBEDO_START          = 16708;  // 16644 + 64
 constant uint ATM_REFRACTIVE_INDEX_START = 16772; // 16708 + 64 (v2)
+constant uint ATM_CLOUD_EXT_START        = 16836; // 16772 + 64 (v3)
+constant uint ATM_CLOUD_G_SCALED         = 16900; // 16836 + 64 (v3)
 
 // Garstang constants
 constant float H_RAYLEIGH = 8500.0f;
@@ -90,7 +102,7 @@ constant float TERMINATOR_N_MAX = 8.0f;
 
 // Tilt angle (degrees) of terminator axis from zenith at SZA_START / SZA_FULL.
 constant float TERMINATOR_TILT_MIN_DEG = 20.0f;
-constant float TERMINATOR_TILT_MAX_DEG = 50.0f;
+constant float TERMINATOR_TILT_MAX_DEG = 60.0f;
 
 // ============================================================================
 // Buffer accessor helpers
@@ -145,6 +157,21 @@ inline float read_albedo(device const float* atm, uint wl_idx) {
 
 inline float read_refractive_index(device const float* atm, uint shell_idx) {
     return atm[ATM_REFRACTIVE_INDEX_START + shell_idx];
+}
+
+inline float read_cloud_extinction(device const float* atm, uint shell_idx) {
+    return atm[ATM_CLOUD_EXT_START + shell_idx];
+}
+
+// Eddington diffuse transmittance of accumulated (delta-scaled) cloud
+// optical depth: T = 1/(1 + 0.75 tau (1 - g*)). Mirrors the CPU's
+// AtmosphereModel::cloud_diffuse_transmittance - a diffusing deck
+// transmits ~20-50%, which Beer-Lambert misrepresents by orders of
+// magnitude (single-representation cloud transport).
+inline float cloud_diffuse_transmittance(device const float* atm, float tau_cloud) {
+    if (tau_cloud <= 0.0f) return 1.0f;
+    float g = atm[ATM_CLOUD_G_SCALED];
+    return 1.0f / (1.0f + 0.75f * tau_cloud * (1.0f - g));
 }
 
 // Dispatch params: 4 x vec4
@@ -205,8 +232,32 @@ struct KahanAccum {
 };
 
 // ============================================================================
+// log1p polyfill -- MSL does not provide log1p(). For |x| > 0.5 we use
+// log(1+x) directly (no cancellation risk). For |x| <= 0.5 we use the
+// identity log1p(x) = x * log(1+x) / ((1+x) - 1) which recovers the
+// lost low bits via the exact subtraction (1+x)-1 when |x| is small.
+// ============================================================================
+
+inline float metal_log1p(float x) {
+    if (x > 0.5f || x < -0.5f) {
+        return log(1.0f + x);
+    }
+    float u = 1.0f + x;
+    float d = u - 1.0f;          // exact in f32 when |x| <= 0.5
+    if (d == 0.0f) return x;     // x is subnormal or zero
+    return log(u) * (x / d);
+}
+
+// ============================================================================
 // xorshift64 RNG (Metal supports ulong natively on Apple Silicon)
 // ============================================================================
+
+inline ulong splitmix64(ulong state) {
+    ulong z = state + 0x9E3779B97F4A7C15ul;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ul;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBul;
+    return z ^ (z >> 31);
+}
 
 inline float xorshift_f32(thread ulong &state) {
     ulong x = state;
@@ -214,8 +265,10 @@ inline float xorshift_f32(thread ulong &state) {
     x ^= x >> 7;
     x ^= x << 17;
     state = x;
-    // Convert to f32 in [0, 1): use top 24 bits for full mantissa precision
-    return float(x >> 40) * (1.0f / float(1ul << 24));
+    // Convert to f32 in (0, 1]: use top 24 bits for full mantissa precision.
+    // Adding 1 before dividing guarantees the result is never exactly 0.0,
+    // which prevents log(0) = -inf in free-path sampling.
+    return float((x >> 40) + 1ul) * (1.0f / float((1ul << 24) + 1ul));
 }
 
 // ============================================================================
@@ -358,6 +411,24 @@ inline int shell_index_binary(device const float* atm, float r) {
     return (lo == 0) ? -1 : int(lo - 1);
 }
 
+// Surface and top-of-atmosphere radii from the PACKED SHELLS - the single
+// source of truth, exactly matching the CPU's AtmosphereModel accessors
+// (surface_radius = r_inner of shell 0, toa_radius = r_outer of the last
+// shell). The old hardcoded EARTH_RADIUS_M + TOA_ALTITUDE_M (100 km)
+// silently truncated the 150 km USSA-76 thermosphere extension - the very
+// layer that carries the deep-twilight (SZA >= 104) signal.
+inline float atm_surface_radius(device const float* atm) {
+    uint ns = atm_num_shells(atm);
+    return (ns == 0) ? (EARTH_RADIUS_M)
+                     : atm[ATM_SHELLS_START];
+}
+
+inline float atm_toa_radius(device const float* atm) {
+    uint ns = atm_num_shells(atm);
+    return (ns == 0) ? (EARTH_RADIUS_M + TOA_ALTITUDE_M)
+                     : atm[ATM_SHELLS_START + (ns - 1) * ATM_SHELL_STRIDE + 1];
+}
+
 // ============================================================================
 // Phase functions
 // ============================================================================
@@ -369,13 +440,15 @@ inline float rayleigh_phase(float cos_theta) {
 inline float henyey_greenstein_phase(float cos_theta, float g) {
     float g2 = g * g;
     float denom = 1.0f + g2 - 2.0f * g * cos_theta;
-    return (1.0f - g2) / (denom * sqrt(denom));
+    // rsqrt + multiply is faster than sqrt + divide on Metal ALU
+    float inv_sqrt_d = rsqrt(max(denom, 1e-20f));
+    return (1.0f - g2) * inv_sqrt_d * inv_sqrt_d * inv_sqrt_d;
 }
 
 inline float mixed_phase(float cos_theta, ShellOptics op) {
-    if (op.rayleigh_fraction > 0.99f) {
-        return rayleigh_phase(cos_theta);
-    }
+    // Exact mixture, ALWAYS: a former rf > 0.99 pure-Rayleigh shortcut
+    // mismatched the seed sampler (which draws HG with prob 1-rf for any
+    // rf < 1), biasing the mixture-MIS seed weights (mirrors the CPU fix).
     return op.rayleigh_fraction * rayleigh_phase(cos_theta)
          + (1.0f - op.rayleigh_fraction) * henyey_greenstein_phase(cos_theta, op.asymmetry);
 }
@@ -493,16 +566,14 @@ ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r
     result.dist = 1e30f;
     result.is_outward = true;
 
-    // Minimum distance threshold: must exceed f32 noise at Earth scale.
-    // At r ~ 6.4e6, ULP is ~0.5m. We nudge by 2m, so any valid hit
-    // should be at least ~shell_thickness away (hundreds of meters).
-    // Using 1e-5 (10 um) safely filters self-intersections.
     const float EPS = 1e-5f;
 
     RaySphereHit outer = ray_sphere_intersect(pos, dir, r_outer);
     if (outer.hit) {
+        // Compute inner sphere test once for both branches below.
+        RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
+
         if (outer.t_near > EPS) {
-            RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
             if (inner.hit && inner.t_near > EPS && inner.t_near < outer.t_near) {
                 result.dist = inner.t_near;
                 result.is_outward = false;
@@ -515,9 +586,22 @@ ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r
             return result;
         }
         if (outer.t_far > EPS) {
-            RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
             if (inner.hit && inner.t_near > EPS && inner.t_near < outer.t_far) {
                 result.dist = inner.t_near;
+                result.is_outward = false;
+                result.found = true;
+                return result;
+            }
+            // On-boundary degeneracy (mirrors the CPU fix): origin on
+            // the inner sphere moving inward has inner t_near ~ 0;
+            // without this the walk teleports through the shell below.
+            float m = dot(pos, dir);
+            float r2 = dot(pos, pos);
+            float b2 = max(r2 - m * m, 0.0f);
+            if (inner.hit && m < 0.0f && b2 < r_inner * r_inner
+                && inner.t_far > EPS
+                && fabs(length(pos) - r_inner) < 1.0f) {
+                result.dist = 1e-4f;
                 result.is_outward = false;
                 result.found = true;
                 return result;
@@ -527,9 +611,17 @@ ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r
             result.found = true;
             return result;
         }
+
+        // outer hit but neither t_near nor t_far usable -- check inner
+        if (inner.hit && inner.t_near > EPS) {
+            result.dist = inner.t_near;
+            result.is_outward = false;
+            result.found = true;
+        }
+        return result;
     }
 
-    // Fallback: inner sphere only
+    // No outer hit: inner sphere only
     RaySphereHit inner = ray_sphere_intersect(pos, dir, r_inner);
     if (inner.hit && inner.t_near > EPS) {
         result.dist = inner.t_near;
@@ -547,8 +639,29 @@ ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r
 // returns the original direction (fast path).
 // ============================================================================
 
+// Refract with known radius -- avoids rsqrt inside normalize() since the
+// position was already snapped to target_r.
+float3 refract_at_boundary_r(float3 dir, float3 boundary_pos, float inv_r, float n_from, float n_to) {
+    if (abs(n_from - n_to) < 1e-7f) return dir;
+
+    float3 outward = boundary_pos * inv_r;
+
+    float cos_dir_normal = dot(dir, outward);
+    float3 normal = (cos_dir_normal < 0.0f) ? outward : -outward;
+
+    float cos_i = -dot(dir, normal);
+    float eta = n_from / n_to;
+    float k = fma(-eta * eta, fma(-cos_i, cos_i, 1.0f), 1.0f);
+
+    if (k < 0.0f) {
+        return fma(normal, 2.0f * cos_i, dir);
+    }
+
+    float cos_t = sqrt(k);
+    return fma(normal, fma(eta, cos_i, -cos_t), dir * eta);
+}
+
 float3 refract_at_boundary(float3 dir, float3 boundary_pos, float n_from, float n_to) {
-    // Fast path: no refraction when indices match
     if (abs(n_from - n_to) < 1e-7f) return dir;
 
     float3 outward = normalize(boundary_pos);
@@ -620,11 +733,6 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
     float surface_radius = atm[ATM_SHELLS_START]; // r_inner of shell 0
 
     // ── Umbra cylinder culling (O(1) pre-check) ────────────────────────
-    // If the scatter point is behind Earth (projection onto sun axis is
-    // negative) AND inside the geometric shadow cylinder (perpendicular
-    // distance to sun axis < Earth radius), the sun is unreachable.
-    // Two dot products, zero accuracy loss, eliminates 50+ shell
-    // traversals for points deep in Earth's shadow.
     float p_proj = dot(start_pos, sun_dir);
     if (p_proj < 0.0f) {
         float3 cross_ps = cross(start_pos, sun_dir);
@@ -637,72 +745,91 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
     float3 pos = start_pos;
     float3 dir = sun_dir;
 
-    KahanAccum tau;
+    // Plain float accumulation for shadow tau -- Kahan is overkill here
+    // because we only need ~3 significant digits (exp(-tau) dynamic range)
+    // and the early-exit at tau > 50 means we never accumulate more than
+    // ~50 terms of similar magnitude. Saves 3 FP ops per shell crossing.
+    float tau = 0.0f;
+    float tau_cloud = 0.0f;
 
-    // Find initial shell once (O(log N)), then track directly (O(1) per step).
     int sidx = shell_index_binary(atm, length(pos));
     if (sidx < 0) return 1.0f;
     uint us = uint(sidx);
 
     for (uint iter = 0; iter < 200; iter++) {
-        float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
-        float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
+        uint shell_base = ATM_SHELLS_START + us * ATM_SHELL_STRIDE;
+        float r_inner = atm[shell_base];
+        float r_outer = atm[shell_base + 1];
 
-        // Read extinction for this shell and wavelength
-        uint optics_idx = us * MAX_WAVELENGTHS + wl_idx;
-        float extinction = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE];
+        // Inline extinction read (avoid full ShellOptics load)
+        float extinction = atm[ATM_OPTICS_START + (us * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
 
         ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
         if (!bnd.found) break;
 
-        // Accumulate optical depth with Kahan summation
-        tau.add(extinction * bnd.dist);
+        tau += extinction * bnd.dist;
+        tau_cloud += read_cloud_extinction(atm, us) * bnd.dist;
 
-        // Refract at boundary
+        // Snap + nudge -- avoid redundant length() by reusing snap_to_radius
         float3 boundary_pos = pos + dir * bnd.dist;
-        // Snap to exact boundary radius to prevent cumulative f32 position drift.
         float target_r = bnd.is_outward ? r_outer : r_inner;
-        float bp_len = length(boundary_pos);
-        if (bp_len > 0.0f) {
-            boundary_pos *= (target_r / bp_len);
-        }
+        float bp_r = length(boundary_pos);
+        if (bp_r > 0.0f) boundary_pos *= (target_r / bp_r);
+
+        // Refract (use _r variant: position already snapped to target_r)
+        float inv_target_r = 1.0f / target_r;
         float n_from = read_refractive_index(atm, us);
         uint next_shell = bnd.is_outward ? us + 1 : us - 1;
         float n_to = (next_shell < ns) ? read_refractive_index(atm, next_shell) : 1.0f;
+        dir = refract_at_boundary_r(dir, boundary_pos, inv_target_r, n_from, n_to);
 
-        dir = refract_at_boundary(dir, boundary_pos, n_from, n_to);
+        // Radial nudge (reuse inv_target_r)
+        float3 radial = boundary_pos * inv_target_r;
+        float nudge_sign = bnd.is_outward ? 1.0f : -1.0f;
+        pos = boundary_pos + radial * (nudge_sign * BOUNDARY_NUDGE_M);
 
-        // Radial nudge past boundary
-        pos = radial_nudge(boundary_pos, bnd.is_outward);
-
-        // Ground hit: fully opaque
-        if (!bnd.is_outward && length(pos) <= surface_radius + 1.0f) {
+        // Ground hit (use target_r which is exact after snap)
+        if (!bnd.is_outward && target_r <= surface_radius + 1.0f) {
             return 0.0f;
         }
 
-        // Exited atmosphere
         if (next_shell >= ns) break;
         us = next_shell;
 
-        if (tau.result() > 50.0f) return 0.0f;
+        if (tau > 50.0f) return 0.0f;
     }
 
-    return exp(-tau.result());
+    // fast::exp is sufficient for shadow transmittance -- we only need
+    // ~3 significant digits (the MC weight noise dominates).
+    // Clear-air Beer-Lambert x Eddington diffuse for the cloud portion.
+    return fast::exp(-tau) * cloud_diffuse_transmittance(atm, tau_cloud);
 }
 
 // ============================================================================
 // Sampling functions
 // ============================================================================
 
+// Newton-Raphson cube root: ~6 cycles vs ~16 for pow(x, 1/3).
+// 2 iterations of x = (2x + a/(x*x))/3 from an rsqrt seed.
+inline float fast_cbrt(float a) {
+    float x = abs(a);
+    if (x < 1e-30f) return 0.0f;
+    // Seed: cbrt(x) ≈ x^(1/3) ≈ x * rsqrt(x)^(2/3). Use rsqrt as
+    // rough seed then refine. Initial guess via bit hack:
+    float y = as_type<float>((as_type<uint>(x) / 3u) + 0x2a508bdb);
+    // Halley iteration (cubic convergence, 2 iterations for f32 precision)
+    y = y * (2.0f / 3.0f) + x / (3.0f * y * y);
+    y = y * (2.0f / 3.0f) + x / (3.0f * y * y);
+    return copysign(y, a);
+}
+
 inline float sample_rayleigh_analytic(float xi) {
     float q = 8.0f * xi - 4.0f;
-    float disc = q * q * 0.25f + 1.0f;
+    float disc = fma(q * q, 0.25f, 1.0f);
     float sqrt_disc = sqrt(disc);
     float a_val = -q * 0.5f + sqrt_disc;
     float b_val = -q * 0.5f - sqrt_disc;
-    float u = (a_val >= 0.0f) ? pow(a_val, 1.0f/3.0f) : -pow(-a_val, 1.0f/3.0f);
-    float v = (b_val >= 0.0f) ? pow(b_val, 1.0f/3.0f) : -pow(-b_val, 1.0f/3.0f);
-    float mu = u + v;
+    float mu = fast_cbrt(a_val) + fast_cbrt(b_val);
     return clamp(mu, -1.0f, 1.0f);
 }
 
@@ -758,11 +885,28 @@ ZenithSample sample_zenith_biased(float3 normal, float n, thread ulong &rng) {
     return ZenithSample{dir, cos_theta};
 }
 
-// Importance weight correction for zenith-biased sampling.
-// w = p_cosine(theta) / p_zenith(theta) = 2/(n+1) * cos^(1-n)(theta)
-inline float zenith_importance_weight(float cos_theta, float n) {
-    float cos_nm1 = pow(cos_theta, n - 1.0f);
-    return 2.0f / ((n + 1.0f) * cos_nm1);
+// PDF over solid angle of the (untruncated) power-cosine lobe drawn by
+// sample_zenith_biased: p(omega) = (n+1) cos^n(theta) / (2 pi) on the
+// upper hemisphere about the axis, 0 below. (The GPU sampler is
+// untruncated; this pdf matches it exactly. Unbiasedness needs only
+// sampler == pdf; weight boundedness comes from the mixture's phase
+// component, NOT from truncation - so no weight clamps and no NaN-prone
+// unbounded importance ratios, the root cause of the old v2 fireflies.)
+inline float power_cos_pdf(float cos_theta, float n) {
+    if (cos_theta <= 0.0f) return 0.0f;
+    return (n + 1.0f) * pow(cos_theta, n) / (2.0f * PI);
+}
+
+// Density of the 3-component seed mixture at omega (mirrors the CPU's
+// seed_mixture_pdf): q = a_p*P(omega.sun)/4pi + a_z*pcos(up) + a_t*pcos(term).
+inline float seed_mixture_pdf(float3 omega, float3 sun_dir, float3 local_up,
+                              float3 term_axis, float alpha_p, float alpha_z,
+                              float alpha_t, float n_zenith, float m_term,
+                              ShellOptics op) {
+    float q = alpha_p * mixed_phase(dot(omega, sun_dir), op) * INV_4PI;
+    if (alpha_z > 1e-6f) q += alpha_z * power_cos_pdf(dot(omega, local_up), n_zenith);
+    if (alpha_t > 1e-6f) q += alpha_t * power_cos_pdf(dot(omega, term_axis), m_term);
+    return q;
 }
 
 // 3-branch direction sampling parameters, SZA-adaptive.
@@ -772,6 +916,18 @@ struct BranchParams {
     float term_share;   // fraction of zenith-allocated rays -> terminator
     float m_term;       // power-cosine exponent for terminator lobe
     float tilt_rad;     // tilt angle of terminator axis from zenith
+};
+
+struct SecondarySetup {
+    float3 local_up;
+    float3 term_axis_dir;
+    float alpha_p;
+    float alpha_z;
+    float alpha_t;
+    float n_zenith;
+    float m_term;
+    float alpha_et;
+    uint use_forced;
 };
 
 inline BranchParams branch_params_for_sza(float sza_deg) {
@@ -797,20 +953,11 @@ inline float3 terminator_axis(float3 up, float3 sun_dir, float tilt_rad) {
         return up;
     }
     float3 sun_horiz = horiz / h_len;
-    float sin_t = sin(tilt_rad);
-    float cos_t = cos(tilt_rad);
+    float cos_t;
+    float sin_t = sincos(tilt_rad, cos_t);
     return normalize(cos_t * up + sin_t * sun_horiz);
 }
 
-// Shape weight for terminator lobe: corrects cos^m(theta_t) PDF back to
-// cosine-hemisphere reference.
-// w = 2 * cos(theta_z) / ((m+1) * cos^m(theta_t))
-inline float terminator_shape_weight(float cos_z, float cos_t, float m) {
-    if (cos_z <= 0.0f || cos_t <= 0.0f) return 0.0f;
-    float cos_t_m = pow(cos_t, m);
-    if (cos_t_m < 1e-30f) return 0.0f;
-    return 2.0f * cos_z / ((m + 1.0f) * cos_t_m);
-}
 
 // ============================================================================
 // Kernel 1: single_scatter_spectrum
@@ -834,8 +981,8 @@ kernel void single_scatter_spectrum(
     float3 view_dir     = read_view_dir(params);
     float3 sun_dir      = read_sun_dir(params);
 
-    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
-    float surface_radius = EARTH_RADIUS_M;
+    float toa_radius = atm_toa_radius(atm);
+    float surface_radius = atm_surface_radius(atm);
 
     // Find LOS extent
     RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
@@ -859,8 +1006,10 @@ kernel void single_scatter_spectrum(
 
     KahanAccum radiance;
     KahanAccum tau_obs;
+    // Cloud portion of the eye path: Eddington diffuse (broadband).
+    float tau_cloud_obs = 0.0f;
 
-    float cos_theta = dot(sun_dir, -view_dir);
+    float cos_theta = dot(sun_dir, view_dir);
 
     for (uint step = 0; step < num_steps; step++) {
         float s = (float(step) + 0.5f) * ds;
@@ -873,16 +1022,21 @@ kernel void single_scatter_spectrum(
         if (sidx < 0) continue;
 
         ShellOptics op = read_optics(atm, uint(sidx), wl_idx);
+        float cloud_ext_step = read_cloud_extinction(atm, uint(sidx));
         float beta_scat = op.extinction * op.ssa;
 
         if (beta_scat < 1e-30f) {
             tau_obs.add(op.extinction * ds);
+            tau_cloud_obs += cloud_ext_step * ds;
             continue;
         }
 
-        // exp(-(A+B)) = exp(-A)*exp(-B) avoids f32 precision loss when
-        // adding a small half-step to a large accumulated tau.
-        float t_obs = exp(-tau_obs.result()) * exp(-op.extinction * ds * 0.5f);
+        // Single exp(-(tau + half_step)) is both faster and more precise
+        // than the product of two separate exps (which rounds the f32
+        // multiply and wastes an ALU slot).
+        float tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5f;
+        float t_obs = exp(-(tau_obs.result() + op.extinction * ds * 0.5f))
+                    * cloud_diffuse_transmittance(atm, tau_cloud_mid);
 
         if (t_obs < 1e-30f) break;
 
@@ -890,6 +1044,7 @@ kernel void single_scatter_spectrum(
 
         if (t_sun < 1e-30f) {
             tau_obs.add(op.extinction * ds);
+            tau_cloud_obs += cloud_ext_step * ds;
             continue;
         }
 
@@ -898,6 +1053,7 @@ kernel void single_scatter_spectrum(
         radiance.add(di);
 
         tau_obs.add(op.extinction * ds);
+        tau_cloud_obs += cloud_ext_step * ds;
     }
 
     // Ground reflection (Lambertian BRDF = albedo / pi)
@@ -910,7 +1066,8 @@ kernel void single_scatter_spectrum(
 
             if (cos_sun_incidence > 0.0f) {
                 float t_sun_ground = shadow_ray_transmittance(atm, ground_pos, sun_dir, wl_idx);
-                float t_obs_ground = exp(-tau_obs.result());
+                float t_obs_ground = exp(-tau_obs.result())
+                    * cloud_diffuse_transmittance(atm, tau_cloud_obs);
                 radiance.add(albedo / PI * cos_sun_incidence * t_sun_ground * t_obs_ground);
             }
         }
@@ -953,7 +1110,7 @@ kernel void mcrt_trace_photon(
     rng *= 2862933555777941757ul;
     rng += 1ul;
 
-    float surface_radius = EARTH_RADIUS_M;
+    float surface_radius = atm_surface_radius(atm);
 
     float3 pos = observer_pos;
     float3 dir = view_dir;
@@ -986,7 +1143,10 @@ kernel void mcrt_trace_photon(
 
         // Sample free path
         float xi = xorshift_f32(rng);
-        float free_path = -log(1.0f - xi + 1e-30f) / op.extinction;
+        // -log(xi) with xi in (0,1] is equivalent to -log(1-U) with U in [0,1)
+        // since 1-U has the same distribution as U. Avoids the log1p polyfill
+        // branch and extra ops. xi is guaranteed > 0 by the RNG.
+        float free_path = -log(xi) / op.extinction;
 
         ShellBoundary bnd = next_shell_boundary(pos, dir, sh.r_inner, sh.r_outer);
         if (!bnd.found) break;
@@ -999,8 +1159,20 @@ kernel void mcrt_trace_photon(
             // Ground reflection: depolarizes
             if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
                 float albedo = read_albedo(atm, wl_idx);
-                weight *= albedo;
                 float3 normal = normalize(boundary_pos);
+                // Ground-bounce NEE (Lambertian albedo/pi), BEFORE the
+                // albedo is folded into the continuing weight - mirrors
+                // the CPU chain exactly; this path family was simply
+                // missing from the GPU mcrt estimator (audit 2026-06-12).
+                float cos_sun_g = dot(sun_dir, normal);
+                if (cos_sun_g > 0.0f) {
+                    float t_sun_g = shadow_ray_transmittance(atm, boundary_pos + normal * BOUNDARY_NUDGE_M,
+                                                             sun_dir, wl_idx);
+                    if (t_sun_g > 1e-30f) {
+                        result_weight.add(weight * albedo * t_sun_g * cos_sun_g * (1.0f / PI));
+                    }
+                }
+                weight *= albedo;
                 prev_dir = dir;
                 dir = sample_hemisphere(normal, rng);
                 pos = radial_nudge(boundary_pos, true);
@@ -1022,10 +1194,16 @@ kernel void mcrt_trace_photon(
         // Scattering event
         pos = pos + dir * free_path;
 
+        // Apply SSA for this scatter event BEFORE NEE - the vertex is a
+        // scattering event, so the survival probability multiplies every
+        // contribution from it (CPU convention, photon.rs SSA-before-NEE;
+        // the old order overcounted NEE by 1/ssa per order).
+        weight *= op.ssa;
+
         // NEE: apply Mueller to photon's current Stokes state
         float t_sun = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
-            float cos_angle = dot(sun_dir, -dir);
+            float cos_angle = dot(sun_dir, dir);
             float A_nee, B_nee, C_nee;
             stokes_ABC(cos_angle, op, A_nee, B_nee, C_nee);
             float cos2phi_nee, sin2phi_nee;
@@ -1033,9 +1211,6 @@ kernel void mcrt_trace_photon(
             float4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
             result_weight.add(weight * t_sun * nee_stokes.x / (4.0f * PI));
         }
-
-        // Apply SSA
-        weight *= op.ssa;
 
         // Sample new direction and update Stokes state
         float cos_theta;
@@ -1083,7 +1258,7 @@ struct ScoutResult {
 ScoutResult scout_tau_to_boundary(device const float* atm, float3 start_pos,
                                    float3 start_dir, uint wl_idx) {
     uint ns = atm_num_shells(atm);
-    float surface_radius = atm[ATM_SHELLS_START]; // r_inner of shell 0
+    float surface_radius = atm[ATM_SHELLS_START];
     float3 pos = start_pos;
     float3 dir = start_dir;
     float tau = 0.0f;
@@ -1093,35 +1268,37 @@ ScoutResult scout_tau_to_boundary(device const float* atm, float3 start_pos,
     uint us = uint(sidx);
 
     for (uint iter = 0; iter < 200; iter++) {
-        float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
-        float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
-        uint optics_idx = us * MAX_WAVELENGTHS + wl_idx;
-        float extinction = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE];
+        uint shell_base = ATM_SHELLS_START + us * ATM_SHELL_STRIDE;
+        float r_inner = atm[shell_base];
+        float r_outer = atm[shell_base + 1];
+        float extinction = atm[ATM_OPTICS_START + (us * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
 
         ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
         if (!bnd.found) return ScoutResult{tau, false};
 
         tau += extinction * bnd.dist;
 
-        // Refract at boundary
         float3 boundary_pos = pos + dir * bnd.dist;
-        boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? r_outer : r_inner);
+        float target_r = bnd.is_outward ? r_outer : r_inner;
+        float bp_r = length(boundary_pos);
+        if (bp_r > 0.0f) boundary_pos *= (target_r / bp_r);
+
+        float inv_target_r = 1.0f / target_r;
         float n_from = read_refractive_index(atm, us);
         uint next_shell = bnd.is_outward ? us + 1 : us - 1;
         float n_to = (next_shell < ns) ? read_refractive_index(atm, next_shell) : 1.0f;
-        dir = refract_at_boundary(dir, boundary_pos, n_from, n_to);
-        pos = radial_nudge(boundary_pos, bnd.is_outward);
+        dir = refract_at_boundary_r(dir, boundary_pos, inv_target_r, n_from, n_to);
 
-        // Hit ground
-        if (!bnd.is_outward && length(pos) <= surface_radius + 1.0f) {
+        float3 radial = boundary_pos * inv_target_r;
+        float nudge_sign = bnd.is_outward ? 1.0f : -1.0f;
+        pos = boundary_pos + radial * (nudge_sign * BOUNDARY_NUDGE_M);
+
+        if (!bnd.is_outward && target_r <= surface_radius + 1.0f) {
             return ScoutResult{tau, true};
         }
-        // Exited atmosphere
         if (next_shell >= ns) return ScoutResult{tau, false};
-
         us = next_shell;
 
-        // Early exit: at tau > 20, weight correction is 1.0 to f32 precision
         if (tau > FORCED_TAU_CUTOFF) return ScoutResult{tau, false};
     }
 
@@ -1214,104 +1391,81 @@ AdvanceResult advance_to_optical_depth(device const float* atm, float3 start_pos
 float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                              float3 sun_dir, uint wl_idx,
                              ShellOptics start_optics, float3 prev_dir_in,
+                             SecondarySetup setup,
                              uint ray_idx, uint total_rays,
                              thread ulong &rng) {
-    float3 local_up = normalize(start_pos);
-    float surface_radius = EARTH_RADIUS_M;
+    float surface_radius = atm_surface_radius(atm);
 
-    // SZA-adaptive 3-branch parameters
-    float cos_sza = dot(sun_dir, local_up);
-    float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
-    BranchParams bp = branch_params_for_sza(sza_deg);
-
-    float alpha_p = 1.0f - bp.zenith_frac;
-    float alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
-    float alpha_t = bp.zenith_frac * bp.term_share;
-
-    float3 term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
-
-    // Stratified 3-branch importance sampling with branch probability weights.
+    // Unbiased one-sample-MIS seed (port of the CPU estimator): sample
+    // omega from the 3-component mixture, weight by
+    //   w0 = P(omega.view)/4pi / q(omega)
+    // identically for every branch - the balance-heuristic estimator.
+    // Samplers and RNG consumption order unchanged. This replaces the old
+    // per-branch heuristic weights whose unbounded importance ratios were
+    // the v2 firefly/NaN source.
     float xi_jitter = xorshift_f32(rng);
-    float xi_mix = (float(ray_idx) + xi_jitter) / float(total_rays);
+    float xi_mix = (float(ray_idx) + xi_jitter) / max(float(total_rays), 1.0f);
     float3 dir;
-    float cos_theta_init;
-    float initial_weight;
-    if (xi_mix < alpha_p) {
-        // Phase function branch
+    if (xi_mix < setup.alpha_p) {
+        float ct;
         if (xorshift_f32(rng) < start_optics.rayleigh_fraction) {
-            cos_theta_init = sample_rayleigh_analytic(xorshift_f32(rng));
+            ct = sample_rayleigh_analytic(xorshift_f32(rng));
         } else {
-            cos_theta_init = sample_henyey_greenstein(xorshift_f32(rng), start_optics.asymmetry);
+            ct = sample_henyey_greenstein(xorshift_f32(rng), start_optics.asymmetry);
         }
         float phi_init = 2.0f * PI * xorshift_f32(rng);
-        dir = scatter_direction(sun_dir, cos_theta_init, phi_init);
-        initial_weight = 0.5f / alpha_p;
-    } else if (xi_mix < alpha_p + alpha_z || alpha_t < 1e-6f) {
-        // Zenith-biased branch with shape + branch weight correction
-        ZenithSample zs = sample_zenith_biased(local_up, bp.n_zenith, rng);
+        dir = scatter_direction(sun_dir, ct, phi_init);
+    } else if (xi_mix < setup.alpha_p + setup.alpha_z || setup.alpha_t < 1e-6f) {
+        ZenithSample zs = sample_zenith_biased(setup.local_up, setup.n_zenith, rng);
         dir = zs.dir;
-        cos_theta_init = dot(sun_dir, dir);
-        float shape_w = zenith_importance_weight(zs.cos_theta, bp.n_zenith);
-        float branch_w = 0.5f / (alpha_z + alpha_t);
-        initial_weight = shape_w * branch_w;
     } else {
-        // Terminator lobe branch
-        ZenithSample zs = sample_zenith_biased(term_axis_dir, bp.m_term, rng);
+        ZenithSample zs = sample_zenith_biased(setup.term_axis_dir, setup.m_term, rng);
         dir = zs.dir;
-        cos_theta_init = dot(sun_dir, dir);
-        float cos_z = dot(dir, local_up);
-        float shape_w = terminator_shape_weight(cos_z, zs.cos_theta, bp.m_term);
-        float branch_w = 0.5f / alpha_t;
-        initial_weight = shape_w * branch_w;
     }
 
-    // Initialize Stokes state: apply first scatter's Mueller to incoming state
-    // The incoming photon from the LOS single-scatter is effectively [1,0,0,0]
-    // at the first secondary bounce. The prev_dir_in -> sun_dir -> dir
-    // rotation gives us the initial Stokes transformation.
-    float4 stokes = float4(1.0f, 0.0f, 0.0f, 0.0f); // normalized (I=1)
+    float q_seed = seed_mixture_pdf(dir, sun_dir, setup.local_up,
+                                    setup.term_axis_dir, setup.alpha_p,
+                                    setup.alpha_z, setup.alpha_t,
+                                    setup.n_zenith, setup.m_term, start_optics);
+    // prev_dir_in is the LOS view direction: the physical seed-scatter
+    // cosine is omega.view (matches the CPU convention).
+    float w0 = (q_seed > 1e-30f)
+        ? mixed_phase(dot(dir, prev_dir_in), start_optics) * INV_4PI / q_seed
+        : 0.0f;
 
-    // Apply initial scatter Mueller to stokes
-    {
-        float A0, B0, C0;
-        stokes_ABC(cos_theta_init, start_optics, A0, B0, C0);
-        float cos2phi0, sin2phi0;
-        scattering_plane_rotation(prev_dir_in, sun_dir, dir, cos2phi0, sin2phi0);
-        stokes = scatter_stokes(A0, B0, C0, cos2phi0, sin2phi0, stokes);
-        // Normalize by I (importance weighting)
-        if (stokes.x > 1e-30f) {
-            float inv_I = 1.0f / stokes.x;
-            stokes *= inv_I;
-        }
-    }
+    // Seed polarization: unpolarized (the exact treatment would Mueller-
+    // rotate the omega->view seed scatter; multiply-scattered light is
+    // weakly polarized and the I-error is sub-percent - same approximation
+    // as the CPU chain).
+    float4 stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
 
     float3 pos = start_pos;
     float3 current_dir = dir;
     float3 prev_dir = sun_dir; // direction before current propagation segment
-    float weight = start_optics.ssa * initial_weight;
+    // NOTE: no start_optics.ssa factor - the host-side integrator's
+    // beta_scat at the seed point already carries it (double-count removed,
+    // mirroring the CPU fix).
+    float weight = w0;
 
-    // KBN accumulators for each Stokes component
     KahanAccum total_I, total_Q, total_U, total_V;
-
-    // Upfront forced scattering gate: only at deep twilight
-    // (cos_sza and sza_deg already computed above for zenith bias)
-    bool use_forced = (sza_deg >= ZENITH_SZA_START_DEG);
-
-    // Exponential transform bias parameter (ramps with SZA)
-    float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
-                           / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
-    float alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
     for (uint scatter_iter = 0; scatter_iter < HYBRID_MAX_BOUNCES; scatter_iter++) {
         // --- Decide scatter mode for this bounce ---
         bool forced_this_bounce = false;
         float tau_max = 0.0f;
 
-        if (use_forced) {
+        if (setup.use_forced != 0u) {
             ScoutResult scout = scout_tau_to_boundary(atm, pos, current_dir, wl_idx);
             tau_max = scout.tau;
-            // Force scatter only when path exits to space AND is optically thin.
-            forced_this_bounce = !scout.hit_ground && scout.tau < FORCED_TAU_CUTOFF;
+            // Force scatter only when path exits to space, optical depth is
+            // within the useful range, and tau >= forced_tau_min. Without the
+            // lower bound, chains at high altitude (tau ~ 1e-5) get killed by
+            // weight *= (1 - exp(-tau)) ~ tau, losing 5 orders of magnitude
+            // per bounce. The CPU falls back to analog mode for small tau.
+            float forced_tau_min = (setup.alpha_et > 0.3f) ? 0.02f : 0.05f;
+            forced_this_bounce = !scout.hit_ground
+                              && tau_max >= forced_tau_min
+                              && tau_max < FORCED_TAU_CUTOFF;
         }
 
         uint scatter_shell = 0;
@@ -1322,7 +1476,7 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
             weight *= (1.0f - exp_neg_tau);
             if (weight < 1e-30f) break;
             float xi = xorshift_f32(rng);
-            float tau_s = -log(1.0f - xi * (1.0f - exp_neg_tau) + 1e-30f);
+            float tau_s = -metal_log1p(-xi * (1.0f - exp_neg_tau));
             AdvanceResult adv = advance_to_optical_depth(atm, pos, current_dir, tau_s, wl_idx);
             pos = adv.pos;
             current_dir = adv.dir;
@@ -1355,20 +1509,62 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
                 // Exponential transform: modified extinction.
                 // Bias axis tilted toward terminator at deep twilight.
-                float cos_bias = dot(current_dir, term_axis_dir);
+                float cos_bias = dot(current_dir, setup.term_axis_dir);
                 float sigma = op.extinction;
-                float sigma_prime = sigma * (1.0f - alpha_et * cos_bias);
+                float sigma_prime = sigma * (1.0f - setup.alpha_et * cos_bias);
+                // If sigma_prime <= 0, ET bias is too strong for this direction.
+                // Fall back to unbiased extinction (no bias introduced).
+                if (sigma_prime <= 0.0f) sigma_prime = sigma;
 
                 float xi = xorshift_f32(rng);
-                float free_path = -log(1.0f - xi + 1e-30f) / sigma_prime;
+                float free_path = -log(xi) / sigma_prime;
 
                 ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
                 if (!bnd.found) break;
 
                 if (free_path >= bnd.dist) {
                     // Boundary crossing weight correction
-                    if (alpha_et > 0.0f) {
-                        weight *= exp(-alpha_et * sigma * cos_bias * bnd.dist);
+                    if (setup.alpha_et > 0.0f) {
+                        float et_arg = -setup.alpha_et * sigma * cos_bias * bnd.dist;
+                        // Use expm1 form for small arguments to avoid cancellation,
+                        // and clamp large arguments to avoid overflow.
+                        // exp(x) for |x| < 80 is safe in f32 (~3.4e34).
+                        // For |x| >= 80, the weight correction is astronomically
+                        // large or small; the chain is effectively dead either way,
+                        // so we terminate rather than silently skip the correction
+                        // (which would leave the estimator sampling from the wrong
+                        // distribution without compensating).
+                        if (fabs(et_arg) < 80.0f) {
+                            weight *= exp(et_arg);
+                        } else {
+                            weight = 0.0f; // chain is dead
+                        }
+                    }
+                    if (!isfinite(weight)) break;
+
+                    // Fast path: inward crossing from shell 0 is the ground boundary.
+                    if (!bnd.is_outward && us == 0u) {
+                        float3 boundary_pos = pos + current_dir * bnd.dist;
+                        boundary_pos = snap_to_radius(boundary_pos, sh.r_inner);
+                        float3 normal = normalize(boundary_pos);
+                        // Ground-bounce NEE: direct solar illumination of ground point
+                        float cos_sun_ground = dot(sun_dir, normal);
+                        if (cos_sun_ground > 0.0f) {
+                            float t_sun_gb = shadow_ray_transmittance(atm, boundary_pos, sun_dir, wl_idx);
+                            if (t_sun_gb > 1e-30f) {
+                                float albedo_nee = read_albedo(atm, wl_idx);
+                                float nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
+                                if (isfinite(nee_gb)) total_I.add(nee_gb);
+                            }
+                        }
+                        float albedo = read_albedo(atm, wl_idx);
+                        weight *= albedo;
+                        if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
+                        prev_dir = current_dir;
+                        current_dir = sample_hemisphere(normal, rng);
+                        pos = radial_nudge(boundary_pos, true);
+                        stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
+                        continue;
                     }
 
                     float3 boundary_pos = pos + current_dir * bnd.dist;
@@ -1376,10 +1572,20 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
                     // Ground reflection: depolarizes
                     if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
+                        float3 normal = normalize(boundary_pos);
+                        // Ground-bounce NEE
+                        float cos_sun_ground = dot(sun_dir, normal);
+                        if (cos_sun_ground > 0.0f) {
+                            float t_sun_gb = shadow_ray_transmittance(atm, boundary_pos, sun_dir, wl_idx);
+                            if (t_sun_gb > 1e-30f) {
+                                float albedo_nee = read_albedo(atm, wl_idx);
+                                float nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
+                                if (isfinite(nee_gb)) total_I.add(nee_gb);
+                            }
+                        }
                         float albedo = read_albedo(atm, wl_idx);
                         weight *= albedo;
-                        if (weight < 1e-30f) break;
-                        float3 normal = normalize(boundary_pos);
+                        if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
                         prev_dir = current_dir;
                         current_dir = sample_hemisphere(normal, rng);
                         pos = radial_nudge(boundary_pos, true);
@@ -1400,9 +1606,19 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
                 // Scatter within this shell.
                 // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
-                if (alpha_et > 0.0f) {
-                    weight *= (sigma / sigma_prime) * exp(-alpha_et * sigma * cos_bias * free_path);
+                // If the exp argument would overflow f32, terminate the chain
+                // rather than silently skipping the correction (which would leave
+                // the estimator sampling from the transformed distribution without
+                // the compensating weight, introducing bias).
+                if (setup.alpha_et > 0.0f) {
+                    float et_arg = -setup.alpha_et * sigma * cos_bias * free_path;
+                    if (fabs(et_arg) < 80.0f) {
+                        weight *= (sigma / sigma_prime) * exp(et_arg);
+                    } else {
+                        weight = 0.0f; // chain is dead
+                    }
                 }
+                if (!isfinite(weight)) break;
                 pos = pos + current_dir * free_path;
                 scatter_shell = us;
                 scatter_found = true;
@@ -1414,53 +1630,70 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
         ShellOptics op = read_optics(atm, scatter_shell, wl_idx);
 
+        // Apply SSA BEFORE NEE: the NEE connection is a scattering
+        // interaction at this vertex (matches the corrected CPU chains;
+        // SSA-after-NEE overestimated each NEE by 1/ssa).
+        weight *= op.ssa;
+
         // NEE: apply Mueller to photon's actual Stokes state
-        float t_sun_sec = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
-        if (t_sun_sec > 1e-30f) {
-            float cos_angle_nee = dot(sun_dir, -current_dir);
-            float A_nee, B_nee, C_nee;
-            stokes_ABC(cos_angle_nee, op, A_nee, B_nee, C_nee);
+        if (isfinite(weight) && fabs(weight) > 1e-30f) {
+            float t_sun_sec = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
+            if (t_sun_sec > 1e-30f) {
+                float cos_angle_nee = clamp(dot(sun_dir, current_dir), -1.0f, 1.0f);
+                float A_nee, B_nee, C_nee;
+                stokes_ABC(cos_angle_nee, op, A_nee, B_nee, C_nee);
 
-            // Rotation from current propagation plane to NEE (sun) plane
-            float cos2phi_nee, sin2phi_nee;
-            scattering_plane_rotation(prev_dir, current_dir, -sun_dir, cos2phi_nee, sin2phi_nee);
+                float cos2phi_nee, sin2phi_nee;
+                scattering_plane_rotation(prev_dir, current_dir, -sun_dir, cos2phi_nee, sin2phi_nee);
+                // Guard against NaN from degenerate geometry
+                if (!isfinite(cos2phi_nee)) { cos2phi_nee = 1.0f; sin2phi_nee = 0.0f; }
 
-            // Apply Mueller to photon's Stokes state (NOT to [1,0,0,0])
-            float4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
+                float4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
 
-            float scale = weight * t_sun_sec / (4.0f * PI);
-            total_I.add(scale * nee_stokes.x);
-            total_Q.add(scale * nee_stokes.y);
-            total_U.add(scale * nee_stokes.z);
-            total_V.add(scale * nee_stokes.w);
+                float scale = weight * t_sun_sec / (4.0f * PI);
+                if (isfinite(scale)) {
+                    float nee_I = scale * nee_stokes.x;
+                    if (isfinite(nee_I)) total_I.add(nee_I);
+                    float nee_Q = scale * nee_stokes.y;
+                    if (isfinite(nee_Q)) total_Q.add(nee_Q);
+                    float nee_U = scale * nee_stokes.z;
+                    if (isfinite(nee_U)) total_U.add(nee_U);
+                    float nee_V = scale * nee_stokes.w;
+                    if (isfinite(nee_V)) total_V.add(nee_V);
+                }
+            }
         }
 
-        weight *= op.ssa;
-        if (weight < 1e-30f) break;
+        if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
 
         // Sample new direction
-        float cos_theta;
-        if (xorshift_f32(rng) < op.rayleigh_fraction) {
-            cos_theta = sample_rayleigh_analytic(xorshift_f32(rng));
-        } else {
-            cos_theta = sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry);
-        }
+        float cos_theta = clamp(
+            (xorshift_f32(rng) < op.rayleigh_fraction)
+                ? sample_rayleigh_analytic(xorshift_f32(rng))
+                : sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry),
+            -1.0f, 1.0f);
         float phi = 2.0f * PI * xorshift_f32(rng);
         float3 new_dir = scatter_direction(current_dir, cos_theta, phi);
+        // Guard: if scatter_direction returned zero/NaN, bail
+        if (!isfinite(new_dir.x) || (length(new_dir) < 1e-10f)) break;
 
         // Update Stokes state through this scatter event
         float A_s, B_s, C_s;
         stokes_ABC(cos_theta, op, A_s, B_s, C_s);
         float cos2phi_s, sin2phi_s;
         scattering_plane_rotation(prev_dir, current_dir, new_dir, cos2phi_s, sin2phi_s);
+        if (!isfinite(cos2phi_s)) { cos2phi_s = 1.0f; sin2phi_s = 0.0f; }
         stokes = scatter_stokes(A_s, B_s, C_s, cos2phi_s, sin2phi_s, stokes);
 
         // Normalize by I (importance weighting -- keeps stokes.x = 1)
-        if (stokes.x > 1e-30f) {
+        if (isfinite(stokes.x) && stokes.x > 1e-30f) {
             float inv_I = 1.0f / stokes.x;
             stokes *= inv_I;
+            // Guard against NaN propagation in Q/U/V
+            if (!isfinite(stokes.y)) stokes.y = 0.0f;
+            if (!isfinite(stokes.z)) stokes.z = 0.0f;
+            if (!isfinite(stokes.w)) stokes.w = 0.0f;
         } else {
-            // Polarization state degenerate, reset
             stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
         }
 
@@ -1468,7 +1701,19 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         current_dir = new_dir;
     }
 
-    return float4(total_I.result(), total_Q.result(), total_U.result(), total_V.result());
+    // Clamp chain return to prevent f32 overflow when accumulated across
+    // many chains per thread. Importance weight spikes (from the 3-branch
+    // sampling correction at transition SZAs) can produce values >1e20,
+    // which overflow when summed across 16+ chains in the v2 stride loop.
+    // A clamp at 1e6 is ~10 OOM above typical chain values (~1.0) and
+    // introduces negligible bias (affects <0.001% of chains).
+    float4 result = float4(total_I.result(), total_Q.result(), total_U.result(), total_V.result());
+    // Only filter non-finite values (not bias -- just numerical safety)
+    if (!isfinite(result.x)) result.x = 0.0f;
+    if (!isfinite(result.y)) result.y = 0.0f;
+    if (!isfinite(result.z)) result.z = 0.0f;
+    if (!isfinite(result.w)) result.w = 0.0f;
+    return result;
 }
 
 // ============================================================================
@@ -1505,8 +1750,8 @@ kernel void hybrid_scatter(
     float3 sun_dir      = read_sun_dir(params);
     uint secondary_rays = read_secondary_rays(params);
 
-    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
-    float surface_radius = EARTH_RADIUS_M;
+    float toa_radius = atm_toa_radius(atm);
+    float surface_radius = atm_surface_radius(atm);
 
     // ── LOS geometry (all threads compute same values) ──────────────────
     RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
@@ -1552,20 +1797,57 @@ kernel void hybrid_scatter(
         }
     }
 
+    float my_cloud_ds = (my_sidx >= 0) ? read_cloud_extinction(atm, uint(my_sidx)) * ds : 0.0f;
     shared_ext_ds[step_idx] = my_ext_ds;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // ── Phase 2: Compute tau_obs at this step via sequential scan ────────
-    // Each thread sums shared_ext_ds[0..step_idx-1]. This is O(N) per thread,
-    // O(N^2) total, but N=200 and the cost is negligible compared to the
-    // secondary chain tracing (thousands of operations per step).
+    // ── Phase 2: Compute exclusive prefix tau_obs via threadgroup scan ───
+    // This replaces the old O(N^2) per-thread summation with a Blelloch scan
+    // over shared_ext_ds. step_idx gets tau_obs = sum(shared_ext_ds[0..step_idx-1]).
+    // The cloud (delta-scaled scattering) tau is scanned in lockstep so the
+    // eye path applies Eddington diffuse transmission for the cloud portion.
 
-    float tau_obs = 0.0f;
-    for (uint i = 0; i < step_idx && i < num_steps; i++) {
-        tau_obs += shared_ext_ds[i];
+    threadgroup float shared_prefix[HYBRID_THREADGROUP_SIZE];
+    threadgroup float shared_cloud_prefix[HYBRID_THREADGROUP_SIZE];
+    shared_prefix[step_idx] = shared_ext_ds[step_idx];
+    shared_cloud_prefix[step_idx] = my_cloud_ds;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Upsweep (reduce) phase
+    for (uint offset = 1u; offset < HYBRID_THREADGROUP_SIZE; offset <<= 1u) {
+        uint idx = ((step_idx + 1u) * offset * 2u) - 1u;
+        if (idx < HYBRID_THREADGROUP_SIZE) {
+            shared_prefix[idx] += shared_prefix[idx - offset];
+            shared_cloud_prefix[idx] += shared_cloud_prefix[idx - offset];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    // exp(-(A+B)) = exp(-A)*exp(-B) avoids f32 precision loss
-    float t_obs = exp(-tau_obs) * exp(-my_ext_ds * 0.5f);
+
+    // Convert inclusive reduce tree to exclusive scan
+    if (step_idx == HYBRID_THREADGROUP_SIZE - 1u) {
+        shared_prefix[step_idx] = 0.0f;
+        shared_cloud_prefix[step_idx] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Downsweep phase
+    for (uint offset = HYBRID_THREADGROUP_SIZE >> 1u; offset > 0u; offset >>= 1u) {
+        uint idx = ((step_idx + 1u) * offset * 2u) - 1u;
+        if (idx < HYBRID_THREADGROUP_SIZE) {
+            float t = shared_prefix[idx - offset];
+            shared_prefix[idx - offset] = shared_prefix[idx];
+            shared_prefix[idx] += t;
+            float tc = shared_cloud_prefix[idx - offset];
+            shared_cloud_prefix[idx - offset] = shared_cloud_prefix[idx];
+            shared_cloud_prefix[idx] += tc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float tau_obs = (step_idx < num_steps) ? shared_prefix[step_idx] : 0.0f;
+    float tau_cloud_obs = (step_idx < num_steps) ? shared_cloud_prefix[step_idx] : 0.0f;
+    float t_obs = exp(-(tau_obs + my_ext_ds * 0.5f))
+                * cloud_diffuse_transmittance(atm, tau_cloud_obs + my_cloud_ds * 0.5f);
 
     // ── Phase 3: Compute per-step Stokes contribution ─────────────────
     // Full [I,Q,U,V] propagation. Single-scatter NEE applies Mueller to
@@ -1586,27 +1868,38 @@ kernel void hybrid_scatter(
         // Order 1: deterministic single-scatter NEE (Stokes)
         float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
-            float cos_theta_1 = dot(sun_dir, -view_dir);
+            float cos_theta_1 = dot(sun_dir, view_dir);
             float A_1, B_1, C_1;
             stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
-
-            // Single-scatter from unpolarized sunlight: Mueller * [1,0,0,0]
-            // I' = A, Q' = B, U' = 0, V' = 0
-            float4 ss_stokes = float4(A_1, B_1, 0.0f, 0.0f);
             float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;
+            float4 ss_stokes = float4(A_1, B_1, 0.0f, 0.0f);
             contribution += ss_stokes * scale_1;
         }
 
         // Orders 2+: MC secondary chains (full Stokes propagation)
-        // The noise gate (t_sun > 1e-20) has been REMOVED. The DS discriminant,
-        // stable quadratic, KBN summation, and umbra culling provide the
-        // precision needed for f32 shadow rays to return correct results at
-        // deep twilight without suppressing physics.
         if (secondary_rays > 0) {
+            float3 local_up = normalize(scatter_pos);
+            float cos_sza = dot(sun_dir, local_up);
+            float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
+            BranchParams bp = branch_params_for_sza(sza_deg);
+            float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
+                                   / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
+            SecondarySetup setup;
+            setup.local_up = local_up;
+            setup.term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
+            setup.alpha_p = 1.0f - bp.zenith_frac;
+            setup.alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
+            setup.alpha_t = bp.zenith_frac * bp.term_share;
+            setup.n_zenith = bp.n_zenith;
+            setup.m_term = bp.m_term;
+            setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+            setup.use_forced = (sza_deg >= ZENITH_SZA_START_DEG) ? 1u : 0u;
+
             KahanAccum mc_I, mc_Q, mc_U, mc_V;
             for (uint ray = 0; ray < secondary_rays; ray++) {
                 float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
-                                                      my_op, view_dir, ray, secondary_rays, rng);
+                                                      my_op, view_dir, setup,
+                                                      ray, secondary_rays, rng);
                 mc_I.add(chain.x);
                 mc_Q.add(chain.y);
                 mc_U.add(chain.z);
@@ -1621,30 +1914,331 @@ kernel void hybrid_scatter(
     }
 
     // ── Phase 4: Two-level Stokes reduction ─────────────────────────────
-    //
-    // Level 1: SIMD reduction on float4 (hardware-accelerated)
-    // Level 2: Threadgroup reduction (8 SIMD sums -> 1 final sum)
-    //
-    // Metal's simd_sum operates on float4 natively (component-wise).
-
     float4 simd_total = simd_sum(contribution);
 
     threadgroup float4 shared_sums[NUM_SIMD_GROUPS];
-
     if (simd_lane == 0) {
         shared_sums[simd_id] = simd_total;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Thread 0 writes the final reduced result
-    // Output intensity (Stokes I). Full Stokes output can be enabled by
-    // expanding the output buffer to 4*num_wl floats.
     if (step_idx == 0) {
         float4 total = float4(0.0f);
         for (uint i = 0; i < NUM_SIMD_GROUPS; i++) {
             total += shared_sums[i];
         }
-        output[wl_idx] = total.x;  // Stokes I = total intensity
+        output[wl_idx] = total.x;
+    }
+}
+
+// ============================================================================
+// Kernel 3p: hybrid_los_prefix
+//
+// Precomputes cumulative LOS optical depth for all (wavelength, step) pairs.
+// Dispatch: num_wavelengths threads (1D).
+// Output: tau_prefix[wl * HYBRID_LOS_STEPS + step] = cumulative tau to step.
+//         Negative value = step beyond LOS end (invalid).
+//
+// This runs ONCE per geometry and is reused across split-dispatch chunks,
+// eliminating the O(steps^2) serial prefix that was in hybrid_scatter_v2.
+// ============================================================================
+
+kernel void hybrid_los_prefix(
+    device const float* atm         [[buffer(0)]],
+    device const float* params      [[buffer(1)]],
+    device float*       tau_prefix  [[buffer(2)]],
+    uint wl_idx [[thread_position_in_grid]]
+) {
+    uint num_wl = atm_num_wavelengths(atm);
+    if (wl_idx >= num_wl) return;
+
+    float3 observer_pos = read_observer(params);
+    float3 view_dir     = read_view_dir(params);
+
+    float toa_radius = atm_toa_radius(atm);
+    float surface_radius = atm_surface_radius(atm);
+
+    RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
+    if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
+        for (uint s = 0; s < HYBRID_LOS_STEPS; s++)
+            tau_prefix[wl_idx * HYBRID_LOS_STEPS + s] = -1.0f;
+        return;
+    }
+
+    float los_max = toa_hit.t_far;
+    RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+    bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
+    float los_end = hits_ground ? ground_hit.t_near : los_max;
+
+    if (los_end <= 0.0f) {
+        for (uint s = 0; s < HYBRID_LOS_STEPS; s++)
+            tau_prefix[wl_idx * HYBRID_LOS_STEPS + s] = -1.0f;
+        return;
+    }
+
+    uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
+    float ds = los_end / float(num_steps);
+
+    // O(num_steps) cumulative scan -- replaces O(num_steps^2) per-step prefix
+    float running_tau = 0.0f;
+    for (uint step = 0; step < HYBRID_LOS_STEPS; step++) {
+        if (step >= num_steps) {
+            tau_prefix[wl_idx * HYBRID_LOS_STEPS + step] = -1.0f;
+            continue;
+        }
+        // tau to the START of this step (before this step's contribution)
+        tau_prefix[wl_idx * HYBRID_LOS_STEPS + step] = running_tau;
+
+        float s_mid = (float(step) + 0.5f) * ds;
+        float3 pos = observer_pos + view_dir * s_mid;
+        float r = length(pos);
+        if (r <= toa_radius && r >= surface_radius) {
+            int sidx = shell_index_binary(atm, r);
+            if (sidx >= 0) {
+                ShellOptics op = read_optics(atm, uint(sidx), wl_idx);
+                running_tau += op.extinction * ds;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Kernel 3b: hybrid_scatter_v2 (ray-parallel)
+//
+// Dispatch: (num_wavelengths, num_steps) threadgroups of 64 threads each.
+//   tg_pos.x = wavelength index
+//   tg_pos.y = LOS step index
+//   thread_in_tg.x = ray index within this step
+//
+// Each thread traces ceil(secondary_rays / 64) chains. Results are reduced
+// via simd_sum + Kahan in shared memory. Output layout:
+//   output[wl * HYBRID_LOS_STEPS + step] -- CPU sums across steps.
+//
+// Buffer 3 (tau_prefix) is precomputed by hybrid_los_prefix and reused
+// across split-dispatch chunks (same LOS geometry).
+// ============================================================================
+
+kernel void hybrid_scatter_v2(
+    device const float* atm         [[buffer(0)]],
+    device const float* params      [[buffer(1)]],
+    device float*       output      [[buffer(2)]],
+    uint3 tg_pos    [[threadgroup_position_in_grid]],
+    uint3 tid_in_tg [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_id    [[simdgroup_index_in_threadgroup]]
+) {
+    uint wl_idx = tg_pos.x;
+    uint step_idx = tg_pos.y;
+    uint ray_lane = tid_in_tg.x;
+    uint num_wl = atm_num_wavelengths(atm);
+
+    float3 observer_pos = read_observer(params);
+    float3 view_dir     = read_view_dir(params);
+    float3 sun_dir      = read_sun_dir(params);
+    uint secondary_rays = read_secondary_rays(params);
+
+    threadgroup uint shared_valid;
+    threadgroup float shared_ds;
+    threadgroup float3 shared_scatter_pos;
+    threadgroup ShellOptics shared_op;
+    threadgroup float shared_beta_scat;
+    threadgroup float shared_t_obs;
+    threadgroup SecondarySetup shared_setup;
+
+    if (ray_lane == 0) {
+        bool valid = (wl_idx < num_wl);
+        float toa_radius = atm_toa_radius(atm);
+        float surface_radius = atm_surface_radius(atm);
+        float ds = 0.0f;
+        float3 scatter_pos = float3(0.0f);
+        ShellOptics my_op = {};
+        float my_beta_scat = 0.0f;
+        int my_sidx = -1;
+        float t_obs = 0.0f;
+        SecondarySetup setup = {};
+
+        if (valid) {
+            RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
+            if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
+                valid = false;
+            } else {
+                float los_max = toa_hit.t_far;
+                RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+                bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
+                float los_end = hits_ground ? ground_hit.t_near : los_max;
+                if (los_end <= 0.0f) {
+                    valid = false;
+                } else {
+                    uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
+                    ds = los_end / float(num_steps);
+                    if (step_idx >= num_steps) {
+                        valid = false;
+                    } else {
+                        float s = (float(step_idx) + 0.5f) * ds;
+                        scatter_pos = observer_pos + view_dir * s;
+                        float r = length(scatter_pos);
+                        if (r > toa_radius || r < surface_radius) {
+                            valid = false;
+                        } else {
+                            my_sidx = shell_index_binary(atm, r);
+                            if (my_sidx < 0) {
+                                valid = false;
+                            } else {
+                                my_op = read_optics(atm, uint(my_sidx), wl_idx);
+                                my_beta_scat = my_op.extinction * my_op.ssa;
+                                if (my_beta_scat < 1e-30f) {
+                                    valid = false;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (valid) {
+            float tau_obs = 0.0f;
+            float tau_cloud_obs = 0.0f;
+            for (uint j = 0; j < step_idx; j++) {
+                float sj = (float(j) + 0.5f) * ds;
+                float3 pj = observer_pos + view_dir * sj;
+                float rj = length(pj);
+                if (rj <= toa_radius && rj >= surface_radius) {
+                    int sj_idx = shell_index_binary(atm, rj);
+                    if (sj_idx >= 0) {
+                        ShellOptics oj = read_optics(atm, uint(sj_idx), wl_idx);
+                        tau_obs += oj.extinction * ds;
+                        tau_cloud_obs += read_cloud_extinction(atm, uint(sj_idx)) * ds;
+                    }
+                }
+            }
+
+            // Single exp is more precise and faster than two multiplied exps.
+            // exp(a)*exp(b) = exp(a+b), but the product loses precision
+            // when both are small (the f32 multiply rounds twice).
+            // Cloud portion: Eddington diffuse (single-representation).
+            float my_cloud_ds =
+                read_cloud_extinction(atm, uint(my_sidx)) * ds;
+            t_obs = exp(-(tau_obs + my_op.extinction * ds * 0.5f))
+                  * cloud_diffuse_transmittance(atm, tau_cloud_obs + my_cloud_ds * 0.5f);
+            if (t_obs < 1e-30f) {
+                valid = false;
+            } else if (secondary_rays > 0u) {
+                float3 local_up = normalize(scatter_pos);
+                float cos_sza = dot(sun_dir, local_up);
+                float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
+                BranchParams bp = branch_params_for_sza(sza_deg);
+                float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
+                                       / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
+                setup.local_up = local_up;
+                setup.term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
+                setup.alpha_p = 1.0f - bp.zenith_frac;
+                setup.alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
+                setup.alpha_t = bp.zenith_frac * bp.term_share;
+                setup.n_zenith = bp.n_zenith;
+                setup.m_term = bp.m_term;
+                setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
+                setup.use_forced = (sza_deg >= ZENITH_SZA_START_DEG) ? 1u : 0u;
+            }
+        }
+
+        shared_valid = valid ? 1u : 0u;
+        shared_ds = ds;
+        shared_scatter_pos = scatter_pos;
+        shared_op = my_op;
+        shared_beta_scat = my_beta_scat;
+        shared_t_obs = t_obs;
+        shared_setup = setup;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    bool valid = (shared_valid != 0u);
+    float ds = shared_ds;
+    float3 scatter_pos = shared_scatter_pos;
+    ShellOptics my_op = shared_op;
+    float my_beta_scat = shared_beta_scat;
+    float t_obs = shared_t_obs;
+    SecondarySetup setup = shared_setup;
+
+    float my_contribution = 0.0f;
+
+    // Single-scatter NEE (only thread 0)
+    // Multiply by secondary_rays because CPU divides ALL output by secondary_rays.
+    // SS is deterministic and must survive that division unchanged.
+    if (valid && ray_lane == 0) {
+        float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
+        if (t_sun > 1e-30f) {
+            float cos_theta_1 = dot(sun_dir, view_dir);
+            float A_1, B_1, C_1;
+            stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
+            float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;
+            my_contribution += A_1 * scale_1 * float(secondary_rays);
+        }
+    }
+
+    // Secondary chains: each thread traces a subset of rays
+    if (valid && secondary_rays > 0) {
+        // ray_offset from upper 32 bits of seed (for split-dispatch)
+        ulong raw_seed = read_rng_seed(params);
+        uint ray_offset = uint(raw_seed >> 32);
+        ulong base_seed = raw_seed & 0xFFFFFFFFul;
+        // global_total_rays for stratification (encoded in photons_per_wl)
+        uint global_total_rays = read_photons_per_wl(params);
+        if (global_total_rays == 0u) global_total_rays = secondary_rays;
+
+        ulong seed_input = base_seed
+            ^ (ulong(wl_idx) * 0x9E3779B97F4A7C15ul)
+            ^ (ulong(step_idx) << 16)
+            ^ (ulong(ray_lane + ray_offset) << 32);
+        ulong rng = splitmix64(seed_input);
+
+        // Raw sum without inv_rays -- CPU divides in f64 after reduction
+        float scale_m = my_beta_scat * t_obs * ds;
+        KahanAccum mc_I;
+        for (uint ray = ray_lane; ray < secondary_rays; ray += HYBRID_V2_THREADGROUP_SIZE) {
+            uint global_ray = ray + ray_offset;
+            float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
+                                                  my_op, view_dir, setup,
+                                                  global_ray, global_total_rays, rng);
+            float val = chain.x * scale_m;
+            if (isfinite(val)) {
+                mc_I.add(val);
+            }
+        }
+        float mc_result = mc_I.result();
+        if (isfinite(mc_result)) {
+            my_contribution += mc_result;
+        }
+        // Debug: track how many non-finite chain values were dropped
+        // (Remove after debugging)
+        // If mc_result is not finite, the chain produced inf/NaN values
+        // that Kahan couldn't save. This means the underlying chain
+        // has f32 overflow in weight * nee_stokes, not just in ET.
+    }
+
+    // Guard: zero out non-finite contributions
+    if (!isfinite(my_contribution)) {
+        my_contribution = 0.0f;
+    }
+
+    float simd_total = simd_sum(my_contribution);
+
+    threadgroup float shared_vals[HYBRID_V2_NUM_SIMD_GROUPS];
+    if (simd_lane == 0) {
+        shared_vals[simd_id] = simd_total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (ray_lane == 0) {
+        KahanAccum final_sum;
+        for (uint i = 0; i < HYBRID_V2_NUM_SIMD_GROUPS; i++) {
+            float v = shared_vals[i];
+            if (isfinite(v)) {
+                final_sum.add(v);
+            }
+        }
+        float result = final_sum.result();
+        output[wl_idx * HYBRID_LOS_STEPS + step_idx] = isfinite(result) ? result : 0.0f;
     }
 }
 

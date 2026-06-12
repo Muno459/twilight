@@ -4,9 +4,9 @@
 //! crossing perceptual thresholds. Distinguishes between:
 //!
 //! - **Shafaq al-abyad** (white twilight): when overall sky brightness
-//!   drops below the threshold — used by Hanafi school for Isha.
+//!   drops below the threshold - used by Hanafi school for Isha.
 //! - **Shafaq al-ahmar** (red twilight): when the red glow on the horizon
-//!   disappears — used by Shafi'i/Maliki/Hanbali schools for Isha.
+//!   disappears - used by Shafi'i/Maliki/Hanbali schools for Isha.
 //!
 //! The threshold model uses mesopic vision (CIE 191:2010) since twilight
 //! spans the transition from photopic to scotopic adaptation.
@@ -18,11 +18,11 @@ use crate::luminance;
 pub enum TwilightColor {
     /// Blue-dominated sky (early twilight, SZA ~90-96°)
     Blue,
-    /// White/neutral sky — shafaq al-abyad (SZA ~96-100°)
+    /// White/neutral sky - shafaq al-abyad (SZA ~96-100°)
     White,
     /// Orange transitional (SZA ~100-102°)
     Orange,
-    /// Red-dominated sky — shafaq al-ahmar (SZA ~102-108°)
+    /// Red-dominated sky - shafaq al-ahmar (SZA ~102-108°)
     Red,
     /// Below detection threshold
     Dark,
@@ -49,27 +49,115 @@ pub struct TwilightAnalysis {
     pub color: TwilightColor,
 }
 
+/// Moonless dark-site night-sky zenith luminance [cd/m^2].
+///
+/// V ~ 21.7 mag/arcsec^2 (Patat 2008, Cerro Paranal; the commonly cited
+/// dark-sky range is 21.6-22.0) converts to ~2.2e-4 cd/m^2 via
+/// L = 10.8e4 * 10^(-0.4 m). This is the floor the twilight signal must
+/// rise above to be perceptible at all - by definition, astronomical
+/// twilight (depression 18 deg) ends when the scattered-sun component
+/// sinks to roughly this level.
+pub const NIGHT_SKY_LUMINANCE: f64 = 2.2e-4;
+
+
+/// Weber contrast-detection fraction C = dL/L at adaptation luminance
+/// `l_adapt` [cd/m^2], for a large, long-duration stimulus (the spreading
+/// dawn glow). Piecewise log-log interpolation anchored on the classical
+/// threshold-vs-intensity data (Blackwell 1946 large-target thresholds,
+/// as tabulated in the visibility literature):
+///
+///   L_b [cd/m^2]:  1e-4   1e-3   1e-2   1e-1    1     >=10
+///   C   (dL/L)  :  0.70   0.35   0.12   0.05  0.025  0.017
+///
+/// The eye detects a much SMALLER relative brightening against a brighter
+/// night sky - this is what makes a brightness-based fajr al-sadiq well
+/// defined even under high-latitude persistent twilight.
+pub fn contrast_threshold_weber(l_adapt: f64) -> f64 {
+    const LB: [f64; 6] = [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0];
+    const C: [f64; 6] = [0.70, 0.35, 0.12, 0.05, 0.025, 0.017];
+    if l_adapt <= LB[0] {
+        return C[0];
+    }
+    if l_adapt >= LB[5] {
+        return C[5];
+    }
+    let x = libm::log10(l_adapt);
+    for i in 0..5 {
+        let x0 = libm::log10(LB[i]);
+        let x1 = libm::log10(LB[i + 1]);
+        if x >= x0 && x <= x1 {
+            let t = (x - x0) / (x1 - x0);
+            let y0 = libm::log10(C[i]);
+            let y1 = libm::log10(C[i + 1]);
+            return libm::pow(10.0, y0 + t * (y1 - y0));
+        }
+    }
+    C[5]
+}
+
+/// Detection threshold for the dawn/dusk glow against an adaptation floor.
+///
+/// Returns the luminance at which the brightening becomes a CLEARLY
+/// PERCEPTIBLE event for an observer adapted to `l_floor`:
+///
+///   L_th = l_floor * (1 + F * C(l_floor))
+///
+/// where C is the Weber TVI fraction above and F is a conservatism/field
+/// factor CALIBRATED from the dark-sky anchor: at l_floor =
+/// NIGHT_SKY_LUMINANCE this reproduces `dark_anchor` exactly (e.g. the
+/// documented Fajr constant 1e-3 cd/m^2), so low-latitude behavior is
+/// bit-compatible with the absolute thresholds while high latitudes get
+/// the physiologically correct (smaller) relative criterion.
+pub fn detection_threshold(l_floor: f64, dark_anchor: f64) -> f64 {
+    let c0 = contrast_threshold_weber(NIGHT_SKY_LUMINANCE);
+    let f = (dark_anchor / NIGHT_SKY_LUMINANCE - 1.0) / c0;
+    l_floor * (1.0 + f * contrast_threshold_weber(l_floor))
+}
+
 /// Threshold configuration for prayer time determination.
 ///
-/// These thresholds define when twilight begins/ends for prayer purposes.
-/// They are calibrated against SQM (Sky Quality Meter) observations and
-/// traditional astronomical twilight definitions.
+/// PROVENANCE (honest accounting): these constants are NOT calibrated
+/// against field observations - no SQM campaign has been run yet (an
+/// earlier doc comment claiming SQM calibration was fabricated and has
+/// been removed). They are instead ANCHORED to published photometry by
+/// the derivations below, and land within the classical fiqh depression
+/// range (14.5-16 deg) when run through this engine's clear-sky
+/// atmosphere. Final calibration requires (a) the libRadtran-validated
+/// absolute radiance scale and (b) field SQM/observer data; both are
+/// tracked on the roadmap. Sensitivity: scaling any threshold by x2
+/// shifts the crossing by roughly 0.5-0.8 deg of depression (~2-4 min
+/// at mid-latitudes).
 #[derive(Debug, Clone)]
 pub struct ThresholdConfig {
-    /// Mesopic luminance threshold for Fajr (dawn detection).
-    /// When sky luminance rises above this, Fajr begins.
-    /// Default: ~0.001 cd/m² (roughly equivalent to 18° depression angle
-    /// under clear-sky conditions at mid-latitudes).
+    /// Mesopic luminance threshold for Fajr (true dawn, al-fajr al-sadiq).
+    ///
+    /// Derivation: the first spreading white glow is perceptible when the
+    /// twilight component rises clearly above the night-sky background
+    /// ([`NIGHT_SKY_LUMINANCE`] ~ 2.2e-4 cd/m^2). For a large diffuse
+    /// stimulus at scotopic adaptation, a conservative "clearly visible"
+    /// contrast is a few hundred percent (cf. Blackwell 1946 contrast
+    /// thresholds at low backgrounds). Default 1e-3 cd/m^2 ~ 4.5x the
+    /// background.
     pub fajr_luminance: f64,
 
-    /// Mesopic luminance threshold for Isha (shafaq al-abyad).
-    /// When overall sky luminance drops below this, Isha begins (Hanafi).
-    /// Default: ~0.003 cd/m² (roughly equivalent to 15° depression).
+    /// Mesopic luminance threshold for Isha per shafaq al-abyad (Hanafi).
+    ///
+    /// Derivation: the WHITE glow disappears when luminance falls to the
+    /// mesopic-to-scotopic transition where cone (color) vision fails and
+    /// the sky can no longer look "white" - the scotopic boundary of the
+    /// CIE mesopic range (~3e-3 cd/m^2; CIE 191:2010 puts the mesopic
+    /// range at ~0.005-5 cd/m^2 with cone intrusion fading just below).
+    /// Default 3e-3 cd/m^2.
     pub isha_abyad_luminance: f64,
 
-    /// Red band luminance threshold for Isha (shafaq al-ahmar).
-    /// When the red glow drops below this, Isha begins (Shafi'i/Maliki/Hanbali).
-    /// Default: ~0.0005 cd/m² (red persists longer than white).
+    /// Red-band (>600 nm) luminance threshold for Isha per shafaq
+    /// al-ahmar (Shafi'i/Maliki/Hanbali).
+    ///
+    /// Derivation: perception of REDNESS requires cones (rods are
+    /// insensitive beyond ~640 nm and color-blind); the red glow vanishes
+    /// when red-band luminance falls to the cone absolute threshold,
+    /// ~5e-4 cd/m^2 (classical cone-threshold photometry, e.g. Hecht).
+    /// Default 5e-4 cd/m^2.
     pub isha_ahmar_red_luminance: f64,
 
     /// Spectral centroid boundary between white and red twilight (nm).
@@ -83,9 +171,9 @@ pub struct ThresholdConfig {
 impl Default for ThresholdConfig {
     fn default() -> Self {
         Self {
-            fajr_luminance: 0.001,
-            isha_abyad_luminance: 0.003,
-            isha_ahmar_red_luminance: 0.0005,
+            fajr_luminance: 1e-3,
+            isha_abyad_luminance: 3e-3,
+            isha_ahmar_red_luminance: 5e-4,
             red_centroid_boundary: 590.0,
             white_centroid_boundary: 530.0,
         }
@@ -127,7 +215,7 @@ fn classify_twilight_color(
     _luminance_red: f64,
     config: &ThresholdConfig,
 ) -> TwilightColor {
-    // Below detection threshold — dark sky
+    // Below detection threshold - dark sky
     if luminance_mesopic < config.isha_ahmar_red_luminance * 0.1 {
         return TwilightColor::Dark;
     }
@@ -174,12 +262,25 @@ pub struct PrayerTimeResult {
 /// For Isha (evening): scan from small SZA to large SZA, find where
 /// luminance drops below threshold.
 ///
-/// For Fajr (morning): same physics — the SZA at which luminance
+/// For Fajr (morning): same physics - the SZA at which luminance
 /// crosses the threshold is the same (symmetric for clear sky).
 pub fn determine_prayer_times(
     analyses: Vec<TwilightAnalysis>,
     config: &ThresholdConfig,
 ) -> PrayerTimeResult {
+    // Fewer than two samples: nothing to interpolate. This happens at
+    // midnight-sun latitudes where the coarse scan never starts (the sun
+    // never reaches SZA 90). Previously `0..(len - 1)` underflowed to
+    // 0..usize::MAX and panicked on `analyses[0]`.
+    if analyses.len() < 2 {
+        return PrayerTimeResult {
+            fajr_sza_deg: None,
+            isha_abyad_sza_deg: None,
+            isha_ahmar_sza_deg: None,
+            analyses,
+        };
+    }
+
     let mut fajr_sza = None;
     let mut isha_abyad_sza = None;
     let mut isha_ahmar_sza = None;
@@ -244,12 +345,70 @@ pub fn determine_prayer_times(
     }
 }
 
+/// Weighted least-squares fit of ln(luminance) vs SZA over a local window,
+/// returning `(crossing_sza, slope)` where the fitted line crosses
+/// `ln(threshold)`.
+///
+/// Twilight luminance decays close to exponentially in SZA, so a local
+/// log-linear fit over several scan points is far more robust to Monte
+/// Carlo noise than interpolating between the two adjacent samples: a
+/// single noisy point can no longer masquerade as the crossing. The
+/// returned slope d(lnL)/dSZA also feeds the confidence interval on the
+/// prayer minute (sigma_sza = relative_SE / |slope|).
+///
+/// Returns None when fewer than 3 usable (positive-luminance) points are
+/// supplied, the fitted slope is not decreasing, or the crossing falls
+/// outside the window (padded by 0.3 deg).
+pub fn fit_crossing_loglinear(points: &[(f64, f64)], threshold: f64) -> Option<(f64, f64)> {
+    if threshold <= 0.0 {
+        return None;
+    }
+    let usable: Vec<(f64, f64)> = points
+        .iter()
+        .filter(|(_, l)| *l > 0.0)
+        .map(|&(s, l)| (s, libm::log(l)))
+        .collect();
+    if usable.len() < 3 {
+        return None;
+    }
+    let n = usable.len() as f64;
+    let sx: f64 = usable.iter().map(|(s, _)| s).sum();
+    let sy: f64 = usable.iter().map(|(_, y)| y).sum();
+    let sxx: f64 = usable.iter().map(|(s, _)| s * s).sum();
+    let sxy: f64 = usable.iter().map(|(s, y)| s * y).sum();
+    let denom = n * sxx - sx * sx;
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let b = (n * sxy - sx * sy) / denom; // d(lnL)/dSZA
+    let a = (sy - b * sx) / n;
+    if b >= -1e-6 {
+        // Luminance must DECREASE with SZA for a twilight crossing.
+        return None;
+    }
+    let crossing = (libm::log(threshold) - a) / b;
+    let lo = usable.iter().map(|(s, _)| *s).fold(f64::MAX, f64::min) - 0.3;
+    let hi = usable.iter().map(|(s, _)| *s).fold(f64::MIN, f64::max) + 0.3;
+    if crossing < lo || crossing > hi {
+        return None;
+    }
+    Some((crossing, b))
+}
+
 /// Linear interpolation to find exact SZA where luminance crosses threshold.
 fn interpolate_crossing(sza0: f64, lum0: f64, sza1: f64, lum1: f64, threshold: f64) -> f64 {
     if (lum1 - lum0).abs() < 1e-30 {
         return (sza0 + sza1) / 2.0;
     }
-    // Use log-space interpolation since luminance drops exponentially
+    // Log-space interpolation (luminance drops ~exponentially with SZA) -
+    // but log() of a zero/negative sample (possible when the darker endpoint
+    // collapses to exactly 0, or an MC estimate goes non-positive) is
+    // undefined and previously pinned the crossing to sza0. Fall back to
+    // linear interpolation in that case.
+    if lum0 <= 0.0 || lum1 <= 0.0 || threshold <= 0.0 {
+        let frac = ((threshold - lum0) / (lum1 - lum0)).clamp(0.0, 1.0);
+        return sza0 + frac * (sza1 - sza0);
+    }
     let log_lum0 = libm::log(lum0);
     let log_lum1 = libm::log(lum1);
     let log_thresh = libm::log(threshold);
@@ -261,6 +420,118 @@ fn interpolate_crossing(sza0: f64, lum0: f64, sza1: f64, lum1: f64, threshold: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── fit_crossing_loglinear ──
+
+    #[test]
+    fn fit_crossing_recovers_exact_exponential() {
+        // L(sza) = exp(a + b*sza) with known crossing.
+        let a = 10.0;
+        let b = -2.3; // one decade per degree
+        let pts: Vec<(f64, f64)> = (0..7)
+            .map(|i| {
+                let s = 100.0 + 0.1 * i as f64;
+                (s, libm::exp(a + b * s))
+            })
+            .collect();
+        let thresh = libm::exp(a + b * 100.33);
+        let (crossing, slope) = fit_crossing_loglinear(&pts, thresh).unwrap();
+        assert!((crossing - 100.33).abs() < 1e-9, "crossing = {}", crossing);
+        assert!((slope - b).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fit_crossing_robust_to_single_noisy_point() {
+        // One sample 3x too bright must not move the fit much (the pairwise
+        // interpolator would latch onto it).
+        let a = 10.0;
+        let b = -2.3;
+        let mut pts: Vec<(f64, f64)> = (0..7)
+            .map(|i| {
+                let s = 100.0 + 0.1 * i as f64;
+                (s, libm::exp(a + b * s))
+            })
+            .collect();
+        pts[3].1 *= 3.0;
+        let thresh = libm::exp(a + b * 100.33);
+        let (crossing, _) = fit_crossing_loglinear(&pts, thresh).unwrap();
+        assert!(
+            (crossing - 100.33).abs() < 0.12,
+            "fit should absorb a single outlier: crossing = {}",
+            crossing
+        );
+    }
+
+    #[test]
+    fn fit_crossing_rejects_rising_luminance() {
+        let pts: Vec<(f64, f64)> = (0..5).map(|i| (100.0 + i as f64 * 0.1, 1e-4 * (i + 1) as f64)).collect();
+        assert!(fit_crossing_loglinear(&pts, 2e-4).is_none());
+    }
+
+    // ── TVI contrast model ──
+
+    #[test]
+    fn tvi_dark_anchor_reproduces_absolute_constants() {
+        // At the dark night-sky floor the TVI detection threshold must equal
+        // the documented absolute constants exactly (regime continuity).
+        let c = ThresholdConfig::default();
+        let t = detection_threshold(NIGHT_SKY_LUMINANCE, c.fajr_luminance);
+        assert!(
+            (t - c.fajr_luminance).abs() / c.fajr_luminance < 1e-12,
+            "dark anchor: {} vs {}",
+            t,
+            c.fajr_luminance
+        );
+    }
+
+    #[test]
+    fn tvi_weber_fraction_decreases_with_adaptation() {
+        // The eye detects smaller relative changes against brighter skies.
+        let c_dark = contrast_threshold_weber(2e-4);
+        let c_mesopic = contrast_threshold_weber(0.2);
+        let c_photopic = contrast_threshold_weber(50.0);
+        assert!(c_dark > c_mesopic && c_mesopic > c_photopic);
+        assert!((0.4..=1.0).contains(&c_dark), "c_dark = {}", c_dark);
+        assert!((0.02..=0.08).contains(&c_mesopic), "c_mesopic = {}", c_mesopic);
+    }
+
+    #[test]
+    fn tvi_bright_floor_needs_small_relative_rise() {
+        // Padborg June floor ~0.2 cd/m^2: dawn detection should require only
+        // a ~10-40% rise over the floor, NOT the dark-site 4.5x.
+        let c = ThresholdConfig::default();
+        let floor = 0.2;
+        let t = detection_threshold(floor, c.fajr_luminance);
+        let rel_rise = t / floor - 1.0;
+        assert!(
+            (0.05..=0.6).contains(&rel_rise),
+            "relative rise at bright floor = {} (threshold {})",
+            rel_rise,
+            t
+        );
+    }
+
+    // ── Threshold provenance (anchored to published photometry) ──
+
+    #[test]
+    fn thresholds_anchor_to_night_sky_background() {
+        let c = ThresholdConfig::default();
+        // Fajr: a clearly-visible diffuse brightening above the dark night
+        // sky - between 2x and 10x the background, not an arbitrary number.
+        let ratio = c.fajr_luminance / NIGHT_SKY_LUMINANCE;
+        assert!(
+            (2.0..=10.0).contains(&ratio),
+            "Fajr threshold / night background = {:.1}, expected 2-10x",
+            ratio
+        );
+        // Ordering: white-glow extinction (mesopic boundary) happens at a
+        // brighter level than first-light detection, which is brighter than
+        // the red-band cone threshold.
+        assert!(c.isha_abyad_luminance > c.fajr_luminance);
+        assert!(c.fajr_luminance > c.isha_ahmar_red_luminance);
+        // All thresholds sit above the night-sky floor.
+        assert!(c.isha_ahmar_red_luminance > NIGHT_SKY_LUMINANCE);
+    }
 
     // Helper: create a flat spectrum with given value
     fn flat_spectrum(value: f64) -> (Vec<f64>, Vec<f64>) {

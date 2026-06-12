@@ -1,40 +1,28 @@
-//! GPU compute backends for the Twilight MCRT engine.
+//! GPU compute backend for the Twilight MCRT engine.
 //!
-//! Provides four native GPU backends for maximum performance on every platform:
+//! Currently provides a single backend: **Metal** (`.metal` shaders,
+//! `objc2-metal` host) for Apple GPUs. The backend implements the
+//! [`GpuBackend`] trait and uses the buffer packing code in [`buffers`] to
+//! convert the CPU reference engine's `f64` atmosphere model into
+//! GPU-friendly `f32` layouts exactly once per upload.
 //!
-//! - **CUDA** (`.cu` shaders, `cudarc` host) -- NVIDIA GPUs
-//! - **Metal** (`.metal` shaders, `objc2-metal` host) -- Apple GPUs
-//! - **Vulkan** (GLSL->SPIR-V, `ash` host) -- AMD/Intel/Android/Linux
-//! - **wgpu** (`.wgsl` shaders) -- WASM/browsers only
-//!
-//! All backends implement the [`GpuBackend`] trait and share the same buffer
-//! packing code ([`buffers`]), so the CPU reference engine's `f64` atmosphere
-//! model is converted to GPU-friendly `f32` layouts exactly once.
+//! Other backends (CUDA, Vulkan, WebGPU) do not exist. The host-side code
+//! that once claimed to support them was deleted because the corresponding
+//! shaders were never written and the features could not compile.
 //!
 //! # Feature gates
-//!
-//! Each backend is behind a cargo feature:
 //!
 //! ```toml
 //! twilight-gpu = { version = "0.1", features = ["metal"] }
 //! ```
 //!
-//! Enable multiple backends to get automatic fallback via [`detect_backends`].
+//! Without the `metal` feature this crate only provides the buffer-packing
+//! layer and the [`GpuBackend`] trait.
 
 pub mod buffers;
 
 #[cfg(feature = "metal")]
 pub mod metal;
-
-#[cfg(feature = "vulkan")]
-pub mod vulkan;
-
-#[cfg(feature = "cuda")]
-pub mod cuda;
-
-#[cfg(feature = "webgpu")]
-#[path = "wgpu_backend.rs"]
-pub mod wgpu_backend;
 
 #[cfg(test)]
 mod oracle;
@@ -92,19 +80,13 @@ impl std::error::Error for GpuError {}
 /// Which GPU backend is being used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendKind {
-    Cuda,
     Metal,
-    Vulkan,
-    Wgpu,
 }
 
 impl core::fmt::Display for BackendKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            BackendKind::Cuda => write!(f, "CUDA"),
             BackendKind::Metal => write!(f, "Metal"),
-            BackendKind::Vulkan => write!(f, "Vulkan"),
-            BackendKind::Wgpu => write!(f, "wgpu"),
         }
     }
 }
@@ -212,7 +194,7 @@ pub struct BatchRequest {
     pub kernel: BatchKernel,
 }
 
-/// Trait implemented by each GPU backend (CUDA, Metal, Vulkan, wgpu).
+/// Trait implemented by GPU backends (currently only Metal).
 ///
 /// The lifecycle is:
 /// 1. `try_init()` -- probe for hardware, compile shaders, allocate pipeline
@@ -281,9 +263,8 @@ pub trait GpuBackend: Send {
 
     /// Dispatch multiple SZA points in a single GPU submission.
     ///
-    /// Encodes all N dispatches into one command buffer (Metal) or command
-    /// submission (Vulkan/CUDA), avoiding the per-dispatch synchronization
-    /// overhead that makes serial dispatch ~25x slower than CPU for prayer
+    /// Encodes all N dispatches into one command buffer, avoiding the
+    /// per-dispatch synchronization overhead of serial dispatch for prayer
     /// pipeline scans (~50 SZA points).
     ///
     /// The default implementation falls back to serial dispatch for backends
@@ -330,49 +311,18 @@ pub trait GpuBackend: Send {
 
 /// Detect which GPU backends are available at runtime.
 ///
-/// Returns a list of `BackendKind` values sorted by preference:
-/// - On macOS/iOS: `[Metal]`
-/// - On Windows with NVIDIA: `[Cuda, Vulkan]`
-/// - On Windows with AMD/Intel: `[Vulkan]`
-/// - On Linux: `[Cuda, Vulkan]` or `[Vulkan]`
-/// - On WASM: `[Wgpu]`
-///
-/// This only checks whether the feature was compiled in and makes a
-/// lightweight probe (e.g., can we open a device). It does not compile
-/// shaders or allocate buffers.
+/// Returns `[Metal]` on Apple platforms when the `metal` feature is
+/// compiled in and a device responds to a lightweight probe; otherwise
+/// an empty list. Does not compile shaders or allocate buffers.
 pub fn detect_backends() -> Vec<BackendKind> {
     #[allow(unused_mut)]
     let mut available = Vec::new();
-
-    // CUDA: check if feature is compiled and driver is accessible
-    #[cfg(feature = "cuda")]
-    {
-        if probe_cuda() {
-            available.push(BackendKind::Cuda);
-        }
-    }
 
     // Metal: check if feature is compiled (always works on macOS/iOS)
     #[cfg(feature = "metal")]
     {
         if probe_metal() {
             available.push(BackendKind::Metal);
-        }
-    }
-
-    // Vulkan: check if feature is compiled and a device is available
-    #[cfg(feature = "vulkan")]
-    {
-        if probe_vulkan() {
-            available.push(BackendKind::Vulkan);
-        }
-    }
-
-    // wgpu: check if feature is compiled and a device is available
-    #[cfg(feature = "webgpu")]
-    {
-        if probe_wgpu() {
-            available.push(BackendKind::Wgpu);
         }
     }
 
@@ -407,59 +357,21 @@ pub fn try_init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     };
 
     match kind {
-        #[cfg(feature = "cuda")]
-        BackendKind::Cuda => init_cuda(config),
         #[cfg(feature = "metal")]
         BackendKind::Metal => init_metal(config),
-        #[cfg(feature = "vulkan")]
-        BackendKind::Vulkan => init_vulkan(config),
-        #[cfg(feature = "webgpu")]
-        BackendKind::Wgpu => init_wgpu(config),
         #[allow(unreachable_patterns)]
         _ => Err(GpuError::BackendUnavailable(kind)),
     }
 }
 
-// ── Probe functions (lightweight device checks) ─────────────────────────
-
-#[cfg(feature = "cuda")]
-fn probe_cuda() -> bool {
-    cuda::probe()
-}
+// ── Probe / init (lightweight device checks) ────────────────────────────
 
 #[cfg(feature = "metal")]
 fn probe_metal() -> bool {
     metal::probe()
 }
 
-#[cfg(feature = "vulkan")]
-fn probe_vulkan() -> bool {
-    vulkan::probe()
-}
-
-// ── Backend init functions (stubs for Phase 11a) ────────────────────────
-
-#[cfg(feature = "cuda")]
-fn init_cuda(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
-    cuda::init(config)
-}
-
 #[cfg(feature = "metal")]
 fn init_metal(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     metal::init(config)
-}
-
-#[cfg(feature = "vulkan")]
-fn init_vulkan(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
-    vulkan::init(config)
-}
-
-#[cfg(feature = "webgpu")]
-fn probe_wgpu() -> bool {
-    wgpu_backend::probe()
-}
-
-#[cfg(feature = "webgpu")]
-fn init_wgpu(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
-    wgpu_backend::init(config)
 }

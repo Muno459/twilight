@@ -64,6 +64,11 @@ pub struct SimulationConfig {
     /// Zenith viewing direction (degrees from straight up).
     /// ~70-80° toward the sun azimuth captures the brightest twilight sky.
     pub view_zenith: f64,
+    /// View azimuth (degrees, 0=north, clockwise). `None` means "look toward
+    /// the solar azimuth" (relative azimuth 0), the historical behavior.
+    /// Set explicitly for off-principal-plane geometry (e.g. libRadtran
+    /// comparison grids).
+    pub view_azimuth: Option<f64>,
     /// Whether to weight radiance by solar spectrum (true = physical units).
     /// When false, radiance is in relative units (useful for debugging).
     pub apply_solar_irradiance: bool,
@@ -82,6 +87,11 @@ pub struct SimulationConfig {
     /// When false (`--fast` mode), uses scalar phase function (P11 only).
     /// Slightly faster, loses ~0.5-2% polarization correction.
     pub polarized: bool,
+    /// Extra entropy mixed into MC seeds. Salt 0 reproduces historical
+    /// runs; distinct salts give statistically independent estimates of
+    /// the same radiance - the basis for K-seed averaging and standard-
+    /// error estimation in the prayer pipeline.
+    pub seed_salt: u64,
 }
 
 impl Default for SimulationConfig {
@@ -92,12 +102,30 @@ impl Default for SimulationConfig {
             elevation: 0.0,
             solar_azimuth: 270.0, // West (Isha/sunset direction)
             view_zenith: 75.0,    // Look toward horizon
+            view_azimuth: None,   // default: toward the solar azimuth
             apply_solar_irradiance: true,
             scattering_mode: ScatteringMode::Single,
             photons_per_wavelength: 10_000,
             polarized: true,
+            seed_salt: 0,
         }
     }
+}
+
+
+/// Mix the config's seed salt into a base seed. Salt 0 leaves the seed
+/// unchanged (bit-for-bit reproducibility of historical runs); any other
+/// salt is dispersed through a splitmix64 finalizer before XOR so
+/// consecutive salts give decorrelated streams.
+#[inline]
+fn mix_salt(base: u64, salt: u64) -> u64 {
+    if salt == 0 {
+        return base;
+    }
+    let mut z = salt;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    base ^ (z ^ (z >> 31))
 }
 
 /// Run simulation at a single solar zenith angle.
@@ -134,7 +162,7 @@ pub(crate) fn compute_geometry(config: &SimulationConfig, sza_deg: f64) -> (Vec3
     );
     let view_dir = solar_direction_ecef(
         config.view_zenith,
-        config.solar_azimuth,
+        config.view_azimuth.unwrap_or(config.solar_azimuth),
         config.latitude,
         config.longitude,
     );
@@ -214,7 +242,7 @@ fn simulate_at_sza_mc(
             for p in 0..nphotons {
                 // Unique seed per (sza, wavelength, photon) triple.
                 // Include sza bits to decorrelate across SZA scan steps.
-                let sza_bits = sza_deg.to_bits();
+                let sza_bits = mix_salt(sza_deg.to_bits(), config.seed_salt);
                 let mut rng = (sza_bits)
                     .wrapping_add(w as u64)
                     .wrapping_mul(6364136223846793005)
@@ -263,7 +291,7 @@ fn simulate_at_sza_hybrid(
 
     if !config.polarized {
         // ALIS path: all wavelengths in a single call.
-        let sza_bits = sza_deg.to_bits();
+        let sza_bits = mix_salt(sza_deg.to_bits(), config.seed_salt);
         let mut rng = sza_bits.wrapping_mul(6364136223846793005).wrapping_add(1);
 
         let radiance_array = photon::hybrid_scatter_radiance_alis(
@@ -282,7 +310,7 @@ fn simulate_at_sza_hybrid(
     let per_wl_radiance: Vec<f64> = (0..num_wl)
         .into_par_iter()
         .map(|w| {
-            let sza_bits = sza_deg.to_bits();
+            let sza_bits = mix_salt(sza_deg.to_bits(), config.seed_salt);
             let mut rng = sza_bits
                 .wrapping_add(w as u64)
                 .wrapping_mul(6364136223846793005)
@@ -371,6 +399,130 @@ mod tests {
         assert!((c.solar_azimuth - 270.0).abs() < 0.01);
         assert!((c.view_zenith - 75.0).abs() < 0.01);
         assert!(c.apply_solar_irradiance);
+    }
+
+    // ── 150 km ceiling (regression for the deep-twilight zero) ──
+
+    /// With the old 100 km ceiling, single-scatter radiance was EXACTLY
+    /// zero for SZA >= ~104 deg - yet prayer-time crossings live at
+    /// 104-106 deg (verified against MYSTIC spherical, which still sees
+    /// signal there). The thermospheric shells (100-150 km) carry that
+    /// signal: it must be nonzero and decreasing in SZA.
+    #[test]
+    fn deep_twilight_single_scatter_nonzero_to_sza_107() {
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            view_zenith: 85.0,
+            scattering_mode: ScatteringMode::Single,
+            ..SimulationConfig::default()
+        };
+        let mut prev = f64::MAX;
+        for sza in [103.0, 104.0, 105.0, 106.0, 107.0] {
+            let r: f64 = simulate_at_sza(&atm, &config, sza).radiance.iter().sum();
+            assert!(
+                r > 0.0,
+                "single-scatter must be nonzero at SZA {} (was exactly 0 \
+                 under the 100 km ceiling), got {:.3e}",
+                sza,
+                r
+            );
+            assert!(r < prev, "radiance must decrease with SZA");
+            prev = r;
+        }
+    }
+
+    // ── Cloud transport (regression for the OD-10 collapse) ──
+
+    /// Through an OD-10 stratus deck the twilight sky must remain visible:
+    /// the cloud portion of the eye/sun paths uses Eddington diffuse
+    /// transmission (delta-Eddington scaled), not Beer-Lambert. Before this,
+    /// radiance collapsed to ~e^-38 ~ 1e-15 and Fajr degenerated to sunrise.
+    #[test]
+    fn stratus_twilight_remains_visible_and_below_clear_sky() {
+        use twilight_data::cloud::{default_properties, CloudType};
+        let clear = make_clear_sky_atm();
+        let props = default_properties(CloudType::Stratus);
+        let cloudy = builder::build_with_cloud_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &props,
+        );
+        let config = SimulationConfig {
+            view_zenith: 85.0,
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 50,
+            polarized: false,
+            ..SimulationConfig::default()
+        };
+        let sza = 100.0;
+        let r_clear: f64 = simulate_at_sza(&clear, &config, sza).radiance.iter().sum();
+        let r_cloudy: f64 = simulate_at_sza(&cloudy, &config, sza).radiance.iter().sum();
+        assert!(
+            r_cloudy > 1e-9,
+            "cloudy twilight collapsed again: {:.3e} (was 1e-15 before the fix)",
+            r_cloudy
+        );
+        assert!(
+            r_cloudy < r_clear,
+            "an OD-10 deck must dim the sky: cloudy={:.3e} clear={:.3e}",
+            r_cloudy,
+            r_clear
+        );
+        // and the dimming should be a sane diffuse factor, not orders of magnitude
+        assert!(
+            r_cloudy > r_clear * 1e-4,
+            "dimming too extreme: cloudy={:.3e} clear={:.3e}",
+            r_cloudy,
+            r_clear
+        );
+    }
+
+    // ── Phase-function orientation (regression for the supplement-angle bug) ──
+
+    /// With a forward-peaked aerosol phase function (HG, g≈0.7), the sky
+    /// toward the sun must be much brighter than the anti-solar sky. Before
+    /// the fix, cos(θ) was negated (the supplement), evaluating the forward
+    /// peak at the BACKWARD angle, and this test fails by ~2 orders of
+    /// magnitude.
+    #[test]
+    fn aerosol_forward_scatter_beats_backscatter() {
+        use twilight_data::aerosol::{default_properties, AerosolType};
+        let props = default_properties(AerosolType::Urban);
+        let atm = builder::build_with_aerosol_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &props,
+        );
+        // Sun well above horizon so both views are sunlit; observer looks
+        // 75° from zenith either toward the sun (rel az 0) or away (180).
+        let mut toward = SimulationConfig {
+            view_zenith: 75.0,
+            scattering_mode: ScatteringMode::Single,
+            ..SimulationConfig::default()
+        };
+        toward.view_azimuth = Some(toward.solar_azimuth); // rel az = 0
+        let mut away = toward.clone();
+        away.view_azimuth = Some(toward.solar_azimuth + 180.0);
+
+        let sza = 60.0;
+        let r_toward = simulate_at_sza(&atm, &toward, sza);
+        let r_away = simulate_at_sza(&atm, &away, sza);
+        // 550 nm bin (index 17 on the 380..780/10nm grid)
+        let i550 = r_toward
+            .wavelengths_nm
+            .iter()
+            .position(|&w| (w - 550.0).abs() < 1e-9)
+            .unwrap();
+        let t = r_toward.radiance[i550];
+        let a = r_away.radiance[i550];
+        assert!(
+            t > 2.0 * a,
+            "forward-scatter sky should be much brighter than anti-solar: \
+             toward={:.4e}, away={:.4e}, ratio={:.2}",
+            t,
+            a,
+            t / a
+        );
     }
 
     // ── simulate_at_sza ──
@@ -944,6 +1096,7 @@ mod tests {
     ///
     /// Run with: cargo test -p twilight-cpu --release -- cv_baseline --nocapture
     #[test]
+    #[ignore = "slow MC diagnostic (minutes); run: cargo test --release -- --ignored cv_baseline --nocapture"]
     fn cv_baseline() {
         use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
         use twilight_core::photon;
@@ -1022,6 +1175,7 @@ mod tests {
     ///
     /// Run with: cargo test -p twilight-cpu --release -- cv_deep_diag --nocapture
     #[test]
+    #[ignore = "slow MC diagnostic (minutes); run: cargo test --release -- --ignored cv_deep_diag --nocapture"]
     fn cv_deep_diag() {
         use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
         use twilight_core::photon;

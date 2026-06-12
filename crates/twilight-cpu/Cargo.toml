@@ -10,6 +10,7 @@ default = []
 gpu = ["dep:twilight-gpu"]
 
 [dependencies]
+libm = "0.2"
 twilight-core = { workspace = true }
 twilight-data = { workspace = true }
 twilight-solar = { workspace = true }

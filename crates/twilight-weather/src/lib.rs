@@ -18,7 +18,11 @@
 //! physics are more complex than what a weather API can provide.
 
 pub mod api;
+pub mod cloud3d;
+pub mod f107;
 pub mod mapping;
+pub mod satellite;
+pub mod satellite_colormaps;
 
 use twilight_data::aerosol::AerosolProperties;
 use twilight_data::cloud::CloudProperties;
@@ -71,7 +75,7 @@ pub struct WeatherConditions {
 #[derive(Debug, Clone, Copy)]
 pub struct GasComposition {
     /// Total column O3 in Dobson Units. `None` means use the standard
-    /// atmosphere default (~347 DU for US Standard 1976).
+    /// atmosphere default (345 DU, US Standard 1976).
     pub o3_column_du: Option<f64>,
     /// Surface NO2 number density in molecules/m^3. `None` means use the
     /// standard atmosphere default.
@@ -104,18 +108,35 @@ pub struct AtmosphericParams {
 /// Returns an error string if the API requests fail.
 pub fn fetch_atmospheric_params(lat: f64, lon: f64) -> Result<AtmosphericParams, String> {
     let conditions = api::fetch_weather(lat, lon)?;
+    Ok(params_from_conditions(conditions))
+}
+
+/// Like [`fetch_atmospheric_params`] but samples the HOURLY FORECAST at a
+/// specific UTC date and hour - the conditions at the actual prayer hour,
+/// not "now". This is the production path: Fajr weather is fetched for the
+/// morning-twilight hour and Isha weather for the evening-twilight hour.
+pub fn fetch_atmospheric_params_at(
+    lat: f64,
+    lon: f64,
+    date: &str,
+    hour_utc: f64,
+) -> Result<AtmosphericParams, String> {
+    let conditions = api::fetch_weather_at(lat, lon, date, hour_utc)?;
+    Ok(params_from_conditions(conditions))
+}
+
+fn params_from_conditions(conditions: WeatherConditions) -> AtmosphericParams {
     let aerosol = mapping::map_aerosol(&conditions);
     let cloud = mapping::map_cloud(&conditions);
     let gas_composition = mapping::map_gas_composition(&conditions);
     let description = mapping::describe(&conditions, &aerosol, &cloud, &gas_composition);
-
-    Ok(AtmosphericParams {
+    AtmosphericParams {
         aerosol,
         cloud,
         gas_composition,
         description,
         conditions,
-    })
+    }
 }
 
 #[cfg(test)]

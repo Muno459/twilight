@@ -9,9 +9,9 @@
 //! Cloud mapping uses the low/mid/high cloud cover breakdown to select
 //! the dominant cloud type, and scales optical depth by coverage fraction.
 //!
-//! Gas composition mapping converts surface O3 and NO2 concentrations
-//! from the CAMS-based air quality API into total column estimates for
-//! the MCRT gas absorption model.
+//! Gas composition mapping converts surface NO2 concentration from the
+//! CAMS-based air quality API into a boundary-layer number-density override.
+//! Surface O3 produces no override (it does not determine the column).
 
 use twilight_data::aerosol::{self, AerosolProperties, AerosolType};
 use twilight_data::cloud::{self, CloudProperties, CloudType};
@@ -48,9 +48,29 @@ pub fn map_aerosol(conditions: &WeatherConditions) -> Option<AerosolProperties> 
         return None;
     }
 
-    // Select type based on composition indicators
+    // Select type based on composition indicators.
+    //
+    // Maritime detection heuristic (no land/sea mask in the API): clean
+    // marine air has low dust, low fine-particle load relative to AOD
+    // (sea salt is coarse: PM2.5/PM10 ratio low), and high humidity. The
+    // sea-salt Angstrom exponent (~0.3) vs continental (~1.3) materially
+    // changes the blue/red extinction split at twilight, so reaching the
+    // maritime types matters; previously they were unreachable from
+    // weather data.
+    let pm_ratio = if conditions.pm10_ug_m3 > 1.0 {
+        conditions.pm2_5_ug_m3 / conditions.pm10_ug_m3
+    } else {
+        1.0
+    };
+    let maritime_like = conditions.dust_ug_m3 < 5.0
+        && conditions.relative_humidity > 70.0
+        && pm_ratio < 0.55;
     let base_type = if conditions.dust_ug_m3 > DUST_THRESHOLD {
         AerosolType::Desert
+    } else if maritime_like && aod <= 0.15 {
+        AerosolType::MaritimeClean
+    } else if maritime_like {
+        AerosolType::MaritimePolluted
     } else if aod > 0.20 {
         AerosolType::Urban
     } else if aod > 0.08 {
@@ -71,96 +91,167 @@ pub fn map_aerosol(conditions: &WeatherConditions) -> Option<AerosolProperties> 
 
 /// Map weather observations to cloud layer properties.
 ///
-/// Uses the low/mid/high cloud cover breakdown from the weather API to
-/// select the dominant cloud layer type and scale its optical depth by
-/// the coverage fraction.
+/// Uses ALL THREE altitude bands (low/mid/high) from the API, combined via
+/// the independent-column approximation: each band transmits
 ///
-/// Priority: low clouds > mid clouds > high clouds (low clouds have the
-/// largest radiative impact on twilight).
+///   T_band = (1 - f) + f * T_diff(OD_band)
 ///
-/// The optical depth is scaled by (cover_fraction)^0.7 to account for
-/// the fact that partial cloud cover doesn't linearly reduce the mean
-/// optical depth (cloud edges contribute, and horizontal transport of
-/// light through gaps matters).
+/// where f is the band's cover fraction and T_diff is the Eddington diffuse
+/// transmission of the band's type OD (matching the engine's cloud
+/// transport). The bands' transmissions multiply (independent overlap), and
+/// the combined transmission is inverted back into one EFFECTIVE optical
+/// depth. This replaces two earlier defects: a priority early-return where
+/// 10% scattered low cloud completely masked 90% high overcast, and an
+/// uncited OD*f^0.7 partial-cover fudge.
+///
+/// The effective layer takes the geometry (base/top) and droplet asymmetry
+/// of the band with the largest transmission DEFICIT (the radiatively
+/// dominant band).
 pub fn map_cloud(conditions: &WeatherConditions) -> Option<CloudProperties> {
-    let low = conditions.cloud_cover_low.clamp(0.0, 100.0);
-    let mid = conditions.cloud_cover_mid.clamp(0.0, 100.0);
-    let high = conditions.cloud_cover_high.clamp(0.0, 100.0);
-
-    // Check for fog (WMO codes 45, 48)
     let is_fog = conditions.weather_code == 45 || conditions.weather_code == 48;
 
-    // Determine dominant cloud layer
-    if is_fog || low >= CLOUD_COVER_THRESHOLD {
-        // Low cloud or fog
-        let cover = if is_fog {
-            100.0_f64.min(low.max(80.0))
-        } else {
-            low
-        };
-        let cover_frac = cover / 100.0;
+    // (cover %, type) per band - low band type refined by cover/visibility.
+    let low_cover = if is_fog {
+        100.0_f64.min(conditions.cloud_cover_low.max(80.0))
+    } else {
+        conditions.cloud_cover_low.clamp(0.0, 100.0)
+    };
+    let low_type = if is_fog || conditions.visibility_m < 1000.0 {
+        CloudType::Stratus
+    } else if low_cover > 60.0 {
+        CloudType::Stratocumulus
+    } else {
+        CloudType::Cumulus
+    };
+    let mid_cover = conditions.cloud_cover_mid.clamp(0.0, 100.0);
+    let high_cover = conditions.cloud_cover_high.clamp(0.0, 100.0);
+    let high_type = if high_cover > 60.0 {
+        CloudType::ThickCirrus
+    } else {
+        CloudType::ThinCirrus
+    };
 
-        let base_type = if is_fog || conditions.visibility_m < 1000.0 {
-            // Fog or very low visibility: thick stratus
-            CloudType::Stratus
-        } else if low > 60.0 {
-            CloudType::Stratocumulus
-        } else {
-            // Scattered low clouds
-            CloudType::Cumulus
-        };
+    // Eddington diffuse transmission of a delta-scaled type OD.
+    let t_diff = |ctype: CloudType| -> (f64, CloudProperties) {
+        let p = cloud::default_properties(ctype);
+        let f_peak = p.asymmetry * p.asymmetry;
+        let de_scale = 1.0 - p.ssa * f_peak;
+        let g_scaled = p.asymmetry / (1.0 + p.asymmetry);
+        let tau_star = p.optical_depth * de_scale;
+        (1.0 / (1.0 + 0.75 * tau_star * (1.0 - g_scaled)), p)
+    };
 
-        let defaults = cloud::default_properties(base_type);
-        let scaled_od = defaults.optical_depth * cover_frac.powf(0.7);
-
-        if scaled_od < 0.01 {
-            return None;
+    let mut t_total = 1.0_f64;
+    let mut dominant: Option<(f64, CloudProperties)> = None; // (deficit, props)
+    for (cover, ctype) in [
+        (low_cover, low_type),
+        (mid_cover, CloudType::Altostratus),
+        (high_cover, high_type),
+    ] {
+        if cover < CLOUD_COVER_THRESHOLD {
+            continue;
         }
-
-        return Some(CloudProperties {
-            optical_depth: scaled_od,
-            ..defaults
-        });
+        let f = (cover / 100.0).clamp(0.0, 1.0);
+        let (t_band_cloudy, props) = t_diff(ctype);
+        let t_band = (1.0 - f) + f * t_band_cloudy;
+        t_total *= t_band;
+        let deficit = 1.0 - t_band;
+        if dominant.as_ref().map(|(d, _)| deficit > *d).unwrap_or(true) {
+            dominant = Some((deficit, props));
+        }
     }
 
-    if mid >= CLOUD_COVER_THRESHOLD {
-        let cover_frac = (mid / 100.0).min(1.0);
-        let defaults = cloud::default_properties(CloudType::Altostratus);
-        let scaled_od = defaults.optical_depth * cover_frac.powf(0.7);
-
-        if scaled_od < 0.01 {
-            return None;
-        }
-
-        return Some(CloudProperties {
-            optical_depth: scaled_od,
-            ..defaults
-        });
+    let (_, dom) = dominant?;
+    if t_total >= 0.995 {
+        return None; // optically negligible
     }
 
-    if high >= CLOUD_COVER_THRESHOLD {
-        let cover_frac = (high / 100.0).min(1.0);
+    // Invert the combined diffuse transmission back to one effective
+    // UNSCALED optical depth for the dominant band's droplet properties
+    // (the builder re-applies delta scaling).
+    let f_peak = dom.asymmetry * dom.asymmetry;
+    let de_scale = 1.0 - dom.ssa * f_peak;
+    let g_scaled = dom.asymmetry / (1.0 + dom.asymmetry);
+    let tau_star_eff = (1.0 / t_total - 1.0) / (0.75 * (1.0 - g_scaled));
+    let od_eff = tau_star_eff / de_scale;
 
-        let base_type = if high > 60.0 {
-            CloudType::ThickCirrus
-        } else {
-            CloudType::ThinCirrus
-        };
+    Some(CloudProperties {
+        optical_depth: od_eff,
+        ..dom
+    })
+}
 
-        let defaults = cloud::default_properties(base_type);
-        let scaled_od = defaults.optical_depth * cover_frac.powf(0.7);
 
-        if scaled_od < 0.01 {
-            return None;
-        }
-
-        return Some(CloudProperties {
-            optical_depth: scaled_od,
-            ..defaults
-        });
+/// Build cloud properties from a SATELLITE sample (GIBS MODIS COT + CTH),
+/// blended with the sunward-path samples ("2.5D"): at twilight the shadow
+/// path crosses the cloud field 50-300 km toward the sun, so the
+/// radiatively relevant optical depth is a blend of the overhead and
+/// sunward columns.
+///
+/// Layer placement uses the measured cloud-top height; geometric thickness
+/// is estimated from COT (thicker optically -> deeper layer, clamped to
+/// 200-3000 m); droplet properties are chosen by the measured top height
+/// (ice cirrus above ~6 km, mixed alto 2.5-6 km, water stratiform below).
+///
+/// Returns None when the satellite saw clear sky everywhere (callers may
+/// still fall back to the model/forecast cloud).
+pub fn map_cloud_satellite(
+    sat: &crate::satellite::SatelliteCloudPath,
+) -> Option<CloudProperties> {
+    let obs_cot = sat.observer.map(|s| s.cot).unwrap_or(0.0);
+    // Sunward weighting: the path fraction scales how much of the sunward
+    // mean enters; with no sunward cloud the observer column stands alone.
+    let eff_cot = if sat.n_path_samples > 0 {
+        let w_path = 0.5 * sat.path_cloud_fraction;
+        obs_cot * (1.0 - w_path) + sat.path_mean_cot * w_path
+    } else {
+        obs_cot
+    };
+    if eff_cot < 0.3 {
+        return None; // optically negligible
     }
 
-    None
+    let top_m = sat
+        .observer
+        .and_then(|s| s.cloud_top_m)
+        .unwrap_or(2500.0);
+    let thickness_m = (eff_cot * 80.0).clamp(200.0, 3000.0);
+    let top_km = (top_m / 1000.0).clamp(0.4, 14.0);
+    let base_km = (top_km - thickness_m / 1000.0).max(0.15);
+
+    // Particle optics: MEASURED effective radius (MODIS microphysics
+    // feed) decides phase when available - droplets retrieve at
+    // ~5-20 um, ice crystals at ~20-60 um (Platnick et al. 2017) -
+    // with the measured top height as fallback proxy.
+    let r_eff = sat.observer.and_then(|s| s.r_eff_um);
+    let (ssa, g) = match r_eff {
+        Some(re) if re >= 25.0 => (0.9995, 0.77), // large crystals: ice
+        Some(re) if re <= 18.0 => {
+            if top_km > 2.5 {
+                (0.999, 0.82) // small droplets aloft: alto/mixed optics
+            } else {
+                (0.999, 0.85) // warm stratiform droplets
+            }
+        }
+        _ => {
+            // No/ambiguous microphysics: height proxy as before.
+            if top_km > 6.0 {
+                (0.9995, 0.77)
+            } else if top_km > 2.5 {
+                (0.999, 0.82)
+            } else {
+                (0.999, 0.85)
+            }
+        }
+    };
+
+    Some(CloudProperties {
+        base_km,
+        top_km,
+        optical_depth: eff_cot,
+        ssa,
+        asymmetry: g,
+    })
 }
 
 // ── Gas composition mapping ─────────────────────────────────────────────
@@ -171,37 +262,14 @@ const NO2_MOLAR_MASS: f64 = 46.0;
 /// Avogadro's number (molecules/mol).
 const AVOGADRO: f64 = 6.022e23;
 
-/// Empirical relationship between surface O3 concentration and total column.
-///
-/// The total column O3 is dominated by the stratospheric layer (peak at
-/// 20-25 km), not surface O3. However, surface O3 correlates loosely with
-/// the total column through large-scale atmospheric dynamics (tropopause
-/// folding, stratosphere-troposphere exchange).
-///
-/// Typical surface O3: 20-80 ug/m3 (rural), 40-200 ug/m3 (urban episodes).
-/// Typical total column: 220-450 DU (global range), ~300 DU (mid-latitude).
-///
-/// We use a conservative linear mapping with a floor of 250 DU and a
-/// ceiling of 450 DU. The baseline is 300 DU at 60 ug/m3 surface O3.
-fn estimate_o3_column_du(surface_o3_ug_m3: f64) -> f64 {
-    // Baseline: 300 DU corresponds to ~60 ug/m3 surface O3
-    // Sensitivity: ~0.5 DU per ug/m3 deviation (weak correlation)
-    let baseline_du = 300.0;
-    let baseline_surface = 60.0;
-    let sensitivity = 0.5; // DU per ug/m3
+/// Surface O3 (a boundary-layer photochemical quantity) does NOT determine
+/// the total O3 column, which is dominated by the stratospheric reservoir
+/// and governed by latitude/season/dynamics. The previous code invented a
+/// linear surface-to-column proxy; it has been removed. Open-Meteo's air
+/// quality API provides surface O3 only, so no column override is produced
+/// - the engine keeps its standard-atmosphere column (345 DU) unless a
+/// real measured column is supplied by the caller.
 
-    let du = baseline_du + (surface_o3_ug_m3 - baseline_surface) * sensitivity;
-
-    // Clamp to physically reasonable range
-    du.clamp(220.0, 450.0)
-}
-
-/// Convert surface NO2 in ug/m3 to number density in molecules/m3.
-///
-/// n [molecules/m3] = (concentration [ug/m3] * 1e-6 [g/ug]) / M [g/mol] * N_A [molecules/mol] * 1e6 [cm3/m3... wait]
-///
-/// Actually: n [molecules/m3] = (C [ug/m3] * 1e-6 [g/ug] * N_A [molecules/mol]) / (M [g/mol] * 1e-3 [kg/g] * 1e3 [L/m3] * 22.4 [L/mol at STP])
-///
 /// Convert NO2 surface concentration from ug/m3 to molecules/m3.
 ///
 /// The concentration C [ug/m3] is already a mass per unit volume, so the
@@ -220,29 +288,28 @@ fn no2_ug_m3_to_molecules_m3(no2_ug_m3: f64) -> f64 {
 /// Converts surface O3 and NO2 concentrations from the CAMS-based air
 /// quality API into values usable by the MCRT gas absorption model:
 ///
-/// - **O3**: Surface concentration is used to estimate total column O3
-///   in Dobson Units via an empirical relationship. This adjusts the
-///   standard ~347 DU column to actual conditions (ozone holes, seasonal
-///   variation, latitude dependence).
+/// - **O3**: surface concentration is reported for display but produces
+///   NO column override - a surface reading does not determine the column
+///   (see note above). The engine keeps its standard 345 DU column.
 ///
 /// - **NO2**: Surface concentration is converted to number density
 ///   (molecules/m^3) to scale the tropospheric NO2 profile. This matters
-///   for Huggins/Chappuis band absorption, especially in polluted urban areas.
+///   for NO2's visible absorption band (~400-500 nm), especially in
+///   polluted urban areas.
 ///
 /// Returns `None` if both O3 and NO2 are zero or missing (no data from API).
 pub fn map_gas_composition(conditions: &WeatherConditions) -> Option<GasComposition> {
     let has_o3 = conditions.ozone_ug_m3 > 0.0;
     let has_no2 = conditions.nitrogen_dioxide_ug_m3 > 0.0;
 
-    if !has_o3 && !has_no2 {
+    let _ = has_o3; // surface O3 is reported but produces no override
+    if !has_no2 {
         return None;
     }
 
-    let o3_column_du = if has_o3 {
-        Some(estimate_o3_column_du(conditions.ozone_ug_m3))
-    } else {
-        None
-    };
+    // Surface O3 cannot be converted to a column (see note above):
+    // no override. Surface NO2 IS a usable boundary-layer override.
+    let o3_column_du: Option<f64> = None;
 
     let no2_surface_density = if has_no2 {
         Some(no2_ug_m3_to_molecules_m3(conditions.nitrogen_dioxide_ug_m3))
@@ -339,6 +406,117 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Satellite cloud mapping ──
+
+    #[test]
+    fn satellite_cloud_places_layer_at_measured_height() {
+        use crate::satellite::{SatelliteCloud, SatelliteCloudPath};
+        let sat = SatelliteCloudPath {
+            observer: Some(SatelliteCloud {
+                cot: 12.0,
+                cloud_top_m: Some(1800.0),
+                cwp_g_m2: None,
+                r_eff_um: None,
+                age_days: 0,
+            }),
+            path_mean_cot: 10.0,
+            path_cloud_fraction: 1.0,
+            n_path_samples: 4,
+        };
+        let c = map_cloud_satellite(&sat).unwrap();
+        assert!((c.top_km - 1.8).abs() < 1e-9, "top at satellite CTH");
+        assert!(c.base_km < c.top_km && c.base_km > 0.0);
+        // blended COT between observer and path
+        assert!(c.optical_depth > 10.0 && c.optical_depth < 12.5);
+        assert!((c.asymmetry - 0.85).abs() < 1e-9, "warm stratiform g");
+    }
+
+    #[test]
+    fn measured_r_eff_overrides_height_proxy() {
+        use crate::satellite::{SatelliteCloud, SatelliteCloudPath};
+        // Large crystals at LOW altitude (e.g. glaciated deck remnant):
+        // the measured microphysics must win over the height proxy.
+        let sat = SatelliteCloudPath {
+            observer: Some(SatelliteCloud {
+                cot: 5.0,
+                cloud_top_m: Some(2000.0),
+                cwp_g_m2: Some(100.0),
+                r_eff_um: Some(30.0),
+                age_days: 0,
+            }),
+            path_mean_cot: 0.0,
+            path_cloud_fraction: 0.0,
+            n_path_samples: 4,
+        };
+        let c = map_cloud_satellite(&sat).unwrap();
+        assert!((c.asymmetry - 0.77).abs() < 1e-9, "measured ice r_eff -> ice g");
+    }
+
+    #[test]
+    fn microphysics_tau_from_cwp_and_reff() {
+        use crate::satellite::SatelliteCloud;
+        let s = SatelliteCloud {
+            cot: 0.0,
+            cloud_top_m: None,
+            cwp_g_m2: Some(100.0),
+            r_eff_um: Some(10.0),
+            age_days: 0,
+        };
+        // tau = 1.5 * 100 / 10 = 15 (classic LWP-100 stratus)
+        assert!((s.microphysics_tau().unwrap() - 15.0).abs() < 1e-9);
+        let none = SatelliteCloud { r_eff_um: None, ..s };
+        assert!(none.microphysics_tau().is_none());
+    }
+
+    #[test]
+    fn satellite_high_cloud_gets_ice_properties() {
+        use crate::satellite::{SatelliteCloud, SatelliteCloudPath};
+        let sat = SatelliteCloudPath {
+            observer: Some(SatelliteCloud {
+                cot: 2.0,
+                cloud_top_m: Some(9500.0),
+                cwp_g_m2: None,
+                r_eff_um: None,
+                age_days: 0,
+            }),
+            path_mean_cot: 0.0,
+            path_cloud_fraction: 0.0,
+            n_path_samples: 4,
+        };
+        let c = map_cloud_satellite(&sat).unwrap();
+        assert!((c.asymmetry - 0.77).abs() < 1e-9, "cirrus-like g for high top");
+        assert!(c.top_km > 9.0);
+    }
+
+    #[test]
+    fn satellite_clear_sky_yields_none() {
+        use crate::satellite::SatelliteCloudPath;
+        let sat = SatelliteCloudPath {
+            observer: None,
+            path_mean_cot: 0.0,
+            path_cloud_fraction: 0.0,
+            n_path_samples: 4,
+        };
+        assert!(map_cloud_satellite(&sat).is_none());
+    }
+
+    #[test]
+    fn maritime_types_reachable_from_marine_conditions() {
+        // Coastal/marine signature: humid, coarse-dominated, low dust.
+        let mut c = base_conditions();
+        c.dust_ug_m3 = 1.0;
+        c.relative_humidity = 85.0;
+        c.pm2_5_ug_m3 = 4.0;
+        c.pm10_ug_m3 = 18.0; // coarse sea salt
+        c.aod_550 = 0.10;
+        let a = map_aerosol(&c).expect("aerosol expected");
+        assert!(
+            a.angstrom_exponent < 0.8,
+            "marine air should select a maritime (low-Angstrom) type, got alpha={}",
+            a.angstrom_exponent
+        );
+    }
     use crate::WeatherConditions;
 
     fn base_conditions() -> WeatherConditions {
@@ -580,13 +758,10 @@ mod tests {
     fn gas_composition_from_typical_conditions() {
         let c = base_conditions(); // O3=50, NO2=10
         let gc = map_gas_composition(&c).expect("Should produce gas composition");
-        assert!(gc.o3_column_du.is_some());
-        let du = gc.o3_column_du.unwrap();
-        assert!(
-            du >= 220.0 && du <= 450.0,
-            "O3 column should be in range: {} DU",
-            du
-        );
+        // Surface O3 must NOT be converted into a column override
+        // (a surface reading does not determine the stratospheric column).
+        assert!(gc.o3_column_du.is_none());
+        assert!(gc.no2_surface_density.is_some());
     }
 
     #[test]
@@ -598,35 +773,20 @@ mod tests {
     }
 
     #[test]
-    fn gas_composition_o3_column_scales_with_surface() {
-        let mut c1 = base_conditions();
-        c1.ozone_ug_m3 = 30.0;
-        let mut c2 = base_conditions();
-        c2.ozone_ug_m3 = 100.0;
-        let gc1 = map_gas_composition(&c1).unwrap();
-        let gc2 = map_gas_composition(&c2).unwrap();
-        assert!(
-            gc2.o3_column_du.unwrap() > gc1.o3_column_du.unwrap(),
-            "Higher surface O3 should give higher column estimate"
-        );
-    }
-
-    #[test]
-    fn gas_composition_o3_column_clamped() {
-        let mut c = base_conditions();
-        c.ozone_ug_m3 = 500.0; // extremely high
-        let gc = map_gas_composition(&c).unwrap();
-        assert!(
-            gc.o3_column_du.unwrap() <= 450.0,
-            "Should be clamped to 450 DU"
-        );
-
-        c.ozone_ug_m3 = 1.0; // extremely low
-        let gc = map_gas_composition(&c).unwrap();
-        assert!(
-            gc.o3_column_du.unwrap() >= 220.0,
-            "Should be clamped to 220 DU"
-        );
+    fn gas_composition_never_invents_o3_column() {
+        // Any surface O3 value - tiny or extreme - must produce no column
+        // override. The old code mapped these through an invented linear
+        // proxy clamped to [220, 450] DU.
+        for o3 in [1.0, 30.0, 100.0, 500.0] {
+            let mut c = base_conditions();
+            c.ozone_ug_m3 = o3;
+            let gc = map_gas_composition(&c).unwrap();
+            assert!(
+                gc.o3_column_du.is_none(),
+                "surface O3 {} ug/m3 must not become a column",
+                o3
+            );
+        }
     }
 
     #[test]
@@ -645,12 +805,11 @@ mod tests {
 
     #[test]
     fn gas_composition_o3_only() {
+        // O3-only input: no overrides at all -> None (nothing to apply).
         let mut c = base_conditions();
         c.ozone_ug_m3 = 60.0;
         c.nitrogen_dioxide_ug_m3 = 0.0;
-        let gc = map_gas_composition(&c).unwrap();
-        assert!(gc.o3_column_du.is_some());
-        assert!(gc.no2_surface_density.is_none());
+        assert!(map_gas_composition(&c).is_none());
     }
 
     #[test]

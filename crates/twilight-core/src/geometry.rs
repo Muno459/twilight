@@ -164,6 +164,25 @@ pub fn next_shell_boundary(
                 if inner_hit.t_near > 1e-10 && inner_hit.t_near < hit.t_far {
                     return Some((inner_hit.t_near, false));
                 }
+                // ON-BOUNDARY DEGENERACY: a ray starting exactly on (or
+                // within numerical fuzz of) the INNER sphere moving
+                // inward has inner t_near ~ 0, which the > 1e-10 guard
+                // rejects - the old code then returned the OUTER far
+                // root, teleporting the walk straight through everything
+                // below (through the planet, for a shadow ray: a
+                // verified T~1 sunlight leak). The signature: the ray
+                // is descending, its perigee is inside the inner
+                // sphere, and the origin sits at the inner radius.
+                // The truthful answer is "crossing inward right now".
+                let m = position.dot(direction);
+                let b2 = (position.length_sq() - m * m).max(0.0);
+                if m < 0.0
+                    && b2 < r_inner * r_inner
+                    && inner_hit.t_far > 1e-10
+                    && (position.length() - r_inner).abs() < 1.0
+                {
+                    return Some((1e-9, false));
+                }
             }
             return Some((hit.t_far, true));
         }
@@ -257,7 +276,7 @@ pub fn refract_at_boundary(dir: Vec3, boundary_pos: Vec3, n_from: f64, n_to: f64
 pub fn geographic_to_ecef(lat_deg: f64, lon_deg: f64, altitude_m: f64) -> Vec3 {
     use libm::{cos, sin};
 
-    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    const EARTH_RADIUS_M: f64 = crate::atmosphere::EARTH_RADIUS_M;
     let lat = lat_deg * core::f64::consts::PI / 180.0;
     let lon = lon_deg * core::f64::consts::PI / 180.0;
     let r = EARTH_RADIUS_M + altitude_m;
@@ -551,7 +570,7 @@ mod tests {
     fn ray_sphere_large_radius_earth() {
         // Observer on Earth's surface looking up: origin at (R_earth, 0, 0), dir = (+1,0,0)
         // Intersect with sphere of radius R_earth + 100km
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let r_toa = r_earth + 100_000.0;
         let origin = Vec3::new(r_earth, 0.0, 0.0);
         let dir = Vec3::new(1.0, 0.0, 0.0);
@@ -592,7 +611,7 @@ mod tests {
     #[test]
     fn ecef_equator_prime_meridian() {
         // (0°N, 0°E, 0m) → (R, 0, 0)
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let pos = geographic_to_ecef(0.0, 0.0, 0.0);
         assert!((pos.x - r_earth).abs() < 1.0);
         assert!(pos.y.abs() < 1.0);
@@ -602,7 +621,7 @@ mod tests {
     #[test]
     fn ecef_north_pole() {
         // (90°N, 0°E, 0m) → (0, 0, R)
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let pos = geographic_to_ecef(90.0, 0.0, 0.0);
         assert!(pos.x.abs() < 1.0);
         assert!(pos.y.abs() < 1.0);
@@ -612,7 +631,7 @@ mod tests {
     #[test]
     fn ecef_south_pole() {
         // (-90°N, 0°E, 0m) → (0, 0, -R)
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let pos = geographic_to_ecef(-90.0, 0.0, 0.0);
         assert!(pos.x.abs() < 1.0);
         assert!(pos.y.abs() < 1.0);
@@ -622,7 +641,7 @@ mod tests {
     #[test]
     fn ecef_equator_90e() {
         // (0°N, 90°E, 0m) → (0, R, 0)
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let pos = geographic_to_ecef(0.0, 90.0, 0.0);
         assert!(pos.x.abs() < 1.0);
         assert!((pos.y - r_earth).abs() < 1.0);
@@ -641,7 +660,7 @@ mod tests {
     #[test]
     fn ecef_all_points_have_correct_radius() {
         // Any point should be at distance R + altitude from origin
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let alt = 500.0;
         for lat in &[-90.0, -45.0, 0.0, 30.0, 60.0, 90.0] {
             for lon in &[-180.0, -90.0, 0.0, 90.0, 180.0] {

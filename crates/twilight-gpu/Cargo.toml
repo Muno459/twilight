@@ -3,25 +3,17 @@ name = "twilight-gpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "GPU compute backends for twilight MCRT (CUDA, Metal, Vulkan, WebGPU)"
+description = "Metal GPU compute backend for twilight MCRT"
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
 metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:block2"]
-vulkan = ["dep:ash", "dep:gpu-allocator"]
-webgpu = ["dep:wgpu", "dep:pollster"]
 
 [dependencies]
 twilight-core = { workspace = true }
 twilight-data = { workspace = true }
 twilight-threshold = { workspace = true }
 twilight-skyglow = { workspace = true }
-
-# CUDA backend
-cudarc = { version = "0.19", optional = true, default-features = false, features = [
-    "std", "driver", "nvrtc", "cuda-12060", "fallback-dynamic-loading",
-] }
 
 # Metal backend
 objc2 = { version = "0.6", optional = true }
@@ -32,14 +24,6 @@ objc2-metal = { version = "0.3", optional = true, features = [
     "MTLArgument", "MTLCommandEncoder", "MTLTypes",
 ] }
 block2 = { version = "0.6", optional = true }
-
-# Vulkan backend
-ash = { version = "0.38", optional = true }
-gpu-allocator = { version = "0.28", optional = true, default-features = false, features = ["vulkan", "std"] }
-
-# WebGPU backend (WASM + native fallback)
-wgpu = { version = "28", optional = true }
-pollster = { version = "0.4", optional = true }
 
 [dev-dependencies]
 twilight-cpu = { workspace = true }

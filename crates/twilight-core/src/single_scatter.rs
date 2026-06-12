@@ -80,7 +80,7 @@ pub fn ray_path_through_shell(
 
     match inner_interval {
         None => {
-            // Ray doesn't enter the inner sphere — full path through shell
+            // Ray doesn't enter the inner sphere - full path through shell
             outer_end - outer_start
         }
         Some((inner_start, inner_end)) => {
@@ -167,6 +167,9 @@ pub fn single_scatter_radiance(
 
     let mut radiance = 0.0;
     let mut tau_obs = 0.0; // Accumulated optical depth from observer to current point
+    // Cloud portion tracked separately: cloud segments of the eye path get
+    // Eddington diffuse transmission (see AtmosphereModel::cloud_diffuse_transmittance).
+    let mut tau_cloud_obs = 0.0;
 
     for step in 0..num_steps {
         // Distance along LOS to midpoint of this step
@@ -193,14 +196,16 @@ pub fn single_scatter_radiance(
         if beta_scat < 1e-30 {
             // Update optical depth even if no scattering
             tau_obs += optics.extinction * ds_base;
+            tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds_base;
             continue;
         }
 
-        // Transmittance from observer to scatter point
-        // T_obs = exp(-tau_obs) where tau_obs is accumulated along the LOS
-        // We add half the current step's optical depth for midpoint rule
+        // Transmittance from observer to scatter point: Beer-Lambert for
+        // clear air + Eddington diffuse for the accumulated cloud portion.
         let tau_obs_mid = tau_obs + optics.extinction * ds_base * 0.5;
-        let t_obs = libm::exp(-tau_obs_mid);
+        let tau_cloud_mid = tau_cloud_obs + atm.cloud_extinction[shell_idx] * ds_base * 0.5;
+        let t_obs = libm::exp(-tau_obs_mid)
+            * atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
         if t_obs < 1e-30 {
             // Negligible contribution beyond this point
@@ -213,22 +218,21 @@ pub fn single_scatter_radiance(
         if t_sun < 1e-30 {
             // This point is in shadow (sun below local horizon)
             tau_obs += optics.extinction * ds_base;
+            tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds_base;
             continue;
         }
 
-        // Scattering angle: angle between sun direction and viewing direction
-        // cos(θ) = sun_dir · (-view_dir) because we want the angle between
-        // the incoming solar ray and the scattered ray toward the observer
-        let cos_theta = sun_dir.dot(-view_dir);
+        // Scattering angle between the incoming solar ray (propagating along
+        // -sun_dir) and the scattered ray toward the observer (propagating
+        // along -view_dir): cos(θ) = (-sun_dir)·(-view_dir) = sun_dir·view_dir.
+        // θ = 0 (forward peak) when looking at the sun - the standard sky-
+        // radiance convention (Chandrasekhar; DISORT/libRadtran).
+        let cos_theta = sun_dir.dot(view_dir);
 
         // Phase function
-        let phase = if optics.rayleigh_fraction > 0.99 {
-            rayleigh_phase(cos_theta)
-        } else {
-            optics.rayleigh_fraction * rayleigh_phase(cos_theta)
-                + (1.0 - optics.rayleigh_fraction)
-                    * henyey_greenstein_phase(cos_theta, optics.asymmetry)
-        };
+        let phase = optics.rayleigh_fraction * rayleigh_phase(cos_theta)
+            + (1.0 - optics.rayleigh_fraction)
+                * henyey_greenstein_phase(cos_theta, optics.asymmetry);
 
         // Contribution from this step
         // dI = β_scat × P(θ)/(4π) × T_sun × T_obs × ds
@@ -238,6 +242,7 @@ pub fn single_scatter_radiance(
 
         // Update accumulated optical depth for next step
         tau_obs += optics.extinction * ds_base;
+        tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds_base;
     }
 
     // Ground reflection: Lambertian BRDF = albedo / π
@@ -260,8 +265,9 @@ pub fn single_scatter_radiance(
             if cos_sun_incidence > 0.0 {
                 let t_sun_ground =
                     shadow_ray_transmittance(atm, ground_pos, sun_dir, wavelength_idx);
-                // tau_obs at this point is the full LOS optical depth to the ground
-                let t_obs_ground = libm::exp(-tau_obs);
+                // Full LOS optical depth to the ground; cloud portion diffuse.
+                let t_obs_ground = libm::exp(-tau_obs)
+                    * atm.cloud_diffuse_transmittance(tau_cloud_obs);
 
                 radiance += albedo / core::f64::consts::PI
                     * cos_sun_incidence
@@ -294,6 +300,10 @@ pub fn shadow_ray_transmittance(
     let mut pos = start_pos;
     let mut dir = sun_dir;
     let mut tau = 0.0;
+    // Cloud optical depth is tracked separately: the cloud portion of the
+    // path gets Eddington DIFFUSE transmission (multiply-forward-scattered
+    // light penetrates a cloud deck), not Beer-Lambert direct extinction.
+    let mut tau_cloud = 0.0;
 
     // Find initial shell once (O(n)), then track directly (O(1) per step).
     let mut shell_idx = match atm.shell_index(pos.length()) {
@@ -308,6 +318,7 @@ pub fn shadow_ray_transmittance(
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
                 tau += optics.extinction * dist;
+                tau_cloud += atm.cloud_extinction[shell_idx] * dist;
 
                 // Refract at boundary
                 let boundary_pos = pos + dir * dist;
@@ -351,7 +362,8 @@ pub fn shadow_ray_transmittance(
         }
     }
 
-    libm::exp(-tau)
+    // Clear-air part: Beer-Lambert. Cloud part: Eddington diffuse.
+    libm::exp(-tau) * atm.cloud_diffuse_transmittance(tau_cloud)
 }
 
 /// Compute single-scattering radiance for all wavelengths simultaneously.
@@ -389,6 +401,8 @@ pub fn single_scatter_spectrum(
 
     // Accumulated optical depth per wavelength
     let mut tau_obs = [0.0f64; 64];
+    // Cloud portion (broadband) of the eye path -> Eddington diffuse.
+    let mut tau_cloud_obs = 0.0f64;
 
     for step in 0..num_steps {
         let s = (step as f64 + 0.5) * ds;
@@ -405,11 +419,15 @@ pub fn single_scatter_spectrum(
         };
 
         // Scattering angle (same for all wavelengths)
-        let cos_theta = sun_dir.dot(-view_dir);
+        let cos_theta = sun_dir.dot(view_dir);
 
         // Shadow ray transmittance per wavelength
         // (compute once per step, reuse geometry)
         let t_sun = shadow_ray_transmittance_spectrum(atm, scatter_pos, sun_dir, num_wl);
+
+        let cloud_ext_step = atm.cloud_extinction[shell_idx];
+        let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
+        let t_cloud_mid = atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
         for w in 0..num_wl {
             let optics = &atm.optics[shell_idx][w];
@@ -421,26 +439,23 @@ pub fn single_scatter_spectrum(
             }
 
             let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
-            let t_obs = libm::exp(-tau_obs_mid);
+            let t_obs = libm::exp(-tau_obs_mid) * t_cloud_mid;
 
             if t_obs < 1e-30 || t_sun[w] < 1e-30 {
                 tau_obs[w] += optics.extinction * ds;
                 continue;
             }
 
-            let phase = if optics.rayleigh_fraction > 0.99 {
-                rayleigh_phase(cos_theta)
-            } else {
-                optics.rayleigh_fraction * rayleigh_phase(cos_theta)
-                    + (1.0 - optics.rayleigh_fraction)
-                        * henyey_greenstein_phase(cos_theta, optics.asymmetry)
-            };
+            let phase = optics.rayleigh_fraction * rayleigh_phase(cos_theta)
+                + (1.0 - optics.rayleigh_fraction)
+                    * henyey_greenstein_phase(cos_theta, optics.asymmetry);
 
             radiance[w] +=
                 beta_scat * phase / (4.0 * core::f64::consts::PI) * t_sun[w] * t_obs * ds;
 
             tau_obs[w] += optics.extinction * ds;
         }
+        tau_cloud_obs += cloud_ext_step * ds;
     }
 
     // Ground reflection (Lambertian BRDF = albedo / π)
@@ -455,7 +470,8 @@ pub fn single_scatter_spectrum(
             for w in 0..num_wl {
                 let albedo = atm.surface_albedo[w];
                 if albedo > 1e-10 && t_sun_ground[w] > 1e-30 {
-                    let t_obs_ground = libm::exp(-tau_obs[w]);
+                    let t_obs_ground = libm::exp(-tau_obs[w])
+                        * atm.cloud_diffuse_transmittance(tau_cloud_obs);
                     radiance[w] += albedo / core::f64::consts::PI
                         * cos_sun_incidence
                         * t_sun_ground[w]
@@ -485,6 +501,9 @@ pub fn shadow_ray_transmittance_spectrum(
     let mut pos = start_pos;
     let mut dir = sun_dir;
     let mut tau = [0.0f64; 64];
+    // Cloud portion of the path gets Eddington diffuse transmission
+    // (see shadow_ray_transmittance). Cloud extinction is broadband.
+    let mut tau_cloud = 0.0f64;
 
     let mut shell_idx = match atm.shell_index(pos.length()) {
         Some(idx) => idx,
@@ -499,6 +518,7 @@ pub fn shadow_ray_transmittance_spectrum(
                 for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
                     *tau_w += atm.optics[shell_idx][w].extinction * dist;
                 }
+                tau_cloud += atm.cloud_extinction[shell_idx] * dist;
 
                 // Refract at boundary
                 let boundary_pos = pos + dir * dist;
@@ -537,19 +557,21 @@ pub fn shadow_ray_transmittance_spectrum(
             None => break,
         }
 
-        // Early out if ALL wavelengths are opaque
+        // Early out if ALL wavelengths are opaque in clear air alone
         let min_tau = tau.iter().take(num_wl).copied().fold(f64::MAX, f64::min);
         if min_tau > 50.0 {
             return [0.0f64; 64];
         }
     }
 
+    let t_cloud = atm.cloud_diffuse_transmittance(tau_cloud);
     let mut result = [0.0f64; 64];
     for (w, res_w) in result.iter_mut().enumerate().take(num_wl) {
-        *res_w = if tau[w] > 50.0 {
+        let tau_clear = tau[w];
+        *res_w = if tau_clear > 50.0 {
             0.0
         } else {
-            libm::exp(-tau[w])
+            libm::exp(-tau_clear) * t_cloud
         };
     }
 
@@ -591,6 +613,10 @@ pub fn transmittance_between_points_spectrum(
     // path lengths. O(num_shells) with two ray-sphere intersections per
     // shell, giving exact results without stepping artifacts.
     let mut tau = [0.0f64; 64];
+    // Cloud scattering crossed by the connection gets Eddington diffuse
+    // transmission, consistent with the shadow-ray and LOS integrators
+    // (single-representation cloud transport).
+    let mut tau_cloud = 0.0f64;
 
     for s in 0..atm.num_shells {
         let shell = &atm.shells[s];
@@ -599,15 +625,17 @@ pub fn transmittance_between_points_spectrum(
             for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
                 *tau_w += atm.optics[s][w].extinction * path_len;
             }
+            tau_cloud += atm.cloud_extinction[s] * path_len;
         }
     }
 
+    let t_cloud = atm.cloud_diffuse_transmittance(tau_cloud);
     let mut result = [0.0f64; 64];
     for (w, res_w) in result.iter_mut().enumerate().take(num_wl) {
         *res_w = if tau[w] > 50.0 {
             0.0
         } else {
-            libm::exp(-tau[w])
+            libm::exp(-tau[w]) * t_cloud
         };
     }
     result
@@ -827,7 +855,7 @@ mod tests {
         // In a Rayleigh-only atmosphere at small SZA (short path lengths),
         // blue scatters more than red (λ⁻⁴ law dominates).
         // At deeper twilight, blue gets attenuated MORE along the long LOS path,
-        // so red can dominate — this is the correct physics of why twilight turns red!
+        // so red can dominate - this is the correct physics of why twilight turns red!
         //
         // Test at SZA=80° (sun above horizon, short paths) where blue should win.
         // But our test atmosphere has high enough extinction that even at SZA=80°,

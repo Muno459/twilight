@@ -273,22 +273,14 @@ impl ParityCoverage {
 /// Output is a formatted table showing which features pass/fail/untested
 /// for each GPU backend. Intended for `--nocapture` test output.
 pub fn parity_report(coverage: &ParityCoverage) -> String {
-    let backends = [
-        BackendKind::Metal,
-        BackendKind::Vulkan,
-        BackendKind::Cuda,
-        BackendKind::Wgpu,
-    ];
+    let backends = [BackendKind::Metal];
 
     let mut out = String::new();
     out.push_str("\nGPU-CPU Parity Coverage Report\n");
     out.push_str("================================================================\n");
 
     // Header row
-    out.push_str(&format!(
-        "{:<28} {:>6} {:>6} {:>6} {:>6}\n",
-        "Feature", "Metal", "Vulkan", "CUDA", "wgpu"
-    ));
+    out.push_str(&format!("{:<28} {:>6}\n", "Feature", "Metal"));
     out.push_str("----------------------------------------------------------------\n");
 
     let mut current_category: Option<ParityCategory> = None;
@@ -1003,15 +995,11 @@ mod tests {
             ParityStatus::Skipped("not implemented yet".to_string()),
         );
 
-        let (pass, fail, skip, _) = cov.summary(BackendKind::Metal);
+        let (pass, fail, skip, untested) = cov.summary(BackendKind::Metal);
         assert_eq!(pass, 1);
         assert_eq!(fail, 1);
         assert_eq!(skip, 1);
-
-        // Vulkan should still be all untested
-        let (pass, _, _, untested) = cov.summary(BackendKind::Vulkan);
-        assert_eq!(pass, 0);
-        assert_eq!(untested, ParityFeature::all().len());
+        assert_eq!(untested, ParityFeature::all().len() - 3);
     }
 
     #[test]
@@ -1021,7 +1009,6 @@ mod tests {
         assert!(!report.is_empty());
         assert!(report.contains("Parity Coverage Report"));
         assert!(report.contains("Metal"));
-        assert!(report.contains("Vulkan"));
     }
 
     #[test]

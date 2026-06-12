@@ -1,14 +1,14 @@
 //! Terrain masking for twilight prayer times.
 //!
-//! Provides elevation data from multiple sources (Copernicus GLO-30 globally,
-//! national LiDAR where available) and computes horizon profiles that modify
-//! sunrise/sunset and twilight times.
+//! Provides elevation data from Copernicus GLO-30 DEM tiles and computes
+//! horizon profiles that modify sunrise/sunset times. (A national-LiDAR
+//! backend was removed: it shipped with a guessed, never-tested endpoint.
+//! Re-add only with a verified data source.)
 
 pub mod cache;
 pub mod copernicus;
 pub mod geotiff;
 pub mod horizon;
-pub mod lidar;
 pub mod projection;
 
 use std::path::Path;
@@ -83,26 +83,10 @@ impl HorizonProfile {
     }
 }
 
-/// Resolve the best available elevation source for a location.
+/// Resolve the elevation source for a location.
 ///
-/// Checks for LiDAR availability first, falls back to Copernicus GLO-30.
-pub fn resolve_source(
-    lat: f64,
-    lon: f64,
-    dem_dir: &Path,
-    dk_api_key: Option<&str>,
-) -> Box<dyn ElevationSource> {
-    // Check Denmark LiDAR
-    if lidar::denmark::covers(lat, lon) {
-        if let Some(key) = dk_api_key {
-            return Box::new(lidar::denmark::DanishDhm::new(dem_dir, key));
-        }
-        eprintln!("Note: Location is in Denmark. Set --dk-api-key or TWILIGHT_DK_API_KEY");
-        eprintln!("      for 0.4m LiDAR. Falling back to Copernicus GLO-30 (30m).");
-        eprintln!("      Register free at https://datafordeler.dk");
-    }
-
-    // Default: Copernicus GLO-30
+/// Currently always Copernicus GLO-30 (the only implemented backend).
+pub fn resolve_source(_lat: f64, _lon: f64, dem_dir: &Path) -> Box<dyn ElevationSource> {
     Box::new(copernicus::CopernicusDem30::new(dem_dir))
 }
 

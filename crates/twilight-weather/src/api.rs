@@ -121,8 +121,127 @@ pub fn fetch_weather(lat: f64, lon: f64) -> Result<WeatherConditions, String> {
     })
 }
 
+
+// ── Hourly forecast types (for prayer-hour sampling) ──
+
+#[derive(Debug, Deserialize)]
+struct WeatherHourlyResponse {
+    latitude: f64,
+    longitude: f64,
+    hourly: Option<WeatherHourly>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WeatherHourly {
+    time: Vec<String>,
+    cloud_cover: Option<Vec<Option<f64>>>,
+    cloud_cover_low: Option<Vec<Option<f64>>>,
+    cloud_cover_mid: Option<Vec<Option<f64>>>,
+    cloud_cover_high: Option<Vec<Option<f64>>>,
+    visibility: Option<Vec<Option<f64>>>,
+    relative_humidity_2m: Option<Vec<Option<f64>>>,
+    weather_code: Option<Vec<Option<i32>>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AirQualityHourlyResponse {
+    hourly: Option<AirQualityHourly>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AirQualityHourly {
+    time: Vec<String>,
+    aerosol_optical_depth: Option<Vec<Option<f64>>>,
+    dust: Option<Vec<Option<f64>>>,
+    pm2_5: Option<Vec<Option<f64>>>,
+    pm10: Option<Vec<Option<f64>>>,
+    ozone: Option<Vec<Option<f64>>>,
+    nitrogen_dioxide: Option<Vec<Option<f64>>>,
+}
+
+fn pick<T: Copy>(v: &Option<Vec<Option<T>>>, idx: usize) -> Option<T> {
+    v.as_ref().and_then(|a| a.get(idx).copied().flatten())
+}
+
+/// Fetch FORECAST weather conditions for a specific UTC date and hour.
+///
+/// Prayer times are computed for a specific civil twilight window, not for
+/// "now": sampling the hourly forecast at the actual Fajr/Isha hour uses
+/// the best data the API offers (Open-Meteo blends the major global models
+/// and serves hourly fields up to 16 days ahead and ~90 days back via the
+/// same endpoint).
+///
+/// `date` is "YYYY-MM-DD"; `hour_utc` is the UTC hour to sample (0-23,
+/// fractional input is rounded to the nearest hour).
+pub fn fetch_weather_at(
+    lat: f64,
+    lon: f64,
+    date: &str,
+    hour_utc: f64,
+) -> Result<WeatherConditions, String> {
+    let hour = (hour_utc.rem_euclid(24.0)).round() as usize % 24;
+    let target = format!("{}T{:02}:00", date, hour);
+
+    let weather_url = format!(
+        "{}?latitude={}&longitude={}&hourly=cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,visibility,relative_humidity_2m,weather_code&start_date={}&end_date={}&timezone=UTC",
+        WEATHER_BASE_URL, lat, lon, date, date
+    );
+    let aq_url = format!(
+        "{}?latitude={}&longitude={}&hourly=aerosol_optical_depth,dust,pm2_5,pm10,ozone,nitrogen_dioxide&start_date={}&end_date={}&timezone=UTC",
+        AIR_QUALITY_BASE_URL, lat, lon, date, date
+    );
+
+    let weather: WeatherHourlyResponse =
+        fetch_json(&weather_url).map_err(|e| format!("Weather API error: {}", e))?;
+    let aq: AirQualityHourlyResponse =
+        fetch_json(&aq_url).map_err(|e| format!("Air Quality API error: {}", e))?;
+
+    let wh = weather
+        .hourly
+        .ok_or_else(|| "Weather API returned no hourly data".to_string())?;
+    let widx = wh
+        .time
+        .iter()
+        .position(|t| t == &target)
+        .unwrap_or_else(|| hour.min(wh.time.len().saturating_sub(1)));
+
+    let (aqidx, aqh) = match aq.hourly {
+        Some(h) => {
+            let i = h
+                .time
+                .iter()
+                .position(|t| t == &target)
+                .unwrap_or_else(|| hour.min(h.time.len().saturating_sub(1)));
+            (i, Some(h))
+        }
+        None => (0, None),
+    };
+
+    Ok(WeatherConditions {
+        aod_550: aqh.as_ref().and_then(|h| pick(&h.aerosol_optical_depth, aqidx)).unwrap_or(0.0),
+        dust_ug_m3: aqh.as_ref().and_then(|h| pick(&h.dust, aqidx)).unwrap_or(0.0),
+        pm2_5_ug_m3: aqh.as_ref().and_then(|h| pick(&h.pm2_5, aqidx)).unwrap_or(0.0),
+        pm10_ug_m3: aqh.as_ref().and_then(|h| pick(&h.pm10, aqidx)).unwrap_or(0.0),
+        ozone_ug_m3: aqh.as_ref().and_then(|h| pick(&h.ozone, aqidx)).unwrap_or(0.0),
+        nitrogen_dioxide_ug_m3: aqh
+            .as_ref()
+            .and_then(|h| pick(&h.nitrogen_dioxide, aqidx))
+            .unwrap_or(0.0),
+        cloud_cover_total: pick(&wh.cloud_cover, widx).unwrap_or(0.0),
+        cloud_cover_low: pick(&wh.cloud_cover_low, widx).unwrap_or(0.0),
+        cloud_cover_mid: pick(&wh.cloud_cover_mid, widx).unwrap_or(0.0),
+        cloud_cover_high: pick(&wh.cloud_cover_high, widx).unwrap_or(0.0),
+        visibility_m: pick(&wh.visibility, widx).unwrap_or(50000.0),
+        relative_humidity: pick(&wh.relative_humidity_2m, widx).unwrap_or(50.0),
+        weather_code: pick(&wh.weather_code, widx).unwrap_or(0),
+        timestamp: target,
+        api_latitude: weather.latitude,
+        api_longitude: weather.longitude,
+    })
+}
+
 /// Fetch and deserialize JSON from a URL.
-fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
+pub(crate) fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)))
         .build()

@@ -26,6 +26,20 @@ use crate::simulation::{compute_geometry, ScatteringMode, SimulationConfig, Spec
 /// then converts the GPU result to `SpectralResult` with optional solar
 /// irradiance weighting. Produces results equivalent to
 /// [`simulation::simulate_at_sza`] but on GPU hardware.
+
+/// Derive a well-mixed 64-bit RNG seed from an SZA value.
+///
+/// `sza_deg.to_bits()` alone is a poor seed: SZAs on the 0.5-degree scan
+/// grid have all-zero low 32 bits, which collapsed to a single constant
+/// when downstream code truncated the seed. The splitmix64 finalizer
+/// spreads the entropy across all 64 bits.
+fn seed_from_sza(sza_deg: f64) -> u64 {
+    let mut z = sza_deg.to_bits();
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
 pub fn simulate_at_sza_gpu(
     gpu: &dyn GpuBackend,
     atm: &AtmosphereModel,
@@ -41,11 +55,11 @@ pub fn simulate_at_sza_gpu(
     let gpu_result = match config.scattering_mode {
         ScatteringMode::Single => gpu.single_scatter(obs, view, sun)?,
         ScatteringMode::Multiple => {
-            let seed = sza_deg.to_bits();
+            let seed = seed_from_sza(sza_deg);
             gpu.mcrt_trace(obs, view, sun, config.photons_per_wavelength as u32, seed)?
         }
         ScatteringMode::Hybrid => {
-            let seed = sza_deg.to_bits();
+            let seed = seed_from_sza(sza_deg);
             gpu.hybrid_scatter(obs, view, sun, config.photons_per_wavelength as u32, seed)?
         }
     };
@@ -95,11 +109,11 @@ pub fn simulate_twilight_scan_gpu(
                 ScatteringMode::Single => BatchKernel::SingleScatter,
                 ScatteringMode::Multiple => BatchKernel::McrtTrace {
                     photons_per_wavelength: config.photons_per_wavelength as u32,
-                    seed: sza_deg.to_bits(),
+                    seed: seed_from_sza(sza_deg),
                 },
                 ScatteringMode::Hybrid => BatchKernel::Hybrid {
                     secondary_rays: config.photons_per_wavelength as u32,
-                    seed: sza_deg.to_bits(),
+                    seed: seed_from_sza(sza_deg),
                 },
             };
             BatchRequest {
@@ -115,6 +129,64 @@ pub fn simulate_twilight_scan_gpu(
     let gpu_results = gpu.scan_batch(&requests)?;
 
     // Convert GPU results to SpectralResult with solar irradiance weighting.
+    let results: Vec<SpectralResult> = gpu_results
+        .iter()
+        .zip(sza_values.iter())
+        .map(|(gr, &sza_deg)| {
+            gpu_result_to_spectral(atm, gr, sza_deg, config.apply_solar_irradiance)
+        })
+        .collect();
+
+    Ok(results)
+}
+
+/// Simulate an arbitrary set of SZA values using one batched GPU submission.
+///
+/// This is used by the prayer pipeline's fine pass so multiple merged refine
+/// regions can still be executed as a single GPU batch instead of one GPU scan
+/// per region.
+///
+/// For hybrid mode, the Metal `scan_batch` implementation dispatches each
+/// hybrid request through `hybrid_scatter` (which uses the v2 split-dispatch
+/// path) while still batching any non-hybrid requests together in a single
+/// command buffer. This is more efficient than the old approach of looping
+/// one `simulate_at_sza_gpu` call per SZA.
+pub fn simulate_twilight_szalist_gpu(
+    gpu: &dyn GpuBackend,
+    atm: &AtmosphereModel,
+    config: &SimulationConfig,
+    sza_values: &[f64],
+) -> Result<Vec<SpectralResult>, GpuError> {
+    if sza_values.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let requests: Vec<BatchRequest> = sza_values
+        .iter()
+        .map(|&sza_deg| {
+            let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
+            let kernel = match config.scattering_mode {
+                ScatteringMode::Single => BatchKernel::SingleScatter,
+                ScatteringMode::Multiple => BatchKernel::McrtTrace {
+                    photons_per_wavelength: config.photons_per_wavelength as u32,
+                    seed: seed_from_sza(sza_deg),
+                },
+                ScatteringMode::Hybrid => BatchKernel::Hybrid {
+                    secondary_rays: config.photons_per_wavelength as u32,
+                    seed: seed_from_sza(sza_deg),
+                },
+            };
+            BatchRequest {
+                observer_pos: [observer_pos.x, observer_pos.y, observer_pos.z],
+                view_dir: [view_dir.x, view_dir.y, view_dir.z],
+                sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z],
+                kernel,
+            }
+        })
+        .collect();
+
+    let gpu_results = gpu.scan_batch(&requests)?;
+
     let results: Vec<SpectralResult> = gpu_results
         .iter()
         .zip(sza_values.iter())

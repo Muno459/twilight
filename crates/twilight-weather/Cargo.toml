@@ -7,6 +7,7 @@ repository.workspace = true
 description = "Real-time weather data for twilight MCRT simulations via Open-Meteo API"
 
 [dependencies]
+png = "0.17"
 twilight-data = { path = "../twilight-data" }
 ureq = "3"
 serde = { version = "1", features = ["derive"] }

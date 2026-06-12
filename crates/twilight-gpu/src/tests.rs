@@ -609,7 +609,18 @@ mod layer4_metal {
             preferred_backend: Some(BackendKind::Metal),
             ..Default::default()
         };
-        crate::try_init(&config).ok()
+        match crate::try_init(&config) {
+            Ok(gpu) => Some(gpu),
+            Err(e) => {
+                // No device -> legitimate skip (headless CI). Device
+                // present but init failed -> the shader doesn't compile;
+                // fail loudly instead of skipping the whole GPU suite.
+                if objc2_metal::MTLCreateSystemDefaultDevice().is_some() {
+                    panic!("Metal device present but backend init failed: {e}");
+                }
+                None
+            }
+        }
     }
 
     #[test]
@@ -634,6 +645,49 @@ mod layer4_metal {
         let atm = oracle::oracle_atmosphere();
         gpu.upload_atmosphere(&atm)
             .expect("Metal upload_atmosphere should succeed");
+    }
+
+    /// Cloudy-atmosphere parity: the v3 buffers carry the cloud diffuse-
+    /// transmission fields; GPU single-scatter under an OD-10 stratus must
+    /// match the CPU within f32 tolerance (previously the GPU lacked the
+    /// Eddington factor entirely and was routed to CPU).
+    #[test]
+    fn metal_single_scatter_cloudy_matches_cpu() {
+        let Some(mut gpu) = try_metal() else { return };
+        use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+        use twilight_data::atmosphere_profiles::AtmosphereType;
+        use twilight_data::cloud::{default_properties, CloudType};
+
+        let props = default_properties(CloudType::Stratus);
+        let atm = twilight_data::builder::build_with_cloud_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &props,
+        );
+        gpu.upload_atmosphere(&atm).unwrap();
+
+        let obs = geographic_to_ecef(21.4225, 39.8262, 0.0);
+        for sza in [85.0, 92.0, 96.0] {
+            let sun = solar_direction_ecef(sza, 270.0, 21.4225, 39.8262);
+            let view = solar_direction_ecef(75.0, 270.0, 21.4225, 39.8262);
+            let gpu_r = gpu.single_scatter([obs.x, obs.y, obs.z],
+                                           [view.x, view.y, view.z],
+                                           [sun.x, sun.y, sun.z]).unwrap();
+            let cpu_r = twilight_core::single_scatter::single_scatter_spectrum(
+                &atm, obs, view, sun);
+            for w in (0..gpu_r.num_wavelengths).step_by(8) {
+                let c = cpu_r[w];
+                let g = gpu_r.radiance[w];
+                if c > 1e-25 {
+                    let rel = ((g - c) / c).abs();
+                    assert!(
+                        rel < 5e-3,
+                        "cloudy parity SZA {} wl#{}: gpu={:.4e} cpu={:.4e} rel={:.2e}",
+                        sza, w, g, c, rel
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -886,40 +940,60 @@ mod layer4_metal {
         let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
         let view = [0.0, 1.0, 0.0];
         let szas = [93.0, 96.0, 100.0, 105.0, 108.0];
+        // Deep-twilight radiance (SZA >= 105) is 1e-9..1e-8, where a
+        // single 50-ray seed has CV ~0.3-0.5. Assert the monotonicity
+        // invariant on a K-seed AVERAGE - a single draw can fluctuate
+        // 2-3x without any physics being wrong. (CPU/GPU transport
+        // equality is covered by the parity tests.)
+        const SEEDS: u64 = 6;
 
         let requests: Vec<BatchRequest> = szas
             .iter()
-            .map(|&sza| {
+            .flat_map(|&sza| {
                 let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
+                (0..SEEDS).map(move |k| BatchRequest {
                     observer_pos: obs,
                     view_dir: view,
                     sun_dir: [sun.x, sun.y, sun.z],
                     kernel: BatchKernel::Hybrid {
                         secondary_rays: 50,
-                        seed: sza.to_bits(),
+                        seed: sza.to_bits() ^ (0x9e37_79b9_7f4a_7c15u64.wrapping_mul(k + 1)),
                     },
-                }
+                })
             })
             .collect();
 
         let results = gpu.scan_batch(&requests).unwrap();
-        assert_eq!(results.len(), szas.len());
+        assert_eq!(results.len(), szas.len() * SEEDS as usize);
 
         for (i, r) in results.iter().enumerate() {
             for (w, &v) in r.radiance.iter().enumerate() {
                 assert!(
                     v >= 0.0 && v.is_finite(),
                     "Metal hybrid batch SZA={} wl={}: invalid {:.4e}",
-                    szas[i],
+                    szas[i / SEEDS as usize],
                     w,
                     v,
                 );
             }
         }
 
-        // Radiance should generally decrease with SZA
-        let totals: Vec<f64> = results.iter().map(|r| r.radiance.iter().sum()).collect();
+        // Radiance should generally decrease with SZA (seed-averaged)
+        let totals: Vec<f64> = szas
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                (0..SEEDS as usize)
+                    .map(|k| {
+                        results[i * SEEDS as usize + k]
+                            .radiance
+                            .iter()
+                            .sum::<f64>()
+                    })
+                    .sum::<f64>()
+                    / SEEDS as f64
+            })
+            .collect();
         for pair in totals.windows(2) {
             if pair[0] > 1e-20 {
                 assert!(
@@ -931,428 +1005,137 @@ mod layer4_metal {
             }
         }
     }
-}
-
-// ── Vulkan backend integration tests ────────────────────────────────────
-
-#[cfg(feature = "vulkan")]
-mod layer4_vulkan {
-    use super::*;
-    use crate::{BackendKind, GpuConfig};
-
-    fn try_vulkan() -> Option<Box<dyn crate::GpuBackend>> {
-        let config = GpuConfig {
-            preferred_backend: Some(BackendKind::Vulkan),
-            ..Default::default()
-        };
-        crate::try_init(&config).ok()
-    }
 
     #[test]
-    fn vulkan_init_and_device_info() {
-        let Some(gpu) = try_vulkan() else { return };
-        let info = gpu.device_info();
-        assert_eq!(info.backend, BackendKind::Vulkan);
-        assert!(
-            !info.name.is_empty(),
-            "Vulkan device name should not be empty"
+    fn metal_single_hybrid_matches_one_item_batch() {
+        use crate::{BatchKernel, BatchRequest};
+        use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+
+        let Some(mut gpu) = try_metal() else { return };
+
+        let atm = twilight_data::builder::build_clear_sky(
+            twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+            0.15,
         );
-        assert!(
-            info.max_workgroup_size >= 256,
-            "Vulkan max_workgroup_size={} should be >= 256",
-            info.max_workgroup_size,
-        );
-    }
-
-    #[test]
-    fn vulkan_upload_atmosphere() {
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm)
-            .expect("Vulkan upload_atmosphere should succeed");
-    }
-
-    #[test]
-    fn vulkan_single_scatter_vs_cpu_oracle() {
-        let Some(mut gpu) = try_vulkan() else { return };
-        let checked = run_single_scatter_parity(gpu.as_mut(), "Vulkan");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn vulkan_mcrt_vs_single_scatter() {
-        let Some(mut gpu) = try_vulkan() else { return };
-        let checked = run_mcrt_vs_single_scatter(gpu.as_mut(), "Vulkan");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn vulkan_hybrid_sanity() {
-        let Some(mut gpu) = try_vulkan() else { return };
-        let checked = run_hybrid_sanity(gpu.as_mut(), "Vulkan");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn vulkan_single_scatter_radiance_non_negative() {
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
         gpu.upload_atmosphere(&atm).unwrap();
 
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
+        let lat = 54.826;
+        let lon = 9.363;
+        let sza_deg: f64 = 96.0;
+        let solar_azimuth: f64 = 270.0;
+        let view_zenith: f64 = 85.0;
+        let rays = 5000u32;
+        let seed = sza_deg.to_bits();
 
-        for &sza in &[80.0, 90.0, 96.0, 100.0, 108.0, 120.0] {
-            let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-            let result = gpu
-                .single_scatter(obs, view, [sun.x, sun.y, sun.z])
-                .unwrap();
-            for (w, &rad) in result.radiance.iter().enumerate() {
-                assert!(
-                    rad >= 0.0,
-                    "Vulkan SZA={} wl={}: negative radiance {:.6e}",
-                    sza,
-                    w,
-                    rad,
-                );
-                assert!(
-                    rad.is_finite(),
-                    "Vulkan SZA={} wl={}: non-finite radiance {:.6e}",
-                    sza,
-                    w,
-                    rad,
-                );
-            }
-        }
-    }
+        let obs = geographic_to_ecef(lat, lon, 0.0);
+        let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+        let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
 
-    #[test]
-    fn vulkan_single_scatter_decreases_with_sza() {
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-
-        let szas = [80.0, 90.0, 96.0, 100.0, 108.0];
-        let mut prev_rad = f64::MAX;
-        for &sza in &szas {
-            let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-            let result = gpu
-                .single_scatter(obs, view, [sun.x, sun.y, sun.z])
-                .unwrap();
-            let rad = result.radiance[1];
-            assert!(
-                rad <= prev_rad + 1e-20,
-                "Vulkan SZA={}: radiance {:.6e} should <= previous {:.6e}",
-                sza,
-                rad,
-                prev_rad,
-            );
-            prev_rad = rad;
-        }
-    }
-
-    #[test]
-    fn vulkan_deep_night_negligible() {
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-        let sun = solar_direction_ecef(120.0, 180.0, 0.0, 0.0);
-
-        let result = gpu
-            .single_scatter(obs, view, [sun.x, sun.y, sun.z])
+        let single = gpu
+            .hybrid_scatter(
+                [obs.x, obs.y, obs.z],
+                [view.x, view.y, view.z],
+                [sun.x, sun.y, sun.z],
+                rays,
+                seed,
+            )
             .unwrap();
-        for (w, &rad) in result.radiance.iter().enumerate() {
+
+        let batch = gpu
+            .scan_batch(&[BatchRequest {
+                observer_pos: [obs.x, obs.y, obs.z],
+                view_dir: [view.x, view.y, view.z],
+                sun_dir: [sun.x, sun.y, sun.z],
+                kernel: BatchKernel::Hybrid {
+                    secondary_rays: rays,
+                    seed,
+                },
+            }])
+            .unwrap();
+
+        let batched = &batch[0];
+        let single_sum: f64 = single.radiance.iter().sum();
+        let batch_sum: f64 = batched.radiance.iter().sum();
+        let rel = ((single_sum - batch_sum) / single_sum.max(1e-30)).abs();
+        assert!(
+            rel < 1e-5,
+            "single hybrid vs one-item batch mismatch: single={:.6e}, batch={:.6e}, rel={:.3e}",
+            single_sum,
+            batch_sum,
+            rel
+        );
+    }
+
+    #[test]
+    fn metal_multi_hybrid_matches_serial_chunk() {
+        use crate::{BatchKernel, BatchRequest};
+        use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+
+        let Some(mut gpu) = try_metal() else { return };
+
+        let atm = twilight_data::builder::build_clear_sky(
+            twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+            0.15,
+        );
+        gpu.upload_atmosphere(&atm).unwrap();
+
+        let lat = 54.826;
+        let lon = 9.363;
+        let solar_azimuth = 270.0;
+        let view_zenith = 85.0;
+        let rays = 5000u32;
+        let szas = [90.0f64, 96.0, 102.0, 108.0];
+
+        let mut requests = Vec::new();
+        let mut serial = Vec::new();
+
+        for &sza_deg in &szas {
+            let seed = sza_deg.to_bits();
+            let obs = geographic_to_ecef(lat, lon, 0.0);
+            let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+            let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+
+            serial.push(
+                gpu.hybrid_scatter(
+                    [obs.x, obs.y, obs.z],
+                    [view.x, view.y, view.z],
+                    [sun.x, sun.y, sun.z],
+                    rays,
+                    seed,
+                )
+                .unwrap(),
+            );
+
+            requests.push(BatchRequest {
+                observer_pos: [obs.x, obs.y, obs.z],
+                view_dir: [view.x, view.y, view.z],
+                sun_dir: [sun.x, sun.y, sun.z],
+                kernel: BatchKernel::Hybrid {
+                    secondary_rays: rays,
+                    seed,
+                },
+            });
+        }
+
+        let batched = gpu.scan_batch(&requests).unwrap();
+        assert_eq!(serial.len(), batched.len());
+
+        for i in 0..serial.len() {
+            let single_sum: f64 = serial[i].radiance.iter().sum();
+            let batch_sum: f64 = batched[i].radiance.iter().sum();
+            let rel = ((single_sum - batch_sum) / single_sum.max(1e-30)).abs();
             assert!(
-                rad < 1e-15,
-                "Vulkan SZA=120 wl={}: radiance {:.6e} should be negligible",
-                w,
-                rad,
+                rel < 1e-5,
+                "multi hybrid batch mismatch at idx {} SZA {}: single={:.6e}, batch={:.6e}, rel={:.3e}",
+                i,
+                szas[i],
+                single_sum,
+                batch_sum,
+                rel
             );
         }
     }
-
-    /// Verify Vulkan scan_batch matches serial single_scatter calls.
-    #[test]
-    fn vulkan_batch_matches_serial() {
-        use crate::{BatchKernel, BatchRequest};
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-        let szas = [80.0, 90.0, 96.0, 100.0, 108.0];
-
-        let serial: Vec<_> = szas
-            .iter()
-            .map(|&sza| {
-                let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                gpu.single_scatter(obs, view, [sun.x, sun.y, sun.z])
-                    .unwrap()
-            })
-            .collect();
-
-        let requests: Vec<BatchRequest> = szas
-            .iter()
-            .map(|&sza| {
-                let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
-                    observer_pos: obs,
-                    view_dir: view,
-                    sun_dir: [sun.x, sun.y, sun.z],
-                    kernel: BatchKernel::SingleScatter,
-                }
-            })
-            .collect();
-        let batched = gpu.scan_batch(&requests).unwrap();
-
-        assert_eq!(serial.len(), batched.len());
-        for (i, (s, b)) in serial.iter().zip(batched.iter()).enumerate() {
-            for w in 0..s.num_wavelengths {
-                assert!(
-                    approx_eq(s.radiance[w], b.radiance[w], 1e-6, F32_ATOL),
-                    "Vulkan batch SZA={} wl={}: serial {:.6e} vs batch {:.6e}",
-                    szas[i],
-                    w,
-                    s.radiance[w],
-                    b.radiance[w],
-                );
-            }
-        }
-    }
-
-    /// Benchmark Vulkan batch vs serial for 50-SZA scan.
-    #[test]
-    fn vulkan_batch_speedup() {
-        use crate::{BatchKernel, BatchRequest};
-        use std::time::Instant;
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-        let szas: Vec<f64> = (0..50).map(|i| 90.0 + i as f64 * 0.4).collect();
-
-        let requests: Vec<BatchRequest> = szas
-            .iter()
-            .map(|&sza| {
-                let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
-                    observer_pos: obs,
-                    view_dir: view,
-                    sun_dir: [sun.x, sun.y, sun.z],
-                    kernel: BatchKernel::SingleScatter,
-                }
-            })
-            .collect();
-
-        // Warmup
-        let _ = gpu.scan_batch(&requests);
-
-        let serial_start = Instant::now();
-        for req in &requests {
-            let _ = gpu
-                .single_scatter(req.observer_pos, req.view_dir, req.sun_dir)
-                .unwrap();
-        }
-        let serial_elapsed = serial_start.elapsed();
-
-        let batch_start = Instant::now();
-        let _ = gpu.scan_batch(&requests).unwrap();
-        let batch_elapsed = batch_start.elapsed();
-
-        let speedup = serial_elapsed.as_secs_f64() / batch_elapsed.as_secs_f64().max(1e-9);
-
-        eprintln!(
-            "  [Vulkan batch] 50-SZA: serial {:?} vs batch {:?} ({:.1}x speedup)",
-            serial_elapsed, batch_elapsed, speedup,
-        );
-
-        // Vulkan has per-dispatch descriptor set overhead, so the speedup
-        // is smaller than Metal's (which uses buffer offsets). Still faster
-        // than serial due to eliminating per-dispatch fence waits.
-        assert!(
-            speedup > 1.3,
-            "Vulkan batch ({:?}) should be >1.3x faster than serial ({:?}), got {:.1}x",
-            batch_elapsed,
-            serial_elapsed,
-            speedup,
-        );
-    }
-
-    /// Verify Vulkan hybrid batch produces valid results.
-    #[test]
-    fn vulkan_batch_hybrid_valid() {
-        use crate::{BatchKernel, BatchRequest};
-        use twilight_core::atmosphere::EARTH_RADIUS_M;
-        use twilight_core::geometry::solar_direction_ecef;
-
-        let Some(mut gpu) = try_vulkan() else { return };
-        let atm = oracle::oracle_atmosphere();
-        gpu.upload_atmosphere(&atm).unwrap();
-
-        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
-        let view = [0.0, 1.0, 0.0];
-        let szas = [93.0, 96.0, 100.0, 105.0, 108.0];
-
-        let requests: Vec<BatchRequest> = szas
-            .iter()
-            .map(|&sza| {
-                let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
-                    observer_pos: obs,
-                    view_dir: view,
-                    sun_dir: [sun.x, sun.y, sun.z],
-                    kernel: BatchKernel::Hybrid {
-                        secondary_rays: 50,
-                        seed: sza.to_bits(),
-                    },
-                }
-            })
-            .collect();
-
-        let results = gpu.scan_batch(&requests).unwrap();
-        assert_eq!(results.len(), szas.len());
-
-        for (i, r) in results.iter().enumerate() {
-            for (w, &v) in r.radiance.iter().enumerate() {
-                assert!(
-                    v >= 0.0 && v.is_finite(),
-                    "Vulkan hybrid batch SZA={} wl={}: invalid {:.4e}",
-                    szas[i],
-                    w,
-                    v,
-                );
-            }
-        }
-    }
 }
-
-// ── CUDA backend integration tests ──────────────────────────────────────
-
-#[cfg(feature = "cuda")]
-mod layer4_cuda {
-    use super::*;
-    use crate::{BackendKind, GpuConfig};
-
-    fn try_cuda() -> Option<Box<dyn crate::GpuBackend>> {
-        let config = GpuConfig {
-            preferred_backend: Some(BackendKind::Cuda),
-            ..Default::default()
-        };
-        crate::try_init(&config).ok()
-    }
-
-    #[test]
-    fn cuda_init_and_device_info() {
-        let Some(gpu) = try_cuda() else { return };
-        let info = gpu.device_info();
-        assert_eq!(info.backend, BackendKind::Cuda);
-        assert!(
-            !info.name.is_empty(),
-            "CUDA device name should not be empty"
-        );
-    }
-
-    #[test]
-    fn cuda_single_scatter_vs_cpu_oracle() {
-        let Some(mut gpu) = try_cuda() else { return };
-        let checked = run_single_scatter_parity(gpu.as_mut(), "CUDA");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn cuda_mcrt_vs_single_scatter() {
-        let Some(mut gpu) = try_cuda() else { return };
-        let checked = run_mcrt_vs_single_scatter(gpu.as_mut(), "CUDA");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn cuda_hybrid_sanity() {
-        let Some(mut gpu) = try_cuda() else { return };
-        let checked = run_hybrid_sanity(gpu.as_mut(), "CUDA");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-}
-
-// ── wgpu backend integration tests ──────────────────────────────────────
-
-#[cfg(feature = "webgpu")]
-mod layer4_wgpu {
-    use super::*;
-    use crate::{BackendKind, GpuConfig};
-
-    fn try_wgpu() -> Option<Box<dyn crate::GpuBackend>> {
-        let config = GpuConfig {
-            preferred_backend: Some(BackendKind::Wgpu),
-            ..Default::default()
-        };
-        crate::try_init(&config).ok()
-    }
-
-    #[test]
-    fn wgpu_init_and_device_info() {
-        let Some(gpu) = try_wgpu() else { return };
-        let info = gpu.device_info();
-        assert_eq!(info.backend, BackendKind::Wgpu);
-        assert!(
-            !info.name.is_empty(),
-            "wgpu device name should not be empty"
-        );
-    }
-
-    #[test]
-    fn wgpu_single_scatter_vs_cpu_oracle() {
-        let Some(mut gpu) = try_wgpu() else { return };
-        let checked = run_single_scatter_parity(gpu.as_mut(), "wgpu");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn wgpu_mcrt_vs_single_scatter() {
-        let Some(mut gpu) = try_wgpu() else { return };
-        let checked = run_mcrt_vs_single_scatter(gpu.as_mut(), "wgpu");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-
-    #[test]
-    fn wgpu_hybrid_sanity() {
-        let Some(mut gpu) = try_wgpu() else { return };
-        let checked = run_hybrid_sanity(gpu.as_mut(), "wgpu");
-        assert!(checked > 0, "should have checked at least one case");
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Layer 5: Cross-backend parity tests
-// ═══════════════════════════════════════════════════════════════════════
-//
-// When multiple GPU backends are available on the same machine, their
-// results must agree within f32 tolerance. These tests initialize all
-// available backends and compare their single_scatter / mcrt outputs.
 
 /// Cross-backend parity tolerance. Backends use the same f32 arithmetic
 /// but may differ in instruction ordering, FMA usage, etc.
@@ -1369,43 +1152,21 @@ fn init_all_backends() -> Vec<(crate::BackendKind, Box<dyn crate::GpuBackend>)> 
             preferred_backend: Some(crate::BackendKind::Metal),
             ..Default::default()
         };
-        if let Ok(gpu) = crate::try_init(&config) {
-            backends.push((crate::BackendKind::Metal, gpu));
+        match crate::try_init(&config) {
+            Ok(gpu) => backends.push((crate::BackendKind::Metal, gpu)),
+            Err(e) => {
+                // Skip ONLY when no Metal device exists (headless CI).
+                // A present device that fails to init means the shader
+                // does not compile - that must FAIL the suite, not
+                // silently skip it (a broken shader once hid behind
+                // this skip while 135 'GPU' tests passed vacuously).
+                if objc2_metal::MTLCreateSystemDefaultDevice().is_some() {
+                    panic!("Metal device present but backend init failed: {e}");
+                }
+            }
         }
     }
 
-    #[cfg(feature = "vulkan")]
-    {
-        let config = crate::GpuConfig {
-            preferred_backend: Some(crate::BackendKind::Vulkan),
-            ..Default::default()
-        };
-        if let Ok(gpu) = crate::try_init(&config) {
-            backends.push((crate::BackendKind::Vulkan, gpu));
-        }
-    }
-
-    #[cfg(feature = "cuda")]
-    {
-        let config = crate::GpuConfig {
-            preferred_backend: Some(crate::BackendKind::Cuda),
-            ..Default::default()
-        };
-        if let Ok(gpu) = crate::try_init(&config) {
-            backends.push((crate::BackendKind::Cuda, gpu));
-        }
-    }
-
-    #[cfg(feature = "webgpu")]
-    {
-        let config = crate::GpuConfig {
-            preferred_backend: Some(crate::BackendKind::Wgpu),
-            ..Default::default()
-        };
-        if let Ok(gpu) = crate::try_init(&config) {
-            backends.push((crate::BackendKind::Wgpu, gpu));
-        }
-    }
 
     backends
 }
@@ -1468,6 +1229,111 @@ fn cross_backend_single_scatter_parity() {
                 }
             }
         }
+    }
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_hybrid_split_dispatch_boundaries_match_cpu_statistics() {
+    use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+
+    let config = crate::GpuConfig {
+        preferred_backend: Some(crate::BackendKind::Metal),
+        ..Default::default()
+    };
+    let mut gpu = match crate::try_init(&config) {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            if objc2_metal::MTLCreateSystemDefaultDevice().is_some() {
+                panic!("Metal device present but backend init failed: {e}");
+            }
+            return;
+        }
+    };
+
+    let atm = twilight_data::builder::build_clear_sky(
+        twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+        0.15,
+    );
+    gpu.upload_atmosphere(&atm).unwrap();
+
+    let lat = 54.826;
+    let lon = 9.363;
+    let sza_deg = 96.0f64;
+    let solar_azimuth = 270.0;
+    let view_zenith = 85.0;
+    let num_wl = atm.num_wavelengths;
+    let obs = geographic_to_ecef(lat, lon, 0.0);
+    let view = solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+    let sun = solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+    let obs_arr = [obs.x, obs.y, obs.z];
+    let view_arr = [view.x, view.y, view.z];
+    let sun_arr = [sun.x, sun.y, sun.z];
+
+    for &secondary_rays in &[0usize, 1, 255, 256, 257, 1023, 1024, 1025] {
+        let seed = sza_deg.to_bits() ^ secondary_rays as u64;
+
+        let gpu_result = gpu
+            .hybrid_scatter(obs_arr, view_arr, sun_arr, secondary_rays as u32, seed)
+            .unwrap();
+
+        let mut cpu_total = 0.0f64;
+        for w in 0..num_wl {
+            let mut rng = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(w as u64)
+                .wrapping_add(1);
+            cpu_total += twilight_core::photon::hybrid_scatter_radiance(
+                &atm,
+                obs,
+                view,
+                sun,
+                w,
+                secondary_rays,
+                &mut rng,
+                true,
+            );
+        }
+
+        let gpu_total: f64 = gpu_result.radiance.iter().sum();
+
+        if secondary_rays == 0 {
+            assert!(
+                approx_eq(cpu_total, gpu_total, 0.05, F32_ATOL),
+                "split boundary rays=0 mismatch: cpu={:.6e}, gpu={:.6e}",
+                cpu_total,
+                gpu_total,
+            );
+            continue;
+        }
+
+        let ratio = if cpu_total.abs() > 1e-30 {
+            gpu_total / cpu_total
+        } else if gpu_total.abs() > 1e-30 {
+            f64::INFINITY
+        } else {
+            1.0
+        };
+
+        // Ray-count-aware tolerance: CPU and GPU draw INDEPENDENT MC
+        // samples, so at 1 ray the ratio of two heavy-tailed draws is
+        // nearly unbounded - but at >=255 rays the means concentrate and
+        // a systematic (e.g. an SSA-ordering or transmittance bug) must
+        // show up. The old flat 20x band hid a non-compiling shader and
+        // several proven kernel divergences (audit 2026-06-12).
+        let band = if secondary_rays >= 255 {
+            0.5..=2.0
+        } else {
+            0.05..=20.0
+        };
+        assert!(
+            ratio.is_finite() && band.contains(&ratio),
+            "split boundary rays={} ratio out of range: cpu={:.6e}, gpu={:.6e}, ratio={:.4}",
+            secondary_rays,
+            cpu_total,
+            gpu_total,
+            ratio,
+        );
     }
 }
 
@@ -1872,25 +1738,35 @@ fn batch_hybrid_physics_invariants() {
     let view = [0.0, 1.0, 0.0];
     let szas = [90.0, 93.0, 96.0, 100.0, 105.0, 108.0];
 
+    // Single 50-ray seeds at deep SZA carry CV ~0.3-0.5: average K seeds
+    // before asserting the SZA-monotonicity invariant (see
+    // metal_batch_hybrid_valid for rationale).
+    const SEEDS: u64 = 6;
+
     for (kind, gpu) in backends.iter() {
         let requests: Vec<BatchRequest> = szas
             .iter()
-            .map(|&sza| {
+            .flat_map(|&sza| {
                 let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
+                (0..SEEDS).map(move |k| BatchRequest {
                     observer_pos: obs,
                     view_dir: view,
                     sun_dir: [sun.x, sun.y, sun.z],
                     kernel: BatchKernel::Hybrid {
                         secondary_rays: 50,
-                        seed: sza.to_bits(),
+                        seed: sza.to_bits() ^ (0x9e37_79b9_7f4a_7c15u64.wrapping_mul(k + 1)),
                     },
-                }
+                })
             })
             .collect();
 
         let results = gpu.scan_batch(&requests).unwrap();
-        assert_eq!(results.len(), szas.len(), "{}: wrong result count", kind);
+        assert_eq!(
+            results.len(),
+            szas.len() * SEEDS as usize,
+            "{}: wrong result count",
+            kind
+        );
 
         // Non-negative radiance
         for (i, r) in results.iter().enumerate() {
@@ -1900,14 +1776,28 @@ fn batch_hybrid_physics_invariants() {
                     "{}: negative radiance {:.4e} at SZA={} wl={}",
                     kind,
                     v,
-                    szas[i],
+                    szas[i / SEEDS as usize],
                     w,
                 );
             }
         }
 
-        // Total radiance should generally decrease with SZA
-        let totals: Vec<f64> = results.iter().map(|r| r.radiance.iter().sum()).collect();
+        // Total radiance should generally decrease with SZA (seed-averaged)
+        let totals: Vec<f64> = szas
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                (0..SEEDS as usize)
+                    .map(|k| {
+                        results[i * SEEDS as usize + k]
+                            .radiance
+                            .iter()
+                            .sum::<f64>()
+                    })
+                    .sum::<f64>()
+                    / SEEDS as f64
+            })
+            .collect();
         for pair in totals.windows(2) {
             // Allow some MC noise: second value should not be > 2x the first
             if pair[0] > 1e-20 {
@@ -2839,9 +2729,6 @@ fn test_parity_coverage_report() {
         }
         for backend in &[
             crate::BackendKind::Metal,
-            crate::BackendKind::Vulkan,
-            crate::BackendKind::Cuda,
-            crate::BackendKind::Wgpu,
         ] {
             cov.record(
                 *backend,
@@ -2861,9 +2748,6 @@ fn test_parity_coverage_report() {
         let valid = header.validate();
         for backend in &[
             crate::BackendKind::Metal,
-            crate::BackendKind::Vulkan,
-            crate::BackendKind::Cuda,
-            crate::BackendKind::Wgpu,
         ] {
             cov.record(
                 *backend,
@@ -2889,9 +2773,6 @@ fn test_parity_coverage_report() {
         let ok = (truth - kahan).abs() < 1e-10;
         for backend in &[
             crate::BackendKind::Metal,
-            crate::BackendKind::Vulkan,
-            crate::BackendKind::Cuda,
-            crate::BackendKind::Wgpu,
         ] {
             cov.record(
                 *backend,
@@ -2920,9 +2801,6 @@ fn test_parity_coverage_report() {
         }
         for backend in &[
             crate::BackendKind::Metal,
-            crate::BackendKind::Vulkan,
-            crate::BackendKind::Cuda,
-            crate::BackendKind::Wgpu,
         ] {
             cov.record(
                 *backend,
@@ -2939,9 +2817,6 @@ fn test_parity_coverage_report() {
     // --- Geometry features ---
     for backend in &[
         crate::BackendKind::Metal,
-        crate::BackendKind::Vulkan,
-        crate::BackendKind::Cuda,
-        crate::BackendKind::Wgpu,
     ] {
         cov.record(
             *backend,
@@ -2959,9 +2834,6 @@ fn test_parity_coverage_report() {
     // --- Scattering features ---
     for backend in &[
         crate::BackendKind::Metal,
-        crate::BackendKind::Vulkan,
-        crate::BackendKind::Cuda,
-        crate::BackendKind::Wgpu,
     ] {
         cov.record(*backend, ParityFeature::RayleighPhase, ParityStatus::Pass);
         cov.record(*backend, ParityFeature::HgPhase, ParityStatus::Pass);
@@ -2978,9 +2850,6 @@ fn test_parity_coverage_report() {
     // --- Shadow Ray features ---
     for backend in &[
         crate::BackendKind::Metal,
-        crate::BackendKind::Vulkan,
-        crate::BackendKind::Cuda,
-        crate::BackendKind::Wgpu,
     ] {
         cov.record(
             *backend,
@@ -3003,9 +2872,6 @@ fn test_parity_coverage_report() {
     // --- Hybrid engine features: untested until GPU shaders are rewritten ---
     for backend in &[
         crate::BackendKind::Metal,
-        crate::BackendKind::Vulkan,
-        crate::BackendKind::Cuda,
-        crate::BackendKind::Wgpu,
     ] {
         cov.record(*backend, ParityFeature::LosSteping, ParityStatus::Untested);
         cov.record(*backend, ParityFeature::Nee, ParityStatus::Untested);

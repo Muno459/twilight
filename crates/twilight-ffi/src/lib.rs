@@ -1,11 +1,15 @@
-//! C FFI bindings for iOS/Android/Flutter.
+//! C FFI bindings.
+//!
+//! Currently exposes a single function: [`twilight_solar_zenith`] (SPA solar
+//! zenith angle). No prayer-time, radiative-transfer, or threshold API is
+//! exported yet - mobile SDK claims should not be made until they are.
 
 use twilight_solar::spa;
 
 /// Compute solar zenith angle for a given location and time.
 ///
 /// # Safety
-/// All parameters are plain values, no pointers — always safe.
+/// All parameters are plain values, no pointers - always safe.
 #[no_mangle]
 pub extern "C" fn twilight_solar_zenith(
     year: i32,

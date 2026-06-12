@@ -2,10 +2,13 @@
 //!
 //! This crate provides:
 //! - CIE 1924 photopic V(λ) and CIE 1951 scotopic V'(λ) vision functions
-//! - Spectral luminance computation (photopic, scotopic, mesopic per CIE 191:2010)
+//! - Spectral luminance computation (photopic, scotopic, simplified mesopic)
+//! - Physical night-sky background (airglow, zodiacal, starlight, moonlight)
 //! - Spectral centroid analysis for red/white twilight classification
 //! - Threshold model for Fajr/Isha prayer time determination
 
 pub mod luminance;
+pub mod night_sky;
+pub mod night_sky_tables;
 pub mod threshold;
 pub mod vision;
