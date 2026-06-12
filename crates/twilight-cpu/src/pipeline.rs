@@ -933,11 +933,38 @@ fn khayt_pass(
     let n_steps = ((hi - lo) / 1.0).floor() as usize + 1;
     let szas: Vec<f64> = (0..n_steps).map(|i| lo + i as f64).collect();
 
-    // ── MCRT fan: per-direction luminance curves (side-independent) ──
+    // ── Terrain: the observer cannot watch sky that is behind a ridge.
+    // Each patch looks just above ITS horizon: view zenith =
+    // 90 - max(default altitude, horizon + 1 deg clearance). The first
+    // dawn light then appears later exactly as it does for a valley
+    // observer. Needs the real (per-side) sun azimuth for absolute
+    // patch azimuths; without terrain the fan is side-independent.
+    let side_sun_azimuth = |engine: &mut SolarEngine, morning: bool| -> Option<f64> {
+        let (w0, w1) = if morning { (0.0, 12.0) } else { (12.0, 28.0) };
+        let mid = (lo + hi) / 2.0;
+        let t = engine.find_zenith_crossing_robust(mid, w0, w1, 0.005, morning)?;
+        engine.azimuth_at_hour(t)
+    };
+    let zenith_for = |sun_az: Option<f64>, offset: f64| -> f64 {
+        let default_alt = 90.0 - params.band_zenith_deg;
+        let alt = match (&input.horizon_profile, sun_az) {
+            (Some(h), Some(az)) => {
+                let ridge = h.angle_at(az + offset);
+                default_alt.max(ridge + 1.0)
+            }
+            _ => default_alt,
+        };
+        90.0 - alt
+    };
+    let sun_az_morning = side_sun_azimuth(engine, true);
+    let sun_az_evening = side_sun_azimuth(engine, false);
+
+    // ── MCRT fan: per-direction luminance curves. Side-independent
+    // unless terrain forces per-side patch elevations.
     let thr_cfg = threshold::ThresholdConfig::default();
-    let sim_dir = |offset: f64| -> Vec<(f64, f64)> {
+    let sim_dir = |offset: f64, view_zenith: f64| -> Vec<(f64, f64)> {
         let mut cfg = base_config.clone();
-        cfg.view_zenith = params.band_zenith_deg;
+        cfg.view_zenith = view_zenith;
         cfg.view_azimuth = Some(base_config.solar_azimuth + offset);
         let stats = scan_szas_with_stats(atm, &cfg, &szas, 2, scan, scan_list);
         stats
@@ -954,10 +981,53 @@ fn khayt_pass(
             })
             .collect()
     };
-    let band_mcrt: Vec<Vec<(f64, f64)>> =
-        params.band_offsets_deg.iter().map(|&o| sim_dir(o)).collect();
-    let ref_mcrt: Vec<Vec<(f64, f64)>> =
-        params.ref_offsets_deg.iter().map(|&o| sim_dir(o)).collect();
+    let fan_for = |sun_az: Option<f64>| -> (Vec<Vec<(f64, f64)>>, Vec<Vec<(f64, f64)>>, Vec<f64>, Vec<f64>) {
+        let band_z: Vec<f64> = params
+            .band_offsets_deg
+            .iter()
+            .map(|&o| zenith_for(sun_az, o))
+            .collect();
+        let ref_z: Vec<f64> = params
+            .ref_offsets_deg
+            .iter()
+            .map(|&o| zenith_for(sun_az, o))
+            .collect();
+        let band: Vec<Vec<(f64, f64)>> = params
+            .band_offsets_deg
+            .iter()
+            .zip(&band_z)
+            .map(|(&o, &z)| sim_dir(o, z))
+            .collect();
+        let refs: Vec<Vec<(f64, f64)>> = params
+            .ref_offsets_deg
+            .iter()
+            .zip(&ref_z)
+            .map(|(&o, &z)| sim_dir(o, z))
+            .collect();
+        (band, refs, band_z, ref_z)
+    };
+    // Terrain raises a patch only when a ridge exceeds the default
+    // altitude; with no terrain (or a flat one) both sides share one fan.
+    let terrain_active = input.horizon_profile.as_ref().is_some_and(|h| {
+        let probe_az: Vec<f64> = [sun_az_morning, sun_az_evening]
+            .iter()
+            .flatten()
+            .flat_map(|az| params.band_offsets_deg.iter().map(move |o| az + o))
+            .collect();
+        probe_az
+            .iter()
+            .any(|&az| h.angle_at(az) + 1.0 > 90.0 - params.band_zenith_deg)
+    });
+    let (band_mcrt, ref_mcrt, band_z_m, ref_z_m) = fan_for(if terrain_active {
+        sun_az_morning
+    } else {
+        None
+    });
+    let (band_mcrt_e, ref_mcrt_e, band_z_e, ref_z_e) = if terrain_active {
+        fan_for(sun_az_evening)
+    } else {
+        (band_mcrt.clone(), ref_mcrt.clone(), band_z_m.clone(), ref_z_m.clone())
+    };
 
     // ── Skyglow: identical additive veil on every patch of the low ring
     // (azimuthal structure of city glow is unknown from the atlas; an
@@ -993,7 +1063,10 @@ fn khayt_pass(
         .copied()
         .filter(|&s| s > lo && s < hi)
         .collect();
-    let mut celestial_side = |morning: bool| -> Vec<(f64, Vec<f64>, Vec<f64>)> {
+    let mut celestial_side = |morning: bool,
+                              band_z: &[f64],
+                              ref_z: &[f64]|
+     -> Vec<(f64, Vec<f64>, Vec<f64>)> {
         // (anchor_sza, band_bg[j], ref_bg[j])
         let (w0, w1) = if morning { (0.0, 12.0) } else { (12.0, 28.0) };
         anchor_szas
@@ -1004,27 +1077,17 @@ fn khayt_pass(
                 let band: Vec<f64> = params
                     .band_offsets_deg
                     .iter()
-                    .map(|&o| {
-                        night_sky_total(
-                            input,
-                            engine,
-                            t,
-                            params.band_zenith_deg,
-                            Some(sun_az + o),
-                        )
+                    .zip(band_z)
+                    .map(|(&o, &z)| {
+                        night_sky_total(input, engine, t, z, Some(sun_az + o))
                     })
                     .collect();
                 let refs: Vec<f64> = params
                     .ref_offsets_deg
                     .iter()
-                    .map(|&o| {
-                        night_sky_total(
-                            input,
-                            engine,
-                            t,
-                            params.band_zenith_deg,
-                            Some(sun_az + o),
-                        )
+                    .zip(ref_z)
+                    .map(|(&o, &z)| {
+                        night_sky_total(input, engine, t, z, Some(sun_az + o))
                     })
                     .collect();
                 Some((sza, band, refs))
@@ -1048,7 +1111,10 @@ fn khayt_pass(
         pick(anchors.last().unwrap())
     };
 
-    let assemble = |anchors: &[(f64, Vec<f64>, Vec<f64>)]| -> KhaytScan {
+    let assemble = |anchors: &[(f64, Vec<f64>, Vec<f64>)],
+                    bm: &[Vec<(f64, f64)>],
+                    rm: &[Vec<(f64, f64)>]|
+     -> KhaytScan {
         let band = szas
             .iter()
             .enumerate()
@@ -1057,10 +1123,8 @@ fn khayt_pass(
                     .map(|j| {
                         let bg = interp(anchors, sza, j, false);
                         PatchLum {
-                            mesopic: band_mcrt[j][i].0 + bg + sg_mes,
-                            red: band_mcrt[j][i].1
-                                + bg * params.celestial_red_fraction
-                                + sg_red,
+                            mesopic: bm[j][i].0 + bg + sg_mes,
+                            red: bm[j][i].1 + bg * params.celestial_red_fraction + sg_red,
                         }
                     })
                     .collect()
@@ -1074,10 +1138,8 @@ fn khayt_pass(
                     .map(|j| {
                         let bg = interp(anchors, sza, j, true);
                         PatchLum {
-                            mesopic: ref_mcrt[j][i].0 + bg + sg_mes,
-                            red: ref_mcrt[j][i].1
-                                + bg * params.celestial_red_fraction
-                                + sg_red,
+                            mesopic: rm[j][i].0 + bg + sg_mes,
+                            red: rm[j][i].1 + bg * params.celestial_red_fraction + sg_red,
                         }
                     })
                     .collect()
@@ -1090,10 +1152,16 @@ fn khayt_pass(
         }
     };
 
-    let morning_anchors = celestial_side(true);
-    let evening_anchors = celestial_side(false);
-    let morning = detect(&assemble(&morning_anchors), &params.for_side(true));
-    let evening = detect(&assemble(&evening_anchors), &params.for_side(false));
+    let morning_anchors = celestial_side(true, &band_z_m, &ref_z_m);
+    let evening_anchors = celestial_side(false, &band_z_e, &ref_z_e);
+    let morning = detect(
+        &assemble(&morning_anchors, &band_mcrt, &ref_mcrt),
+        &params.for_side(true),
+    );
+    let evening = detect(
+        &assemble(&evening_anchors, &band_mcrt_e, &ref_mcrt_e),
+        &params.for_side(false),
+    );
 
     let mut out = KhaytTimes::default();
     if let Some(c) = morning.sadiq {
@@ -2372,5 +2440,64 @@ mod tests {
         assert_eq!(input.hour, 12);
         assert_eq!(input.minute, 30);
         assert_eq!(input.second, 30);
+    }
+}
+
+#[cfg(test)]
+mod khayt_terrain_tests {
+    use super::*;
+    use twilight_terrain::HorizonProfile;
+
+    /// A ridge toward the dawn azimuth must delay the khayt Fajr: the
+    /// observer's first visible sky sits above the ridge, where the dawn
+    /// band brightens later.
+    #[test]
+    fn eastern_ridge_delays_khayt_fajr() {
+        let mk = |angles: [f64; 360]| HorizonProfile {
+            angles_deg: angles,
+            observer_lat: 21.4225,
+            observer_lon: 39.8262,
+            observer_elev_m: 0.0,
+            radius_km: 30.0,
+            source_name: "test".into(),
+        };
+        let mut angles = [0.0f64; 360];
+        let profile_flat = mk(angles);
+        // 8-degree ridge across the whole eastern half (dawn azimuths).
+        for (az, a) in angles.iter_mut().enumerate() {
+            if (20..160).contains(&az) {
+                *a = 8.0;
+            }
+        }
+        let profile_ridge = mk(angles);
+
+        let base = PrayerTimeInput {
+            latitude: 21.4225,
+            longitude: 39.8262,
+            year: 2026,
+            month: 6,
+            day: 13,
+            timezone: 3.0,
+            scattering_mode: crate::simulation::ScatteringMode::Single,
+            ..Default::default()
+        };
+        let flat_in = PrayerTimeInput {
+            horizon_profile: Some(profile_flat),
+            ..base.clone()
+        };
+        let ridge_in = PrayerTimeInput {
+            horizon_profile: Some(profile_ridge),
+            ..base
+        };
+        let out_flat = compute_prayer_times(&flat_in);
+        let out_ridge = compute_prayer_times(&ridge_in);
+        let (f, r) = (
+            out_flat.khayt.fajr_time.expect("flat khayt fajr"),
+            out_ridge.khayt.fajr_time.expect("ridge khayt fajr"),
+        );
+        assert!(
+            r > f + 0.005,
+            "ridge must delay khayt fajr: flat {f:.4} vs ridge {r:.4}"
+        );
     }
 }

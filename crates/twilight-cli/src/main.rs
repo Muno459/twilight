@@ -179,6 +179,90 @@ enum Commands {
         #[arg(long)]
         no_refraction: bool,
     },
+    /// Sky Quality Meter field calibration: predict a night's zenith
+    /// sky-brightness curve and compare it against measured SQM logs
+    Sqm {
+        #[command(subcommand)]
+        action: SqmCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum SqmCommands {
+    /// Predict the zenith sky-brightness curve for one night
+    /// (local sunset to next sunrise). CSV to stdout or --out, summary
+    /// to stderr (stdout when --out is set, keeping the CSV clean).
+    Predict(SqmArgs),
+    /// Compare a measured SQM log against the predicted curve and
+    /// report the offset binned by solar depression - the
+    /// threshold-calibration measurement (see docs/SQM_CAMPAIGN.md)
+    Compare(SqmCompareArgs),
+}
+
+/// Shared arguments for the sqm subcommands.
+#[derive(Args)]
+struct SqmArgs {
+    /// Latitude in degrees (north positive)
+    #[arg(short, long)]
+    lat: f64,
+    /// Longitude in degrees (east positive)
+    #[arg(short = 'n', long)]
+    lon: f64,
+    /// Date in YYYY-MM-DD format: the evening the night STARTS
+    #[arg(short, long)]
+    date: String,
+    /// Timezone offset from UTC (hours). Determined automatically from
+    /// the coordinates when omitted (IANA tzdb). Set only to override.
+    #[arg(short, long)]
+    tz: Option<f64>,
+    /// Elevation above sea level in meters
+    #[arg(short, long, default_value = "0")]
+    elevation: f64,
+    /// Surface albedo (0-1)
+    #[arg(long, default_value = "0.15")]
+    albedo: f64,
+    /// Delta T (TT - UT1) in seconds
+    #[arg(long, default_value = "69.184")]
+    delta_t: f64,
+    /// Fetch live weather data from Open-Meteo (aerosol/cloud/gas).
+    /// Provenance lines print to stdout, so pair with --out when piping
+    /// the CSV.
+    #[arg(long)]
+    weather: bool,
+    /// Light pollution: satellite atlas auto mode (Falchi atlas at the
+    /// observer; no DNB temporal rescale, unlike `pray --skyglow`)
+    #[arg(long)]
+    skyglow: bool,
+    /// Light pollution: Bortle dark-sky class (1-9)
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+    bortle: Option<u8>,
+    /// Light pollution: VIIRS nighttime radiance (nW/cm^2/sr)
+    #[arg(long)]
+    radiance: Option<f64>,
+    /// Scattering mode (default: single - deterministic and fast, the
+    /// right speed for a whole-night scan; use hybrid for full MC)
+    #[arg(long, value_enum, default_value = "single")]
+    scattering: CliScattering,
+    /// Secondary rays per step (hybrid/MC modes)
+    #[arg(short, long, default_value = "100")]
+    photons: usize,
+    /// Time step in minutes
+    #[arg(long, default_value = "5")]
+    step_min: f64,
+    /// Write the CSV to this file instead of stdout
+    #[arg(long)]
+    out: Option<String>,
+}
+
+#[derive(Args)]
+struct SqmCompareArgs {
+    #[command(flatten)]
+    base: SqmArgs,
+    /// SQM log file: Unihedron SQM-LE/LU format (semicolon-separated,
+    /// `#` comment headers, UTC timestamp first, mag last) or a simple
+    /// 2-column CSV (timestamp_iso,mag). Autodetected.
+    #[arg(long)]
+    log: String,
 }
 
 /// Arguments to `pray`, passed around as one unit instead of 28
@@ -2233,6 +2317,607 @@ fn report(
     );
 }
 
+// ===================== SQM field calibration =====================
+//
+// `sqm predict` produces the engine's forecast of what a zenith-pointed
+// Sky Quality Meter should read through one night; `sqm compare` aligns
+// a real meter log to that forecast and reports the bias binned by
+// solar depression. The depression-binned bias IS the field measurement
+// that calibrates the twilight thresholds (docs/SQM_CAMPAIGN.md).
+
+/// One predicted point of the night curve.
+struct SqmPoint {
+    /// Unix epoch seconds (UTC) of the instant.
+    epoch_utc: f64,
+    /// Solar zenith angle [deg].
+    sza_deg: f64,
+    /// Total zenith luminance [cd/m^2]: MCRT twilight + celestial
+    /// background + skyglow.
+    total_cd: f64,
+    /// The same, as mag/arcsec^2 (what the SQM displays).
+    mag: f64,
+}
+
+/// A predicted night curve plus the metadata to label it.
+struct SqmCurve {
+    points: Vec<SqmPoint>,
+    tz_offset: f64,
+    tz_label: String,
+    atm_desc: String,
+    glow_desc: String,
+    date: (i32, i32, i32),
+    /// Local fractional hours (relative to the start date's midnight).
+    sunset_h: f64,
+    sunrise_h: f64,
+}
+
+/// The civil day after (y, m, d).
+fn next_civil_day(year: i32, month: i32, day: i32) -> (i32, i32, i32) {
+    use chrono::Datelike;
+    chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32)
+        .and_then(|d| d.succ_opt())
+        .map(|d| (d.year(), d.month() as i32, d.day() as i32))
+        .unwrap_or((year, month, day + 1))
+}
+
+/// Unix epoch seconds (UTC) of local midnight on (y, m, d) in a fixed
+/// UTC offset frame.
+fn local_midnight_epoch(year: i32, month: i32, day: i32, tz_offset: f64) -> f64 {
+    let naive = chrono::NaiveDate::from_ymd_opt(year, month as u32, day as u32)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .map(|dt| dt.and_utc().timestamp() as f64)
+        .unwrap_or(0.0);
+    naive - tz_offset * 3600.0
+}
+
+/// Epoch seconds -> "YYYY-MM-DDTHH:MM:SSZ".
+fn iso_utc(epoch: f64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(epoch.round() as i64, 0)
+        .map(|d| d.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_else(|| "invalid".to_string())
+}
+
+/// Epoch seconds -> local ISO with the fixed engine offset
+/// ("YYYY-MM-DDTHH:MM:SS+02:00").
+fn iso_local(epoch: f64, tz_offset: f64) -> String {
+    let off = chrono::FixedOffset::east_opt((tz_offset * 3600.0).round() as i32);
+    match (
+        chrono::DateTime::<chrono::Utc>::from_timestamp(epoch.round() as i64, 0),
+        off,
+    ) {
+        (Some(d), Some(o)) => d
+            .with_timezone(&o)
+            .format("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string(),
+        _ => "invalid".to_string(),
+    }
+}
+
+/// Parse an ISO timestamp to Unix epoch seconds. Explicit offsets
+/// (Z, +02:00) are honored; bare timestamps are taken as UTC - the
+/// convention of the Unihedron log's first column.
+fn parse_epoch_utc(s: &str) -> Option<f64> {
+    let s = s.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.timestamp() as f64);
+    }
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, fmt) {
+            return Some(ndt.and_utc().timestamp() as f64);
+        }
+    }
+    None
+}
+
+/// Parsed SQM readings (epoch_utc seconds, mag) plus the detected
+/// format label.
+type SqmLog = (Vec<(f64, f64)>, &'static str);
+
+/// Parse an SQM log into (epoch_utc, mag) readings.
+///
+/// Two formats, autodetected per file (the one that parses more lines
+/// wins):
+/// - Unihedron SQM-LE/LU: `#` comment headers, then semicolon-separated
+///   `utc_iso;local_iso;temperature;counts;Hz;mag` (UTC field first,
+///   magnitude last).
+/// - Simple CSV: `timestamp_iso,mag` (bare timestamps read as UTC).
+fn parse_sqm_log(path: &str) -> Result<SqmLog, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {}", path, e))?;
+    let mut unihedron: Vec<(f64, f64)> = Vec::new();
+    let mut csv: Vec<(f64, f64)> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let semi: Vec<&str> = line.split(';').collect();
+        if semi.len() >= 6 {
+            if let (Some(t), Ok(m)) = (
+                parse_epoch_utc(semi[0]),
+                semi[semi.len() - 1].trim().parse::<f64>(),
+            ) {
+                unihedron.push((t, m));
+                continue;
+            }
+        }
+        let comma: Vec<&str> = line.split(',').collect();
+        if comma.len() >= 2 {
+            if let (Some(t), Ok(m)) = (parse_epoch_utc(comma[0]), comma[1].trim().parse::<f64>())
+            {
+                csv.push((t, m));
+            }
+        }
+    }
+    if unihedron.is_empty() && csv.is_empty() {
+        return Err(format!(
+            "no readings parsed from {} (expected Unihedron semicolon format or timestamp_iso,mag CSV)",
+            path
+        ));
+    }
+    if unihedron.len() >= csv.len() {
+        Ok((unihedron, "unihedron"))
+    } else {
+        Ok((csv, "csv"))
+    }
+}
+
+/// Artificial zenith luminance [cd/m^2] for the sqm commands, plus its
+/// provenance. Priority: --radiance, --bortle, --skyglow (Falchi atlas
+/// value at its epoch; the DNB temporal rescale of `pray --skyglow` is
+/// deliberately skipped here - a field campaign should record the site
+/// and pass --radiance or --bortle for a stable, reproducible input).
+fn sqm_skyglow_cd(args: &SqmArgs) -> (f64, String) {
+    let from_radiance = |r: f64, label: String| {
+        let mcd = twilight_skyglow::bortle::radiance_to_zenith_luminance(r);
+        (mcd * 1e-3, format!("{} -> {:.3} mcd/m^2 artificial", label, mcd))
+    };
+    if let Some(r) = args.radiance {
+        from_radiance(r, format!("VIIRS {:.2} nW/cm^2/sr", r))
+    } else if let Some(b) = args.bortle {
+        from_radiance(
+            twilight_skyglow::bortle::bortle_to_radiance(b),
+            format!("Bortle {}", b),
+        )
+    } else if args.skyglow {
+        let cache = repo_root().join("data/skyglow");
+        match twilight_skyglow::atlas::artificial_zenith(&cache, args.lat, args.lon) {
+            Some(a) => (
+                a.zenith_mcd * 1e-3,
+                format!(
+                    "satellite atlas {} -> {:.3} mcd/m^2 artificial",
+                    a.year, a.zenith_mcd
+                ),
+            ),
+            None => {
+                eprintln!(
+                    "Note: no skyglow atlas data here; running without skyglow - pass --bortle or --radiance."
+                );
+                (0.0, "none (atlas lookup failed)".to_string())
+            }
+        }
+    } else {
+        (0.0, "none".to_string())
+    }
+}
+
+/// Predict the zenith sky-brightness curve for the night starting on
+/// args.date: local sunset (SPA zenith crossing at 90.8333 deg) to the
+/// next morning's sunrise, in steps of --step-min.
+///
+/// Per step, three luminance components are summed [cd/m^2]:
+/// 1. MCRT twilight sky: simulate_at_sza at view_zenith 0, reduced to
+///    CIE mesopic luminance (the engine's threshold currency; at
+///    twilight light levels mesopic tracks photopic, which is close to
+///    the SQM's response). Skipped for SZA > 110 deg, where the solar
+///    contribution sits orders of magnitude below the celestial floor.
+/// 2. Celestial background: the full measured-data night-sky model
+///    (airglow at the F10.7 = 130 mid-cycle default, Leinert zodiacal
+///    table, Pioneer starlight map, Meeus-series moon) - NOT the
+///    dark-sky constant, so moonlit calibration nights predict
+///    correctly. Extinction k mirrors the pipeline: 0.16 gas + 1.2 per
+///    AOD (0.05 default aerosol term without weather).
+/// 3. Configured skyglow (constant across the night).
+///
+/// Conversion to mag/arcsec^2 via luminance_to_sqm, which takes
+/// mcd/m^2: total_cd * 1e3.
+fn sqm_predict_curve(args: &SqmArgs) -> SqmCurve {
+    let (year, month, day) = resolve_date(&args.date);
+    let tz = resolve_timezone(args.lat, args.lon, year, month, day, args.tz);
+
+    // Night window from real SPA zenith crossings (refraction-corrected
+    // bisection, not the approximate transit formula).
+    let spa_d = spa_input_for(
+        args.lat,
+        args.lon,
+        args.elevation,
+        tz.offset_hours,
+        args.delta_t,
+        year,
+        month,
+        day,
+    );
+    let (y2, m2, d2) = next_civil_day(year, month, day);
+    let spa_d2 = spa_input_for(
+        args.lat,
+        args.lon,
+        args.elevation,
+        tz.offset_hours,
+        args.delta_t,
+        y2,
+        m2,
+        d2,
+    );
+    let sunset = spa::find_zenith_crossing(&spa_d, 90.8333, 12.0, 24.0, 0.0001);
+    let sunrise = spa::find_zenith_crossing(&spa_d2, 90.8333, 0.0, 12.0, 0.0001);
+    let (Some(sunset_h), Some(sunrise_next)) = (sunset, sunrise) else {
+        eprintln!(
+            "Error: no sunset/sunrise crossing on {} at {:.3},{:.3} (polar day or polar night) - sqm needs a real night.",
+            args.date, args.lat, args.lon
+        );
+        std::process::exit(1);
+    };
+    let sunrise_h = sunrise_next + 24.0;
+
+    // Atmosphere: live weather or US Standard clear sky, mirroring `pray`.
+    let date_iso = format!("{}-{:02}-{:02}", year, month, day);
+    let (aerosol_props, cloud_props, gas, atm_desc) = if args.weather {
+        let utc_spa = spa_input_for(
+            args.lat,
+            args.lon,
+            args.elevation,
+            0.0,
+            args.delta_t,
+            year,
+            month,
+            day,
+        );
+        let twilight_hour_utc = spa::solar_position(&SpaInput {
+            hour: 12,
+            ..utc_spa.clone()
+        })
+        .ok()
+        .map(|o| (o.sunset + 0.75).rem_euclid(24.0));
+        let sun_az =
+            sun_azimuth_at(&utc_spa, twilight_hour_utc.unwrap_or(21.0)).unwrap_or(270.0);
+        let w = weather_block(
+            args.lat,
+            args.lon,
+            &date_iso,
+            twilight_hour_utc,
+            sun_az,
+            Path::new("data/satellite"),
+        );
+        (w.aerosol, w.cloud, w.gas, w.description)
+    } else {
+        (
+            None,
+            None,
+            None,
+            "US Standard 1976 (clear sky)".to_string(),
+        )
+    };
+    let atm = if let Some(ref gc) = gas {
+        builder::build_full_with_gas(
+            AtmosphereType::UsStandard,
+            args.albedo,
+            aerosol_props.as_ref(),
+            cloud_props.as_ref(),
+            gc.o3_column_du,
+            gc.no2_surface_density,
+        )
+    } else {
+        builder::build_full(
+            AtmosphereType::UsStandard,
+            args.albedo,
+            aerosol_props.as_ref(),
+            cloud_props.as_ref(),
+        )
+    };
+
+    // Broadband V extinction for the celestial components, same recipe
+    // as the prayer pipeline (gas 0.16 + aerosol term).
+    let extinction_k = 0.16
+        + aerosol_props
+            .as_ref()
+            .map(|a| 1.2 * a.aod_550)
+            .unwrap_or(0.05);
+
+    let config = SimulationConfig {
+        latitude: args.lat,
+        longitude: args.lon,
+        elevation: args.elevation,
+        // Irrelevant for a zenith view: the scattering angle is fixed
+        // by the SZA alone.
+        solar_azimuth: 270.0,
+        view_zenith: 0.0,
+        view_azimuth: None,
+        apply_solar_irradiance: true,
+        scattering_mode: args.scattering.to_scattering_mode(),
+        photons_per_wavelength: args.photons,
+        polarized: true,
+        seed_salt: 0,
+    };
+    let threshold_config = twilight_threshold::threshold::ThresholdConfig::default();
+    let (glow_cd, glow_desc) = sqm_skyglow_cd(args);
+
+    let base_epoch = local_midnight_epoch(year, month, day, tz.offset_hours);
+    let step_h = args.step_min.max(0.25) / 60.0;
+    let mut points = Vec::new();
+    let mut h = sunset_h;
+    while h <= sunrise_h + 1e-9 {
+        // SZA via SPA; hours past 24 roll to the next civil day.
+        let (base, hh) = if h < 24.0 {
+            (&spa_d, h)
+        } else {
+            (&spa_d2, h - 24.0)
+        };
+        let mut inp = base.clone();
+        let total_s = (hh * 3600.0).round() as i32;
+        inp.hour = total_s / 3600;
+        inp.minute = (total_s % 3600) / 60;
+        inp.second = total_s % 60;
+        let Ok(pos) = spa::solar_position(&inp) else {
+            h += step_h;
+            continue;
+        };
+        let sza = pos.zenith;
+
+        let sun_cd = if sza <= 110.0 {
+            let result = simulation::simulate_at_sza(&atm, &config, sza);
+            let analysis = twilight_threshold::threshold::analyze_twilight(
+                sza,
+                &result.wavelengths_nm,
+                &result.radiance,
+                &threshold_config,
+            );
+            analysis.luminance_mesopic
+        } else {
+            0.0
+        };
+
+        // Raw (un-wrapped) UTC hour relative to the START date: the
+        // night-sky model's Julian-day arithmetic places hour 25+ on
+        // the correct next civil day (same convention as the pipeline).
+        let night_inp = twilight_threshold::night_sky::NightSkyInput {
+            latitude: args.lat,
+            longitude: args.lon,
+            year,
+            month,
+            day,
+            hour_utc: h - tz.offset_hours,
+            view_zenith_deg: 0.0,
+            view_azimuth_deg: 0.0,
+            solar_f107: 130.0,
+            extinction_k,
+        };
+        let night = twilight_threshold::night_sky::night_sky_luminance(&night_inp);
+
+        let total_cd = sun_cd + night.total + glow_cd;
+        let mag = twilight_skyglow::bortle::luminance_to_sqm(total_cd * 1e3);
+        points.push(SqmPoint {
+            epoch_utc: base_epoch + h * 3600.0,
+            sza_deg: sza,
+            total_cd,
+            mag,
+        });
+        h += step_h;
+    }
+
+    SqmCurve {
+        points,
+        tz_offset: tz.offset_hours,
+        tz_label: tz.label,
+        atm_desc,
+        glow_desc,
+        date: (year, month, day),
+        sunset_h,
+        sunrise_h,
+    }
+}
+
+/// Human summary of a predicted curve: the darkest point and the two
+/// times the curve enters/leaves the 0.1-mag band above the floor
+/// (predicted twilight end and dawn start as an SQM would see them).
+fn sqm_summary(curve: &SqmCurve) -> String {
+    let mut s = String::new();
+    let (y, m, d) = curve.date;
+    s.push_str(&format!(
+        "Night of {}-{:02}-{:02}: sunset {} to sunrise {} ({} points)\n",
+        y,
+        m,
+        d,
+        format_fractional_hour(curve.sunset_h),
+        format_fractional_hour(curve.sunrise_h),
+        curve.points.len()
+    ));
+    let Some(darkest) = curve
+        .points
+        .iter()
+        .max_by(|a, b| a.mag.partial_cmp(&b.mag).unwrap_or(std::cmp::Ordering::Equal))
+    else {
+        s.push_str("No points predicted.\n");
+        return s;
+    };
+    let floor = darkest.mag;
+    s.push_str(&format!(
+        "Darkest:      {:.2} mag/arcsec^2 ({:.3e} cd/m^2) at {}\n",
+        floor,
+        darkest.total_cd,
+        iso_local(darkest.epoch_utc, curve.tz_offset)
+    ));
+    let edge = floor - 0.1;
+    if let Some(p) = curve.points.iter().find(|p| p.mag >= edge) {
+        s.push_str(&format!(
+            "Twilight end: {} (first point within 0.1 mag of the floor; SZA {:.1} deg)\n",
+            iso_local(p.epoch_utc, curve.tz_offset),
+            p.sza_deg
+        ));
+    }
+    if let Some(p) = curve.points.iter().rev().find(|p| p.mag >= edge) {
+        s.push_str(&format!(
+            "Dawn start:   {} (last point within 0.1 mag of the floor; SZA {:.1} deg)\n",
+            iso_local(p.epoch_utc, curve.tz_offset),
+            p.sza_deg
+        ));
+    }
+    s
+}
+
+fn cmd_sqm_predict(args: SqmArgs) {
+    let curve = sqm_predict_curve(&args);
+    let mut csv = String::new();
+    csv.push_str(&format!(
+        "# twilight sqm predict: date={}-{:02}-{:02} lat={} lon={} elevation={}m tz={} atmosphere=\"{}\" skyglow=\"{}\" scattering={:?} step_min={}\n",
+        curve.date.0,
+        curve.date.1,
+        curve.date.2,
+        args.lat,
+        args.lon,
+        args.elevation,
+        curve.tz_label,
+        curve.atm_desc,
+        curve.glow_desc,
+        args.scattering.to_scattering_mode(),
+        args.step_min
+    ));
+    csv.push_str("time_local_iso,time_utc_iso,sza_deg,sim_total_cd_m2,sim_mag_arcsec2\n");
+    for p in &curve.points {
+        csv.push_str(&format!(
+            "{},{},{:.3},{:.6e},{:.3}\n",
+            iso_local(p.epoch_utc, curve.tz_offset),
+            iso_utc(p.epoch_utc),
+            p.sza_deg,
+            p.total_cd,
+            p.mag
+        ));
+    }
+    let summary = sqm_summary(&curve);
+    match &args.out {
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &csv) {
+                eprintln!("Error: cannot write {}: {}", path, e);
+                std::process::exit(1);
+            }
+            println!("Wrote {} points to {}", curve.points.len(), path);
+            print!("{}", summary);
+        }
+        None => {
+            print!("{}", csv);
+            eprint!("{}", summary);
+        }
+    }
+}
+
+fn cmd_sqm_compare(args: SqmCompareArgs) {
+    let (readings, log_format) = match parse_sqm_log(&args.log) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let curve = sqm_predict_curve(&args.base);
+    if curve.points.len() < 2 {
+        eprintln!("Error: predicted curve has fewer than 2 points.");
+        std::process::exit(1);
+    }
+    let pts = &curve.points;
+    let t0 = pts[0].epoch_utc;
+    let t1 = pts[pts.len() - 1].epoch_utc;
+
+    // Align each reading to the predicted curve by UTC time (linear
+    // interpolation), keeping only points with the sun below the
+    // horizon (depression >= 0).
+    let mut aligned: Vec<(f64, f64)> = Vec::new(); // (depression_deg, sim - measured)
+    for &(t, meas) in &readings {
+        if t < t0 || t > t1 {
+            continue;
+        }
+        let i = pts
+            .partition_point(|p| p.epoch_utc <= t)
+            .clamp(1, pts.len() - 1);
+        let (a, b) = (&pts[i - 1], &pts[i]);
+        let span = b.epoch_utc - a.epoch_utc;
+        let f = if span > 0.0 { (t - a.epoch_utc) / span } else { 0.0 };
+        let sim_mag = a.mag + f * (b.mag - a.mag);
+        let sza = a.sza_deg + f * (b.sza_deg - a.sza_deg);
+        let depression = sza - 90.0;
+        if depression < 0.0 {
+            continue;
+        }
+        aligned.push((depression, sim_mag - meas));
+    }
+
+    println!("SQM Comparison Report");
+    println!("=====================");
+    println!(
+        "Log:        {} (format: {}, {} readings)",
+        args.log,
+        log_format,
+        readings.len()
+    );
+    println!(
+        "Night:      {} to {} ({} predicted points, step {} min)",
+        iso_local(t0, curve.tz_offset),
+        iso_local(t1, curve.tz_offset),
+        pts.len(),
+        args.base.step_min
+    );
+    println!("Atmosphere: {}", curve.atm_desc);
+    println!("Skyglow:    {}", curve.glow_desc);
+    println!(
+        "Aligned:    {} readings inside the night window (depression >= 0)",
+        aligned.len()
+    );
+    if aligned.len() < 10 {
+        eprintln!(
+            "Error: only {} readings align with the predicted night (need >= 10).",
+            aligned.len()
+        );
+        std::process::exit(1);
+    }
+
+    let n = aligned.len() as f64;
+    let mean: f64 = aligned.iter().map(|(_, o)| o).sum::<f64>() / n;
+    let rms: f64 = (aligned.iter().map(|(_, o)| o * o).sum::<f64>() / n).sqrt();
+    println!();
+    println!("Mean offset (sim - measured): {:+.3} mag", mean);
+    println!("RMS offset:                   {:.3} mag", rms);
+    println!();
+    println!("Offset by solar depression (the threshold-calibration measurement):");
+    let bins: [(f64, f64, &str); 4] = [
+        (0.0, 6.0, "0-6 deg  (civil)"),
+        (6.0, 12.0, "6-12 deg (nautical)"),
+        (12.0, 18.0, "12-18 deg (astronomical)"),
+        (18.0, 180.0, "18+ deg  (night floor)"),
+    ];
+    for (lo, hi, label) in bins {
+        let sel: Vec<f64> = aligned
+            .iter()
+            .filter(|(d, _)| *d >= lo && *d < hi)
+            .map(|(_, o)| *o)
+            .collect();
+        if sel.is_empty() {
+            println!("  {:<26} n={:>4}  (no data)", label, 0);
+        } else {
+            let bn = sel.len() as f64;
+            let bm = sel.iter().sum::<f64>() / bn;
+            let br = (sel.iter().map(|o| o * o).sum::<f64>() / bn).sqrt();
+            println!(
+                "  {:<26} n={:>4}  mean {:+.3}  rms {:.3}",
+                label,
+                sel.len(),
+                bm,
+                br
+            );
+        }
+    }
+    println!();
+    println!("Positive offset = engine predicts a DARKER sky than measured.");
+    println!("Feed the depression-binned bias back per docs/SQM_CAMPAIGN.md.");
+}
+
 /// Format a human-readable atmosphere description.
 fn format_atm_desc(aerosol: Option<AerosolType>, cloud: Option<CloudType>) -> String {
     match (aerosol, cloud) {
@@ -2517,5 +3202,9 @@ fn main() {
                 no_refraction,
             );
         }
+        Commands::Sqm { action } => match action {
+            SqmCommands::Predict(args) => cmd_sqm_predict(args),
+            SqmCommands::Compare(args) => cmd_sqm_compare(args),
+        },
     }
 }

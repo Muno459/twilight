@@ -68,6 +68,9 @@ TWILIGHT_CLI = REPO / "target" / "release" / "twilight-cli"
 OUT_DIR = REPO / "validation"
 
 # Matched to twilight's grid: 380-780 nm. uvspec wavelength range.
+# Env-overridable for the overnight 1e8 campaign.
+MC_BACKWARD_PHOTONS = int(os.environ.get("MC_BACKWARD_PHOTONS", "10000000"))
+TW_DEEP_PHOTONS = int(os.environ.get("TW_DEEP_PHOTONS", "4000"))
 WL_MIN, WL_MAX = 380.0, 780.0
 
 # twilight default surface albedo (crates/twilight-cli pray/compare default)
@@ -121,6 +124,13 @@ def deck_radiance(common: str, solver: str, sza: float, umus: list[float],
         "disort": "rte_solver disort\nnumber_of_streams 16\npseudospherical",
         "mystic": ("rte_solver montecarlo\nmc_spherical 1D\n"
                    "mc_photons 2000000\nmc_vroom on"),
+        # Backward mode: traces from the zenith sensor toward the sun,
+        # which is the only tractable geometry at SZA >= 98 (forward MC
+        # goes photon-starved: the sky there is 1e-7..1e-9 of TOA).
+        # Verified against forward MYSTIC at SZA 95 before use.
+        "mystic-backward": ("rte_solver montecarlo\nmc_spherical 1D\n"
+                            f"mc_photons {MC_BACKWARD_PHOTONS}\n"
+                            "mc_backward\nmc_vroom on"),
     }[solver]
     body = common
     if wl is not None:
@@ -291,7 +301,8 @@ def compare_tier1(lrt, solver, szas, tol, shape_only, solar_file):
 
 
 
-def compare_tier1b_mystic(lrt, szas, tol, shape_only, solar_file):
+def compare_tier1b_mystic(lrt, szas, tol, shape_only, solar_file,
+                          solver="mystic", tw_photons=500):
     """Tier 1b: deep-twilight ZENITH radiance vs MYSTIC spherical MC.
 
     One single-direction (zenith) MYSTIC run per (SZA, wavelength): MYSTIC
@@ -310,14 +321,14 @@ def compare_tier1b_mystic(lrt, szas, tol, shape_only, solar_file):
     # Straight shadow rays: MYSTIC mc_spherical does not refract - remove
     # twilight's refraction for the apples-to-apples run.
     tw = run_twilight_compare(szas, [0.0], [0.0], True, None,
-                              scattering="hybrid", photons=500,
+                              scattering="hybrid", photons=tw_photons,
                               no_refraction=True)
 
     n_pass = n_fail = 0
     rows = []
     for sza in szas:
         for w in wls:
-            deck = deck_radiance(common, "mystic", sza, [-1.0], [0.0], wl=(w, w))
+            deck = deck_radiance(common, solver, sza, [-1.0], [0.0], wl=(w, w))
             tag = f"tier1b_sza{sza:g}_wl{w:g}"
             run_uvspec(lrt, deck, tag)
             spc = OUT_DIR / "mc.rad.spc"
@@ -378,7 +389,7 @@ def _report(rows, n_pass, n_fail, tol):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tier", choices=["1a", "1b", "2", "3"], default=None)
+    ap.add_argument("--tier", choices=["1a", "1b", "1b-deep", "2", "3"], default=None)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--decks-only", action="store_true",
                     help="emit uvspec decks without running (no libRadtran needed)")
@@ -406,6 +417,16 @@ def main():
             ok &= compare_tier1b_mystic(lrt, [95, 98, 100, 102, 104, 106],
                                         tol=0.10, shape_only=args.shape_only,
                                         solar_file=args.solar_file)
+        elif tier == "1b-deep":
+            # The deep campaign: MYSTIC backward from the zenith sensor
+            # (forward is photon-starved past 98) at 1e7 photons, with a
+            # heavier twilight side. SZA 95 is repeated as the anchor
+            # where forward MYSTIC already passed.
+            ok &= compare_tier1b_mystic(lrt, [95, 96, 98, 100, 102, 104, 106],
+                                        tol=0.15, shape_only=args.shape_only,
+                                        solar_file=args.solar_file,
+                                        solver="mystic-backward",
+                                        tw_photons=TW_DEEP_PHOTONS)
         elif tier in ("2", "3"):
             print(f"Tier {tier}: deck templates not yet automated - "
                   "see module docstring for the design.")
