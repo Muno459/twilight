@@ -1860,7 +1860,7 @@ mod tests {
             for w in 0..atm.num_wavelengths {
                 let ssa = atm.optics[s][w].ssa;
                 assert!(
-                    ssa >= 0.0 && ssa <= 1.0,
+                    (0.0..=1.0).contains(&ssa),
                     "SSA out of bounds at shell {} wl {}: {}",
                     s,
                     w,

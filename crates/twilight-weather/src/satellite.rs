@@ -19,6 +19,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::error::WeatherError;
+
 const GIBS_BASE: &str = "https://gibs.earthdata.nasa.gov/wmts/epsg4326/best";
 const COT_LAYER: &str = "MODIS_Aqua_Cloud_Optical_Thickness";
 const CTH_LAYER: &str = "MODIS_Aqua_Cloud_Top_Height_Day";
@@ -582,6 +584,7 @@ pub struct SatelliteCloudPath {
     pub n_path_samples: usize,
 }
 
+#[cfg(test)]
 fn tile_for(lat: f64, lon: f64) -> (u32, u32, u32, u32) {
     tile_for_grid(lat, lon, TILE_DEG)
 }
@@ -610,7 +613,7 @@ fn fetch_tile(
     date: &str,
     row: u32,
     col: u32,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, WeatherError> {
     let path = cache_path(cache_dir, layer, date, row, col);
     if let Ok(bytes) = std::fs::read(&path) {
         if !bytes.is_empty() {
@@ -628,26 +631,34 @@ fn fetch_tile(
         .timeout_global(Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)))
         .build()
         .new_agent();
-    let mut resp = agent
-        .get(&url)
-        .call()
-        .map_err(|e| format!("GIBS fetch failed: {e}"))?;
-    let mut bytes = Vec::new();
-    resp.body_mut()
-        .as_reader()
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("GIBS read failed: {e}"))?;
-    let _ = std::fs::create_dir_all(cache_dir);
-    let _ = std::fs::write(&path, &bytes);
+    let bytes = crate::retry::with_retries(WeatherError::is_transient, || {
+        let mut resp = agent
+            .get(&url)
+            .call()
+            .map_err(|e| WeatherError::from_ureq(e, &url))?;
+        let mut bytes = Vec::new();
+        resp.body_mut()
+            .as_reader()
+            .read_to_end(&mut bytes)
+            .map_err(|e| WeatherError::network(format!("GIBS read failed ({url}): {e}")))?;
+        Ok(bytes)
+    })?;
+    let _ = crate::cache::write_atomic(&path, &bytes);
+    // Dated tiles go stale; evict anything fetched more than 14 days ago.
+    crate::cache::prune_stale(cache_dir, "");
     Ok(bytes)
 }
 
 /// Decode a palette/RGBA PNG and return (rgba_pixels, width, height).
-fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), WeatherError> {
     let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
-    let mut reader = decoder.read_info().map_err(|e| format!("png: {e}"))?;
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| WeatherError::parse(format!("png: {e}")))?;
     let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).map_err(|e| format!("png: {e}"))?;
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| WeatherError::parse(format!("png: {e}")))?;
     let (w, h) = (info.width, info.height);
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf,
@@ -658,7 +669,11 @@ fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
             }
             out
         }
-        other => return Err(format!("unexpected png color type {other:?}")),
+        other => {
+            return Err(WeatherError::parse(format!(
+                "unexpected png color type {other:?}"
+            )))
+        }
     };
     Ok((rgba, w, h))
 }
@@ -698,7 +713,7 @@ fn sample_layer(
     date: &str,
     lat: f64,
     lon: f64,
-) -> Result<LayerSample, String> {
+) -> Result<LayerSample, WeatherError> {
     let tile_deg = if layer == CWP_LAYER || layer == REFF_LAYER {
         TILE_DEG_1KM
     } else {

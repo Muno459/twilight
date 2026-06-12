@@ -823,15 +823,10 @@ mod tests {
     #[test]
     fn kahan_sum_beats_naive_on_extreme_range() {
         // Values spanning 1e-25 to 1e-5: naive f32 loses the small values
-        let mut values = Vec::new();
-        for _ in 0..1000 {
-            values.push(1e-25f32);
-        }
+        let mut values = vec![1e-25f32; 1000];
         values.push(1e-5f32);
         values.push(-1e-5f32);
-        for _ in 0..1000 {
-            values.push(1e-25f32);
-        }
+        values.extend(std::iter::repeat_n(1e-25f32, 1000));
 
         let f64_sum: f64 = values.iter().map(|&v| v as f64).sum();
         let kahan = kahan_sum_f32(&values) as f64;

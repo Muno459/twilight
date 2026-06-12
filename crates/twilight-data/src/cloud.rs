@@ -281,6 +281,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)] // pairwise index comparison
     fn cloud_types_are_distinct() {
         for i in 0..ALL_CLOUD_TYPES.len() {
             for j in (i + 1)..ALL_CLOUD_TYPES.len() {

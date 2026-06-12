@@ -14,13 +14,17 @@ observers: from 45.5E the view zenith angle at e.g. Padborg is ~70 deg,
 so native pixels are smeared to roughly 3.3 x 9.9 km; the reconstruction
 is correspondingly coarser north-south.
 
+Error protocol: handled failures print ONE JSON line {"error": <code>,
+"detail": ...} and exit 2 (coverage), 3 (environment) or 4 (network);
+the codes are documented in cloud3d_common.
+
 Usage:
   python3 tools/cloud3d_seviri.py --lat 54.82 --lon 9.36 \
       --azimuth 45 --out profile.json --png padborg3d.png --place Padborg
 """
 
 import argparse
-import json
+import importlib.util
 import math
 import os
 import shutil
@@ -30,15 +34,21 @@ import tempfile
 
 import numpy as np
 
-# satpy's dask threading segfaults on this Python; synchronous is plenty
-# for one 128x128 window.
-import dask
-
-dask.config.set(scheduler="synchronous")
-
+from cloud3d_common import (
+    SidecarError,
+    assert_rows_north_to_south,
+    cloud_fraction,
+    col_mean,
+    model_heights,
+    ok,
+    print_summary,
+    run_main,
+    sample_curtain,
+    sample_path,
+    window_mean,
+    write_result,
+)
 from cloud3d_profile import (
-    MODEL_TOP_M,
-    N_LEVELS,
     destination,
     iwc_from_output,
     normalize,
@@ -62,6 +72,13 @@ def run_model_isolated(x_in, model_path):
     torch each bring their own OpenMP runtime on macOS and the model
     forward segfaults. Process isolation sidesteps it entirely.
     """
+    # The subprocess reuses this interpreter, so a parent-side find_spec
+    # (no import, no OpenMP clash) gives a clean missing_deps failure
+    # instead of a CalledProcessError traceback.
+    if importlib.util.find_spec("torch") is None:
+        raise SidecarError("missing_deps", "torch not importable")
+    if not os.path.exists(model_path):
+        raise SidecarError("missing_deps", f"model not found: {model_path}")
     with tempfile.TemporaryDirectory() as td:
         xin = os.path.join(td, "x.npy")
         yout = os.path.join(td, "y.npy")
@@ -82,10 +99,14 @@ def run_model_isolated(x_in, model_path):
 def get_token():
     path = os.path.expanduser("~/.eumdac/credentials")
     if not os.path.exists(path):
-        raise SystemExit("no ~/.eumdac/credentials - register (free) at "
-                         "eoportal.eumetsat.int and run "
-                         "`eumdac set-credentials <key> <secret>`")
-    import eumdac
+        raise SidecarError("missing_deps",
+                           "no ~/.eumdac/credentials - register (free) at "
+                           "eoportal.eumetsat.int and run "
+                           "`eumdac set-credentials <key> <secret>`")
+    try:
+        import eumdac
+    except ImportError as e:
+        raise SidecarError("missing_deps", str(e))
     key, secret = open(path).read().strip().split(",")
     return eumdac.AccessToken((key, secret))
 
@@ -93,7 +114,6 @@ def get_token():
 def fetch_latest_nat(token, before_iso=None):
     """Newest IODC scan (optionally at/before an ISO time) -> local .nat."""
     import eumdac
-    import itertools
 
     ds = eumdac.DataStore(token)
     col = ds.get_collection(COLLECTION)
@@ -102,7 +122,11 @@ def fetch_latest_nat(token, before_iso=None):
         from datetime import datetime, timedelta
         end = datetime.fromisoformat(before_iso)
         kwargs = {"dtstart": end - timedelta(hours=6), "dtend": end}
-    product = next(itertools.islice(col.search(**kwargs), 1))
+    product = next(iter(col.search(**kwargs)), None)
+    if product is None:
+        raise SidecarError("no_granules",
+                           f"{COLLECTION} search returned nothing"
+                           + (f" at/before {before_iso}" if before_iso else ""))
     pid = str(product)
 
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -154,11 +178,21 @@ def main():
     args = ap.parse_args()
 
     token = get_token()
-    nat_path, pid, sensing_end = fetch_latest_nat(token, args.time)
+    try:
+        nat_path, pid, sensing_end = fetch_latest_nat(token, args.time)
+    except OSError as e:  # requests exceptions subclass OSError
+        raise SidecarError("network", f"EUMETSAT Data Store fetch failed: {e}")
     scan_time = sensing_end.strftime("%Y-%m-%dT%H:%MZ")
 
     # ── Load the 11 channels with physical calibration ──
-    from satpy import Scene
+    # satpy's dask threading segfaults on this Python; synchronous is
+    # plenty for one 128x128 window.
+    try:
+        import dask
+        from satpy import Scene
+    except ImportError as e:
+        raise SidecarError("missing_deps", str(e))
+    dask.config.set(scheduler="synchronous")
 
     scn = Scene(reader="seviri_l1b_native", filenames=[nat_path])
     solar, thermal = CHANNELS[:3], CHANNELS[3:]
@@ -168,9 +202,8 @@ def main():
     area = scn[CHANNELS[8]].attrs["area"]  # IR_108 full-disk area
     rc = lonlat_to_rowcol(area, args.lon, args.lat)
     if rc is None:
-        print(json.dumps({"error": "below horizon",
-                          "detail": f"{args.lat},{args.lon} not visible from {SAT_LON}E"}))
-        return 2
+        raise SidecarError("below_horizon",
+                           f"{args.lat},{args.lon} not visible from {SAT_LON}E")
     jc, ic = rc
     half_x = (args.window_x or args.window) // 2
     half_y = (args.window_y or args.window) // 2
@@ -205,26 +238,25 @@ def main():
     # ── Run the model (isolated process; see run_model_isolated) ──
     out = run_model_isolated(x_in, args.model)
     iwc = iwc_from_output(out)
-    heights = np.linspace(MODEL_TOP_M, 0.0, N_LEVELS)
+    heights = model_heights()
 
-    # ── Aggregate (mirrors the GOES sidecar) ──
+    # ── Aggregate (shared helpers; rows are north->south after the flip) ──
     h_, w_ = iwc.shape[1], iwc.shape[2]
     jc_w, ic_w = jc - j0, ic - i0
     if rows_north_up:
         jc_w = (h_ - 1) - jc_w
+    lat_a = area.get_lonlat(j0, ic)[1]
+    lat_b = area.get_lonlat(j1 - 1, ic)[1]
+    first, last = (lat_b, lat_a) if rows_north_up else (lat_a, lat_b)
+    assert_rows_north_to_south(first, last)
 
-    def col_mean(jj, ii, r):
-        ja, jb = max(0, jj - r), min(h_, jj + r + 1)
-        ia, ib = max(0, ii - r), min(w_, ii + r + 1)
-        return iwc[:, ja:jb, ia:ib].mean(axis=(1, 2))
+    center = col_mean(iwc, jc_w, ic_w, 1)
+    wmean = window_mean(iwc)
+    cf = cloud_fraction(iwc, heights)
 
-    center = col_mean(jc_w, ic_w, 1)
-    window_mean = iwc.mean(axis=(1, 2))
-    dz = MODEL_TOP_M / (N_LEVELS - 1)
-    iwp = iwc.sum(axis=0) * dz
-    cloud_fraction = float((iwp > 1.0).mean())
-
-    def sample_at(km, az):
+    def sampler(km, az):
+        # Absolute grid indices first, then reject anything outside the
+        # window (never clamp to the edge).
         la, lo = destination(args.lat, args.lon, az, km)
         rc2 = lonlat_to_rowcol(area, lo, la)
         if rc2 is None:
@@ -236,44 +268,31 @@ def main():
             return jj, ii
         return None
 
-    path, cols, kms = [], [], []
-    if args.azimuth is not None:
-        for km in (0.0, 50.0, 100.0, 200.0, 300.0):
-            s = sample_at(km, args.azimuth)
-            if s:
-                path.append({"km": km, "iwc_g_m3": col_mean(s[0], s[1], 2).tolist()})
-        for km in np.arange(0.0, 321.0, 8.0):
-            s = sample_at(float(km), args.azimuth)
-            if s:
-                cols.append(iwc[:, s[0], s[1]])
-                kms.append(km)
+    path = sample_path(iwc, sampler, args.azimuth)
+    cols, kms = sample_curtain(iwc, sampler, args.azimuth)
 
-    result = {
-        "satellite": "meteosat-9-iodc",
-        "granule": pid,
-        "time_utc": scan_time,
-        "requested_utc": args.time or "latest",
-        "model": args.model,
-        "heights_m": heights.tolist(),
-        "cloud_fraction": cloud_fraction,
-        "profiles": {
-            "center": center.tolist(),
-            "window_mean": window_mean.tolist(),
-            "path": path,
-        },
-        "iwc_units": "g/m3",
-    }
-    with open(args.out, "w") as f:
-        json.dump(result, f)
+    write_result(
+        args.out,
+        satellite="meteosat-9-iodc",
+        granule=pid,
+        time_utc=scan_time,
+        requested_utc=args.time or "latest",
+        model=args.model,
+        heights=heights,
+        cloud_frac=cf,
+        center=center,
+        window_mean=wmean,
+        path=path,
+    )
 
-    # synthesize the fields render_png expects from the GOES namespace
-    args.date = scan_time[:10]
-    args.hour = int(scan_time[11:13]) + int(scan_time[14:16]) / 60.0
-
+    place = args.place or f"{args.lat:.2f}N {args.lon:.2f}E"
     if args.png and cols:
-        render_png(args.png, iwc, heights, args, scan_time,
-                   "meteosat-9 (IODC 45.5E)", SAT_LON, None, None,
-                   jc_w, ic_w, np.stack(cols, axis=1), np.array(kms),
+        render_png(args.png, iwc, heights, scan_time,
+                   "meteosat-9 (IODC 45.5E)", jc_w, ic_w,
+                   np.stack(cols, axis=1), np.array(kms),
+                   date_str=scan_time[:10],
+                   hour=int(scan_time[11:13]) + int(scan_time[14:16]) / 60.0,
+                   azimuth=args.azimuth, place=place,
                    px_km=(km_e, km_s))
 
     if args.png3d:
@@ -289,18 +308,13 @@ def main():
         else:
             tex = np.clip((300.0 - raw[8]) / 110.0, 0.0, 1.0)
         render_3d(args.png3d, iwc, heights, km_e, km_s, jc_w, ic_w,
-                  texture=tex,
-                  place=args.place or f"{args.lat:.2f}N {args.lon:.2f}E",
+                  texture=tex, place=place,
                   scan_label=f"Meteosat-9 SEVIRI (IODC) scan {scan_time}",
                   azimuth=args.azimuth)
 
-    print(f"cloud3d-seviri: {pid} scan {scan_time}", file=sys.stderr)
-    print(f"cloud3d-seviri: cloud fraction {cloud_fraction:.2f}, "
-          f"max IWC {float(iwc.max()):.4f} g/m^3, path samples {len(path)}",
-          file=sys.stderr)
-    print(json.dumps({"ok": True, "out": args.out}))
-    return 0
+    print_summary("cloud3d-seviri", f"{pid} scan {scan_time}", iwc, cf, path)
+    return ok(args.out)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_main(main))

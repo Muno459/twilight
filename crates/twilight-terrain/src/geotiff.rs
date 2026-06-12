@@ -7,6 +7,8 @@ use std::fs::File;
 use std::path::Path;
 use tiff::decoder::{Decoder, DecodingResult};
 
+use crate::error::TerrainError;
+
 /// A loaded GeoTIFF elevation tile.
 pub struct ElevationTile {
     /// Elevation values in row-major order (top-left to bottom-right).
@@ -54,16 +56,16 @@ impl GeoTransform {
 
 impl ElevationTile {
     /// Load an elevation tile from a GeoTIFF file.
-    pub fn from_file(path: &Path) -> Result<Self, String> {
-        let file =
-            File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    pub fn from_file(path: &Path) -> Result<Self, TerrainError> {
+        let file = File::open(path)
+            .map_err(|e| TerrainError::io(format!("Failed to open {}: {}", path.display(), e)))?;
 
-        let mut decoder =
-            Decoder::new(file).map_err(|e| format!("Failed to decode TIFF: {}", e))?;
+        let mut decoder = Decoder::new(file)
+            .map_err(|e| TerrainError::parse(format!("Failed to decode TIFF: {}", e)))?;
 
         let (width, height) = decoder
             .dimensions()
-            .map_err(|e| format!("Failed to read dimensions: {}", e))?;
+            .map_err(|e| TerrainError::parse(format!("Failed to read dimensions: {}", e)))?;
 
         // Extract GeoTIFF metadata from tags
         let geo = read_geo_transform(&mut decoder, width, height)?;
@@ -71,7 +73,7 @@ impl ElevationTile {
         // Decode pixel data
         let result = decoder
             .read_image()
-            .map_err(|e| format!("Failed to read image data: {}", e))?;
+            .map_err(|e| TerrainError::parse(format!("Failed to read image data: {}", e)))?;
 
         let data = match result {
             DecodingResult::F32(d) => d,
@@ -80,18 +82,22 @@ impl ElevationTile {
             DecodingResult::U16(d) => d.into_iter().map(|v| v as f32).collect(),
             DecodingResult::I32(d) => d.into_iter().map(|v| v as f32).collect(),
             DecodingResult::U32(d) => d.into_iter().map(|v| v as f32).collect(),
-            _ => return Err("Unsupported pixel data type for elevation".to_string()),
+            _ => {
+                return Err(TerrainError::parse(
+                    "Unsupported pixel data type for elevation",
+                ))
+            }
         };
 
         let expected = width as usize * height as usize;
         if data.len() != expected {
-            return Err(format!(
+            return Err(TerrainError::parse(format!(
                 "Data length {} != expected {} ({}x{})",
                 data.len(),
                 expected,
                 width,
                 height
-            ));
+            )));
         }
 
         Ok(ElevationTile {
@@ -176,7 +182,7 @@ fn read_geo_transform(
     _decoder: &mut Decoder<File>,
     _width: u32,
     _height: u32,
-) -> Result<GeoTransform, String> {
+) -> Result<GeoTransform, TerrainError> {
     // ModelPixelScaleTag (33550): [ScaleX, ScaleY, ScaleZ]
     // ModelTiepointTag (33922): [I, J, K, X, Y, Z]
     //
@@ -199,26 +205,28 @@ fn read_geo_transform(
     // For now, return a placeholder that will be filled by the backend-specific code.
     // Each backend (copernicus, lidar) knows its tile structure and can provide
     // the correct GeoTransform without relying on tag parsing.
-    Err("GeoTransform must be provided by the backend (use from_file_with_geo)".to_string())
+    Err(TerrainError::parse(
+        "GeoTransform must be provided by the backend (use from_file_with_geo)",
+    ))
 }
 
 impl ElevationTile {
     /// Load an elevation tile with an externally-provided GeoTransform.
     /// Use this when the backend knows the tile's geographic extent.
-    pub fn from_file_with_geo(path: &Path, geo: GeoTransform) -> Result<Self, String> {
-        let file =
-            File::open(path).map_err(|e| format!("Failed to open {}: {}", path.display(), e))?;
+    pub fn from_file_with_geo(path: &Path, geo: GeoTransform) -> Result<Self, TerrainError> {
+        let file = File::open(path)
+            .map_err(|e| TerrainError::io(format!("Failed to open {}: {}", path.display(), e)))?;
 
-        let mut decoder =
-            Decoder::new(file).map_err(|e| format!("Failed to decode TIFF: {}", e))?;
+        let mut decoder = Decoder::new(file)
+            .map_err(|e| TerrainError::parse(format!("Failed to decode TIFF: {}", e)))?;
 
         let (width, height) = decoder
             .dimensions()
-            .map_err(|e| format!("Failed to read dimensions: {}", e))?;
+            .map_err(|e| TerrainError::parse(format!("Failed to read dimensions: {}", e)))?;
 
         let result = decoder
             .read_image()
-            .map_err(|e| format!("Failed to read image data: {}", e))?;
+            .map_err(|e| TerrainError::parse(format!("Failed to read image data: {}", e)))?;
 
         let data = match result {
             DecodingResult::F32(d) => d,
@@ -227,18 +235,22 @@ impl ElevationTile {
             DecodingResult::U16(d) => d.into_iter().map(|v| v as f32).collect(),
             DecodingResult::I32(d) => d.into_iter().map(|v| v as f32).collect(),
             DecodingResult::U32(d) => d.into_iter().map(|v| v as f32).collect(),
-            _ => return Err("Unsupported pixel data type for elevation".to_string()),
+            _ => {
+                return Err(TerrainError::parse(
+                    "Unsupported pixel data type for elevation",
+                ))
+            }
         };
 
         let expected = width as usize * height as usize;
         if data.len() != expected {
-            return Err(format!(
+            return Err(TerrainError::parse(format!(
                 "Data length {} != expected {} ({}x{})",
                 data.len(),
                 expected,
                 width,
                 height
-            ));
+            )));
         }
 
         Ok(ElevationTile {
@@ -254,17 +266,17 @@ impl ElevationTile {
     pub fn from_reader_with_geo<R: std::io::Read + std::io::Seek>(
         reader: R,
         geo: GeoTransform,
-    ) -> Result<Self, String> {
-        let mut decoder =
-            Decoder::new(reader).map_err(|e| format!("Failed to decode TIFF: {}", e))?;
+    ) -> Result<Self, TerrainError> {
+        let mut decoder = Decoder::new(reader)
+            .map_err(|e| TerrainError::parse(format!("Failed to decode TIFF: {}", e)))?;
 
         let (width, height) = decoder
             .dimensions()
-            .map_err(|e| format!("Failed to read dimensions: {}", e))?;
+            .map_err(|e| TerrainError::parse(format!("Failed to read dimensions: {}", e)))?;
 
         let result = decoder
             .read_image()
-            .map_err(|e| format!("Failed to read image data: {}", e))?;
+            .map_err(|e| TerrainError::parse(format!("Failed to read image data: {}", e)))?;
 
         let data = match result {
             DecodingResult::F32(d) => d,
@@ -273,18 +285,22 @@ impl ElevationTile {
             DecodingResult::U16(d) => d.into_iter().map(|v| v as f32).collect(),
             DecodingResult::I32(d) => d.into_iter().map(|v| v as f32).collect(),
             DecodingResult::U32(d) => d.into_iter().map(|v| v as f32).collect(),
-            _ => return Err("Unsupported pixel data type for elevation".to_string()),
+            _ => {
+                return Err(TerrainError::parse(
+                    "Unsupported pixel data type for elevation",
+                ))
+            }
         };
 
         let expected = width as usize * height as usize;
         if data.len() != expected {
-            return Err(format!(
+            return Err(TerrainError::parse(format!(
                 "Data length {} != expected {} ({}x{})",
                 data.len(),
                 expected,
                 width,
                 height
-            ));
+            )));
         }
 
         Ok(ElevationTile {

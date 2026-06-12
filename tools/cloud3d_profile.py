@@ -28,23 +28,42 @@ Locations outside (Europe/Africa/Asia) need EUMETSAT SEVIRI/FCI
 credentials - not implemented here; the engine falls back to the GIBS
 MODIS COT+CTH route.
 
+Error protocol: handled failures print ONE JSON line {"error": <code>,
+"detail": ...} and exit 2 (coverage), 3 (environment) or 4 (network);
+the codes are documented in cloud3d_common.
+
 Usage:
   python3 tools/cloud3d_profile.py --lat 40.7 --lon -74.0 \
       --date 2026-06-12 --hour 8.5 --azimuth 62 --out profile.json
 """
 
 import argparse
-import json
 import math
+import os
 import re
 import sys
 import urllib.request
 
 import numpy as np
 
-# ── Model constants (verified against the Cloud3DTACO dataset) ──────
-MODEL_TOP_M = 18945.0
-N_LEVELS = 80
+# MODEL_TOP_M / N_LEVELS re-exported for callers of this module.
+from cloud3d_common import (
+    MODEL_TOP_M,
+    N_LEVELS,
+    SidecarError,
+    assert_rows_north_to_south,
+    cloud_fraction,
+    col_mean,
+    model_heights,
+    ok,
+    print_summary,
+    run_main,
+    sample_curtain,
+    sample_path,
+    window_mean,
+    write_result,
+)
+
 # GOES ABI channels matching the 11 SEVIRI narrow bands, wavelength order.
 ABI_CHANNELS = ["C02", "C03", "C05", "C07", "C08", "C10", "C11", "C12", "C13", "C14", "C16"]
 SOLAR = {"C02", "C03", "C05"}  # reflectance channels
@@ -281,9 +300,9 @@ def render_3d(png_path, iwc, heights, km_e, km_s, jc_w, ic_w,
           file=sys.stderr)
 
 
-def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
-               xs_win, ys_win, jc_w, ic_w, curtain, curtain_km,
-               px_km=(2.0, 2.0)):
+def render_png(png_path, iwc, heights, scan_time, bucket, jc_w, ic_w,
+               curtain, curtain_km, date_str, hour, azimuth=None,
+               place="", px_km=(2.0, 2.0)):
     """Figure: column-IWP map + vertical curtain along the sun azimuth +
     observer profile. Approximate orientation: rows ~ N->S, cols ~ W->E
     (geostationary grids are slightly rotated away from nadir).
@@ -311,8 +330,8 @@ def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
                      interpolation="nearest")
     ax1.set_facecolor("#1a1a2e")
     ax1.plot(0, 0, "r*", markersize=16, markeredgecolor="white", label="observer")
-    if args.azimuth is not None:
-        az = math.radians(args.azimuth)
+    if azimuth is not None:
+        az = math.radians(azimuth)
         ax1.annotate("", xy=(120 * math.sin(az), 120 * math.cos(az)),
                      xytext=(0, 0),
                      arrowprops=dict(color="orangered", width=2, headwidth=10))
@@ -361,7 +380,7 @@ def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
         f"          trained on CloudSat radar profiles)\n"
         f"input     11-channel {bucket} full-disk scan\n"
         f"scan      {scan_time}\n"
-        f"requested {args.date} {args.hour:.2f}h UTC\n"
+        f"requested {date_str} {hour:.2f}h UTC\n"
         f"window    {iwc.shape[2]}x{iwc.shape[1]} px @ {pxx:.1f}x{pxy:.1f} km\n"
         f"vertical  80 levels x {dzkm * 1000:.0f} m (0-18.9 km)\n"
         f"cloudy    {100.0 * float((iwp > 1.0).mean()):.0f}% of columns (IWP > 1 g/m$^2$)\n"
@@ -370,7 +389,6 @@ def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
     ax4.text(0.02, 0.95, txt, family="monospace", fontsize=10.5,
              va="top", transform=ax4.transAxes)
 
-    place = args.place or f"{args.lat:.2f}N {args.lon:.2f}E"
     fig.suptitle(f"cloud3d - satellite 3D cloud reconstruction over {place}",
                  fontsize=15, y=0.99)
     fig.savefig(png_path, dpi=140, bbox_inches="tight",
@@ -404,10 +422,9 @@ def main():
 
     sat = pick_satellite(args.lon)
     if sat is None:
-        print(json.dumps({"error": "outside GOES coverage",
-                          "detail": "lon %.1f not within %.0f deg of GOES-East/West; "
-                                    "use the GIBS fallback" % (args.lon, MAX_VIEW_DLON)}))
-        return 2
+        raise SidecarError("outside_coverage",
+                           "lon %.1f not within %.0f deg of GOES-East/West; "
+                           "use the GIBS fallback" % (args.lon, MAX_VIEW_DLON))
     bucket, sat_lon, _ = sat
 
     # Walk back from the requested hour to the most recent available scan
@@ -419,35 +436,42 @@ def main():
     keys, used = [], None
     when = date
     h = int(args.hour) % 24
-    for _ in range(30):
-        keys = list_granules(bucket, when, h)
-        if keys:
-            used = (when, h)
-            break
-        h -= 1
-        if h < 0:
-            h, when = 23, when - timedelta(days=1)
+    try:
+        for _ in range(30):
+            keys = list_granules(bucket, when, h)
+            if keys:
+                used = (when, h)
+                break
+            h -= 1
+            if h < 0:
+                h, when = 23, when - timedelta(days=1)
+    except OSError as e:
+        raise SidecarError("network", f"{bucket} S3 listing failed: {e}")
     if not keys:
-        print(json.dumps({"error": "no granules", "detail": f"{bucket} {date} hour {args.hour}"}))
-        return 2
+        raise SidecarError("no_granules", f"{bucket} {date} hour {args.hour}")
     if used != (date, int(args.hour) % 24):
         print(f"cloud3d: requested {date} {args.hour:.1f}h not yet scanned; "
               f"using latest {used[0]} {used[1]:02d}h", file=sys.stderr)
     key = pick_granule(keys, args.hour)
 
     # ── Lazy open over anonymous S3 ──
-    import s3fs
-    import xarray as xr
+    try:
+        import s3fs
+        import xarray as xr
+    except ImportError as e:
+        raise SidecarError("missing_deps", str(e))
 
     fs = s3fs.S3FileSystem(anon=True)
     # h5netcdf slicing is lazy: only the HDF5 chunks covering the window
     # are fetched over S3 range requests (tens of MB, not the full granule).
-    ds = xr.open_dataset(fs.open(f"{bucket}/{key}"), engine="h5netcdf")
+    try:
+        ds = xr.open_dataset(fs.open(f"{bucket}/{key}"), engine="h5netcdf")
+    except OSError as e:
+        raise SidecarError("network", f"{bucket}/{key} open failed: {e}")
 
     scan = latlon_to_scan(args.lat, args.lon, sat_lon)
     if scan is None:
-        print(json.dumps({"error": "below horizon", "detail": f"{bucket} cannot see this point"}))
-        return 2
+        raise SidecarError("below_horizon", f"{bucket} cannot see this point")
     cx, cy = scan
     xs = ds["x"].values  # radians, ascending
     ys = ds["y"].values  # radians, descending
@@ -458,70 +482,63 @@ def main():
     i0, i1 = max(0, ic - half), min(len(xs), ic + half)
 
     raw = np.empty((11, j1 - j0, i1 - i0), dtype=np.float32)
-    for n, ch in enumerate(ABI_CHANNELS):
-        v = ds[f"CMI_{ch}"][j0:j1, i0:i1].values.astype(np.float32)
-        if ch in SOLAR:
-            v = v * 100.0  # reflectance factor 0..1 -> percent
-        raw[n] = v
+    try:
+        for n, ch in enumerate(ABI_CHANNELS):
+            v = ds[f"CMI_{ch}"][j0:j1, i0:i1].values.astype(np.float32)
+            if ch in SOLAR:
+                v = v * 100.0  # reflectance factor 0..1 -> percent
+            raw[n] = v
+    except OSError as e:
+        raise SidecarError("network", f"{bucket}/{key} read failed: {e}")
     ds.close()
 
     x_in = normalize(raw)
 
     # ── Run the model ──
-    import torch
+    try:
+        import torch
+    except ImportError as e:
+        raise SidecarError("missing_deps", str(e))
+    if not os.path.exists(args.model):
+        raise SidecarError("missing_deps", f"model not found: {args.model}")
 
     model = torch.jit.load(args.model, map_location="cpu")
     model.eval()
     with torch.no_grad():
         out = model(torch.from_numpy(x_in[None]))[0].numpy()  # [80,H,W]
     iwc = iwc_from_output(out)
-    heights = np.linspace(MODEL_TOP_M, 0.0, N_LEVELS)
+    heights = model_heights()
 
-    # ── Aggregate profiles ──
+    # ── Aggregate profiles (shared helpers, rows already north->south) ──
     h_, w_ = iwc.shape[1], iwc.shape[2]
     jc_w, ic_w = jc - j0, ic - i0
+    assert_rows_north_to_south(float(ys[j0]), float(ys[j1 - 1]))
 
-    def col_mean(jj, ii, r):
-        ja, jb = max(0, jj - r), min(h_, jj + r + 1)
-        ia, ib = max(0, ii - r), min(w_, ii + r + 1)
-        return iwc[:, ja:jb, ia:ib].mean(axis=(1, 2))
+    center = col_mean(iwc, jc_w, ic_w, 1)
+    wmean = window_mean(iwc)
+    cf = cloud_fraction(iwc, heights)
 
-    center = col_mean(jc_w, ic_w, 1)
-    window_mean = iwc.mean(axis=(1, 2))
-    # cloud fraction: columns with ice water path > 1 g/m^2
-    dz = MODEL_TOP_M / (N_LEVELS - 1)
-    iwp = iwc.sum(axis=0) * dz
-    cloud_fraction = float((iwp > 1.0).mean())
+    def sampler(km, az):
+        # Absolute grid indices first, then reject anything outside the
+        # window - an argmin over the window slice would silently clamp
+        # far samples to the window edge and mislabel them.
+        la, lo = destination(args.lat, args.lon, az, km)
+        s = latlon_to_scan(la, lo, sat_lon)
+        if s is None:
+            return None
+        px, py = s
+        ii = int(np.argmin(np.abs(xs - px))) - i0
+        jj = int(np.argmin(np.abs(ys - py))) - j0
+        if 0 <= jj < h_ and 0 <= ii < w_:
+            return jj, ii
+        return None
 
-    path = []
-    if args.azimuth is not None:
-        for km in (0.0, 50.0, 100.0, 200.0, 300.0):
-            la, lo = destination(args.lat, args.lon, args.azimuth, km)
-            s = latlon_to_scan(la, lo, sat_lon)
-            if s is None:
-                continue
-            px, py = s
-            ii = int(np.argmin(np.abs(xs[i0:i1] - px)))
-            jj = int(np.argmin(np.abs(ys[j0:j1] - py)))
-            # only accept points inside the window
-            if 0 <= ii < w_ and 0 <= jj < h_:
-                path.append({"km": km, "iwc_g_m3": col_mean(jj, ii, 2).tolist()})
-
+    path = sample_path(iwc, sampler, args.azimuth)
+    cols, kms = [], []
     if args.png:
         # Vertical curtain along the sun azimuth (8 km sampling, 0-320 km).
         az = args.azimuth if args.azimuth is not None else 270.0
-        cols, kms = [], []
-        for km in np.arange(0.0, 321.0, 8.0):
-            la, lo = destination(args.lat, args.lon, az, float(km))
-            s = latlon_to_scan(la, lo, sat_lon)
-            if s is None:
-                continue
-            px, py = s
-            ii = int(np.argmin(np.abs(xs[i0:i1] - px)))
-            jj = int(np.argmin(np.abs(ys[j0:j1] - py)))
-            if 0 <= ii < w_ and 0 <= jj < h_:
-                cols.append(iwc[:, jj, ii])
-                kms.append(km)
+        cols, kms = sample_curtain(iwc, sampler, az)
 
     # The ACTUAL scan time from the granule name (_sYYYYDDDHHMMSSt) - the
     # requested twilight hour is usually in the future; never label model
@@ -534,28 +551,26 @@ def main():
     else:
         scan_time = "unknown"
 
-    result = {
-        "satellite": bucket,
-        "granule": key,
-        "time_utc": scan_time,
-        "requested_utc": f"{args.date}T{int(args.hour):02d}:{int(args.hour % 1 * 60):02d}",
-        "model": args.model,
-        "heights_m": heights.tolist(),
-        "cloud_fraction": cloud_fraction,
-        "profiles": {
-            "center": center.tolist(),
-            "window_mean": window_mean.tolist(),
-            "path": path,
-        },
-        "iwc_units": "g/m3",
-    }
-    with open(args.out, "w") as f:
-        json.dump(result, f)
+    write_result(
+        args.out,
+        satellite=bucket,
+        granule=key,
+        time_utc=scan_time,
+        requested_utc=f"{args.date}T{int(args.hour):02d}:{int(args.hour % 1 * 60):02d}",
+        model=args.model,
+        heights=heights,
+        cloud_frac=cf,
+        center=center,
+        window_mean=wmean,
+        path=path,
+    )
 
+    place = args.place or f"{args.lat:.2f}N {args.lon:.2f}E"
     if args.png and cols:
-        render_png(args.png, iwc, heights, args, scan_time, bucket, sat_lon,
-                   None, None, jc_w, ic_w,
-                   np.stack(cols, axis=1), np.array(kms))
+        render_png(args.png, iwc, heights, scan_time, bucket, jc_w, ic_w,
+                   np.stack(cols, axis=1), np.array(kms),
+                   date_str=args.date, hour=args.hour,
+                   azimuth=args.azimuth, place=place)
 
     if args.png3d:
         # Ground texture: visible reflectance by day, inverted 10.3 um
@@ -566,17 +581,13 @@ def main():
         else:
             tex = np.clip((300.0 - raw[8]) / 110.0, 0.0, 1.0)
         render_3d(args.png3d, iwc, heights, 2.0, 2.0, jc_w, ic_w,
-                  texture=tex,
-                  place=args.place or f"{args.lat:.2f}N {args.lon:.2f}E",
+                  texture=tex, place=place,
                   scan_label=f"{bucket} ABI scan {scan_time}",
                   azimuth=args.azimuth)
 
-    print(f"cloud3d: {bucket} {key.split('/')[-1]}", file=sys.stderr)
-    print(f"cloud3d: cloud fraction {cloud_fraction:.2f}, "
-          f"max IWC {float(iwc.max()):.4f} g/m^3, path samples {len(path)}", file=sys.stderr)
-    print(json.dumps({"ok": True, "out": args.out}))
-    return 0
+    print_summary("cloud3d", f"{bucket} {key.split('/')[-1]}", iwc, cf, path)
+    return ok(args.out)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_main(main))

@@ -391,7 +391,7 @@ mod tests {
             .0;
         let peak_wl = wavelength_at(blue_peak_idx);
         assert!(
-            peak_wl >= 430.0 && peak_wl <= 470.0,
+            (430.0..=470.0).contains(&peak_wl),
             "LED blue peak should be 430-470nm, got {}nm",
             peak_wl
         );
@@ -431,7 +431,7 @@ mod tests {
     fn blue_fraction_bounded() {
         for &f in &[0.0, 0.25, 0.5, 0.75, 1.0] {
             let bf = blue_fraction(f);
-            assert!(bf >= 0.0 && bf <= 1.0, "Blue fraction out of range: {}", bf);
+            assert!((0.0..=1.0).contains(&bf), "Blue fraction out of range: {}", bf);
         }
     }
 

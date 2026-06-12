@@ -1247,7 +1247,7 @@ mod tests {
         // All n are 1.0 by default, so refraction is identity
         let t = shadow_ray_transmittance(&atm, pos, sun, 1);
         assert!(
-            t >= 0.0 && t <= 1.0,
+            (0.0..=1.0).contains(&t),
             "Transmittance should be in [0,1], got {}",
             t
         );
@@ -1263,7 +1263,7 @@ mod tests {
 
         let t = shadow_ray_transmittance(&atm, pos, sun, 0);
         assert!(
-            t >= 0.0 && t <= 1.0,
+            (0.0..=1.0).contains(&t),
             "Transmittance with refraction should be in [0,1], got {}",
             t
         );
@@ -1287,8 +1287,8 @@ mod tests {
         let t_straight = shadow_ray_transmittance(&atm_straight, pos, sun, 0);
 
         // Both should be valid transmittances
-        assert!(t_refract >= 0.0 && t_refract <= 1.0);
-        assert!(t_straight >= 0.0 && t_straight <= 1.0);
+        assert!((0.0..=1.0).contains(&t_refract));
+        assert!((0.0..=1.0).contains(&t_straight));
 
         // They should differ (refraction bends the ray, changing path lengths)
         // But the difference is small (< a few percent for near-horizon geometry)

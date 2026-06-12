@@ -11,7 +11,7 @@
 /// near-horizon path lengths by <0.1% - below the engine's MC noise and
 /// the libRadtran cross-validation agreement. The ephemeris/geodesy side
 /// (twilight-solar) uses the full WGS84 ellipsoid where it matters.
-pub const EARTH_RADIUS_M: f64 = 6_371_008.7714;
+pub const EARTH_RADIUS_M: f64 = 6_371_008.771_4;
 
 /// Fallback top-of-atmosphere altitude in meters, used ONLY for empty
 /// models ([`AtmosphereModel::toa_radius`] reads the real top shell -

@@ -348,7 +348,7 @@ mod tests {
     fn radiance_to_bortle_city() {
         // 100 nW/cm^2/sr is roughly Bortle 8
         let b = radiance_to_bortle(100.0);
-        assert!(b >= 7 && b <= 9, "100 nW should be Bortle 7-9, got {}", b);
+        assert!((7..=9).contains(&b), "100 nW should be Bortle 7-9, got {}", b);
     }
 
     #[test]

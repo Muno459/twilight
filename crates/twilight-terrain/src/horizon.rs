@@ -226,7 +226,7 @@ mod tests {
         fn name(&self) -> &str {
             "Flat test"
         }
-        fn prepare(&mut self, _: f64, _: f64, _: f64, _: f64) -> Result<(), String> {
+        fn prepare(&mut self, _: f64, _: f64, _: f64, _: f64) -> Result<(), crate::TerrainError> {
             Ok(())
         }
     }
@@ -264,7 +264,7 @@ mod tests {
         fn name(&self) -> &str {
             "Mountain test"
         }
-        fn prepare(&mut self, _: f64, _: f64, _: f64, _: f64) -> Result<(), String> {
+        fn prepare(&mut self, _: f64, _: f64, _: f64, _: f64) -> Result<(), crate::TerrainError> {
             Ok(())
         }
     }

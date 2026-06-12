@@ -12,5 +12,7 @@ png = "0.17"
 flate2 = "1"
 twilight-core = { workspace = true }
 twilight-data = { workspace = true }
+# Shared HTTP retry and tile-cache helpers (retry::with_retries, cache::*).
+twilight-weather = { workspace = true }
 
 [dev-dependencies]

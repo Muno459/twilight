@@ -648,7 +648,7 @@ mod tests {
         let total = total_oracle_cases();
         // 5 + 65 + 30 + 24 + 5 + 4 = 133
         assert!(
-            total >= 100 && total <= 200,
+            (100..=200).contains(&total),
             "Expected ~133 oracle cases, got {}",
             total,
         );

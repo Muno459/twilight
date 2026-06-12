@@ -262,13 +262,13 @@ const NO2_MOLAR_MASS: f64 = 46.0;
 /// Avogadro's number (molecules/mol).
 const AVOGADRO: f64 = 6.022e23;
 
-/// Surface O3 (a boundary-layer photochemical quantity) does NOT determine
-/// the total O3 column, which is dominated by the stratospheric reservoir
-/// and governed by latitude/season/dynamics. The previous code invented a
-/// linear surface-to-column proxy; it has been removed. Open-Meteo's air
-/// quality API provides surface O3 only, so no column override is produced
-/// - the engine keeps its standard-atmosphere column (345 DU) unless a
-/// real measured column is supplied by the caller.
+// Surface O3 (a boundary-layer photochemical quantity) does NOT determine
+// the total O3 column, which is dominated by the stratospheric reservoir
+// and governed by latitude/season/dynamics. The previous code invented a
+// linear surface-to-column proxy; it has been removed. Open-Meteo's air
+// quality API provides surface O3 only, so no column override is produced;
+// the engine keeps its standard-atmosphere column (345 DU) unless a real
+// measured column is supplied by the caller.
 
 /// Convert NO2 surface concentration from ug/m3 to molecules/m3.
 ///
@@ -537,6 +537,7 @@ mod tests {
             timestamp: String::new(),
             api_latitude: 50.0,
             api_longitude: 10.0,
+            data_warnings: Vec::new(),
         }
     }
 

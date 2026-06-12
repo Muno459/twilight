@@ -214,6 +214,35 @@ impl De440 {
         Ok(topo)
     }
 
+    /// Compute topocentric solar position at a given UTC fractional hour.
+    ///
+    /// The fractional hour is decomposed into signed h/m/s components and
+    /// fed to the pure Julian-day conversion, so values outside [0, 24)
+    /// (negative for timezone-east queries, >= 24 for past-midnight
+    /// windows) land on the correct adjacent civil day without explicit
+    /// calendar rollover. Seconds precision is preserved.
+    #[allow(clippy::too_many_arguments)] // Calendar components + observer location are all independent
+    pub fn solar_position_at_hour(
+        &mut self,
+        year: i32,
+        month: i32,
+        day: i32,
+        fractional_hour: f64,
+        delta_t: f64,
+        latitude: f64,
+        longitude: f64,
+        elevation: f64,
+    ) -> Result<TopocentricPosition, De440Error> {
+        let total_seconds = fractional_hour * 3600.0;
+        let hour = (total_seconds / 3600.0) as i32;
+        let minute = ((total_seconds - hour as f64 * 3600.0) / 60.0) as i32;
+        let second = (total_seconds - hour as f64 * 3600.0 - minute as f64 * 60.0) as i32;
+
+        self.solar_position(
+            year, month, day, hour, minute, second, delta_t, latitude, longitude, elevation,
+        )
+    }
+
     /// Compute solar zenith angle (degrees) at a given UTC fractional hour.
     ///
     /// Convenience method matching the SPA pipeline interface.
@@ -229,16 +258,18 @@ impl De440 {
         longitude: f64,
         elevation: f64,
     ) -> Result<f64, De440Error> {
-        let total_seconds = fractional_hour * 3600.0;
-        let hour = (total_seconds / 3600.0) as i32;
-        let minute = ((total_seconds - hour as f64 * 3600.0) / 60.0) as i32;
-        let second = (total_seconds - hour as f64 * 3600.0 - minute as f64 * 60.0) as i32;
-
-        let topo = self.solar_position(
-            year, month, day, hour, minute, second, delta_t, latitude, longitude, elevation,
-        )?;
-
-        Ok(topo.zenith)
+        Ok(self
+            .solar_position_at_hour(
+                year,
+                month,
+                day,
+                fractional_hour,
+                delta_t,
+                latitude,
+                longitude,
+                elevation,
+            )?
+            .zenith)
     }
 
     /// Find the UTC fractional hour when the solar zenith angle crosses
@@ -455,6 +486,48 @@ mod tests {
     }
 
     #[test]
+    fn test_solar_position_at_hour_rolls_civil_day() {
+        let path = match get_de440_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("DE440 not available, skipping");
+                return;
+            }
+        };
+        let mut de = De440::open(&path).unwrap();
+        let (lat, lon, elev, dt) = (21.4225, 39.8262, 277.0, 69.184);
+
+        // Negative UTC hour (timezone east of Greenwich) = previous civil day.
+        let neg = de
+            .solar_position_at_hour(2024, 6, 15, -2.5, dt, lat, lon, elev)
+            .unwrap();
+        let prev = de
+            .solar_position(2024, 6, 14, 21, 30, 0, dt, lat, lon, elev)
+            .unwrap();
+        assert!((neg.zenith - prev.zenith).abs() < 1e-9);
+        assert!((neg.azimuth - prev.azimuth).abs() < 1e-9);
+
+        // Hour >= 24 = next civil day.
+        let over = de
+            .solar_position_at_hour(2024, 6, 15, 25.5, dt, lat, lon, elev)
+            .unwrap();
+        let next = de
+            .solar_position(2024, 6, 16, 1, 30, 0, dt, lat, lon, elev)
+            .unwrap();
+        assert!((over.zenith - next.zenith).abs() < 1e-9);
+        assert!((over.azimuth - next.azimuth).abs() < 1e-9);
+
+        // Seconds are preserved: 12h + 90s is not the same as 12h.
+        let with_sec = de
+            .solar_position_at_hour(2024, 6, 15, 12.0 + 90.0 / 3600.0, dt, lat, lon, elev)
+            .unwrap();
+        let exact = de
+            .solar_position(2024, 6, 15, 12, 1, 30, dt, lat, lon, elev)
+            .unwrap();
+        assert!((with_sec.zenith - exact.zenith).abs() < 1e-9);
+    }
+
+    #[test]
     #[ignore]
     fn test_de440_sun_position_j2000() {
         let path = match get_de440_path() {
@@ -599,7 +672,7 @@ mod tests {
         let mut de = De440::open(&path).unwrap();
         let pos = de.sun_position_icrf(0.0).unwrap();
 
-        let horizons_x = 2.649903367743050e7;
+        let horizons_x = 2.649_903_367_743_05e7;
         let horizons_y = -1.327574173383451e8;
         let horizons_z = -5.755671847054072e7;
 
@@ -647,7 +720,7 @@ mod tests {
         let tdb = (2_460_388.0 - 2_451_545.0) * 86400.0;
         let pos = de.sun_position_icrf(tdb).unwrap();
 
-        let horizons_x = 1.488262271675500e8;
+        let horizons_x = 1.488_262_271_675_5e8;
         let horizons_y = -4.653065462862011e6;
         let horizons_z = -2.017521535139262e6;
 

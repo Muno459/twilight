@@ -26,6 +26,7 @@
 use std::path::Path;
 
 use crate::dnb_colormap::DNB_RADIANCE_LUT;
+use crate::error::SkyglowError;
 
 /// Preferred layer (NOAA-20: current through ~yesterday) and fallback.
 const LAYERS: [&str; 2] = [
@@ -58,6 +59,26 @@ fn tile_for(lat: f64, lon: f64) -> (u32, u32, u32, u32) {
     (row, col, py.min(TILE_PX - 1), px.min(TILE_PX - 1))
 }
 
+/// Fetch one tile body, retrying transient failures.
+fn fetch_tile(url: &str) -> Result<Vec<u8>, SkyglowError> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .new_agent();
+    twilight_weather::retry::with_retries(SkyglowError::is_transient, || {
+        let mut resp = agent
+            .get(url)
+            .call()
+            .map_err(|e| SkyglowError::from_ureq(e, url))?;
+        if resp.status() != 200 {
+            return Err(SkyglowError::http(resp.status().as_u16(), url));
+        }
+        resp.body_mut()
+            .read_to_vec()
+            .map_err(|e| SkyglowError::from_ureq(e, url))
+    })
+}
+
 /// Fetch one tile (disk-cached) and return the palette index at the pixel.
 fn index_at(
     cache_dir: &Path,
@@ -74,20 +95,11 @@ fn index_at(
         let url = format!(
             "https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/{layer}/default/{date}/500m/{TMS_LEVEL}/{row}/{col}.png"
         );
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(std::time::Duration::from_secs(30)))
-            .build()
-            .new_agent();
-        let mut resp = agent.get(&url).call().ok()?;
-        if resp.status() != 200 {
-            return None;
-        }
-        let body = resp.body_mut().read_to_vec().ok()?;
-        let _ = std::fs::create_dir_all(cache_dir);
-        let tmp = path.with_extension("part");
-        if std::fs::write(&tmp, &body).is_ok() {
-            let _ = std::fs::rename(&tmp, &path);
-        }
+        let body = fetch_tile(&url).ok()?;
+        let _ = twilight_weather::cache::write_atomic(&path, &body);
+        // Dated tiles go stale; evict DNB tiles fetched more than 14 days
+        // ago (the prefix spares the static atlas tiles in this dir).
+        twilight_weather::cache::prune_stale(cache_dir, "dnb_");
         body
     };
 

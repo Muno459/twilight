@@ -7,9 +7,12 @@
 
 pub mod cache;
 pub mod copernicus;
+pub mod error;
 pub mod geotiff;
 pub mod horizon;
 pub mod projection;
+
+pub use error::TerrainError;
 
 use std::path::Path;
 
@@ -33,7 +36,7 @@ pub trait ElevationSource {
         min_lon: f64,
         max_lat: f64,
         max_lon: f64,
-    ) -> Result<(), String>;
+    ) -> Result<(), TerrainError>;
 }
 
 /// A 360-degree horizon profile around an observer.

@@ -34,6 +34,20 @@ extern "C" {}
 /// iteration (if the file exists), falling back to the embedded source.
 const SHADER_SOURCE: &str = include_str!("../shaders/twilight.metal");
 
+/// Kernels write this to output[0] and abort when the atmosphere buffer
+/// fails the magic/version gate (HEADER_SENTINEL in twilight.metal).
+/// Radiance and per-photon weights are never negative, so the exact bit
+/// pattern of -1.0 cannot occur in valid output.
+const HEADER_SENTINEL: f32 = -1.0;
+
+/// Detect the shader-side header gate sentinel in a readback slice.
+fn check_header_sentinel(output: &[f32]) -> Result<(), GpuError> {
+    if output.first().map(|v| v.to_bits()) == Some(HEADER_SENTINEL.to_bits()) {
+        return Err(GpuError::BufferVersionMismatch);
+    }
+    Ok(())
+}
+
 /// Metal backend implementing the [`GpuBackend`] trait.
 ///
 /// # Safety
@@ -83,6 +97,12 @@ pub fn probe() -> bool {
 
 /// Initialize the Metal backend: get device, compile shaders, create pipelines.
 pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
+    Ok(Box::new(init_backend(config)?))
+}
+
+/// Concrete-typed init. Tests need the concrete `MetalBackend` to reach
+/// test-only helpers (e.g. corrupting the uploaded buffer header).
+pub(crate) fn init_backend(config: &GpuConfig) -> Result<MetalBackend, GpuError> {
     // 1. Get default Metal device
     let device = MTLCreateSystemDefaultDevice().ok_or(GpuError::NoDevice)?;
 
@@ -121,7 +141,7 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
         max_workgroup_size: 256, // Conservative default for Apple GPUs
     };
 
-    Ok(Box::new(MetalBackend {
+    Ok(MetalBackend {
         device,
         queue,
         pso_single_scatter,
@@ -134,7 +154,7 @@ pub fn init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
         info,
         config: config.clone(),
         num_wavelengths: 0,
-    }))
+    })
 }
 
 // ── GpuBackend implementation ───────────────────────────────────────────
@@ -178,6 +198,7 @@ impl GpuBackend for MetalBackend {
         )?;
 
         let radiance = f32_buffer_slice(&buf_output, nw);
+        check_header_sentinel(radiance)?;
         Ok(GpuSpectralResult {
             radiance: radiance.iter().map(|&v| v as f64).collect(),
             num_wavelengths: nw,
@@ -219,6 +240,7 @@ impl GpuBackend for MetalBackend {
 
         // CPU reduce: average per-photon weights for each wavelength
         let raw = f32_buffer_slice(&buf_output, total_threads);
+        check_header_sentinel(raw)?;
         let ppw = photons_per_wavelength as usize;
         let mut radiance = Vec::with_capacity(nw);
         for w in 0..nw {
@@ -332,6 +354,7 @@ impl GpuBackend for MetalBackend {
             )?;
 
             let raw = f32_buffer_slice(&buf_output, chunk_len * output_len);
+            check_header_sentinel(raw)?;
             for chunk_idx in 0..chunk_len {
                 let base = chunk_idx * output_len;
                 for (i, &v) in raw[base..base + output_len].iter().enumerate() {
@@ -463,6 +486,19 @@ impl GpuBackend for MetalBackend {
 // ── Internal helpers ────────────────────────────────────────────────────
 
 impl MetalBackend {
+    /// Overwrite the packed version word of the uploaded atmosphere buffer
+    /// in place (shared-mode buffers are CPU-visible). Simulates a stale
+    /// or misversioned upload for the header-gate test.
+    #[cfg(test)]
+    pub(crate) fn corrupt_atm_version_word(&self) {
+        use crate::buffers::{atm_offsets, BUFFER_VERSION};
+        let buf = self.buf_atm.as_ref().expect("atmosphere not uploaded");
+        let ptr = buf.contents().as_ptr() as *mut f32;
+        unsafe {
+            *ptr.add(atm_offsets::HEADER_VERSION) = f32::from_bits(BUFFER_VERSION + 1);
+        }
+    }
+
     fn scan_batch_non_hybrid(
         &self,
         requests: &[BatchRequest],
@@ -632,6 +668,7 @@ impl MetalBackend {
         let mut results = Vec::with_capacity(n);
 
         for s in &slices {
+            check_header_sentinel(&all_output[s.offset_f32..s.offset_f32 + s.raw_len])?;
             match s.kernel {
                 BatchKernel::McrtTrace {
                     photons_per_wavelength,
@@ -719,6 +756,7 @@ impl MetalBackend {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // GPU dispatch plumbing: buffers + geometry are independent
     fn dispatch_hybrid_v2_chunk(
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -873,7 +911,7 @@ fn create_empty_buffer(
 }
 
 /// Borrow f32 values from a shared Metal buffer.
-fn f32_buffer_slice<'a>(buffer: &'a ProtocolObject<dyn MTLBuffer>, n: usize) -> &'a [f32] {
+fn f32_buffer_slice(buffer: &ProtocolObject<dyn MTLBuffer>, n: usize) -> &[f32] {
     let ptr = buffer.contents();
     unsafe { std::slice::from_raw_parts(ptr.as_ptr() as *const f32, n) }
 }

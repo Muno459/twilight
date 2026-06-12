@@ -50,6 +50,7 @@ pub const SCOTOPIC_V_PRIME: [f64; 81] = [
 ];
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)] // constant-coupling pin tests
 mod tests {
     use super::*;
 
@@ -80,7 +81,7 @@ mod tests {
         // All values should be in [0, 1]
         for (i, &v) in PHOTOPIC_V.iter().enumerate() {
             assert!(
-                v >= 0.0 && v <= 1.0,
+                (0.0..=1.0).contains(&v),
                 "V[{}] at {}nm = {} outside [0, 1]",
                 i,
                 PHOTOPIC_WAVELENGTHS_NM[i],
@@ -184,7 +185,7 @@ mod tests {
         let peak_wl = PHOTOPIC_WAVELENGTHS_NM[max_idx];
         // Peak should be near 505-510nm (indices 25-26)
         assert!(
-            peak_wl >= 490.0 && peak_wl <= 515.0,
+            (490.0..=515.0).contains(&peak_wl),
             "Scotopic peak at {}nm (index {}), expected near 507nm",
             peak_wl,
             max_idx
@@ -195,7 +196,7 @@ mod tests {
     fn scotopic_values_in_valid_range() {
         for (i, &v) in SCOTOPIC_V_PRIME.iter().enumerate() {
             assert!(
-                v >= 0.0 && v <= 1.0,
+                (0.0..=1.0).contains(&v),
                 "V'[{}] at {}nm = {} outside [0, 1]",
                 i,
                 PHOTOPIC_WAVELENGTHS_NM[i],

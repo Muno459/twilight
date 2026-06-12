@@ -1,3 +1,4 @@
+#![allow(clippy::needless_range_loop)] // parallel spectral arrays in parity checks
 //! Cross-backend test infrastructure for GPU validation.
 //!
 //! Tests are organized in layers:
@@ -647,6 +648,79 @@ mod layer4_metal {
             .expect("Metal upload_atmosphere should succeed");
     }
 
+    /// A corrupted version word must trip the shader-side header gate and
+    /// surface as GpuError::BufferVersionMismatch on every kernel path,
+    /// never as silently wrong radiance.
+    #[test]
+    fn metal_buffer_version_gate_fails_loudly() {
+        use crate::{BatchKernel, BatchRequest, GpuBackend, GpuError};
+        use twilight_core::atmosphere::EARTH_RADIUS_M;
+        use twilight_core::geometry::solar_direction_ecef;
+
+        // Same skip/fail policy as try_metal, but with the concrete type
+        // (the corrupt helper is not part of the GpuBackend trait).
+        let mut gpu = match crate::metal::init_backend(&GpuConfig::default()) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                if objc2_metal::MTLCreateSystemDefaultDevice().is_some() {
+                    panic!("Metal device present but backend init failed: {e}");
+                }
+                return;
+            }
+        };
+        let atm = oracle::oracle_atmosphere();
+        gpu.upload_atmosphere(&atm).unwrap();
+
+        let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
+        let view = [0.0, 1.0, 0.0];
+        let sun = solar_direction_ecef(96.0, 180.0, 0.0, 0.0);
+        let sun_arr = [sun.x, sun.y, sun.z];
+
+        // Sanity: valid header dispatches fine.
+        gpu.single_scatter(obs, view, sun_arr).unwrap();
+
+        gpu.corrupt_atm_version_word();
+
+        assert!(
+            matches!(
+                gpu.single_scatter(obs, view, sun_arr),
+                Err(GpuError::BufferVersionMismatch)
+            ),
+            "single_scatter must reject a corrupted version word",
+        );
+        assert!(
+            matches!(
+                gpu.mcrt_trace(obs, view, sun_arr, 64, 42),
+                Err(GpuError::BufferVersionMismatch)
+            ),
+            "mcrt_trace must reject a corrupted version word",
+        );
+        assert!(
+            matches!(
+                gpu.hybrid_scatter(obs, view, sun_arr, 8, 42),
+                Err(GpuError::BufferVersionMismatch)
+            ),
+            "hybrid_scatter must reject a corrupted version word",
+        );
+        let batch = [BatchRequest {
+            observer_pos: obs,
+            view_dir: view,
+            sun_dir: sun_arr,
+            kernel: BatchKernel::SingleScatter,
+        }];
+        assert!(
+            matches!(
+                gpu.scan_batch(&batch),
+                Err(GpuError::BufferVersionMismatch)
+            ),
+            "scan_batch must reject a corrupted version word",
+        );
+
+        // Re-upload restores a valid header.
+        gpu.upload_atmosphere(&atm).unwrap();
+        gpu.single_scatter(obs, view, sun_arr).unwrap();
+    }
+
     /// Cloudy-atmosphere parity: the v3 buffers carry the cloud diffuse-
     /// transmission fields; GPU single-scatter under an OD-10 stratus must
     /// match the CPU within f32 tolerance (previously the GPU lacked the
@@ -862,6 +936,7 @@ mod layer4_metal {
 
     /// Benchmark Metal batch vs serial for 50-SZA scan (prayer pipeline).
     #[test]
+    #[ignore = "wall-clock benchmark, flaky under load; run explicitly"]
     fn metal_batch_speedup() {
         use crate::{BatchKernel, BatchRequest};
         use std::time::Instant;
@@ -1890,6 +1965,7 @@ fn batch_single_request_matches_serial() {
 
 /// Benchmark: batched dispatch should be faster than serial for many SZA points.
 #[test]
+#[ignore = "wall-clock benchmark, flaky under load; run explicitly"]
 fn benchmark_batch_vs_serial_single_scatter() {
     use crate::{BatchKernel, BatchRequest};
     use std::time::Instant;
@@ -1965,6 +2041,7 @@ fn benchmark_batch_vs_serial_single_scatter() {
 
 /// Benchmark: batched hybrid dispatch (prayer pipeline scenario).
 #[test]
+#[ignore = "wall-clock benchmark, flaky under load; run explicitly"]
 fn benchmark_batch_vs_serial_hybrid() {
     use crate::{BatchKernel, BatchRequest};
     use std::time::Instant;
@@ -2231,19 +2308,11 @@ fn test_parity_kahan_summation() {
     // Simulate a deep twilight radiance accumulation:
     // Many tiny contributions from high-altitude scattering (1e-25)
     // plus a few large contributions from near-surface scattering (1e-5)
-    let mut values = Vec::new();
-
-    // 500 tiny contributions
-    for _ in 0..500 {
-        values.push(1e-25f32);
-    }
-    // 2 large contributions
+    // 500 tiny contributions, 2 large, 500 more tiny
+    let mut values: Vec<f32> = vec![1e-25f32; 500];
     values.push(3.7e-6f32);
     values.push(2.1e-6f32);
-    // 500 more tiny contributions
-    for _ in 0..500 {
-        values.push(1e-25f32);
-    }
+    values.extend(std::iter::repeat_n(1e-25f32, 500));
 
     let f64_truth: f64 = values.iter().map(|&v| v as f64).sum();
     let kahan = crate::parity::kahan_sum_f32(&values) as f64;
@@ -2317,7 +2386,7 @@ fn test_parity_scatter_direction() {
                 let angle_err = if dot > 1.0 - 1e-12 {
                     0.0
                 } else {
-                    dot.min(1.0).max(-1.0).acos()
+                    dot.clamp(-1.0, 1.0).acos()
                 };
                 if angle_err > max_angle_err {
                     max_angle_err = angle_err;
@@ -2591,7 +2660,7 @@ fn test_parity_rng_sequence() {
 
             // f32 in [0, 1)
             assert!(
-                f32_val >= 0.0 && f32_val < 1.0,
+                (0.0..1.0).contains(&f32_val),
                 "seed={}: f32 value {} out of [0,1) at step {}",
                 seed,
                 f32_val,
@@ -2727,9 +2796,8 @@ fn test_parity_coverage_report() {
                 break;
             }
         }
-        for backend in &[
-            crate::BackendKind::Metal,
-        ] {
+        {
+            let backend = &crate::BackendKind::Metal;
             cov.record(
                 *backend,
                 ParityFeature::RefractiveIndexPacking,
@@ -2746,9 +2814,8 @@ fn test_parity_coverage_report() {
     {
         let header = crate::buffers::BufferHeader::current();
         let valid = header.validate();
-        for backend in &[
-            crate::BackendKind::Metal,
-        ] {
+        {
+            let backend = &crate::BackendKind::Metal;
             cov.record(
                 *backend,
                 ParityFeature::HeaderValidation,
@@ -2771,9 +2838,8 @@ fn test_parity_coverage_report() {
         let truth: f64 = vals.iter().map(|&v| v as f64).sum();
         let kahan = kahan_sum_f32(&vals) as f64;
         let ok = (truth - kahan).abs() < 1e-10;
-        for backend in &[
-            crate::BackendKind::Metal,
-        ] {
+        {
+            let backend = &crate::BackendKind::Metal;
             cov.record(
                 *backend,
                 ParityFeature::KahanSummation,
@@ -2794,14 +2860,13 @@ fn test_parity_coverage_report() {
         for _ in 0..50 {
             let (f32_val, _) = xorshift_advance(&mut state);
             let _ = twilight_core::photon::xorshift_f64(&mut cpu_state);
-            if state != cpu_state || f32_val < 0.0 || f32_val >= 1.0 {
+            if state != cpu_state || !(0.0..1.0).contains(&f32_val) {
                 ok = false;
                 break;
             }
         }
-        for backend in &[
-            crate::BackendKind::Metal,
-        ] {
+        {
+            let backend = &crate::BackendKind::Metal;
             cov.record(
                 *backend,
                 ParityFeature::RngQuality,
@@ -2815,9 +2880,8 @@ fn test_parity_coverage_report() {
     }
 
     // --- Geometry features ---
-    for backend in &[
-        crate::BackendKind::Metal,
-    ] {
+    {
+        let backend = &crate::BackendKind::Metal;
         cov.record(
             *backend,
             ParityFeature::RaySphereIntersect,
@@ -2832,9 +2896,8 @@ fn test_parity_coverage_report() {
     }
 
     // --- Scattering features ---
-    for backend in &[
-        crate::BackendKind::Metal,
-    ] {
+    {
+        let backend = &crate::BackendKind::Metal;
         cov.record(*backend, ParityFeature::RayleighPhase, ParityStatus::Pass);
         cov.record(*backend, ParityFeature::HgPhase, ParityStatus::Pass);
         cov.record(
@@ -2848,9 +2911,8 @@ fn test_parity_coverage_report() {
     }
 
     // --- Shadow Ray features ---
-    for backend in &[
-        crate::BackendKind::Metal,
-    ] {
+    {
+        let backend = &crate::BackendKind::Metal;
         cov.record(
             *backend,
             ParityFeature::ShellByShellTrace,
@@ -2870,9 +2932,8 @@ fn test_parity_coverage_report() {
     }
 
     // --- Hybrid engine features: untested until GPU shaders are rewritten ---
-    for backend in &[
-        crate::BackendKind::Metal,
-    ] {
+    {
+        let backend = &crate::BackendKind::Metal;
         cov.record(*backend, ParityFeature::LosSteping, ParityStatus::Untested);
         cov.record(*backend, ParityFeature::Nee, ParityStatus::Untested);
         cov.record(
@@ -2921,6 +2982,7 @@ fn test_parity_coverage_report() {
 ///
 /// Output is purely diagnostic (eprintln), no assertions.
 #[test]
+#[ignore = "heavy CPU MC convergence diagnostic (no assertions), 40+ min in debug; run explicitly"]
 fn cpu_convergence_at_deep_twilight() {
     let atm = twilight_data::builder::build_clear_sky(
         twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,

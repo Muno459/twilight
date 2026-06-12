@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::cache;
+use crate::error::TerrainError;
 use crate::geotiff::{ElevationTile, GeoTransform};
 use crate::ElevationSource;
 
@@ -102,11 +103,8 @@ impl CopernicusDem30 {
 
         let path = match cache::download_to_cache(&self.cache_dir, &filename, &url) {
             Ok(p) => p,
+            Err(TerrainError::NotCovered(_)) => return None, // ocean tile, no data
             Err(e) => {
-                if e.contains("404") {
-                    // Ocean tile, no data
-                    return None;
-                }
                 eprintln!("Warning: failed to download DEM tile: {}", e);
                 return None;
             }
@@ -129,16 +127,17 @@ fn load_tile_from_path(
     path: &Path,
     lat_floor: i32,
     lon_floor: i32,
-) -> Result<ElevationTile, String> {
+) -> Result<ElevationTile, TerrainError> {
     use std::fs::File;
     use tiff::decoder::Decoder;
 
     // First pass: get dimensions
-    let file = File::open(path).map_err(|e| format!("Failed to open: {}", e))?;
-    let mut decoder = Decoder::new(file).map_err(|e| format!("Failed to decode: {}", e))?;
+    let file = File::open(path).map_err(|e| TerrainError::io(format!("Failed to open: {}", e)))?;
+    let mut decoder =
+        Decoder::new(file).map_err(|e| TerrainError::parse(format!("Failed to decode: {}", e)))?;
     let (width, height) = decoder
         .dimensions()
-        .map_err(|e| format!("Failed to read dimensions: {}", e))?;
+        .map_err(|e| TerrainError::parse(format!("Failed to read dimensions: {}", e)))?;
 
     let geo = CopernicusDem30::geo_transform_for_tile(lat_floor, lon_floor, width, height);
     ElevationTile::from_file_with_geo(path, geo)
@@ -170,7 +169,7 @@ impl ElevationSource for CopernicusDem30 {
         min_lon: f64,
         max_lat: f64,
         max_lon: f64,
-    ) -> Result<(), String> {
+    ) -> Result<(), TerrainError> {
         let lat_lo = min_lat.floor() as i32;
         let lat_hi = max_lat.floor() as i32;
         let lon_lo = min_lon.floor() as i32;
@@ -178,7 +177,6 @@ impl ElevationSource for CopernicusDem30 {
 
         let total = ((lat_hi - lat_lo + 1) * (lon_hi - lon_lo + 1)) as usize;
         let mut loaded = 0;
-        let errors: Vec<String> = Vec::new();
 
         for lat_f in lat_lo..=lat_hi {
             for lon_f in lon_lo..=lon_hi {
@@ -193,9 +191,6 @@ impl ElevationSource for CopernicusDem30 {
             eprintln!("\r  Loaded {} DEM tiles.          ", total);
         }
 
-        if !errors.is_empty() {
-            return Err(errors.join("; "));
-        }
         Ok(())
     }
 }

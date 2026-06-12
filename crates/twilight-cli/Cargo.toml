@@ -20,5 +20,6 @@ twilight-terrain = { workspace = true }
 twilight-skyglow = { workspace = true }
 twilight-gpu = { workspace = true, optional = true, features = ["metal"] }
 clap = { version = "4", features = ["derive", "env"] }
+serde_json = "1"
 image = "0.25.10"
 rayon = "1.11.0"

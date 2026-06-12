@@ -739,6 +739,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)] // packed-offset indexing
     fn packed_solar_wavelengths_match() {
         use twilight_data::solar_spectrum::SOLAR_WAVELENGTHS_NM;
         let solar = PackedSolarSpectrum::pack();
@@ -799,6 +800,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)] // packed-offset indexing
     fn packed_vision_scotopic_values_present() {
         use twilight_threshold::vision::SCOTOPIC_V_PRIME;
         let vision = PackedVisionLuts::pack();
@@ -987,6 +989,83 @@ mod tests {
                 rel_err,
             );
         }
+    }
+
+    // ── Shader offset coupling ──────────────────────────────────────────
+    //
+    // The shader hardcodes the atm_offsets values as `constant uint ATM_*`.
+    // There is no codegen tying the two together, so this test parses the
+    // MSL source and compares numerically -- a cheap guard against silent
+    // layout drift.
+
+    /// Extract the value of `constant uint <name> = <value>;` from MSL
+    /// source. Handles decimal and 0x-hex literals with an optional `u`
+    /// suffix and trailing `//` comments.
+    fn shader_uint_const(source: &str, name: &str) -> u32 {
+        for line in source.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("constant uint ") else {
+                continue;
+            };
+            let Some((lhs, rhs)) = rest.split_once('=') else {
+                continue;
+            };
+            if lhs.trim() != name {
+                continue;
+            }
+            let value = rhs
+                .split(';')
+                .next()
+                .unwrap()
+                .trim()
+                .trim_end_matches('u');
+            let parsed = match value.strip_prefix("0x") {
+                Some(hex) => u32::from_str_radix(hex, 16),
+                None => value.parse(),
+            };
+            return parsed
+                .unwrap_or_else(|e| panic!("bad literal for {} ({:?}): {}", name, value, e));
+        }
+        panic!("constant uint {} not found in twilight.metal", name);
+    }
+
+    #[test]
+    fn shader_constants_match_buffers_rs() {
+        let src = include_str!("../shaders/twilight.metal");
+
+        let expected: &[(&str, usize)] = &[
+            ("ATM_HEADER_MAGIC", atm_offsets::HEADER_MAGIC),
+            ("ATM_HEADER_VERSION", atm_offsets::HEADER_VERSION),
+            ("ATM_NUM_SHELLS", atm_offsets::NUM_SHELLS),
+            ("ATM_NUM_WAVELENGTHS", atm_offsets::NUM_WAVELENGTHS),
+            ("ATM_SHELLS_START", atm_offsets::SHELLS_START),
+            ("ATM_SHELL_STRIDE", atm_offsets::SHELL_STRIDE),
+            ("ATM_OPTICS_START", atm_offsets::OPTICS_START),
+            ("ATM_OPTICS_STRIDE", atm_offsets::OPTICS_STRIDE),
+            ("ATM_ALBEDO_START", atm_offsets::ALBEDO_START),
+            ("ATM_REFRACTIVE_INDEX_START", atm_offsets::REFRACTIVE_INDEX_START),
+            ("ATM_CLOUD_EXT_START", atm_offsets::CLOUD_EXT_START),
+            ("ATM_CLOUD_G_SCALED", atm_offsets::CLOUD_G_SCALED),
+            ("MAX_WAVELENGTHS", MAX_WAVELENGTHS),
+        ];
+        for &(name, rust_value) in expected {
+            let shader_value = shader_uint_const(src, name) as usize;
+            assert_eq!(
+                shader_value, rust_value,
+                "shader {} = {} disagrees with buffers.rs value {}",
+                name, shader_value, rust_value,
+            );
+        }
+
+        assert_eq!(
+            shader_uint_const(src, "BUFFER_MAGIC"),
+            BUFFER_MAGIC,
+            "shader BUFFER_MAGIC disagrees with buffers.rs",
+        );
+        assert_eq!(
+            shader_uint_const(src, "BUFFER_VERSION"),
+            BUFFER_VERSION,
+            "shader BUFFER_VERSION disagrees with buffers.rs",
+        );
     }
 
     #[test]

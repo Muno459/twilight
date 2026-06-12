@@ -50,6 +50,9 @@ pub enum GpuError {
     Dispatch(String),
     /// Data readback from GPU failed.
     Readback(String),
+    /// A kernel rejected a buffer whose header magic/version did not match
+    /// the layout this host was compiled against (stale or corrupt upload).
+    BufferVersionMismatch,
     /// Timeout waiting for GPU results.
     Timeout,
     /// Generic platform-specific error.
@@ -67,6 +70,12 @@ impl core::fmt::Display for GpuError {
             GpuError::BufferAllocation(msg) => write!(f, "GPU buffer allocation failed: {}", msg),
             GpuError::Dispatch(msg) => write!(f, "GPU dispatch failed: {}", msg),
             GpuError::Readback(msg) => write!(f, "GPU readback failed: {}", msg),
+            GpuError::BufferVersionMismatch => write!(
+                f,
+                "GPU buffer magic/version mismatch: kernel rejected a stale or \
+                 corrupt buffer (expected version {})",
+                buffers::BUFFER_VERSION,
+            ),
             GpuError::Timeout => write!(f, "GPU operation timed out"),
             GpuError::Platform(msg) => write!(f, "GPU platform error: {}", msg),
         }

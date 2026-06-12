@@ -18,11 +18,16 @@
 //! physics are more complex than what a weather API can provide.
 
 pub mod api;
+pub mod cache;
 pub mod cloud3d;
+pub mod error;
 pub mod f107;
 pub mod mapping;
+pub mod retry;
 pub mod satellite;
 pub mod satellite_colormaps;
+
+pub use error::WeatherError;
 
 use twilight_data::aerosol::AerosolProperties;
 use twilight_data::cloud::CloudProperties;
@@ -64,6 +69,10 @@ pub struct WeatherConditions {
     pub api_latitude: f64,
     /// Longitude actually used by the API (grid cell center)
     pub api_longitude: f64,
+    /// Data gaps hit while assembling these conditions: every field the
+    /// API failed to report and the documented conservative default that
+    /// replaced it. Empty = every field was measured.
+    pub data_warnings: Vec<String>,
 }
 
 /// Atmospheric gas composition overrides derived from observations.
@@ -105,8 +114,8 @@ pub struct AtmosphericParams {
 /// properties, and returns everything ready for the MCRT pipeline.
 ///
 /// # Errors
-/// Returns an error string if the API requests fail.
-pub fn fetch_atmospheric_params(lat: f64, lon: f64) -> Result<AtmosphericParams, String> {
+/// Returns a [`WeatherError`] if the API requests fail.
+pub fn fetch_atmospheric_params(lat: f64, lon: f64) -> Result<AtmosphericParams, WeatherError> {
     let conditions = api::fetch_weather(lat, lon)?;
     Ok(params_from_conditions(conditions))
 }
@@ -120,7 +129,7 @@ pub fn fetch_atmospheric_params_at(
     lon: f64,
     date: &str,
     hour_utc: f64,
-) -> Result<AtmosphericParams, String> {
+) -> Result<AtmosphericParams, WeatherError> {
     let conditions = api::fetch_weather_at(lat, lon, date, hour_utc)?;
     Ok(params_from_conditions(conditions))
 }
@@ -161,6 +170,7 @@ mod tests {
             timestamp: "2026-03-05T12:00".to_string(),
             api_latitude: 54.82,
             api_longitude: 9.36,
+            data_warnings: Vec::new(),
         }
     }
 
@@ -182,6 +192,7 @@ mod tests {
             timestamp: "2026-03-05T12:00".to_string(),
             api_latitude: 54.82,
             api_longitude: 9.36,
+            data_warnings: Vec::new(),
         }
     }
 
@@ -203,6 +214,7 @@ mod tests {
             timestamp: "2026-03-05T12:00".to_string(),
             api_latitude: 54.82,
             api_longitude: 9.36,
+            data_warnings: Vec::new(),
         }
     }
 
@@ -224,6 +236,7 @@ mod tests {
             timestamp: "2026-03-05T12:00".to_string(),
             api_latitude: 21.42,
             api_longitude: 39.83,
+            data_warnings: Vec::new(),
         }
     }
 
