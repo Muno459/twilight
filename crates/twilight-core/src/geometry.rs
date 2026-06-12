@@ -164,6 +164,25 @@ pub fn next_shell_boundary(
                 if inner_hit.t_near > 1e-10 && inner_hit.t_near < hit.t_far {
                     return Some((inner_hit.t_near, false));
                 }
+                // ON-BOUNDARY DEGENERACY: a ray starting exactly on (or
+                // within numerical fuzz of) the INNER sphere moving
+                // inward has inner t_near ~ 0, which the > 1e-10 guard
+                // rejects — the old code then returned the OUTER far
+                // root, teleporting the walk straight through everything
+                // below (through the planet, for a shadow ray: a
+                // verified T~1 sunlight leak). The signature: the ray
+                // is descending, its perigee is inside the inner
+                // sphere, and the origin sits at the inner radius.
+                // The truthful answer is "crossing inward right now".
+                let m = position.dot(direction);
+                let b2 = (position.length_sq() - m * m).max(0.0);
+                if m < 0.0
+                    && b2 < r_inner * r_inner
+                    && inner_hit.t_far > 1e-10
+                    && (position.length() - r_inner).abs() < 1.0
+                {
+                    return Some((1e-9, false));
+                }
             }
             return Some((hit.t_far, true));
         }

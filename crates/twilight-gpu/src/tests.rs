@@ -1315,8 +1315,19 @@ fn metal_hybrid_split_dispatch_boundaries_match_cpu_statistics() {
             1.0
         };
 
+        // Ray-count-aware tolerance: CPU and GPU draw INDEPENDENT MC
+        // samples, so at 1 ray the ratio of two heavy-tailed draws is
+        // nearly unbounded — but at >=255 rays the means concentrate and
+        // a systematic (e.g. an SSA-ordering or transmittance bug) must
+        // show up. The old flat 20x band hid a non-compiling shader and
+        // several proven kernel divergences (audit 2026-06-12).
+        let band = if secondary_rays >= 255 {
+            0.5..=2.0
+        } else {
+            0.05..=20.0
+        };
         assert!(
-            ratio.is_finite() && (0.05..=20.0).contains(&ratio),
+            ratio.is_finite() && band.contains(&ratio),
             "split boundary rays={} ratio out of range: cpu={:.6e}, gpu={:.6e}, ratio={:.4}",
             secondary_rays,
             cpu_total,

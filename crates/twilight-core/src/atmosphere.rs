@@ -205,8 +205,15 @@ impl AtmosphereModel {
     /// and shadow-ray transmittances: through a diffusing layer the eye
     /// (and the twilight sky illumination) receives multiply-forward-
     /// scattered light, which exponential extinction misrepresents by
-    /// orders of magnitude (OD-10 stratus: e^{-10.8} ~ 2e-5 vs the
-    /// physical ~0.19).
+    /// orders of magnitude. OD-10 stratus (g = 0.85): delta-scaled
+    /// tau' ~ 2.8, g* ~ 0.46, so T_diff = 1/(1 + 0.75*2.8*0.54) ~ 0.47 —
+    /// vs Beer-Lambert e^{-10.8} ~ 2e-5.
+    ///
+    /// CONVENTION (single representation): this factor is applied once
+    /// per DETERMINISTIC leg (eye LOS, NEE shadow rays, BDPT
+    /// connections). MC chain segments crossing decks carry only the
+    /// cloud's absorption (already folded into shell `optics`) — never
+    /// this factor — identically on CPU and GPU.
     #[inline]
     pub fn cloud_diffuse_transmittance(&self, tau_cloud: f64) -> f64 {
         if tau_cloud <= 0.0 {

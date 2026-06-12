@@ -592,6 +592,20 @@ ShellBoundary next_shell_boundary(float3 pos, float3 dir, float r_inner, float r
                 result.found = true;
                 return result;
             }
+            // On-boundary degeneracy (mirrors the CPU fix): origin on
+            // the inner sphere moving inward has inner t_near ~ 0;
+            // without this the walk teleports through the shell below.
+            float m = dot(pos, dir);
+            float r2 = dot(pos, pos);
+            float b2 = max(r2 - m * m, 0.0f);
+            if (inner.hit && m < 0.0f && b2 < r_inner * r_inner
+                && inner.t_far > EPS
+                && fabs(length(pos) - r_inner) < 1.0f) {
+                result.dist = 1e-4f;
+                result.is_outward = false;
+                result.found = true;
+                return result;
+            }
             result.dist = outer.t_far;
             result.is_outward = true;
             result.found = true;
@@ -1145,8 +1159,20 @@ kernel void mcrt_trace_photon(
             // Ground reflection: depolarizes
             if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
                 float albedo = read_albedo(atm, wl_idx);
-                weight *= albedo;
                 float3 normal = normalize(boundary_pos);
+                // Ground-bounce NEE (Lambertian albedo/pi), BEFORE the
+                // albedo is folded into the continuing weight — mirrors
+                // the CPU chain exactly; this path family was simply
+                // missing from the GPU mcrt estimator (audit 2026-06-12).
+                float cos_sun_g = dot(sun_dir, normal);
+                if (cos_sun_g > 0.0f) {
+                    float t_sun_g = shadow_ray_transmittance(atm, boundary_pos + normal * BOUNDARY_NUDGE_M,
+                                                             sun_dir, wl_idx);
+                    if (t_sun_g > 1e-30f) {
+                        result_weight.add(weight * albedo * t_sun_g * cos_sun_g * (1.0f / PI));
+                    }
+                }
+                weight *= albedo;
                 prev_dir = dir;
                 dir = sample_hemisphere(normal, rng);
                 pos = radial_nudge(boundary_pos, true);
@@ -1168,6 +1194,12 @@ kernel void mcrt_trace_photon(
         // Scattering event
         pos = pos + dir * free_path;
 
+        // Apply SSA for this scatter event BEFORE NEE — the vertex is a
+        // scattering event, so the survival probability multiplies every
+        // contribution from it (CPU convention, photon.rs SSA-before-NEE;
+        // the old order overcounted NEE by 1/ssa per order).
+        weight *= op.ssa;
+
         // NEE: apply Mueller to photon's current Stokes state
         float t_sun = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
@@ -1179,9 +1211,6 @@ kernel void mcrt_trace_photon(
             float4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
             result_weight.add(weight * t_sun * nee_stokes.x / (4.0f * PI));
         }
-
-        // Apply SSA
-        weight *= op.ssa;
 
         // Sample new direction and update Stokes state
         float cos_theta;
