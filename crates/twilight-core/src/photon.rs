@@ -1375,6 +1375,10 @@ struct SplitParticleAlis {
     dir: Vec3,
     hero_weight: f64,
     weight_ratio: [f64; 64],
+    /// Spectral-MIS path-pdf ratios `pdf_ratio[c] = q_c(path)/q_hero(path)`
+    /// (idealized analog free-flight + phase pdfs, as if `c` were the hero).
+    /// See `trace_secondary_chain_alis`.
+    pdf_ratio: [f64; 64],
     rng: McRng,
 }
 
@@ -1734,17 +1738,11 @@ fn trace_light_subpath(
         let one_minus_exp_h = 1.0 - exp_neg_tau_h;
         hero_weight *= one_minus_exp_h;
 
-        // ALIS forced scattering weight ratio correction for non-hero
-        // wavelengths: each wavelength has a different total optical depth,
-        // so its forced scattering weight differs.
-        for w in 0..num_wl {
-            let one_minus_exp_w = 1.0 - libm::exp(-tau_maxes[w]);
-            weight_ratio[w] *= if one_minus_exp_h > 1e-30 {
-                one_minus_exp_w / one_minus_exp_h
-            } else {
-                0.0
-            };
-        }
+        // NO per-wavelength truncation-normalization ratio here — the
+        // hero factor above plus the density ratio at the scatter site
+        // are already the exact likelihood ratio (see the identical
+        // note in the ALIS chain; the former extra factor spectrally
+        // biased every BDPT light vertex).
 
         // VSPG importance-weighted scatter position sampling.
         // Biases toward high-altitude shells; weight correction maintains
@@ -2788,11 +2786,14 @@ fn trace_secondary_chain(
                             if alpha_et > 0.0 {
                                 weight *= libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
                             }
-                            // Deck crossing: diffuse attenuation (cloud
-                            // transport is closed-form; see scalar chain).
-                            weight *= atm.cloud_diffuse_transmittance(
-                                atm.cloud_extinction[shell_idx] * boundary_dist,
-                            );
+                            // Deck crossings carry cloud ABSORPTION only
+                            // (already in `optics`); the deck's diffuse
+                            // transmittance is applied exactly once per
+                            // path on the deterministic eye/sun legs.
+                            // A per-crossing T_diff here both double-
+                            // counted diffusion against those legs and
+                            // disagreed with the forced-scatter branch
+                            // and the GPU (audit 2026-06-12).
 
                             let (np, nd) = cross_boundary(
                                 pos,
@@ -3143,16 +3144,12 @@ fn trace_secondary_chain_scalar(
                                     weight *=
                                         libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
                                 }
-                                // Cloud decks are transported in closed form
-                                // (Eddington); a chain segment crossing a
-                                // deck must carry the same diffuse
-                                // attenuation or it over-transmits. Per-
-                                // segment factors slightly over-attenuate
-                                // vs the whole-deck factor (1/(1+a)(1+b)
-                                // <= 1/(1+a+b)) — conservative.
-                                weight *= atm.cloud_diffuse_transmittance(
-                                    atm.cloud_extinction[shell_idx] * boundary_dist,
-                                );
+                                // Chain deck crossings: cloud absorption
+                                // only — single-representation convention
+                                // (see polarized-chain note; the former
+                                // per-crossing T_diff over-attenuated
+                                // 13-74% and diverged from forced mode
+                                // and the GPU).
 
                                 let (np, nd) = cross_boundary(
                                     pos,
@@ -3392,6 +3389,36 @@ fn scalar_phase_value(cos_theta: f64, optics: &crate::atmosphere::ShellOptics) -
     optics.rayleigh_fraction * rayleigh_phase(cos_theta)
         + (1.0 - optics.rayleigh_fraction)
             * henyey_greenstein_phase(cos_theta, optics.asymmetry)
+}
+
+/// Spectral one-sample MIS weight (balance heuristic over hero choices).
+///
+/// `pr[c] = q~_c(path)/q~_hero(path)` is the idealized path-pdf ratio as if
+/// wavelength `c` had been the hero (`pr[hero] == 1` by construction). With
+/// heroes drawn uniformly from `num_wl` wavelengths, the one-sample MIS
+/// estimator weights each contribution by
+/// `num_wl * w_hero = num_wl * q~_h / sum_c q~_c = num_wl / sum_c pr[c]`.
+///
+/// The weights are normalized across hero choices for any fixed path
+/// (`sum_h w_h = 1`), so the estimator is exactly unbiased even though the
+/// idealized pdfs omit the shared VSPG/ET modulations. Since `pr[w]` sits in
+/// the denominator of wavelength `w`'s contribution, the spectral weight is
+/// bounded by `num_wl` times the own-hero weight, removing the
+/// `e^{(sigma_h - sigma_w) t}` heavy tail of plain hero-ratio reweighting.
+///
+/// An overflowed (`inf`) ratio means another hero is astronomically more
+/// likely to generate this path; the correct balance weight is ~0.
+#[inline]
+fn spectral_mis_weight(pr: &[f64; 64], num_wl: usize) -> f64 {
+    let mut sum = 0.0f64;
+    for &r in pr.iter().take(num_wl) {
+        sum += r;
+    }
+    if sum.is_finite() && sum > 1e-300 {
+        num_wl as f64 / sum
+    } else {
+        0.0
+    }
 }
 
 /// Multi-wavelength scout: compute optical depth to boundary for all wavelengths.
@@ -3667,6 +3694,41 @@ fn trace_secondary_chain_alis(
         };
     }
 
+    // --- Spectral one-sample MIS over hero choices (balance heuristic) ---
+    //
+    // Plain hero-ratio reweighting divides every wavelength's analog target
+    // by the HERO's free-flight pdf. The per-event ratio
+    // (sigma_w/sigma_h) e^{(sigma_h-sigma_w)t} has an infinite second moment
+    // whenever sigma_w < sigma_h/2 (E[ratio^2] ~ Int e^{(sigma_h-2sigma_w)t} dt),
+    // so the estimator, while unbiased, converges one-sidedly from below at
+    // any practical chain count -- a systematic-looking spectral deficit that
+    // grows with SZA (longer chains) and |sigma_w - sigma_h|.
+    //
+    // Cure (Wilkie et al. 2014 hero-wavelength spectral sampling): heroes are
+    // drawn uniformly per chain, and each contribution is weighted by the
+    // balance heuristic over the hero choices:
+    //     contribution_w *= num_wl / sum_c pdf_ratio[c]
+    // where pdf_ratio[c] = q~_c(path)/q~_h(path) is the path-pdf ratio under
+    // the IDEALIZED proposal of wavelength c as hero (analog free-flight,
+    // seed-mixture and phase-function pdfs; the shared VSPG/ET/weight-window
+    // modulations cancel or are absorbed into the weight function). The
+    // weights are normalized across hero choices by construction
+    // (sum_h w_h = 1 for any path), so the estimator stays exactly unbiased,
+    // while the spectral weight of wavelength w is bounded by num_wl times
+    // its own-hero weight: pdf_ratio[hero] = 1 and pdf_ratio[w] appears in
+    // the denominator. This removes the heavy tail.
+    let mut pdf_ratio = [0.0f64; 64];
+    for w in 0..num_wl {
+        let optics_w = &atm.optics[start_shell][w];
+        pdf_ratio[w] = if q_seed > 1e-300 {
+            seed_mixture_pdf(
+                dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, optics_w,
+            ) / q_seed
+        } else {
+            1.0
+        };
+    }
+
     let surface_radius = atm.surface_radius();
     let mut total = [0.0f64; 64];
 
@@ -3694,6 +3756,7 @@ fn trace_secondary_chain_alis(
         dir: Vec3::new(0.0, 0.0, 1.0),
         hero_weight: 0.0,
         weight_ratio: [0.0f64; 64],
+        pdf_ratio: [0.0f64; 64],
         rng: dummy_rng,
     }; MAX_SPLIT_PARTICLES];
     let mut stack_len: usize = 1;
@@ -3702,6 +3765,7 @@ fn trace_secondary_chain_alis(
         dir,
         hero_weight: initial_weight,
         weight_ratio,
+        pdf_ratio,
         rng: *rng,
     };
     let mut main_processed = false;
@@ -3715,6 +3779,7 @@ fn trace_secondary_chain_alis(
         let mut current_dir = stack[stack_len].dir;
         let mut hero_weight = stack[stack_len].hero_weight;
         let mut wr = stack[stack_len].weight_ratio;
+        let mut pr = stack[stack_len].pdf_ratio;
         let mut local_rng = stack[stack_len].rng;
         let mut bounce_idx: usize = 0;
 
@@ -3757,14 +3822,16 @@ fn trace_secondary_chain_alis(
                 let one_minus_exp_h = 1.0 - exp_neg_tau_h;
                 hero_weight *= one_minus_exp_h;
 
-                for w in 0..num_wl {
-                    let one_minus_exp_w = 1.0 - libm::exp(-tau_maxes[w]);
-                    wr[w] *= if one_minus_exp_h > 1e-30 {
-                        one_minus_exp_w / one_minus_exp_h
-                    } else {
-                        0.0
-                    };
-                }
+                // NO per-wavelength (1-e^-tau_w)/(1-e^-tau_h) factor here:
+                // the hero truncated-exponential proposal p(tau) =
+                // sigma_h e^{-tau_h}/(1-e^{-tau_h,max}) against the
+                // integrand sigma_w e^{-tau_w} gives the EXACT ratio
+                // (1-e^{-tau_h,max}) * (sigma_w/sigma_h) e^{-(tau_w-tau_h)}
+                // — the first factor is on hero_weight above, the second
+                // is applied at the scatter site below. An extra
+                // normalization ratio multiplied here double-counted the
+                // truncation and suppressed red-channel multiple scatter
+                // by up to ~12x (audit 2026-06-12, empirically confirmed).
 
                 // VSPG: sample from pre-collected segments (no re-walk).
                 let (tau_s, vspg_w) = vspg_sample_from_segments(
@@ -3785,7 +3852,10 @@ fn trace_secondary_chain_alis(
                     let tau_h_pos = taus_at_pos[hero_wl];
                     for w in 0..num_wl {
                         let sigma_w = atm.optics[scatter_shell][w].extinction;
-                        wr[w] *= (sigma_w / sigma_h) * libm::exp(-(taus_at_pos[w] - tau_h_pos));
+                        let ratio =
+                            (sigma_w / sigma_h) * libm::exp(-(taus_at_pos[w] - tau_h_pos));
+                        wr[w] *= ratio;
+                        pr[w] *= ratio;
                     }
                 }
             } else {
@@ -3808,7 +3878,9 @@ fn trace_secondary_chain_alis(
                                 for w in 0..num_wl {
                                     let sigma_w = atm.optics[shell_idx][w].extinction;
                                     if sigma_w > 1e-30 {
-                                        wr[w] *= libm::exp(-sigma_w * dist);
+                                        let ratio = libm::exp(-sigma_w * dist);
+                                        wr[w] *= ratio;
+                                        pr[w] *= ratio;
                                     }
                                 }
                                 let (np, nd) = cross_boundary(
@@ -3841,15 +3913,15 @@ fn trace_secondary_chain_alis(
                                     hero_weight *=
                                         libm::exp(-alpha_et * sigma_h * cos_bias * boundary_dist);
                                 }
-                                // Deck crossing: diffuse attenuation (see
-                                // Stokes chain note). Broadband — applies
-                                // to the hero weight; wr ratios unchanged.
-                                hero_weight *= atm.cloud_diffuse_transmittance(
-                                    atm.cloud_extinction[shell_idx] * boundary_dist,
-                                );
+                                // Chain deck crossings: cloud absorption
+                                // only (single-representation convention,
+                                // see polarized-chain note).
                                 for w in 0..num_wl {
                                     let sigma_w = atm.optics[shell_idx][w].extinction;
-                                    wr[w] *= libm::exp(-(sigma_w - sigma_h) * boundary_dist);
+                                    let ratio =
+                                        libm::exp(-(sigma_w - sigma_h) * boundary_dist);
+                                    wr[w] *= ratio;
+                                    pr[w] *= ratio;
                                 }
 
                                 let (np, nd) = cross_boundary(
@@ -3874,10 +3946,12 @@ fn trace_secondary_chain_alis(
                                         let t_suns_gb = shadow_ray_transmittance_spectrum(
                                             atm, pos, sun_dir, num_wl,
                                         );
+                                        let mis_w = spectral_mis_weight(&pr, num_wl);
                                         let inv_pi = 1.0 / core::f64::consts::PI;
                                         for w in 0..num_wl {
                                             if t_suns_gb[w] > 1e-30 {
-                                                total[w] += hero_weight
+                                                total[w] += mis_w
+                                                    * hero_weight
                                                     * wr[w]
                                                     * atm.surface_albedo[w]
                                                     * t_suns_gb[w]
@@ -3919,8 +3993,10 @@ fn trace_secondary_chain_alis(
                     for w in 0..num_wl {
                         let sigma_w = atm.optics[shell_idx][w].extinction;
                         if sigma_h > 1e-30 {
-                            wr[w] *=
+                            let ratio =
                                 (sigma_w / sigma_h) * libm::exp(-(sigma_w - sigma_h) * free_path);
+                            wr[w] *= ratio;
+                            pr[w] *= ratio;
                         }
                     }
                     pos = pos + current_dir * free_path;
@@ -3961,13 +4037,19 @@ fn trace_secondary_chain_alis(
                 // independent estimates for these orders. Higher-order bounces
                 // get full weight since BDPT does not cover them.
                 let nee_weight = if bdpt_covered { nee_r2_weight } else { 1.0 };
+                let mis_w = spectral_mis_weight(&pr, num_wl);
 
                 for w in 0..num_wl {
                     if t_suns[w] > 1e-30 {
                         let optics_w = &atm.optics[scatter_shell][w];
                         let phase_w = scalar_phase_value(cos_angle_nee, optics_w);
-                        total[w] +=
-                            nee_weight * hero_weight * wr[w] * t_suns[w] * phase_w * INV_4PI;
+                        total[w] += mis_w
+                            * nee_weight
+                            * hero_weight
+                            * wr[w]
+                            * t_suns[w]
+                            * phase_w
+                            * INV_4PI;
                     }
                 }
             }
@@ -4115,7 +4197,9 @@ fn trace_secondary_chain_alis(
                 for w in 0..num_wl {
                     let optics_w = &atm.optics[scatter_shell][w];
                     let phase_w = scalar_phase_value(cos_theta_for_alis, optics_w);
-                    wr[w] *= phase_w / phase_hero;
+                    let ratio = phase_w / phase_hero;
+                    wr[w] *= ratio;
+                    pr[w] *= ratio;
                 }
             }
 
@@ -4163,6 +4247,7 @@ fn trace_secondary_chain_alis(
                                 dir: current_dir,
                                 hero_weight,
                                 weight_ratio: wr,
+                                pdf_ratio: pr,
                                 rng: McRng::from_seed(child_seed),
                             };
                             stack_len += 1;
@@ -4451,31 +4536,29 @@ pub fn hybrid_scatter_radiance_alis(
             let mut mc_totals = [0.0f64; 64];
 
             for ray in 0..rays_this_step {
-                // Select hero as the wavelength with maximum extinction at
-                // this LOS step's shell. This ensures sigma_w/sigma_h <= 1
-                // at every scatter event, preventing ALIS weight ratio wr[w]
-                // from growing exponentially over many bounces.
-                // In a Rayleigh-dominated atmosphere, lambda^-4 scaling
-                // preserves the extinction ordering across all shells, so
-                // the hero remains max-extinction throughout the chain.
-                // Round-robin offset ensures different wavelengths get hero
-                // turns when multiple wavelengths have similar extinction.
-                let hero_wl = {
-                    let mut best = ray % num_wl;
-                    let mut best_ext = atm.optics[shell_idx][best].extinction;
-                    for w in 0..num_wl {
-                        let ext = atm.optics[shell_idx][w].extinction;
-                        if ext > best_ext {
-                            best = w;
-                            best_ext = ext;
-                        }
-                    }
-                    best
-                };
-
                 // Per-chain McRng: master advances by 1 per chain.
                 let _ = xorshift_f64(rng_state);
                 let mut mc_rng = McRng::from_seed(*rng_state);
+
+                // Hero selection: uniform random per chain, derived from the
+                // master state (splitmix64-decorrelated from the chain's own
+                // RNG streams). Uniform random heroes are REQUIRED for the
+                // spectral one-sample MIS in trace_secondary_chain_alis: the
+                // balance-heuristic weight num_wl / sum_c pdf_ratio[c] is only
+                // unbiased when every wavelength has equal hero probability
+                // for every chain (random choice keeps this exact for ANY
+                // rays_this_step, unlike round-robin with n % num_wl != 0).
+                //
+                // A previous deterministic max-extinction hero kept
+                // sigma_w/sigma_h <= 1 per event but left the free-path
+                // reweighting (sigma_w/sigma_h) e^{(sigma_h-sigma_w)t} with an
+                // infinite second moment whenever sigma_w < sigma_h/2: the
+                // unbiased-but-heavy-tailed estimator read systematically low
+                // at any practical ray count, suppressing non-hero multiple
+                // scatter by 2-14x at deep SZA (audit 2026-06-12, empirically
+                // confirmed against per-wavelength tracing).
+                let hero_wl =
+                    (splitmix64(*rng_state ^ 0xA115_4E80_5EED_0001) % num_wl as u64) as usize;
                 let chain_result = trace_secondary_chain_alis(
                     atm,
                     scatter_pos,
@@ -7024,9 +7107,9 @@ mod tests {
 
     #[test]
     fn split_particle_alis_size_reasonable() {
-        // weight_ratio[64] = 512 bytes, plus overhead.
+        // weight_ratio[64] + pdf_ratio[64] = 1024 bytes, plus overhead.
         let size = core::mem::size_of::<SplitParticleAlis>();
-        assert!(size <= 640, "SplitParticleAlis too large: {} bytes", size);
+        assert!(size <= 1152, "SplitParticleAlis too large: {} bytes", size);
     }
 
     #[test]
@@ -7042,10 +7125,10 @@ mod tests {
 
     #[test]
     fn split_stack_alis_fits_in_stack() {
-        // MAX_SPLIT_PARTICLES * sizeof(SplitParticleAlis) should be < 16 KB
+        // MAX_SPLIT_PARTICLES * sizeof(SplitParticleAlis) should be < 32 KB
         let total = MAX_SPLIT_PARTICLES * core::mem::size_of::<SplitParticleAlis>();
         assert!(
-            total <= 16384,
+            total <= 32768,
             "ALIS split stack too large: {} bytes",
             total
         );
