@@ -1252,6 +1252,7 @@ dependencies = [
 name = "twilight-cpu"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "rayon",
  "twilight-core",
  "twilight-data",

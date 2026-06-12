@@ -212,6 +212,12 @@ pub struct PrayerTimeOutput {
     pub skyglow_bortle: Option<u8>,
     /// Estimated prayer time shift due to light pollution (minutes).
     pub skyglow_shift_minutes: Option<f64>,
+    /// The khayt al-abyad (Quran 2:187) contrast-criterion times — the
+    /// PRIMARY determination: Fajr = white thread distinct WITH lateral
+    /// spread; Isha = shafaq distinctness disappears (ahmar primary).
+    /// The absolute-threshold times above remain as the legacy
+    /// comparison method.
+    pub khayt: KhaytTimes,
 }
 
 // ── Solar position engine abstraction ──────────────────────────────
@@ -713,6 +719,305 @@ fn scan_szas_with_stats(
     SzaStats { results, rel_se }
 }
 
+/// Physical night-sky background [cd/m^2] toward a view direction at a
+/// local fractional hour. `view_azimuth` None = toward the sun's azimuth
+/// at that instant. Moon from the JPL ephemeris when loaded.
+fn night_sky_total(
+    input: &PrayerTimeInput,
+    engine: &mut SolarEngine,
+    t_local: f64,
+    view_zenith_deg: f64,
+    view_azimuth_deg: Option<f64>,
+) -> f64 {
+    let az = view_azimuth_deg
+        .or_else(|| engine.azimuth_at_hour(t_local))
+        .unwrap_or(270.0);
+    // Raw UTC hour, deliberately NOT wrapped into [0,24): both the Meeus
+    // and DE440 paths convert through pure Julian-day arithmetic, so
+    // hour 25.5 lands on the correct NEXT civil day. (Wrapping would put
+    // a past-midnight Isha moon a full day early — a 13 deg lunar
+    // position error.)
+    let hour_utc = t_local - input.timezone;
+    let inp = twilight_threshold::night_sky::NightSkyInput {
+        latitude: input.latitude,
+        longitude: input.longitude,
+        year: input.year,
+        month: input.month,
+        day: input.day,
+        hour_utc,
+        view_zenith_deg,
+        view_azimuth_deg: az,
+        solar_f107: input.solar_f107.unwrap_or(130.0),
+        extinction_k: 0.16 + input.custom_aerosol.map(|a| 1.2 * a.aod_550).unwrap_or(0.05),
+    };
+    // Real JPL ephemeris for the Moon when the BSP is loaded; truncated
+    // Meeus series otherwise.
+    let lum = match engine.de440.as_mut() {
+        Some(de) => match de.moon_state(
+            input.year,
+            input.month,
+            input.day,
+            hour_utc,
+            input.delta_t,
+            input.latitude,
+            input.longitude,
+            input.elevation,
+        ) {
+            Ok(moon) => {
+                twilight_threshold::night_sky::night_sky_luminance_with_moon(&inp, &moon)
+            }
+            Err(_) => twilight_threshold::night_sky::night_sky_luminance(&inp),
+        },
+        None => twilight_threshold::night_sky::night_sky_luminance(&inp),
+    };
+    lum.total
+}
+
+/// Times and diagnostics from the khayt al-abyad pass (see
+/// [`crate::khayt`]). All times are local fractional hours.
+#[derive(Debug, Clone, Default)]
+pub struct KhaytTimes {
+    /// Fajr sadiq: white-thread distinctness WITH lateral spread.
+    pub fajr_time: Option<f64>,
+    pub fajr_sza_deg: Option<f64>,
+    /// Al-fajr al-kadhib: central distinctness without spread (the
+    /// zodiacal wedge), when it precedes sadiq.
+    pub kadhib_time: Option<f64>,
+    /// Isha per shafaq al-ahmar (red-band distinctness disappears) —
+    /// Shafi'i/Maliki/Hanbali.
+    pub isha_ahmar_time: Option<f64>,
+    pub isha_ahmar_sza_deg: Option<f64>,
+    /// Isha per shafaq al-abyad (white distinctness disappears) — Hanafi.
+    pub isha_abyad_time: Option<f64>,
+    pub isha_abyad_sza_deg: Option<f64>,
+    /// Contrast margin per band azimuth at the Fajr crossing (diagnostic).
+    pub fajr_margins: Vec<f64>,
+}
+
+/// The khayt al-abyad pass: simulate the fan of sky patches, compose
+/// per-patch totals (MCRT + celestial background + skyglow), and detect
+/// the Quranic contrast events on both sides of the night.
+///
+/// The MCRT radiance depends only on (SZA, relative azimuth), so ONE fan
+/// scan serves both Fajr and Isha; only the celestial background (moon,
+/// zodiacal geometry) is evaluated per side.
+#[allow(clippy::too_many_arguments)]
+fn khayt_pass(
+    input: &PrayerTimeInput,
+    atm: &twilight_core::atmosphere::AtmosphereModel,
+    base_config: &SimulationConfig,
+    scan: &dyn Fn(
+        &twilight_core::atmosphere::AtmosphereModel,
+        &SimulationConfig,
+        f64,
+        f64,
+        f64,
+    ) -> Vec<SpectralResult>,
+    scan_list: Option<
+        &dyn Fn(
+            &twilight_core::atmosphere::AtmosphereModel,
+            &SimulationConfig,
+            &[f64],
+        ) -> Vec<SpectralResult>,
+    >,
+    engine: &mut SolarEngine,
+    max_sza: f64,
+) -> KhaytTimes {
+    use crate::khayt::{detect, KhaytParams, KhaytScan, PatchLum};
+
+    let params = KhaytParams::default();
+    let lo = 93.0_f64;
+    let hi = (max_sza - 0.25).min(111.0);
+    if hi - lo < 3.0 {
+        return KhaytTimes::default(); // never dark enough for the fan
+    }
+    let n_steps = ((hi - lo) / 1.0).floor() as usize + 1;
+    let szas: Vec<f64> = (0..n_steps).map(|i| lo + i as f64).collect();
+
+    // ── MCRT fan: per-direction luminance curves (side-independent) ──
+    let thr_cfg = threshold::ThresholdConfig::default();
+    let sim_dir = |offset: f64| -> Vec<(f64, f64)> {
+        let mut cfg = base_config.clone();
+        cfg.view_zenith = params.band_zenith_deg;
+        cfg.view_azimuth = Some(base_config.solar_azimuth + offset);
+        let stats = scan_szas_with_stats(atm, &cfg, &szas, 2, scan, scan_list);
+        stats
+            .results
+            .iter()
+            .map(|r| {
+                let a = threshold::analyze_twilight(
+                    r.sza_deg,
+                    &r.wavelengths_nm,
+                    &r.radiance,
+                    &thr_cfg,
+                );
+                (a.luminance_mesopic, a.luminance_red)
+            })
+            .collect()
+    };
+    let band_mcrt: Vec<Vec<(f64, f64)>> =
+        params.band_offsets_deg.iter().map(|&o| sim_dir(o)).collect();
+    let ref_mcrt: Vec<Vec<(f64, f64)>> =
+        params.ref_offsets_deg.iter().map(|&o| sim_dir(o)).collect();
+
+    // ── Skyglow: identical additive veil on every patch of the low ring
+    // (azimuthal structure of city glow is unknown from the atlas; an
+    // equal veil still raises adaptation and suppresses contrast, which
+    // is its physically dominant effect on detection).
+    let (sg_mes, sg_red) = match &input.skyglow {
+        Some(sg) => {
+            let elev = 90.0 - params.band_zenith_deg;
+            let lift = twilight_skyglow::angular::enhancement_factor(elev);
+            let mes = sg.zenith_luminance * lift;
+            // Red share from the skyglow's own spectrum (HPS vs LED mix).
+            let n = sg.num_wavelengths.min(sg.spectral_radiance.len());
+            let wl: Vec<f64> = (0..n).map(|i| 380.0 + 10.0 * i as f64).collect();
+            let mes_s = twilight_threshold::luminance::mesopic_luminance(
+                &wl,
+                &sg.spectral_radiance[..n],
+            );
+            let red_s = twilight_threshold::luminance::red_band_luminance(
+                &wl,
+                &sg.spectral_radiance[..n],
+            );
+            let red_frac = if mes_s > 1e-30 { red_s / mes_s } else { 0.3 };
+            (mes, mes * red_frac)
+        }
+        None => (0.0, 0.0),
+    };
+
+    // ── Celestial background per patch per side: anchors in SZA,
+    // piecewise-linear in between. The absolute azimuth of each patch is
+    // (real sun azimuth at that instant) + offset.
+    let anchor_szas: Vec<f64> = [97.0, 101.0, 105.0, 109.0]
+        .iter()
+        .copied()
+        .filter(|&s| s > lo && s < hi)
+        .collect();
+    let mut celestial_side = |morning: bool| -> Vec<(f64, Vec<f64>, Vec<f64>)> {
+        // (anchor_sza, band_bg[j], ref_bg[j])
+        let (w0, w1) = if morning { (0.0, 12.0) } else { (12.0, 28.0) };
+        anchor_szas
+            .iter()
+            .filter_map(|&sza| {
+                let t = engine.find_zenith_crossing_robust(sza, w0, w1, 0.001, morning)?;
+                let sun_az = engine.azimuth_at_hour(t).unwrap_or(base_config.solar_azimuth);
+                let band: Vec<f64> = params
+                    .band_offsets_deg
+                    .iter()
+                    .map(|&o| {
+                        night_sky_total(
+                            input,
+                            engine,
+                            t,
+                            params.band_zenith_deg,
+                            Some(sun_az + o),
+                        )
+                    })
+                    .collect();
+                let refs: Vec<f64> = params
+                    .ref_offsets_deg
+                    .iter()
+                    .map(|&o| {
+                        night_sky_total(
+                            input,
+                            engine,
+                            t,
+                            params.band_zenith_deg,
+                            Some(sun_az + o),
+                        )
+                    })
+                    .collect();
+                Some((sza, band, refs))
+            })
+            .collect()
+    };
+    let interp = |anchors: &[(f64, Vec<f64>, Vec<f64>)], sza: f64, j: usize, is_ref: bool| -> f64 {
+        let pick = |a: &(f64, Vec<f64>, Vec<f64>)| if is_ref { a.2[j] } else { a.1[j] };
+        if anchors.is_empty() {
+            return threshold::NIGHT_SKY_LUMINANCE;
+        }
+        if sza <= anchors[0].0 {
+            return pick(&anchors[0]);
+        }
+        for w in anchors.windows(2) {
+            if sza <= w[1].0 {
+                let f = (sza - w[0].0) / (w[1].0 - w[0].0);
+                return pick(&w[0]) * (1.0 - f) + pick(&w[1]) * f;
+            }
+        }
+        pick(anchors.last().unwrap())
+    };
+
+    let assemble = |anchors: &[(f64, Vec<f64>, Vec<f64>)]| -> KhaytScan {
+        let band = szas
+            .iter()
+            .enumerate()
+            .map(|(i, &sza)| {
+                (0..params.band_offsets_deg.len())
+                    .map(|j| {
+                        let bg = interp(anchors, sza, j, false);
+                        PatchLum {
+                            mesopic: band_mcrt[j][i].0 + bg + sg_mes,
+                            red: band_mcrt[j][i].1
+                                + bg * params.celestial_red_fraction
+                                + sg_red,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let refs = szas
+            .iter()
+            .enumerate()
+            .map(|(i, &sza)| {
+                (0..params.ref_offsets_deg.len())
+                    .map(|j| {
+                        let bg = interp(anchors, sza, j, true);
+                        PatchLum {
+                            mesopic: ref_mcrt[j][i].0 + bg + sg_mes,
+                            red: ref_mcrt[j][i].1
+                                + bg * params.celestial_red_fraction
+                                + sg_red,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        KhaytScan {
+            szas: szas.clone(),
+            band,
+            refs,
+        }
+    };
+
+    let morning_anchors = celestial_side(true);
+    let evening_anchors = celestial_side(false);
+    let morning = detect(&assemble(&morning_anchors), &params.for_side(true));
+    let evening = detect(&assemble(&evening_anchors), &params.for_side(false));
+
+    let mut out = KhaytTimes::default();
+    if let Some(c) = morning.sadiq {
+        out.fajr_sza_deg = Some(c.sza_deg);
+        out.fajr_time = engine.find_zenith_crossing_robust(c.sza_deg, 0.0, 12.0, 0.0001, true);
+        out.fajr_margins = morning.margins_at_sadiq.clone();
+    }
+    if let Some(c) = morning.kadhib {
+        out.kadhib_time = engine.find_zenith_crossing_robust(c.sza_deg, 0.0, 12.0, 0.0001, true);
+    }
+    if let Some(c) = evening.ahmar {
+        out.isha_ahmar_sza_deg = Some(c.sza_deg);
+        out.isha_ahmar_time =
+            engine.find_zenith_crossing_robust(c.sza_deg, 12.0, 28.0, 0.0001, false);
+    }
+    if let Some(c) = evening.sadiq {
+        out.isha_abyad_sza_deg = Some(c.sza_deg);
+        out.isha_abyad_time =
+            engine.find_zenith_crossing_robust(c.sza_deg, 12.0, 28.0, 0.0001, false);
+    }
+    out
+}
+
 fn compute_prayer_times_inner(
     input: &PrayerTimeInput,
     atm: &twilight_core::atmosphere::AtmosphereModel,
@@ -1147,47 +1452,7 @@ fn compute_prayer_times_inner(
     // crossings, and re-convert the times.
     let night_sky_at = |engine: &mut SolarEngine, t_local: Option<f64>| -> Option<f64> {
         let t = t_local?;
-        let az = engine.azimuth_at_hour(t).unwrap_or(270.0);
-        // Raw UTC hour, deliberately NOT wrapped into [0,24): both the
-        // Meeus and DE440 paths convert through pure Julian-day
-        // arithmetic, so hour 25.5 lands on the correct NEXT civil day.
-        // (Wrapping would put a past-midnight Isha moon a full day early —
-        // a 13 deg lunar position error.)
-        let hour_utc = t - input.timezone;
-        let inp = twilight_threshold::night_sky::NightSkyInput {
-            latitude: input.latitude,
-            longitude: input.longitude,
-            year: input.year,
-            month: input.month,
-            day: input.day,
-            hour_utc,
-            view_zenith_deg: 85.0,
-            view_azimuth_deg: az,
-            solar_f107: input.solar_f107.unwrap_or(130.0),
-            extinction_k: 0.16
-                + input.custom_aerosol.map(|a| 1.2 * a.aod_550).unwrap_or(0.05),
-        };
-        // Real JPL ephemeris for the Moon when the BSP is loaded;
-        // truncated Meeus series otherwise.
-        let lum = match engine.de440.as_mut() {
-            Some(de) => match de.moon_state(
-                input.year,
-                input.month,
-                input.day,
-                hour_utc,
-                input.delta_t,
-                input.latitude,
-                input.longitude,
-                input.elevation,
-            ) {
-                Ok(moon) => twilight_threshold::night_sky::night_sky_luminance_with_moon(
-                    &inp, &moon,
-                ),
-                Err(_) => twilight_threshold::night_sky::night_sky_luminance(&inp),
-            },
-            None => twilight_threshold::night_sky::night_sky_luminance(&inp),
-        };
-        Some(lum.total)
+        Some(night_sky_total(input, engine, t, 85.0, None))
     };
     let bg_fajr = night_sky_at(&mut engine, fajr_time);
     let bg_isha = night_sky_at(&mut engine, isha_abyad_time);
@@ -1292,9 +1557,20 @@ fn compute_prayer_times_inner(
         24.0,
     );
 
+    // ── THE KHAYT AL-ABYAD PASS (primary criterion) ────────────────
+    // Simulate the horizon fan and detect the Quranic contrast events:
+    // the white thread distinct from the black with lateral spread
+    // (Fajr sadiq), the narrow wedge alone (fajr kadhib), and the
+    // mirrored disappearances for Isha (ahmar primary).
+    let khayt = match max_sza_deg {
+        Some(ms) => khayt_pass(input, atm, &config, scan, scan_list, &mut engine, ms),
+        None => KhaytTimes::default(),
+    };
+
     let elapsed = start.elapsed();
 
     PrayerTimeOutput {
+        khayt,
         fajr_time,
         isha_abyad_time,
         isha_ahmar_time,

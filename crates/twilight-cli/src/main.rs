@@ -1721,6 +1721,50 @@ fn cmd_pray(
         }
     }
 
+    // ── PRIMARY: the khayt al-abyad criterion (Quran 2:187) ──
+    let kh = &output.khayt;
+    if let (Some(time), Some(sza)) = (kh.fajr_time, kh.fajr_sza_deg) {
+        println!(
+            "  Fajr (khayt al-abyad): {}  (SZA {:.2}°, depression {:.2}°)",
+            format_fractional_hour(time),
+            sza,
+            sza - 90.0
+        );
+        println!(
+            "    └ white thread distinct from black + lateral spread (2:187, mustatir)"
+        );
+        if let Some(kt) = kh.kadhib_time {
+            println!(
+                "    └ false dawn (al-fajr al-kadhib) visible from {} — do not pray Fajr yet",
+                format_fractional_hour(kt)
+            );
+        }
+    } else {
+        println!("  Fajr (khayt al-abyad): N/A (contrast criterion not crossed in scan)");
+    }
+    if let (Some(time), Some(sza)) = (kh.isha_ahmar_time, kh.isha_ahmar_sza_deg) {
+        println!(
+            "  Isha (shafaq ahmar):   {}  (SZA {:.2}°, depression {:.2}°)",
+            format_fractional_hour(time),
+            sza,
+            sza - 90.0
+        );
+        println!("    └ red band no longer distinct — Shafi'i/Maliki/Hanbali (primary)");
+    } else {
+        println!("  Isha (shafaq ahmar):   N/A (contrast criterion not crossed in scan)");
+    }
+    if let (Some(time), Some(sza)) = (kh.isha_abyad_time, kh.isha_abyad_sza_deg) {
+        println!(
+            "  Isha (shafaq abyad):   {}  (SZA {:.2}°, depression {:.2}°)",
+            format_fractional_hour(time),
+            sza,
+            sza - 90.0
+        );
+        println!("    └ white band no longer distinct — Hanafi");
+    }
+    println!();
+    println!("  Legacy absolute-threshold method (comparison):");
+
     // Fajr
     if let (Some(time), Some(sza), Some(dep)) = (
         output.fajr_time,
