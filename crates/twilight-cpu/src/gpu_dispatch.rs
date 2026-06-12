@@ -26,7 +26,7 @@ use crate::simulation::{compute_geometry, ScatteringMode, SimulationConfig, Spec
 /// then converts the GPU result to `SpectralResult` with optional solar
 /// irradiance weighting. Produces results equivalent to
 /// [`simulation::simulate_at_sza`] but on GPU hardware.
-
+///
 /// Derive a well-mixed 64-bit RNG seed from an SZA value.
 ///
 /// `sza_deg.to_bits()` alone is a poor seed: SZAs on the 0.5-degree scan

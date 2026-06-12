@@ -19,6 +19,8 @@ use std::path::Path;
 use serde::Deserialize;
 use twilight_data::cloud::CloudProperties;
 
+use crate::error::WeatherError;
+
 /// Ice density [g/m^3].
 const RHO_ICE: f64 = 0.917e6;
 /// Ice effective radius assumed for the IWC->extinction conversion [m].
@@ -61,13 +63,15 @@ pub struct Cloud3dPathSample {
 }
 
 /// Load a sidecar-produced profile JSON.
-pub fn load(path: &Path) -> Result<Cloud3dProfile, String> {
+pub fn load(path: &Path) -> Result<Cloud3dProfile, WeatherError> {
     let body = std::fs::read_to_string(path)
-        .map_err(|e| format!("cloud3d profile read failed: {e}"))?;
-    let p: Cloud3dProfile =
-        serde_json::from_str(&body).map_err(|e| format!("cloud3d profile parse failed: {e}"))?;
+        .map_err(|e| WeatherError::io(format!("cloud3d profile read failed: {e}")))?;
+    let p: Cloud3dProfile = serde_json::from_str(&body)
+        .map_err(|e| WeatherError::parse(format!("cloud3d profile parse failed: {e}")))?;
     if p.heights_m.len() < 2 || p.profiles.center.len() != p.heights_m.len() {
-        return Err("cloud3d profile: inconsistent level count".to_string());
+        return Err(WeatherError::parse(
+            "cloud3d profile: inconsistent level count",
+        ));
     }
     Ok(p)
 }

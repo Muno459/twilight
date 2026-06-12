@@ -15,6 +15,8 @@
 
 use serde::Deserialize;
 
+use crate::error::WeatherError;
+
 const F107_URL: &str = "https://services.swpc.noaa.gov/json/f107_cm_flux.json";
 
 /// Physical sanity bounds for F10.7 (sfu). The historical record spans
@@ -55,16 +57,16 @@ impl SolarFlux {
 }
 
 /// Fetch the latest measured F10.7 from NOAA SWPC.
-pub fn fetch_f107() -> Result<SolarFlux, String> {
+pub fn fetch_f107() -> Result<SolarFlux, WeatherError> {
     let records: Vec<F107Record> = crate::api::fetch_json(F107_URL)?;
     parse_records(records)
 }
 
-fn parse_records(records: Vec<F107Record>) -> Result<SolarFlux, String> {
+fn parse_records(records: Vec<F107Record>) -> Result<SolarFlux, WeatherError> {
     let latest = records
         .iter()
         .find(|r| (F107_MIN..=F107_MAX).contains(&r.flux))
-        .ok_or_else(|| "F10.7 feed: no physically valid records".to_string())?;
+        .ok_or_else(|| WeatherError::no_data("F10.7 feed: no physically valid records"))?;
     let mean = records
         .iter()
         .filter_map(|r| r.ninety_day_mean)

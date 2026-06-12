@@ -21,6 +21,8 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::error::SkyglowError;
+
 const ATLAS_BASE: &str = "https://djlorenz.github.io/astronomy/binary_tiles";
 /// Newest published atlas edition.
 const ATLAS_YEAR: u32 = 2024;
@@ -78,7 +80,7 @@ fn compressed_to_ratio(c: i64) -> f64 {
     (5.0 / 195.0) * ((0.0195 * c as f64).exp() - 1.0)
 }
 
-fn fetch_tile(cache_dir: &Path, tx: u32, ty: u32) -> Result<Vec<i8>, String> {
+fn fetch_tile(cache_dir: &Path, tx: u32, ty: u32) -> Result<Vec<i8>, SkyglowError> {
     let cache: PathBuf = cache_dir.join(format!("lorenz{ATLAS_YEAR}_tile_{tx}_{ty}.dat"));
     let gz_bytes: Vec<u8> = if let Ok(b) = std::fs::read(&cache) {
         b
@@ -88,24 +90,28 @@ fn fetch_tile(cache_dir: &Path, tx: u32, ty: u32) -> Result<Vec<i8>, String> {
             .timeout_global(Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)))
             .build()
             .new_agent();
-        let mut resp = agent
-            .get(&url)
-            .call()
-            .map_err(|e| format!("atlas fetch failed: {e}"))?;
-        let mut bytes = Vec::new();
-        resp.body_mut()
-            .as_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|e| format!("atlas read failed: {e}"))?;
-        let _ = std::fs::create_dir_all(cache_dir);
-        let _ = std::fs::write(&cache, &bytes);
+        let bytes = twilight_weather::retry::with_retries(SkyglowError::is_transient, || {
+            let mut resp = agent
+                .get(&url)
+                .call()
+                .map_err(|e| SkyglowError::from_ureq(e, &url))?;
+            let mut bytes = Vec::new();
+            resp.body_mut()
+                .as_reader()
+                .read_to_end(&mut bytes)
+                .map_err(|e| SkyglowError::network(format!("atlas read failed ({url}): {e}")))?;
+            Ok(bytes)
+        })?;
+        // Atlas tiles are a fixed edition, not a dated product: cached
+        // forever (no pruning), written atomically.
+        let _ = twilight_weather::cache::write_atomic(&cache, &bytes);
         bytes
     };
     let mut decoder = flate2::read::GzDecoder::new(gz_bytes.as_slice());
     let mut raw = Vec::new();
     decoder
         .read_to_end(&mut raw)
-        .map_err(|e| format!("atlas gunzip failed: {e}"))?;
+        .map_err(|e| SkyglowError::parse(format!("atlas gunzip failed: {e}")))?;
     Ok(raw.into_iter().map(|b| b as i8).collect())
 }
 

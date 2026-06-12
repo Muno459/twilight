@@ -675,8 +675,8 @@ mod tests {
             upward_flux: 1e6,
         };
 
-        let b1 = zenith_brightness(&[s1.clone()], &config);
-        let b2 = zenith_brightness(&[s2.clone()], &config);
+        let b1 = zenith_brightness(std::slice::from_ref(&s1), &config);
+        let b2 = zenith_brightness(std::slice::from_ref(&s2), &config);
         let b_both = zenith_brightness(&[s1, s2], &config);
 
         assert!(
@@ -777,8 +777,8 @@ mod tests {
             upward_flux: 1e6,
         };
 
-        let b_low = zenith_brightness(&[source.clone()], &config_low_aod);
-        let b_high = zenith_brightness(&[source.clone()], &config_high_aod);
+        let b_low = zenith_brightness(std::slice::from_ref(&source), &config_low_aod);
+        let b_high = zenith_brightness(std::slice::from_ref(&source), &config_high_aod);
         let b_extreme = zenith_brightness(&[source], &config_extreme_aod);
 
         // All should be positive

@@ -6,9 +6,14 @@
 //! Two endpoints:
 //! - `api.open-meteo.com/v1/forecast`: cloud cover, visibility, humidity
 //! - `air-quality-api.open-meteo.com/v1/air-quality`: AOD, dust, PM, O3, NO2
+//!
+//! Missing data is never papered over with optimistic values: fields the
+//! API did not report fall back to documented CONSERVATIVE defaults and
+//! every substitution is recorded in `WeatherConditions::data_warnings`.
 
 use serde::Deserialize;
 
+use crate::error::WeatherError;
 use crate::WeatherConditions;
 
 const WEATHER_BASE_URL: &str = "https://api.open-meteo.com/v1/forecast";
@@ -16,6 +21,14 @@ const AIR_QUALITY_BASE_URL: &str = "https://air-quality-api.open-meteo.com/v1/ai
 
 /// Timeout for HTTP requests in milliseconds.
 const REQUEST_TIMEOUT_MS: u64 = 10_000;
+
+/// Conservative fallbacks for fields the API did not report. Chosen to
+/// avoid the optimistic bias of assuming pristine air (AOD 0, 50 km
+/// visibility): a continental-background aerosol load and moderate-haze
+/// visibility. Every use is recorded in `data_warnings`.
+const DEFAULT_AOD_550: f64 = 0.15;
+const DEFAULT_VISIBILITY_M: f64 = 10_000.0;
+const DEFAULT_RELATIVE_HUMIDITY: f64 = 50.0;
 
 // ── Weather API response types ──
 
@@ -55,14 +68,123 @@ struct AirQualityCurrent {
     nitrogen_dioxide: Option<f64>,
 }
 
+// ── Missing-field accounting ──
+
+/// One sample of every field the two endpoints can deliver, before
+/// missing-field substitution. Shared by the current and hourly paths.
+struct RawSample {
+    aod_550: Option<f64>,
+    dust: Option<f64>,
+    pm2_5: Option<f64>,
+    pm10: Option<f64>,
+    ozone: Option<f64>,
+    nitrogen_dioxide: Option<f64>,
+    cloud_cover: Option<f64>,
+    cloud_cover_low: Option<f64>,
+    cloud_cover_mid: Option<f64>,
+    cloud_cover_high: Option<f64>,
+    visibility: Option<f64>,
+    relative_humidity: Option<f64>,
+    weather_code: Option<i32>,
+}
+
+/// Air-quality fields assumed when the whole air-quality feed is absent.
+/// Trace species at 0 read downstream as "no data, no override".
+fn aq_background() -> RawSample {
+    RawSample {
+        aod_550: Some(DEFAULT_AOD_550),
+        dust: Some(0.0),
+        pm2_5: Some(0.0),
+        pm10: Some(0.0),
+        ozone: Some(0.0),
+        nitrogen_dioxide: Some(0.0),
+        cloud_cover: None,
+        cloud_cover_low: None,
+        cloud_cover_mid: None,
+        cloud_cover_high: None,
+        visibility: None,
+        relative_humidity: None,
+        weather_code: None,
+    }
+}
+
+const AQ_FEED_MISSING: &str = "air quality feed returned no data; assuming continental \
+background (AOD 0.15, no dust/PM/O3/NO2)";
+
+fn or_default(value: Option<f64>, default: f64, what: &str, warnings: &mut Vec<String>) -> f64 {
+    match value {
+        Some(v) => v,
+        None => {
+            warnings.push(format!("{what} missing; assuming {default}"));
+            default
+        }
+    }
+}
+
+/// Substitute documented conservative defaults for missing fields,
+/// recording each substitution in `warnings`.
+fn conditions_from(
+    raw: RawSample,
+    timestamp: String,
+    api_latitude: f64,
+    api_longitude: f64,
+    mut warnings: Vec<String>,
+) -> WeatherConditions {
+    let w = &mut warnings;
+    let aod_550 = or_default(raw.aod_550, DEFAULT_AOD_550, "aerosol optical depth", w);
+    let dust_ug_m3 = or_default(raw.dust, 0.0, "dust [ug/m3]", w);
+    let pm2_5_ug_m3 = or_default(raw.pm2_5, 0.0, "PM2.5 [ug/m3]", w);
+    let pm10_ug_m3 = or_default(raw.pm10, 0.0, "PM10 [ug/m3]", w);
+    let ozone_ug_m3 = or_default(raw.ozone, 0.0, "surface O3 [ug/m3]", w);
+    let nitrogen_dioxide_ug_m3 = or_default(raw.nitrogen_dioxide, 0.0, "surface NO2 [ug/m3]", w);
+    let cloud_cover_total = or_default(raw.cloud_cover, 0.0, "total cloud cover [%]", w);
+    let cloud_cover_low = or_default(raw.cloud_cover_low, 0.0, "low cloud cover [%]", w);
+    let cloud_cover_mid = or_default(raw.cloud_cover_mid, 0.0, "mid cloud cover [%]", w);
+    let cloud_cover_high = or_default(raw.cloud_cover_high, 0.0, "high cloud cover [%]", w);
+    let visibility_m = or_default(raw.visibility, DEFAULT_VISIBILITY_M, "visibility [m]", w);
+    let relative_humidity = or_default(
+        raw.relative_humidity,
+        DEFAULT_RELATIVE_HUMIDITY,
+        "relative humidity [%]",
+        w,
+    );
+    let weather_code = match raw.weather_code {
+        Some(c) => c,
+        None => {
+            w.push("weather code missing; assuming clear (0)".to_string());
+            0
+        }
+    };
+    WeatherConditions {
+        aod_550,
+        dust_ug_m3,
+        pm2_5_ug_m3,
+        pm10_ug_m3,
+        ozone_ug_m3,
+        nitrogen_dioxide_ug_m3,
+        cloud_cover_total,
+        cloud_cover_low,
+        cloud_cover_mid,
+        cloud_cover_high,
+        visibility_m,
+        relative_humidity,
+        weather_code,
+        timestamp,
+        api_latitude,
+        api_longitude,
+        data_warnings: warnings,
+    }
+}
+
 /// Fetch current weather conditions from Open-Meteo.
 ///
 /// Makes two HTTP requests (weather + air quality) and merges the results
 /// into a single `WeatherConditions` struct.
 ///
 /// # Errors
-/// Returns an error string if either request fails or returns invalid JSON.
-pub fn fetch_weather(lat: f64, lon: f64) -> Result<WeatherConditions, String> {
+/// Returns a [`WeatherError`] if either request fails, returns invalid
+/// JSON, or the weather feed carries no current conditions.
+pub fn fetch_weather(lat: f64, lon: f64) -> Result<WeatherConditions, WeatherError> {
     let weather_url = format!(
         "{}?latitude={}&longitude={}&current=cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,visibility,relative_humidity_2m,weather_code",
         WEATHER_BASE_URL, lat, lon
@@ -73,54 +195,54 @@ pub fn fetch_weather(lat: f64, lon: f64) -> Result<WeatherConditions, String> {
         AIR_QUALITY_BASE_URL, lat, lon
     );
 
-    // Fetch weather data
-    let weather: WeatherResponse =
-        fetch_json(&weather_url).map_err(|e| format!("Weather API error: {}", e))?;
+    let weather: WeatherResponse = fetch_json(&weather_url)?;
+    let aq: AirQualityResponse = fetch_json(&aq_url)?;
 
-    // Fetch air quality data
-    let aq: AirQualityResponse =
-        fetch_json(&aq_url).map_err(|e| format!("Air Quality API error: {}", e))?;
+    // The primary weather feed must answer; the air-quality feed is
+    // allowed to be absent (recorded as a data gap, not invented away).
+    let wc = weather
+        .current
+        .ok_or_else(|| WeatherError::no_data("weather API returned no current conditions"))?;
 
-    let wc = weather.current.unwrap_or(WeatherCurrent {
-        time: None,
-        cloud_cover: None,
-        cloud_cover_low: None,
-        cloud_cover_mid: None,
-        cloud_cover_high: None,
-        visibility: None,
-        relative_humidity_2m: None,
-        weather_code: None,
-    });
+    let mut warnings = Vec::new();
+    let aqc = match aq.current {
+        Some(c) => c,
+        None => {
+            warnings.push(AQ_FEED_MISSING.to_string());
+            AirQualityCurrent {
+                aerosol_optical_depth: Some(DEFAULT_AOD_550),
+                dust: Some(0.0),
+                pm2_5: Some(0.0),
+                pm10: Some(0.0),
+                ozone: Some(0.0),
+                nitrogen_dioxide: Some(0.0),
+            }
+        }
+    };
 
-    let aqc = aq.current.unwrap_or(AirQualityCurrent {
-        aerosol_optical_depth: None,
-        dust: None,
-        pm2_5: None,
-        pm10: None,
-        ozone: None,
-        nitrogen_dioxide: None,
-    });
-
-    Ok(WeatherConditions {
-        aod_550: aqc.aerosol_optical_depth.unwrap_or(0.0),
-        dust_ug_m3: aqc.dust.unwrap_or(0.0),
-        pm2_5_ug_m3: aqc.pm2_5.unwrap_or(0.0),
-        pm10_ug_m3: aqc.pm10.unwrap_or(0.0),
-        ozone_ug_m3: aqc.ozone.unwrap_or(0.0),
-        nitrogen_dioxide_ug_m3: aqc.nitrogen_dioxide.unwrap_or(0.0),
-        cloud_cover_total: wc.cloud_cover.unwrap_or(0.0),
-        cloud_cover_low: wc.cloud_cover_low.unwrap_or(0.0),
-        cloud_cover_mid: wc.cloud_cover_mid.unwrap_or(0.0),
-        cloud_cover_high: wc.cloud_cover_high.unwrap_or(0.0),
-        visibility_m: wc.visibility.unwrap_or(50000.0),
-        relative_humidity: wc.relative_humidity_2m.unwrap_or(50.0),
-        weather_code: wc.weather_code.unwrap_or(0),
-        timestamp: wc.time.unwrap_or_default(),
-        api_latitude: weather.latitude,
-        api_longitude: weather.longitude,
-    })
+    let raw = RawSample {
+        aod_550: aqc.aerosol_optical_depth,
+        dust: aqc.dust,
+        pm2_5: aqc.pm2_5,
+        pm10: aqc.pm10,
+        ozone: aqc.ozone,
+        nitrogen_dioxide: aqc.nitrogen_dioxide,
+        cloud_cover: wc.cloud_cover,
+        cloud_cover_low: wc.cloud_cover_low,
+        cloud_cover_mid: wc.cloud_cover_mid,
+        cloud_cover_high: wc.cloud_cover_high,
+        visibility: wc.visibility,
+        relative_humidity: wc.relative_humidity_2m,
+        weather_code: wc.weather_code,
+    };
+    Ok(conditions_from(
+        raw,
+        wc.time.unwrap_or_default(),
+        weather.latitude,
+        weather.longitude,
+        warnings,
+    ))
 }
-
 
 // ── Hourly forecast types (for prayer-hour sampling) ──
 
@@ -173,12 +295,17 @@ fn pick<T: Copy>(v: &Option<Vec<Option<T>>>, idx: usize) -> Option<T> {
 ///
 /// `date` is "YYYY-MM-DD"; `hour_utc` is the UTC hour to sample (0-23,
 /// fractional input is rounded to the nearest hour).
+///
+/// # Errors
+/// The requested hour must exist in the returned hourly series; a series
+/// that does not contain it fails with [`WeatherError::NoData`] rather
+/// than silently sampling a different hour.
 pub fn fetch_weather_at(
     lat: f64,
     lon: f64,
     date: &str,
     hour_utc: f64,
-) -> Result<WeatherConditions, String> {
+) -> Result<WeatherConditions, WeatherError> {
     let hour = (hour_utc.rem_euclid(24.0)).round() as usize % 24;
     let target = format!("{}T{:02}:00", date, hour);
 
@@ -191,78 +318,82 @@ pub fn fetch_weather_at(
         AIR_QUALITY_BASE_URL, lat, lon, date, date
     );
 
-    let weather: WeatherHourlyResponse =
-        fetch_json(&weather_url).map_err(|e| format!("Weather API error: {}", e))?;
-    let aq: AirQualityHourlyResponse =
-        fetch_json(&aq_url).map_err(|e| format!("Air Quality API error: {}", e))?;
+    let weather: WeatherHourlyResponse = fetch_json(&weather_url)?;
+    let aq: AirQualityHourlyResponse = fetch_json(&aq_url)?;
 
     let wh = weather
         .hourly
-        .ok_or_else(|| "Weather API returned no hourly data".to_string())?;
-    let widx = wh
-        .time
-        .iter()
-        .position(|t| t == &target)
-        .unwrap_or_else(|| hour.min(wh.time.len().saturating_sub(1)));
+        .ok_or_else(|| WeatherError::no_data("weather API returned no hourly data"))?;
+    let widx = wh.time.iter().position(|t| t == &target).ok_or_else(|| {
+        WeatherError::no_data(format!(
+            "weather API hourly series has no entry for {target} UTC"
+        ))
+    })?;
 
-    let (aqidx, aqh) = match aq.hourly {
+    let mut warnings = Vec::new();
+    let aq_raw = match aq.hourly {
         Some(h) => {
-            let i = h
-                .time
-                .iter()
-                .position(|t| t == &target)
-                .unwrap_or_else(|| hour.min(h.time.len().saturating_sub(1)));
-            (i, Some(h))
+            let i = h.time.iter().position(|t| t == &target).ok_or_else(|| {
+                WeatherError::no_data(format!(
+                    "air quality hourly series has no entry for {target} UTC"
+                ))
+            })?;
+            RawSample {
+                aod_550: pick(&h.aerosol_optical_depth, i),
+                dust: pick(&h.dust, i),
+                pm2_5: pick(&h.pm2_5, i),
+                pm10: pick(&h.pm10, i),
+                ozone: pick(&h.ozone, i),
+                nitrogen_dioxide: pick(&h.nitrogen_dioxide, i),
+                ..aq_background()
+            }
         }
-        None => (0, None),
+        None => {
+            warnings.push(AQ_FEED_MISSING.to_string());
+            aq_background()
+        }
     };
 
-    Ok(WeatherConditions {
-        aod_550: aqh.as_ref().and_then(|h| pick(&h.aerosol_optical_depth, aqidx)).unwrap_or(0.0),
-        dust_ug_m3: aqh.as_ref().and_then(|h| pick(&h.dust, aqidx)).unwrap_or(0.0),
-        pm2_5_ug_m3: aqh.as_ref().and_then(|h| pick(&h.pm2_5, aqidx)).unwrap_or(0.0),
-        pm10_ug_m3: aqh.as_ref().and_then(|h| pick(&h.pm10, aqidx)).unwrap_or(0.0),
-        ozone_ug_m3: aqh.as_ref().and_then(|h| pick(&h.ozone, aqidx)).unwrap_or(0.0),
-        nitrogen_dioxide_ug_m3: aqh
-            .as_ref()
-            .and_then(|h| pick(&h.nitrogen_dioxide, aqidx))
-            .unwrap_or(0.0),
-        cloud_cover_total: pick(&wh.cloud_cover, widx).unwrap_or(0.0),
-        cloud_cover_low: pick(&wh.cloud_cover_low, widx).unwrap_or(0.0),
-        cloud_cover_mid: pick(&wh.cloud_cover_mid, widx).unwrap_or(0.0),
-        cloud_cover_high: pick(&wh.cloud_cover_high, widx).unwrap_or(0.0),
-        visibility_m: pick(&wh.visibility, widx).unwrap_or(50000.0),
-        relative_humidity: pick(&wh.relative_humidity_2m, widx).unwrap_or(50.0),
-        weather_code: pick(&wh.weather_code, widx).unwrap_or(0),
-        timestamp: target,
-        api_latitude: weather.latitude,
-        api_longitude: weather.longitude,
-    })
+    let raw = RawSample {
+        cloud_cover: pick(&wh.cloud_cover, widx),
+        cloud_cover_low: pick(&wh.cloud_cover_low, widx),
+        cloud_cover_mid: pick(&wh.cloud_cover_mid, widx),
+        cloud_cover_high: pick(&wh.cloud_cover_high, widx),
+        visibility: pick(&wh.visibility, widx),
+        relative_humidity: pick(&wh.relative_humidity_2m, widx),
+        weather_code: pick(&wh.weather_code, widx),
+        ..aq_raw
+    };
+    Ok(conditions_from(
+        raw,
+        target,
+        weather.latitude,
+        weather.longitude,
+        warnings,
+    ))
 }
 
-/// Fetch and deserialize JSON from a URL.
-pub(crate) fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
+/// Fetch and deserialize JSON from a URL, retrying transient failures.
+pub(crate) fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, WeatherError> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)))
         .build()
         .new_agent();
 
-    let mut response = agent
-        .get(url)
-        .call()
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
-
-    let body = response
-        .body_mut()
-        .read_to_string()
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+    let body = crate::retry::with_retries(WeatherError::is_transient, || {
+        let mut response = agent
+            .get(url)
+            .call()
+            .map_err(|e| WeatherError::from_ureq(e, url))?;
+        response
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| WeatherError::from_ureq(e, url))
+    })?;
 
     serde_json::from_str(&body).map_err(|e| {
-        format!(
-            "Failed to parse JSON: {} (body: {})",
-            e,
-            &body[..body.len().min(200)]
-        )
+        let head: String = body.chars().take(200).collect();
+        WeatherError::parse(format!("invalid JSON from {url}: {e} (body: {head})"))
     })
 }
 
@@ -289,6 +420,73 @@ mod tests {
         );
         assert!(url.contains("air-quality-api.open-meteo.com"));
         assert!(url.contains("21.42"));
+    }
+
+    fn full_raw() -> RawSample {
+        RawSample {
+            aod_550: Some(0.08),
+            dust: Some(1.0),
+            pm2_5: Some(5.0),
+            pm10: Some(9.0),
+            ozone: Some(55.0),
+            nitrogen_dioxide: Some(12.0),
+            cloud_cover: Some(40.0),
+            cloud_cover_low: Some(10.0),
+            cloud_cover_mid: Some(20.0),
+            cloud_cover_high: Some(30.0),
+            visibility: Some(25_000.0),
+            relative_humidity: Some(60.0),
+            weather_code: Some(2),
+        }
+    }
+
+    #[test]
+    fn complete_sample_yields_no_warnings() {
+        let c = conditions_from(full_raw(), "t".into(), 50.0, 10.0, Vec::new());
+        assert!(c.data_warnings.is_empty(), "{:?}", c.data_warnings);
+        assert!((c.aod_550 - 0.08).abs() < 1e-12);
+        assert!((c.visibility_m - 25_000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn missing_fields_get_conservative_defaults_and_warnings() {
+        let raw = RawSample {
+            aod_550: None,
+            visibility: None,
+            relative_humidity: None,
+            ..full_raw()
+        };
+        let c = conditions_from(raw, "t".into(), 50.0, 10.0, Vec::new());
+        // Conservative, not pristine: continental AOD and 10 km visibility.
+        assert!((c.aod_550 - DEFAULT_AOD_550).abs() < 1e-12);
+        assert!((c.visibility_m - DEFAULT_VISIBILITY_M).abs() < 1e-9);
+        assert!((c.relative_humidity - DEFAULT_RELATIVE_HUMIDITY).abs() < 1e-9);
+        assert_eq!(c.data_warnings.len(), 3, "{:?}", c.data_warnings);
+        assert!(c.data_warnings[0].contains("aerosol optical depth"));
+    }
+
+    #[test]
+    fn aq_feed_missing_recorded_once() {
+        // Whole-feed absence: one block-level warning, no per-field spam.
+        let raw = RawSample {
+            cloud_cover: Some(0.0),
+            cloud_cover_low: Some(0.0),
+            cloud_cover_mid: Some(0.0),
+            cloud_cover_high: Some(0.0),
+            visibility: Some(20_000.0),
+            relative_humidity: Some(50.0),
+            weather_code: Some(0),
+            ..aq_background()
+        };
+        let c = conditions_from(
+            raw,
+            "t".into(),
+            50.0,
+            10.0,
+            vec![AQ_FEED_MISSING.to_string()],
+        );
+        assert_eq!(c.data_warnings.len(), 1, "{:?}", c.data_warnings);
+        assert!((c.aod_550 - DEFAULT_AOD_550).abs() < 1e-12);
     }
 
     // Integration test: actually fetch from Open-Meteo

@@ -1145,13 +1145,7 @@ mod tests {
             RefractResult::Refracted(d) => {
                 // The angular deflection should be tiny (< 0.01 degrees per boundary)
                 let cos_angle = dir.dot(d);
-                let angle_rad = libm::acos(if cos_angle > 1.0 {
-                    1.0
-                } else if cos_angle < -1.0 {
-                    -1.0
-                } else {
-                    cos_angle
-                });
+                let angle_rad = libm::acos(cos_angle.clamp(-1.0, 1.0));
                 let angle_deg = angle_rad * 180.0 / core::f64::consts::PI;
                 assert!(
                     angle_deg < 0.01,

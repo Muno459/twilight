@@ -7,6 +7,8 @@
 //! - Spectral centroid analysis for red/white twilight classification
 //! - Threshold model for Fajr/Isha prayer time determination
 
+#![allow(clippy::needless_range_loop)] // parallel spectral arrays
+
 pub mod luminance;
 pub mod night_sky;
 pub mod night_sky_tables;

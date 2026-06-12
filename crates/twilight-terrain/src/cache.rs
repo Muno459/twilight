@@ -7,11 +7,18 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::error::TerrainError;
+
 /// Ensure the cache directory exists. Creates it if needed.
-pub fn ensure_dir(dir: &Path) -> Result<(), String> {
+pub fn ensure_dir(dir: &Path) -> Result<(), TerrainError> {
     if !dir.exists() {
-        fs::create_dir_all(dir)
-            .map_err(|e| format!("Failed to create cache dir {}: {}", dir.display(), e))?;
+        fs::create_dir_all(dir).map_err(|e| {
+            TerrainError::io(format!(
+                "Failed to create cache dir {}: {}",
+                dir.display(),
+                e
+            ))
+        })?;
     }
     Ok(())
 }
@@ -28,24 +35,24 @@ pub fn tile_path(dir: &Path, filename: &str) -> PathBuf {
 
 /// Write data to a cache file atomically.
 /// Writes to a .tmp file first, then renames to prevent partial files.
-pub fn write_atomic(dir: &Path, filename: &str, data: &[u8]) -> Result<PathBuf, String> {
+pub fn write_atomic(dir: &Path, filename: &str, data: &[u8]) -> Result<PathBuf, TerrainError> {
     ensure_dir(dir)?;
 
     let final_path = dir.join(filename);
     let tmp_path = dir.join(format!("{}.tmp", filename));
 
     fs::write(&tmp_path, data)
-        .map_err(|e| format!("Failed to write {}: {}", tmp_path.display(), e))?;
+        .map_err(|e| TerrainError::io(format!("Failed to write {}: {}", tmp_path.display(), e)))?;
 
     fs::rename(&tmp_path, &final_path)
-        .map_err(|e| format!("Failed to rename {}: {}", tmp_path.display(), e))?;
+        .map_err(|e| TerrainError::io(format!("Failed to rename {}: {}", tmp_path.display(), e)))?;
 
     Ok(final_path)
 }
 
 /// Download a URL to the cache directory. Returns the cached file path.
 /// Skips download if the file already exists.
-pub fn download_to_cache(dir: &Path, filename: &str, url: &str) -> Result<PathBuf, String> {
+pub fn download_to_cache(dir: &Path, filename: &str, url: &str) -> Result<PathBuf, TerrainError> {
     let final_path = dir.join(filename);
     if final_path.exists() {
         return Ok(final_path);
@@ -64,17 +71,17 @@ pub fn download_to_cache(dir: &Path, filename: &str, url: &str) -> Result<PathBu
     let response = agent
         .get(url)
         .call()
-        .map_err(|e| format!("HTTP request failed for {}: {}", url, e))?;
+        .map_err(|e| TerrainError::network(format!("HTTP request failed for {}: {}", url, e)))?;
 
     let status = response.status().as_u16();
     if status == 404 {
-        return Err(format!(
+        return Err(TerrainError::not_covered(format!(
             "DEM tile not found (404): {} -- likely ocean area",
             url
-        ));
+        )));
     }
     if status != 200 {
-        return Err(format!("HTTP {} for {}", status, url));
+        return Err(TerrainError::http(status, url));
     }
 
     // Read response body
@@ -90,7 +97,7 @@ pub fn download_to_cache(dir: &Path, filename: &str, url: &str) -> Result<PathBu
         .into_body()
         .as_reader()
         .read_to_end(&mut body)
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .map_err(|e| TerrainError::network(format!("Failed to read response body: {}", e)))?;
 
     let size_mb = body.len() as f64 / 1_048_576.0;
     eprintln!("  Downloaded {:.1} MB", size_mb);

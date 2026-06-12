@@ -650,7 +650,7 @@ mod tests {
         let atm = make_clear_sky_atm();
         let config = default_config();
         let results = simulate_twilight_scan(&atm, &config, 91.0, 105.0, 2.0);
-        let totals: Vec<f64> = results.iter().map(|r| total_radiance(r)).collect();
+        let totals: Vec<f64> = results.iter().map(total_radiance).collect();
 
         // Radiance should generally decrease (may have small bumps from geometry)
         // Check first vs last

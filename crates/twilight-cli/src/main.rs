@@ -1,14 +1,18 @@
-use clap::{Parser, Subcommand, ValueEnum};
-use twilight_cpu::pipeline::{self, PrayerTimeInput};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use std::path::{Path, PathBuf};
+use twilight_cpu::pipeline::{self, PrayerTimeInput, PrayerTimeOutput};
 use twilight_cpu::simulation::{self, ScatteringMode, SimulationConfig, SpectralResult};
-use twilight_data::aerosol::AerosolType;
+use twilight_data::aerosol::{AerosolProperties, AerosolType};
 use twilight_data::atmosphere_profiles::AtmosphereType;
 use twilight_data::builder;
-use twilight_data::cloud::CloudType;
+use twilight_data::cloud::{CloudProperties, CloudType};
+use twilight_skyglow::SkyglowResult;
 use twilight_solar::de440::De440;
 use twilight_solar::spa::{self, SpaInput};
 use twilight_terrain::horizon;
+use twilight_terrain::HorizonProfile;
 use twilight_threshold::threshold::TwilightColor;
+use twilight_weather::GasComposition;
 
 /// Twilight - Monte Carlo Radiative Transfer engine for Fajr/Isha prayer times.
 #[derive(Parser)]
@@ -117,97 +121,7 @@ enum Commands {
         fast: bool,
     },
     /// Compute physically-based Fajr and Isha prayer times using MCRT
-    Pray {
-        /// Latitude in degrees (north positive)
-        #[arg(short, long)]
-        lat: f64,
-        /// Longitude in degrees (east positive)
-        #[arg(short = 'n', long)]
-        lon: f64,
-        /// Date in YYYY-MM-DD format
-        #[arg(short, long)]
-        date: String,
-        /// Timezone offset from UTC (hours)
-        #[arg(short, long, default_value = "0")]
-        tz: f64,
-        /// Elevation above sea level in meters
-        #[arg(short, long, default_value = "0")]
-        elevation: f64,
-        /// Surface albedo (0-1)
-        #[arg(long, default_value = "0.15")]
-        albedo: f64,
-        /// Delta T (TT - UT1) in seconds
-        #[arg(long, default_value = "69.184")]
-        delta_t: f64,
-        /// SZA scan resolution in degrees (smaller = more accurate, slower)
-        #[arg(long, default_value = "0.5")]
-        sza_step: f64,
-        /// Aerosol type (default: none = clear sky)
-        #[arg(long, value_enum, default_value = "none")]
-        aerosol: CliAerosol,
-        /// Cloud type (default: none = clear sky)
-        #[arg(long, value_enum, default_value = "none")]
-        cloud: CliCloud,
-        /// Path to DE440 BSP file for JPL ephemeris (primary engine)
-        #[arg(long)]
-        de440: Option<String>,
-        /// Scattering mode: single, mc, or hybrid (default: hybrid)
-        #[arg(long, value_enum, default_value = "hybrid")]
-        scattering: CliScattering,
-        /// Number of secondary rays per wavelength per step (hybrid/MC modes)
-        #[arg(short, long, default_value = "100")]
-        photons: usize,
-        /// Show detailed twilight analysis
-        #[arg(long)]
-        verbose: bool,
-        /// Fetch live weather data from Open-Meteo (overrides --aerosol and --cloud)
-        #[arg(long)]
-        weather: bool,
-        /// Enable terrain masking using digital elevation data.
-        /// Downloads Copernicus GLO-30 (30m) tiles on first use.
-        #[arg(long)]
-        terrain: bool,
-        /// Cache directory for DEM tiles (default: data/dem)
-        #[arg(long, default_value = "data/dem")]
-        dem_dir: String,
-        /// Horizon scan radius in km (default: 30)
-        #[arg(long, default_value = "30")]
-        horizon_radius: f64,
-        /// Enable light pollution skyglow model.
-        /// Adds artificial sky brightness to MCRT luminance, shifting prayer times.
-        #[arg(long)]
-        skyglow: bool,
-        /// Bortle dark-sky class (1-9). Alternative to --radiance.
-        /// 1=pristine, 5=suburban, 8=city, 9=inner city.
-        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
-        bortle: Option<u8>,
-        /// VIIRS nighttime radiance at the observer (nW/cm^2/sr).
-        /// Use instead of --bortle for precise input.
-        #[arg(long)]
-        radiance: Option<f64>,
-        /// LED fraction of local lighting (0.0 = all HPS sodium, 1.0 = all LED).
-        /// Default 0.5 (typical mixed modern city).
-        #[arg(long, default_value = "0.5")]
-        led_fraction: f64,
-        /// Force CPU-only computation (skip GPU)
-        #[arg(long)]
-        cpu: bool,
-        /// Preferred GPU backend: metal (auto-detect if omitted)
-        #[arg(long, value_enum)]
-        gpu_backend: Option<CliGpuBackend>,
-        /// Scalar radiance mode (skip Stokes polarization tracking).
-        /// Default is full Stokes [I,Q,U,V]. Use --fast for ~10% speedup
-        /// at the cost of ~0.5-2% polarization correction to intensity.
-        #[arg(long)]
-        fast: bool,
-        /// 3D cloud vertical profile from the cloud3d satellite model
-        /// (SegFormer trained on CloudSat radar profiles). Pass "auto" to
-        /// run tools/cloud3d_profile.py on live GOES imagery (needs
-        /// python3+torch; Americas/Pacific coverage), or a path to a
-        /// sidecar-produced JSON. Overrides single-layer cloud sources.
-        #[arg(long)]
-        cloud3d: Option<String>,
-    },
+    Pray(PrayArgs),
     /// Emit machine-readable spectral radiance for external RT comparison
     /// (e.g. libRadtran/uvspec). CSV to stdout:
     /// sza_deg,view_zenith_deg,rel_azimuth_deg,wavelength_nm,radiance_w_m2_sr_nm
@@ -265,6 +179,101 @@ enum Commands {
         #[arg(long)]
         no_refraction: bool,
     },
+}
+
+/// Arguments to `pray`, passed around as one unit instead of 28
+/// positional parameters.
+#[derive(Args)]
+struct PrayArgs {
+    /// Latitude in degrees (north positive)
+    #[arg(short, long)]
+    lat: f64,
+    /// Longitude in degrees (east positive)
+    #[arg(short = 'n', long)]
+    lon: f64,
+    /// Date in YYYY-MM-DD format
+    #[arg(short, long)]
+    date: String,
+    /// Timezone offset from UTC (hours)
+    #[arg(short, long, default_value = "0")]
+    tz: f64,
+    /// Elevation above sea level in meters
+    #[arg(short, long, default_value = "0")]
+    elevation: f64,
+    /// Surface albedo (0-1)
+    #[arg(long, default_value = "0.15")]
+    albedo: f64,
+    /// Delta T (TT - UT1) in seconds
+    #[arg(long, default_value = "69.184")]
+    delta_t: f64,
+    /// SZA scan resolution in degrees (smaller = more accurate, slower)
+    #[arg(long, default_value = "0.5")]
+    sza_step: f64,
+    /// Aerosol type (default: none = clear sky)
+    #[arg(long, value_enum, default_value = "none")]
+    aerosol: CliAerosol,
+    /// Cloud type (default: none = clear sky)
+    #[arg(long, value_enum, default_value = "none")]
+    cloud: CliCloud,
+    /// Path to DE440 BSP file for JPL ephemeris (primary engine)
+    #[arg(long)]
+    de440: Option<String>,
+    /// Scattering mode: single, mc, or hybrid (default: hybrid)
+    #[arg(long, value_enum, default_value = "hybrid")]
+    scattering: CliScattering,
+    /// Number of secondary rays per wavelength per step (hybrid/MC modes)
+    #[arg(short, long, default_value = "100")]
+    photons: usize,
+    /// Show detailed twilight analysis
+    #[arg(long)]
+    verbose: bool,
+    /// Fetch live weather data from Open-Meteo (overrides --aerosol and --cloud)
+    #[arg(long)]
+    weather: bool,
+    /// Enable terrain masking using digital elevation data.
+    /// Downloads Copernicus GLO-30 (30m) tiles on first use.
+    #[arg(long)]
+    terrain: bool,
+    /// Cache directory for DEM tiles (default: data/dem)
+    #[arg(long, default_value = "data/dem")]
+    dem_dir: String,
+    /// Horizon scan radius in km (default: 30)
+    #[arg(long, default_value = "30")]
+    horizon_radius: f64,
+    /// Enable light pollution skyglow model.
+    /// Adds artificial sky brightness to MCRT luminance, shifting prayer times.
+    #[arg(long)]
+    skyglow: bool,
+    /// Bortle dark-sky class (1-9). Alternative to --radiance.
+    /// 1=pristine, 5=suburban, 8=city, 9=inner city.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=9))]
+    bortle: Option<u8>,
+    /// VIIRS nighttime radiance at the observer (nW/cm^2/sr).
+    /// Use instead of --bortle for precise input.
+    #[arg(long)]
+    radiance: Option<f64>,
+    /// LED fraction of local lighting (0.0 = all HPS sodium, 1.0 = all LED).
+    /// Default 0.5 (typical mixed modern city).
+    #[arg(long, default_value = "0.5")]
+    led_fraction: f64,
+    /// Force CPU-only computation (skip GPU)
+    #[arg(long)]
+    cpu: bool,
+    /// Preferred GPU backend: metal (auto-detect if omitted)
+    #[arg(long, value_enum)]
+    gpu_backend: Option<CliGpuBackend>,
+    /// Scalar radiance mode (skip Stokes polarization tracking).
+    /// Default is full Stokes [I,Q,U,V]. Use --fast for ~10% speedup
+    /// at the cost of ~0.5-2% polarization correction to intensity.
+    #[arg(long)]
+    fast: bool,
+    /// 3D cloud vertical profile from the cloud3d satellite model
+    /// (SegFormer trained on CloudSat radar profiles). Pass "auto" to
+    /// run tools/cloud3d_profile.py on live GOES imagery (needs
+    /// python3+torch; Americas/Pacific coverage), or a path to a
+    /// sidecar-produced JSON. Overrides single-layer cloud sources.
+    #[arg(long)]
+    cloud3d: Option<String>,
 }
 
 /// CLI aerosol type selector.
@@ -461,21 +470,134 @@ fn format_uncertainty(min: Option<f64>) -> String {
     }
 }
 
+/// Format a fractional hour as HH:MM:SS via the one canonical
+/// implementation, `pipeline::format_time` (integer-seconds rounding,
+/// no float truncation drift).
 fn format_fractional_hour(h: f64) -> String {
     if !(0.0..=48.0).contains(&h) {
         return "N/A".to_string();
     }
     // Hours >= 24 are past-midnight events (high-latitude Isha can fall on
     // the next civil day) - display wrapped with a +1d marker.
-    let (h, next_day) = if h >= 24.0 { (h - 24.0, true) } else { (h, false) };
-    let hours = h as u32;
-    let minutes = ((h - hours as f64) * 60.0) as u32;
-    let seconds = ((h - hours as f64 - minutes as f64 / 60.0) * 3600.0) as u32;
-    if next_day {
-        format!("{:02}:{:02}:{:02} (+1d)", hours, minutes, seconds)
+    if h >= 24.0 {
+        format!("{} (+1d)", pipeline::format_time(h - 24.0))
     } else {
-        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+        pipeline::format_time(h)
     }
+}
+
+/// Parse and validate a YYYY-MM-DD date string. Malformed input is a
+/// hard error: a mistyped date must fail, never silently compute times
+/// for some other day.
+fn resolve_date(date: &str) -> (i32, i32, i32) {
+    fn bail(date: &str, reason: &str) -> ! {
+        eprintln!(
+            "Error: invalid date '{}': {}; expected YYYY-MM-DD (e.g. 2026-06-13)",
+            date, reason
+        );
+        std::process::exit(1);
+    }
+    let parts: Vec<&str> = date.split('-').collect();
+    if parts.len() != 3 {
+        bail(date, "wrong number of components");
+    }
+    let year: i32 = parts[0]
+        .parse()
+        .unwrap_or_else(|_| bail(date, "year is not a number"));
+    let month: i32 = parts[1]
+        .parse()
+        .unwrap_or_else(|_| bail(date, "month is not a number"));
+    let day: i32 = parts[2]
+        .parse()
+        .unwrap_or_else(|_| bail(date, "day is not a number"));
+    if !(1..=12).contains(&month) {
+        bail(date, "month must be 1-12");
+    }
+    if !(1..=31).contains(&day) {
+        bail(date, "day must be 1-31");
+    }
+    (year, month, day)
+}
+
+/// Canonical SpaInput for this CLI: local midnight on the given date,
+/// with the standard-atmosphere refraction constants used everywhere
+/// (1013.25 hPa, 15 C, 0.5667 deg refraction, flat horizon). Callers
+/// needing another instant override the time fields or use
+/// `sun_azimuth_at`.
+#[allow(clippy::too_many_arguments)] // one date + one observer frame, fixed by SPA
+fn spa_input_for(
+    lat: f64,
+    lon: f64,
+    elevation: f64,
+    tz: f64,
+    delta_t: f64,
+    year: i32,
+    month: i32,
+    day: i32,
+) -> SpaInput {
+    SpaInput {
+        year,
+        month,
+        day,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        timezone: tz,
+        latitude: lat,
+        longitude: lon,
+        elevation,
+        pressure: 1013.25,
+        temperature: 15.0,
+        delta_t,
+        slope: 0.0,
+        azm_rotation: 0.0,
+        atmos_refract: 0.5667,
+    }
+}
+
+/// Solar azimuth (degrees) at a fractional hour of day on `base`'s date
+/// and frame. Integer-seconds rounding, not float truncation.
+fn sun_azimuth_at(base: &SpaInput, fractional_hour: f64) -> Option<f64> {
+    let mut inp = base.clone();
+    let total = (fractional_hour * 3600.0).round() as i32;
+    inp.hour = total / 3600;
+    inp.minute = (total % 3600) / 60;
+    inp.second = total % 60;
+    spa::solar_position(&inp).ok().map(|o| o.azimuth)
+}
+
+/// Current UTC civil date from the system clock. `mcrt --weather` has no
+/// --date flag but the forecast and satellite samplers need one.
+/// Days-to-civil conversion per Howard Hinnant's date algorithms.
+fn current_utc_date() -> (i32, i32, i32) {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let z = secs.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
+    (year as i32, month as i32, day as i32)
+}
+
+/// Workspace root for sidecar and data paths: the nearest ancestor of
+/// the running executable containing Cargo.toml (target/release lives
+/// inside the workspace). Falls back to the CWD for installed binaries.
+fn repo_root() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.ancestors()
+                .find(|p| p.join("Cargo.toml").is_file())
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn cmd_solar(
@@ -487,14 +609,7 @@ fn cmd_solar(
     delta_t: f64,
     de440_path: Option<&str>,
 ) {
-    let parts: Vec<&str> = date.split('-').collect();
-    if parts.len() != 3 {
-        eprintln!("Error: date must be in YYYY-MM-DD format");
-        std::process::exit(1);
-    }
-    let year: i32 = parts[0].parse().unwrap_or(2024);
-    let month: i32 = parts[1].parse().unwrap_or(1);
-    let day: i32 = parts[2].parse().unwrap_or(1);
+    let (year, month, day) = resolve_date(date);
 
     println!("Twilight Solar Position Calculator");
     println!("==================================");
@@ -512,22 +627,8 @@ fn cmd_solar(
     println!();
 
     let noon_input = SpaInput {
-        year,
-        month,
-        day,
         hour: 12,
-        minute: 0,
-        second: 0,
-        timezone: tz,
-        latitude: lat,
-        longitude: lon,
-        elevation,
-        pressure: 1013.25,
-        temperature: 15.0,
-        delta_t,
-        slope: 0.0,
-        azm_rotation: 0.0,
-        atmos_refract: 0.5667,
+        ..spa_input_for(lat, lon, elevation, tz, delta_t, year, month, day)
     };
 
     match spa::solar_position(&noon_input) {
@@ -588,24 +689,7 @@ fn cmd_solar(
     println!("{:<35} {:>10}  {:>10}", "Event", "Morning", "Evening");
     println!("{:-<60}", "");
 
-    let base_input = SpaInput {
-        year,
-        month,
-        day,
-        hour: 0,
-        minute: 0,
-        second: 0,
-        timezone: tz,
-        latitude: lat,
-        longitude: lon,
-        elevation,
-        pressure: 1013.25,
-        temperature: 15.0,
-        delta_t,
-        slope: 0.0,
-        azm_rotation: 0.0,
-        atmos_refract: 0.5667,
-    };
+    let base_input = spa_input_for(lat, lon, elevation, tz, delta_t, year, month, day);
 
     for angle in TWILIGHT_ANGLES {
         let morning = spa::find_zenith_crossing(&base_input, angle.zenith, 0.0, 12.0, 0.0001);
@@ -651,10 +735,6 @@ fn cmd_mcrt(
     gpu_backend: Option<CliGpuBackend>,
     fast: bool,
 ) {
-    // Suppress unused warnings when gpu feature is disabled
-    #[cfg(not(feature = "gpu"))]
-    let _ = gpu_backend;
-
     println!("Twilight MCRT Simulation");
     println!("=======================");
     println!("Location:     {:.4}°N, {:.4}°E", lat, lon);
@@ -665,50 +745,40 @@ fn cmd_mcrt(
     println!("Photons/λ:    {}", photons);
     println!("Wavelengths:  380-780 nm (41 bands, 10nm steps)");
 
-    // Resolve atmosphere: weather API or manual flags
-    let (aerosol_props, cloud_props, gas_composition, atm_desc) =
-        if use_weather {
-            match twilight_weather::fetch_atmospheric_params(lat, lon) {
-                Ok(params) => {
-                    println!("Weather:      {}", params.description);
-                    let c = &params.conditions;
-                    println!(
-                    "  API data:   AOD={:.2}, cloud={:.0}% (L:{:.0}/M:{:.0}/H:{:.0}), vis={:.0}m",
-                    c.aod_550, c.cloud_cover_total, c.cloud_cover_low,
-                    c.cloud_cover_mid, c.cloud_cover_high, c.visibility_m
-                );
-                    if c.ozone_ug_m3 > 0.0 || c.nitrogen_dioxide_ug_m3 > 0.0 {
-                        println!(
-                            "  Gas data:   O3={:.0} ug/m3, NO2={:.0} ug/m3",
-                            c.ozone_ug_m3, c.nitrogen_dioxide_ug_m3
-                        );
-                    }
-                    (
-                        params.aerosol,
-                        params.cloud,
-                        params.gas_composition,
-                        format!("Live weather: {}", params.description),
-                    )
-                }
-                Err(e) => {
-                    eprintln!("Warning: failed to fetch weather: {}", e);
-                    eprintln!("Falling back to clear sky.");
-                    (
-                        None,
-                        None,
-                        None,
-                        "US Standard 1976 (clear sky, weather fetch failed)".to_string(),
-                    )
-                }
-            }
-        } else {
-            let aerosol_type = aerosol.to_aerosol_type();
-            let cloud_type = cloud.to_cloud_type();
-            let ap = aerosol_type.map(twilight_data::aerosol::default_properties);
-            let cp = cloud_type.map(twilight_data::cloud::default_properties);
-            let desc = format_atm_desc(aerosol_type, cloud_type);
-            (ap, cp, None, desc)
-        };
+    // Resolve atmosphere: weather API or manual flags. mcrt has no
+    // --date flag, so the forecast is sampled on today's UTC date at
+    // this evening's twilight hour, same as `pray`.
+    let (aerosol_props, cloud_props, gas_composition, atm_desc) = if use_weather {
+        let (year, month, day) = current_utc_date();
+        let date_iso = format!("{}-{:02}-{:02}", year, month, day);
+        // Sea level and the 2024 delta-T default: minutes of slack in
+        // the sampling hour cannot move the hourly forecast bucket.
+        let utc_spa = spa_input_for(lat, lon, 0.0, 0.0, 69.184, year, month, day);
+        let twilight_hour_utc = spa::solar_position(&SpaInput {
+            hour: 12,
+            ..utc_spa.clone()
+        })
+        .ok()
+        .map(|o| (o.sunset + 0.75).rem_euclid(24.0));
+        let sun_azimuth =
+            sun_azimuth_at(&utc_spa, twilight_hour_utc.unwrap_or(21.0)).unwrap_or(270.0);
+        let w = weather_block(
+            lat,
+            lon,
+            &date_iso,
+            twilight_hour_utc,
+            sun_azimuth,
+            Path::new("data/satellite"),
+        );
+        (w.aerosol, w.cloud, w.gas, w.description)
+    } else {
+        let aerosol_type = aerosol.to_aerosol_type();
+        let cloud_type = cloud.to_cloud_type();
+        let ap = aerosol_type.map(twilight_data::aerosol::default_properties);
+        let cp = cloud_type.map(twilight_data::cloud::default_properties);
+        let desc = format_atm_desc(aerosol_type, cloud_type);
+        (ap, cp, None, desc)
+    };
 
     println!("Atmosphere:   {}", atm_desc);
     println!("Surface:      albedo = {:.2}", albedo);
@@ -789,7 +859,8 @@ fn cmd_mcrt(
         }
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = force_cpu;
+            // gpu feature off: the GPU flags exist but cannot take effect.
+            let _ = (force_cpu, gpu_backend);
             "CPU (rayon)"
         }
     };
@@ -996,539 +1067,641 @@ fn cmd_compare(
     }
 }
 
-#[allow(clippy::too_many_arguments)] // CLI dispatch: all params come from parsed command-line args
-fn cmd_pray(
+/// Atmosphere inputs resolved from live weather, plus the description
+/// for the run header.
+struct WeatherBlock {
+    aerosol: Option<AerosolProperties>,
+    cloud: Option<CloudProperties>,
+    gas: Option<GasComposition>,
+    description: String,
+}
+
+/// Live-weather resolution shared by `pray` and `mcrt`.
+///
+/// Production weather sampling: prayer times happen at specific twilight
+/// hours, so the hourly FORECAST is sampled at the evening-twilight hour
+/// (sunset + 45 min) for the scan - the best data the API offers - with
+/// a fallback to current conditions if the forecast fetch fails. The
+/// satellite cloud override then replaces the forecast cloud layer when
+/// the satellite measured one.
+fn weather_block(
     lat: f64,
     lon: f64,
-    date: &str,
-    tz: f64,
-    elevation: f64,
-    albedo: f64,
-    delta_t: f64,
-    sza_step: f64,
-    aerosol: CliAerosol,
-    cloud: CliCloud,
-    de440_path: Option<&str>,
-    scattering: CliScattering,
-    photons: usize,
-    verbose: bool,
-    use_weather: bool,
-    use_terrain: bool,
+    date_iso: &str,
+    twilight_hour_utc: Option<f64>,
+    sun_azimuth: f64,
+    satellite_cache: &Path,
+) -> WeatherBlock {
+    let fetched = match twilight_hour_utc {
+        Some(h) => twilight_weather::fetch_atmospheric_params_at(lat, lon, date_iso, h)
+            .map(|p| {
+                (
+                    p,
+                    format!("forecast @ {} {:02}:00 UTC", date_iso, h.round() as u32 % 24),
+                )
+            })
+            .or_else(|e| {
+                eprintln!(
+                    "Note: hourly forecast unavailable ({}); using current conditions.",
+                    e
+                );
+                twilight_weather::fetch_atmospheric_params(lat, lon)
+                    .map(|p| (p, "current conditions".to_string()))
+            }),
+        None => twilight_weather::fetch_atmospheric_params(lat, lon)
+            .map(|p| (p, "current conditions".to_string())),
+    };
+    let sat_cloud = resolve_satellite_cloud(satellite_cache, date_iso, lat, lon, sun_azimuth);
+
+    match fetched {
+        Ok((mut params, src)) => {
+            println!("Weather src: {}", src);
+            if let Some(sc) = sat_cloud {
+                params.cloud = Some(sc);
+                params.description = format!("{} + satellite cloud", params.description);
+            }
+            let c = &params.conditions;
+            println!(
+                "Weather:    AOD={:.2}, cloud={:.0}% (L:{:.0}/M:{:.0}/H:{:.0}), vis={:.0}m",
+                c.aod_550,
+                c.cloud_cover_total,
+                c.cloud_cover_low,
+                c.cloud_cover_mid,
+                c.cloud_cover_high,
+                c.visibility_m
+            );
+            for w in &c.data_warnings {
+                eprintln!("Weather data gap: {}", w);
+            }
+            if c.ozone_ug_m3 > 0.0 || c.nitrogen_dioxide_ug_m3 > 0.0 {
+                println!(
+                    "Gas:        O3={:.0} ug/m3, NO2={:.0} ug/m3",
+                    c.ozone_ug_m3, c.nitrogen_dioxide_ug_m3
+                );
+                if let Some(ref gc) = params.gas_composition {
+                    if let Some(du) = gc.o3_column_du {
+                        println!("            O3 column estimate: {:.0} DU", du);
+                    }
+                }
+            }
+            WeatherBlock {
+                description: format!("Live weather: {}", params.description),
+                aerosol: params.aerosol,
+                cloud: params.cloud,
+                gas: params.gas_composition,
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to fetch weather: {}", e);
+            eprintln!("Falling back to clear sky.");
+            WeatherBlock {
+                aerosol: None,
+                cloud: None,
+                gas: None,
+                description: "US Standard 1976 (clear sky, weather fetch failed)".to_string(),
+            }
+        }
+    }
+}
+
+/// SATELLITE CLOUD ENHANCEMENT: sample the GIBS MODIS cloud field
+/// (COT + cloud-top height) at the observer and along the sun
+/// azimuth ("2.5D" - the twilight shadow path crosses the cloud
+/// field tens to hundreds of km sunward). When the satellite saw
+/// cloud, it overrides the model forecast's cloud layer: measured
+/// optical depth at measured altitude beats a model cover fraction.
+fn resolve_satellite_cloud(
+    cache: &Path,
+    date_iso: &str,
+    lat: f64,
+    lon: f64,
+    sun_azimuth: f64,
+) -> Option<CloudProperties> {
+    let sp = twilight_weather::satellite::sample_cloud_path(cache, date_iso, lat, lon, sun_azimuth);
+    if sp.observer.is_none() && sp.path_cloud_fraction <= 0.0 {
+        return None;
+    }
+    if let Some(obs) = sp.observer {
+        println!(
+            "Satellite:  MODIS COT {:.1} @ top {:.1} km (age {}d), sunward cloud {:.0}% (mean COT {:.1})",
+            obs.cot,
+            obs.cloud_top_m.unwrap_or(0.0) / 1000.0,
+            obs.age_days,
+            sp.path_cloud_fraction * 100.0,
+            sp.path_mean_cot
+        );
+    } else {
+        println!(
+            "Satellite:  clear overhead; sunward cloud {:.0}% (mean COT {:.1})",
+            sp.path_cloud_fraction * 100.0,
+            sp.path_mean_cot
+        );
+    }
+    twilight_weather::mapping::map_cloud_satellite(&sp)
+}
+
+/// Parse the cloud3d sidecar error protocol: handled failures print one
+/// stdout JSON line, {"error": code, "detail": ...}.
+fn sidecar_error(stdout: &str) -> Option<(String, String)> {
+    stdout.lines().rev().find_map(|line| {
+        let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+        let code = v.get("error")?.as_str()?.to_string();
+        let detail = v
+            .get("detail")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string();
+        Some((code, detail))
+    })
+}
+
+/// Launch tools/cloud3d_profile.py on live GOES imagery. The script and
+/// its model/data live in the source tree, so paths resolve against the
+/// repo root, not the CWD. Sidecar exit codes: 2 = coverage,
+/// 3 = environment, 4 = network, each with the JSON error line.
+fn run_cloud3d_sidecar(
+    lat: f64,
+    lon: f64,
+    date_iso: &str,
+    hour_utc: f64,
+    sun_azimuth: f64,
+) -> Option<PathBuf> {
+    let root = repo_root();
+    let script = root.join("tools/cloud3d_profile.py");
+    if !script.is_file() {
+        eprintln!(
+            "Note: cloud3d sidecar not found at {}; continuing without 3D profile.",
+            script.display()
+        );
+        return None;
+    }
+    let out_dir = root.join("data/cloud3d");
+    let _ = std::fs::create_dir_all(&out_dir);
+    let out = out_dir.join("profile.json");
+    let model = std::env::var("CLOUD3D_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| out_dir.join("iwc.jit.pt"));
+    eprintln!("Cloud3D:    running sidecar on live GOES imagery...");
+    let result = std::process::Command::new("python3")
+        .arg(&script)
+        .args(["--lat", &lat.to_string(), "--lon", &lon.to_string()])
+        .args(["--date", date_iso, "--hour", &format!("{hour_utc:.2}")])
+        .args(["--azimuth", &format!("{sun_azimuth:.1}")])
+        .arg("--model")
+        .arg(&model)
+        .arg("--out")
+        .arg(&out)
+        .stderr(std::process::Stdio::inherit())
+        .output();
+    match result {
+        Ok(o) if o.status.success() => {
+            // Pass the captured protocol success line through unchanged.
+            print!("{}", String::from_utf8_lossy(&o.stdout));
+            Some(out)
+        }
+        Ok(o) => {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let cause = match sidecar_error(&stdout) {
+                Some((code, detail)) => {
+                    let what = match code.as_str() {
+                        "outside_coverage" => {
+                            "location outside GOES-East/West coverage (Americas/Pacific only)"
+                        }
+                        "no_granules" => "no GOES granules published for this date/hour",
+                        "below_horizon" => "the satellite cannot see this location",
+                        "missing_deps" => "missing Python dependencies",
+                        "network" => "network failure fetching GOES data",
+                        other => other,
+                    };
+                    format!("{}: {}", what, detail)
+                }
+                None => format!("exited with {}", o.status),
+            };
+            eprintln!(
+                "Note: cloud3d sidecar: {}; continuing without 3D profile.",
+                cause
+            );
+            None
+        }
+        Err(e) => {
+            eprintln!("Note: cloud3d sidecar failed to launch ({e}); continuing.");
+            None
+        }
+    }
+}
+
+/// 3D CLOUDS (cloud3d): an 80-level ice-water-content profile
+/// reconstructed from live geostationary imagery by the cloud3d model
+/// (trained on CloudSat radar). Real measured VERTICAL STRUCTURE -
+/// multiple independent layers - replacing any single-slab source.
+/// `spec` is "auto" (run the sidecar) or a path to sidecar JSON.
+#[allow(clippy::too_many_arguments)] // observer, instant and cache, no natural grouping left
+fn resolve_cloud3d(
+    spec: &str,
+    lat: f64,
+    lon: f64,
+    date_iso: &str,
+    hour_utc: f64,
+    sun_azimuth: f64,
+    satellite_cache: &Path,
+) -> Option<Vec<CloudProperties>> {
+    let json_path: PathBuf = if spec == "auto" {
+        run_cloud3d_sidecar(lat, lon, date_iso, hour_utc, sun_azimuth)?
+    } else {
+        PathBuf::from(spec)
+    };
+    match twilight_weather::cloud3d::load(&json_path) {
+        Ok(p) => {
+            // cloud3d gives the vertical STRUCTURE; the NRT MODIS
+            // COT (when the satellite measured one here, cached
+            // from the weather step) gives the AMPLITUDE.
+            let measured_cot =
+                twilight_weather::satellite::sample_cloud(satellite_cache, date_iso, lat, lon)
+                    .map(|s| s.cot)
+                    .filter(|&c| c > 0.5);
+            let layers = p.to_cloud_layers(measured_cot);
+            if let Some(cot) = measured_cot {
+                if !layers.is_empty() {
+                    println!(
+                        "Cloud3D:    amplitude rescaled to measured MODIS COT {:.1}",
+                        cot
+                    );
+                }
+            }
+            if layers.is_empty() {
+                println!(
+                    "Cloud3D:    {} {} - clear column (window cloud fraction {:.0}%)",
+                    p.satellite,
+                    p.time_utc,
+                    p.cloud_fraction * 100.0
+                );
+                None
+            } else {
+                let tau: f64 = layers.iter().map(|l| l.optical_depth).sum();
+                println!(
+                    "Cloud3D:    {} {}: {} layer(s), total tau {:.2}, window cloud fraction {:.0}%",
+                    p.satellite,
+                    p.time_utc,
+                    layers.len(),
+                    tau,
+                    p.cloud_fraction * 100.0
+                );
+                for l in &layers {
+                    println!(
+                        "            {:.1}-{:.1} km, tau {:.2} (g {:.2})",
+                        l.base_km, l.top_km, l.optical_depth, l.asymmetry
+                    );
+                }
+                Some(layers)
+            }
+        }
+        Err(e) => {
+            eprintln!("Note: cloud3d profile load failed ({e}); continuing.");
+            None
+        }
+    }
+}
+
+/// Terrain masking: horizon profile from DEM tiles around the observer.
+fn resolve_terrain(
+    lat: f64,
+    lon: f64,
     dem_dir: &str,
     horizon_radius: f64,
-    use_skyglow: bool,
-    bortle: Option<u8>,
-    radiance_nw: Option<f64>,
-    led_fraction: f64,
-    force_cpu: bool,
-    gpu_backend_pref: Option<CliGpuBackend>,
-    fast: bool,
-    cloud3d: Option<&str>,
-) {
-    // Suppress unused warnings when gpu feature is disabled
-    #[cfg(not(feature = "gpu"))]
-    let _ = gpu_backend_pref;
+) -> Option<HorizonProfile> {
+    let dem_path = Path::new(dem_dir);
+    let mut source = twilight_terrain::resolve_source(lat, lon, dem_path);
 
-    let parts: Vec<&str> = date.split('-').collect();
-    if parts.len() != 3 {
-        eprintln!("Error: date must be in YYYY-MM-DD format");
-        std::process::exit(1);
+    // Compute bounding box for the horizon scan radius
+    let radius_deg = horizon_radius / 111.0; // approximate degrees for bbox
+    match source.prepare(
+        lat - radius_deg,
+        lon - radius_deg,
+        lat + radius_deg,
+        lon + radius_deg,
+    ) {
+        Ok(()) => {
+            println!(
+                "Terrain:    {} (radius {:.0} km)",
+                source.name(),
+                horizon_radius
+            );
+            let profile = horizon::compute_horizon(source.as_ref(), lat, lon, horizon_radius);
+            let max_hz = profile.max_angle();
+            let min_hz = profile.min_angle();
+            println!(
+                "  Observer: {:.1}m elevation, horizon range {:.3}° to {:.3}°",
+                profile.observer_elev_m, min_hz, max_hz
+            );
+            if max_hz > 0.1 {
+                println!(
+                    "  Terrain masking active: up to {:.1}° obstruction ({:.0} min shift)",
+                    max_hz,
+                    max_hz * 4.0
+                );
+            }
+            Some(profile)
+        }
+        Err(e) => {
+            eprintln!("Warning: failed to load terrain data: {}", e);
+            eprintln!("         Continuing without terrain masking.");
+            None
+        }
     }
-    let year: i32 = parts[0].parse().unwrap_or(2024);
-    let month: i32 = parts[1].parse().unwrap_or(1);
-    let day: i32 = parts[2].parse().unwrap_or(1);
+}
+
+/// Light pollution skyglow: explicit --radiance/--bortle when given,
+/// otherwise the satellite auto mode.
+fn resolve_skyglow(args: &PrayArgs, year: i32, month: i32, day: i32) -> Option<SkyglowResult> {
+    if !(args.skyglow || args.bortle.is_some() || args.radiance.is_some()) {
+        return None;
+    }
+    let radiance = if let Some(r) = args.radiance {
+        r
+    } else if let Some(b) = args.bortle {
+        twilight_skyglow::bortle::bortle_to_radiance(b)
+    } else {
+        // SATELLITE AUTO MODE - two independent satellite feeds:
+        //  1. Lorenz atlas: PROPAGATED artificial zenith brightness
+        //     (the right observable), frozen at its 2024 epoch.
+        //  2. VIIRS Black Marble (GIBS, daily): CURRENT upward
+        //     nighttime-lights radiance, moonlight-removed and
+        //     BRDF-corrected. Same sensor at both epochs gives a
+        //     temporal ratio that brings the atlas to today; where
+        //     the atlas has no data, the live DNB stands alone.
+        let cache = Path::new(&args.dem_dir)
+            .parent()
+            .map(|p| p.join("skyglow"))
+            .unwrap_or_else(|| PathBuf::from("data/skyglow"));
+        let atlas = twilight_skyglow::atlas::artificial_zenith(&cache, args.lat, args.lon);
+        let today = (year, month as u32, day as u32);
+        match atlas {
+            Some(a) => {
+                let mut mcd = a.zenith_mcd;
+                match twilight_skyglow::dnb::epoch_ratio(
+                    &cache,
+                    args.lat,
+                    args.lon,
+                    today,
+                    a.year as i32,
+                ) {
+                    Some((ratio, now, epoch_nw)) => {
+                        mcd *= ratio;
+                        println!(
+                            "Skyglow:    satellite atlas {} {:.3} mcd/m^2 x DNB trend {:.2} \
+                             ({:.1} nW now vs {:.1} nW {}) -> {:.3} mcd/m^2",
+                            a.year, a.zenith_mcd, ratio, now.radiance_nw, epoch_nw, a.year, mcd
+                        );
+                    }
+                    None => {
+                        // No same-sensor data at the atlas epoch (the
+                        // GapFilled layers reach back ~1 year). Fall
+                        // back to a ONE-SIDED live cross-check: a
+                        // bright local pixel proves new lights the
+                        // 2024 atlas missed (raise to the DNB-implied
+                        // floor) - but a dim local pixel proves
+                        // nothing, because the atlas value is
+                        // PROPAGATED sky brightness that may come
+                        // from a metro tens of km away (Brondby's sky
+                        // is lit by central Copenhagen, not its own
+                        // pixel). Never darken from a point sample.
+                        let atlas_nw = twilight_skyglow::bortle::zenith_luminance_to_radiance(mcd);
+                        match twilight_skyglow::dnb::measure(&cache, args.lat, args.lon, today, 1) {
+                            Some(s) if s.radiance_nw > 0.05 => {
+                                let r = s.radiance_nw / atlas_nw.max(1e-6);
+                                if r > 3.0 {
+                                    mcd = twilight_skyglow::bortle::radiance_to_zenith_luminance(
+                                        s.radiance_nw,
+                                    );
+                                    println!(
+                                        "Skyglow:    atlas {} {:.3} mcd/m^2 raised by live \
+                                         DNB {:.1} nW ({:.1}x brighter than atlas-implied) \
+                                         -> {:.3} mcd/m^2",
+                                        a.year, a.zenith_mcd, s.radiance_nw, r, mcd
+                                    );
+                                } else {
+                                    println!(
+                                        "Skyglow:    satellite atlas {} {:.3} mcd/m^2 \
+                                         (live DNB cross-check: {:.1} nW local vs {:.1} nW \
+                                         implied - consistent)",
+                                        a.year, a.zenith_mcd, s.radiance_nw, atlas_nw
+                                    );
+                                }
+                            }
+                            _ => {
+                                println!(
+                                    "Skyglow:    satellite atlas {} -> artificial zenith \
+                                     {:.3} mcd/m^2 (no live DNB here)",
+                                    a.year, a.zenith_mcd
+                                );
+                            }
+                        }
+                    }
+                }
+                twilight_skyglow::bortle::zenith_luminance_to_radiance(mcd)
+            }
+            None => {
+                // Atlas gap: live Black Marble alone.
+                match twilight_skyglow::dnb::measure(&cache, args.lat, args.lon, today, 1) {
+                    Some(s) => {
+                        println!(
+                            "Skyglow:    live VIIRS Black Marble {:.1} nW/cm^2/sr \
+                             (median of {} nights, {})",
+                            s.radiance_nw,
+                            s.dates_used.len(),
+                            s.layer
+                        );
+                        s.radiance_nw
+                    }
+                    None => {
+                        eprintln!("Note: no satellite skyglow data here; using Bortle 5 default.");
+                        twilight_skyglow::bortle::bortle_to_radiance(5)
+                    }
+                }
+            }
+        }
+    };
+
+    let result = twilight_skyglow::quick_estimate_at_angle(radiance, args.led_fraction, 10.0);
+    let lum_mcd = twilight_skyglow::bortle::radiance_to_zenith_luminance(radiance);
+    println!(
+        "Skyglow:    Bortle {}, zenith {:.2} mcd/m^2, LED fraction {:.0}%",
+        result.bortle_class,
+        lum_mcd,
+        args.led_fraction * 100.0
+    );
+    let shift = twilight_skyglow::bortle::estimated_prayer_shift_minutes(lum_mcd);
+    if shift > 0.5 {
+        println!("  Estimated prayer time shift: ~{:.0} minutes", shift);
+    }
+    Some(result)
+}
+
+/// Assemble the pipeline input from the resolved pieces. Weather-derived
+/// properties travel in the custom_* slots; manual flags go through the
+/// type-based path.
+fn build_input(
+    args: &PrayArgs,
+    date: (i32, i32, i32),
+    weather: Option<WeatherBlock>,
+    cloud_layers: Option<Vec<CloudProperties>>,
+    horizon_profile: Option<HorizonProfile>,
+    skyglow: Option<SkyglowResult>,
+    solar_f107: Option<f64>,
+) -> PrayerTimeInput {
+    let (year, month, day) = date;
+    let (aerosol_type, cloud_type, custom_aerosol, custom_cloud, o3_du, no2_density) = match weather
+    {
+        Some(w) => {
+            let (o3, no2) = w
+                .gas
+                .map(|gc| (gc.o3_column_du, gc.no2_surface_density))
+                .unwrap_or((None, None));
+            (None, None, w.aerosol, w.cloud, o3, no2)
+        }
+        None => {
+            let at = args.aerosol.to_aerosol_type();
+            let ct = args.cloud.to_cloud_type();
+            (at, ct, None, None, None, None)
+        }
+    };
+    PrayerTimeInput {
+        latitude: args.lat,
+        longitude: args.lon,
+        elevation: args.elevation,
+        year,
+        month,
+        day,
+        timezone: args.tz,
+        delta_t: args.delta_t,
+        surface_albedo: args.albedo,
+        sza_step: args.sza_step,
+        aerosol_type,
+        cloud_type,
+        custom_aerosol,
+        custom_cloud,
+        de440_path: args.de440.clone(),
+        scattering_mode: args.scattering.to_scattering_mode(),
+        photons_per_wavelength: args.photons,
+        horizon_profile,
+        skyglow,
+        o3_column_du: o3_du,
+        no2_surface_density: no2_density,
+        polarized: !args.fast,
+        solar_f107,
+        cloud_layers,
+        verbose: args.verbose,
+        ..Default::default()
+    }
+}
+
+fn cmd_pray(args: PrayArgs) {
+    let (year, month, day) = resolve_date(&args.date);
 
     println!("Twilight MCRT Prayer Time Calculator");
     println!("====================================");
     println!("Date:       {}-{:02}-{:02}", year, month, day);
-    println!("Location:   {:.4}°N, {:.4}°E", lat, lon);
-    println!("Elevation:  {:.0} m", elevation);
-    println!("Timezone:   UTC{:+.1}", tz);
-    println!("Albedo:     {:.2}", albedo);
-    println!("SZA step:   {:.2}°", sza_step);
+    println!("Location:   {:.4}°N, {:.4}°E", args.lat, args.lon);
+    println!("Elevation:  {:.0} m", args.elevation);
+    println!("Timezone:   UTC{:+.1}", args.tz);
+    println!("Albedo:     {:.2}", args.albedo);
+    println!("SZA step:   {:.2}°", args.sza_step);
 
-    // Resolve atmosphere: weather API or manual flags.
-    //
-    // Production weather sampling: prayer times happen at specific twilight
-    // hours, so the hourly FORECAST is sampled at the evening-twilight hour
-    // (sunset + 45 min) for the scan - the best data the API offers - with
-    // a fallback to current conditions if the forecast fetch fails.
-    let twilight_hour_utc: Option<f64> = {
-        // Quick SPA sunset for the forecast hour (UTC fractional hours).
-        let spa_in = SpaInput {
-            year,
-            month,
-            day,
-            hour: 12,
-            minute: 0,
-            second: 0,
-            timezone: 0.0,
-            latitude: lat,
-            longitude: lon,
-            elevation,
-            pressure: 1013.25,
-            temperature: 15.0,
-            delta_t,
-            slope: 0.0,
-            azm_rotation: 0.0,
-            atmos_refract: 0.5667,
-        };
-        spa::solar_position(&spa_in)
-            .ok()
-            .map(|o| (o.sunset + 0.75).rem_euclid(24.0))
-    };
+    // The forecast sampling hour (evening twilight = SPA sunset + 45 min,
+    // UTC) and the matching sun azimuth, shared by the weather block and
+    // the cloud3d sidecar.
     let date_iso = format!("{}-{:02}-{:02}", year, month, day);
-    let (weather_aerosol, weather_cloud, weather_gas, atm_desc) = if use_weather {
-        let fetched = match twilight_hour_utc {
-            Some(h) => twilight_weather::fetch_atmospheric_params_at(lat, lon, &date_iso, h)
-                .map(|p| (p, format!("forecast @ {} {:02}:00 UTC", date_iso, h.round() as u32 % 24)))
-                .or_else(|e| {
-                    eprintln!("Note: hourly forecast unavailable ({}); using current conditions.", e);
-                    twilight_weather::fetch_atmospheric_params(lat, lon)
-                        .map(|p| (p, "current conditions".to_string()))
-                }),
-            None => twilight_weather::fetch_atmospheric_params(lat, lon)
-                .map(|p| (p, "current conditions".to_string())),
-        };
-        // SATELLITE CLOUD ENHANCEMENT: sample the GIBS MODIS cloud field
-        // (COT + cloud-top height) at the observer and along the sun
-        // azimuth ("2.5D" - the twilight shadow path crosses the cloud
-        // field tens to hundreds of km sunward). When the satellite saw
-        // cloud, it overrides the model forecast's cloud layer: measured
-        // optical depth at measured altitude beats a model cover fraction.
-        let sat_cloud = {
-            let cache = std::path::Path::new(&dem_dir)
-                .parent()
-                .map(|p| p.join("satellite"))
-                .unwrap_or_else(|| std::path::PathBuf::from("data/satellite"));
-            // Sun azimuth at the evening-twilight hour for the path samples.
-            let sun_az = twilight_hour_utc
-                .and_then(|h| {
-                    let mut inp = SpaInput {
-                        year,
-                        month,
-                        day,
-                        hour: 12,
-                        minute: 0,
-                        second: 0,
-                        timezone: 0.0,
-                        latitude: lat,
-                        longitude: lon,
-                        elevation,
-                        pressure: 1013.25,
-                        temperature: 15.0,
-                        delta_t,
-                        slope: 0.0,
-                        azm_rotation: 0.0,
-                        atmos_refract: 0.5667,
-                    };
-                    let total = (h * 3600.0).round() as i32;
-                    inp.hour = total / 3600;
-                    inp.minute = (total % 3600) / 60;
-                    inp.second = total % 60;
-                    spa::solar_position(&inp).ok().map(|o| o.azimuth)
-                })
-                .unwrap_or(270.0);
-            let sp = twilight_weather::satellite::sample_cloud_path(
-                &cache, &date_iso, lat, lon, sun_az,
-            );
-            if sp.observer.is_some() || sp.path_cloud_fraction > 0.0 {
-                if let Some(obs) = sp.observer {
-                    println!(
-                        "Satellite:  MODIS COT {:.1} @ top {:.1} km (age {}d), sunward cloud {:.0}% (mean COT {:.1})",
-                        obs.cot,
-                        obs.cloud_top_m.unwrap_or(0.0) / 1000.0,
-                        obs.age_days,
-                        sp.path_cloud_fraction * 100.0,
-                        sp.path_mean_cot
-                    );
-                } else {
-                    println!(
-                        "Satellite:  clear overhead; sunward cloud {:.0}% (mean COT {:.1})",
-                        sp.path_cloud_fraction * 100.0,
-                        sp.path_mean_cot
-                    );
-                }
-                twilight_weather::mapping::map_cloud_satellite(&sp)
-            } else {
-                None
-            }
-        };
+    let utc_spa = spa_input_for(
+        args.lat,
+        args.lon,
+        args.elevation,
+        0.0,
+        args.delta_t,
+        year,
+        month,
+        day,
+    );
+    let twilight_hour_utc = spa::solar_position(&SpaInput {
+        hour: 12,
+        ..utc_spa.clone()
+    })
+    .ok()
+    .map(|o| (o.sunset + 0.75).rem_euclid(24.0));
+    let sampling_hour_utc = twilight_hour_utc.unwrap_or(21.0);
+    let sun_azimuth = sun_azimuth_at(&utc_spa, sampling_hour_utc).unwrap_or(270.0);
+    let satellite_cache = Path::new(&args.dem_dir)
+        .parent()
+        .map(|p| p.join("satellite"))
+        .unwrap_or_else(|| PathBuf::from("data/satellite"));
 
-        match fetched.map(|(mut p, src)| {
-            println!("Weather src: {}", src);
-            if let Some(sc) = sat_cloud {
-                p.cloud = Some(sc);
-                p.description = format!("{} + satellite cloud", p.description);
-            }
-            p
-        }) {
-            Ok(params) => {
-                let c = &params.conditions;
-                println!(
-                    "Weather:    AOD={:.2}, cloud={:.0}% (L:{:.0}/M:{:.0}/H:{:.0}), vis={:.0}m",
-                    c.aod_550,
-                    c.cloud_cover_total,
-                    c.cloud_cover_low,
-                    c.cloud_cover_mid,
-                    c.cloud_cover_high,
-                    c.visibility_m
-                );
-                if c.ozone_ug_m3 > 0.0 || c.nitrogen_dioxide_ug_m3 > 0.0 {
-                    println!(
-                        "Gas:        O3={:.0} ug/m3, NO2={:.0} ug/m3",
-                        c.ozone_ug_m3, c.nitrogen_dioxide_ug_m3
-                    );
-                    if let Some(ref gc) = params.gas_composition {
-                        if let Some(du) = gc.o3_column_du {
-                            println!("            O3 column estimate: {:.0} DU", du);
-                        }
-                    }
-                }
-                let desc = format!("Live weather: {}", params.description);
-                (params.aerosol, params.cloud, params.gas_composition, desc)
-            }
-            Err(e) => {
-                eprintln!("Warning: failed to fetch weather: {}", e);
-                eprintln!("Falling back to clear sky.");
-                (
-                    None,
-                    None,
-                    None,
-                    "US Standard 1976 (clear sky, weather fetch failed)".to_string(),
-                )
-            }
-        }
+    let weather = if args.weather {
+        Some(weather_block(
+            args.lat,
+            args.lon,
+            &date_iso,
+            twilight_hour_utc,
+            sun_azimuth,
+            &satellite_cache,
+        ))
     } else {
-        let aerosol_type = aerosol.to_aerosol_type();
-        let cloud_type = cloud.to_cloud_type();
-        let ap = aerosol_type.map(twilight_data::aerosol::default_properties);
-        let cp = cloud_type.map(twilight_data::cloud::default_properties);
-        let desc = format_atm_desc(aerosol_type, cloud_type);
-        (ap, cp, None, desc)
+        None
     };
 
-    // 3D CLOUDS (cloud3d): an 80-level ice-water-content profile
-    // reconstructed from live geostationary imagery by the cloud3d model
-    // (trained on CloudSat radar). Real measured VERTICAL STRUCTURE -
-    // multiple independent layers - replacing any single-slab source.
-    let cloud_layers: Option<Vec<twilight_data::cloud::CloudProperties>> =
-        cloud3d.and_then(|spec| {
-            let json_path: std::path::PathBuf = if spec == "auto" {
-                let out = std::path::PathBuf::from("data/cloud3d/profile.json");
-                let _ = std::fs::create_dir_all("data/cloud3d");
-                let model = std::env::var("CLOUD3D_MODEL")
-                    .unwrap_or_else(|_| "data/cloud3d/iwc.jit.pt".to_string());
-                let hour = twilight_hour_utc.unwrap_or(21.0);
-                // Sun azimuth at the twilight hour for the sunward path samples.
-                let sun_az = {
-                    let mut inp = SpaInput {
-                        year,
-                        month,
-                        day,
-                        hour: 12,
-                        minute: 0,
-                        second: 0,
-                        timezone: 0.0,
-                        latitude: lat,
-                        longitude: lon,
-                        elevation,
-                        pressure: 1013.25,
-                        temperature: 15.0,
-                        delta_t,
-                        slope: 0.0,
-                        azm_rotation: 0.0,
-                        atmos_refract: 0.5667,
-                    };
-                    let total = (hour * 3600.0).round() as i32;
-                    inp.hour = total / 3600;
-                    inp.minute = (total % 3600) / 60;
-                    inp.second = total % 60;
-                    spa::solar_position(&inp).ok().map(|o| o.azimuth).unwrap_or(270.0)
-                };
-                eprintln!("Cloud3D:    running sidecar on live GOES imagery...");
-                let status = std::process::Command::new("python3")
-                    .arg("tools/cloud3d_profile.py")
-                    .args(["--lat", &lat.to_string(), "--lon", &lon.to_string()])
-                    .args(["--date", &date_iso, "--hour", &format!("{hour:.2}")])
-                    .args(["--azimuth", &format!("{sun_az:.1}")])
-                    .args(["--model", &model])
-                    .arg("--out")
-                    .arg(&out)
-                    .status();
-                match status {
-                    Ok(s) if s.success() => out,
-                    Ok(_) => {
-                        eprintln!(
-                            "Note: cloud3d sidecar found no usable imagery here \
-                             (outside GOES coverage?); continuing without 3D profile."
-                        );
-                        return None;
-                    }
-                    Err(e) => {
-                        eprintln!("Note: cloud3d sidecar failed to launch ({e}); continuing.");
-                        return None;
-                    }
-                }
-            } else {
-                std::path::PathBuf::from(spec)
-            };
-            match twilight_weather::cloud3d::load(&json_path) {
-                Ok(p) => {
-                    // cloud3d gives the vertical STRUCTURE; the NRT MODIS
-                    // COT (when the satellite measured one here, cached
-                    // from the weather step) gives the AMPLITUDE.
-                    let measured_cot = {
-                        let cache = std::path::Path::new(&dem_dir)
-                            .parent()
-                            .map(|p| p.join("satellite"))
-                            .unwrap_or_else(|| std::path::PathBuf::from("data/satellite"));
-                        twilight_weather::satellite::sample_cloud(&cache, &date_iso, lat, lon)
-                            .map(|s| s.cot)
-                            .filter(|&c| c > 0.5)
-                    };
-                    let layers = p.to_cloud_layers(measured_cot);
-                    if measured_cot.is_some() && !layers.is_empty() {
-                        println!(
-                            "Cloud3D:    amplitude rescaled to measured MODIS COT {:.1}",
-                            measured_cot.unwrap()
-                        );
-                    }
-                    if layers.is_empty() {
-                        println!(
-                            "Cloud3D:    {} {} - clear column (window cloud fraction {:.0}%)",
-                            p.satellite,
-                            p.time_utc,
-                            p.cloud_fraction * 100.0
-                        );
-                        None
-                    } else {
-                        let tau: f64 = layers.iter().map(|l| l.optical_depth).sum();
-                        println!(
-                            "Cloud3D:    {} {}: {} layer(s), total tau {:.2}, window cloud fraction {:.0}%",
-                            p.satellite,
-                            p.time_utc,
-                            layers.len(),
-                            tau,
-                            p.cloud_fraction * 100.0
-                        );
-                        for l in &layers {
-                            println!(
-                                "            {:.1}-{:.1} km, tau {:.2} (g {:.2})",
-                                l.base_km, l.top_km, l.optical_depth, l.asymmetry
-                            );
-                        }
-                        Some(layers)
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Note: cloud3d profile load failed ({e}); continuing.");
-                    None
-                }
-            }
-        });
+    let cloud_layers = args.cloud3d.as_deref().and_then(|spec| {
+        resolve_cloud3d(
+            spec,
+            args.lat,
+            args.lon,
+            &date_iso,
+            sampling_hour_utc,
+            sun_azimuth,
+            &satellite_cache,
+        )
+    });
 
+    let atm_desc = match weather.as_ref() {
+        Some(w) => w.description.clone(),
+        None => format_atm_desc(args.aerosol.to_aerosol_type(), args.cloud.to_cloud_type()),
+    };
     println!("Atmosphere: {}", atm_desc);
-    let ephemeris_label = if de440_path.is_some() {
+    let ephemeris_label = if args.de440.is_some() {
         "JPL DE440"
     } else {
         "NREL SPA"
     };
-    let scattering_mode = scattering.to_scattering_mode();
-    let polarized = !fast;
-    let method_str = match scattering_mode {
+    let method_str = match args.scattering.to_scattering_mode() {
         ScatteringMode::Single => "Single-scatter MCRT + CIE mesopic vision".to_string(),
         ScatteringMode::Multiple => format!(
             "Multiple-scatter MC ({} photons/wl) + CIE mesopic vision",
-            photons
+            args.photons
         ),
         ScatteringMode::Hybrid => format!(
             "Hybrid SS+MC ({} sec. rays/step) + CIE mesopic vision",
-            photons
+            args.photons
         ),
     };
     println!("Ephemeris:  {}", ephemeris_label);
     println!("Method:     {}", method_str);
-    let pol_str = if polarized {
-        "Stokes [I,Q,U,V]"
-    } else {
+    let pol_str = if args.fast {
         "Scalar (--fast)"
+    } else {
+        "Stokes [I,Q,U,V]"
     };
     println!("Polarize:   {}", pol_str);
 
-    // Terrain masking
-    let horizon_profile = if use_terrain {
-        let dem_path = std::path::Path::new(dem_dir);
-        let mut source = twilight_terrain::resolve_source(lat, lon, dem_path);
-
-        // Compute bounding box for the horizon scan radius
-        let radius_deg = horizon_radius / 111.0; // approximate degrees for bbox
-        match source.prepare(
-            lat - radius_deg,
-            lon - radius_deg,
-            lat + radius_deg,
-            lon + radius_deg,
-        ) {
-            Ok(()) => {
-                println!(
-                    "Terrain:    {} (radius {:.0} km)",
-                    source.name(),
-                    horizon_radius
-                );
-                let profile = horizon::compute_horizon(source.as_ref(), lat, lon, horizon_radius);
-                let max_hz = profile.max_angle();
-                let min_hz = profile.min_angle();
-                println!(
-                    "  Observer: {:.1}m elevation, horizon range {:.3}° to {:.3}°",
-                    profile.observer_elev_m, min_hz, max_hz
-                );
-                if max_hz > 0.1 {
-                    println!(
-                        "  Terrain masking active: up to {:.1}° obstruction ({:.0} min shift)",
-                        max_hz,
-                        max_hz * 4.0
-                    );
-                }
-                Some(profile)
-            }
-            Err(e) => {
-                eprintln!("Warning: failed to load terrain data: {}", e);
-                eprintln!("         Continuing without terrain masking.");
-                None
-            }
-        }
+    let horizon_profile = if args.terrain {
+        resolve_terrain(args.lat, args.lon, &args.dem_dir, args.horizon_radius)
     } else {
         None
     };
 
-    // Light pollution skyglow
-    let skyglow_result = if use_skyglow || bortle.is_some() || radiance_nw.is_some() {
-        let radiance = if let Some(r) = radiance_nw {
-            r
-        } else if let Some(b) = bortle {
-            twilight_skyglow::bortle::bortle_to_radiance(b)
-        } else {
-            // SATELLITE AUTO MODE - two independent satellite feeds:
-            //  1. Lorenz atlas: PROPAGATED artificial zenith brightness
-            //     (the right observable), frozen at its 2024 epoch.
-            //  2. VIIRS Black Marble (GIBS, daily): CURRENT upward
-            //     nighttime-lights radiance, moonlight-removed and
-            //     BRDF-corrected. Same sensor at both epochs gives a
-            //     temporal ratio that brings the atlas to today; where
-            //     the atlas has no data, the live DNB stands alone.
-            let cache = std::path::Path::new(&dem_dir)
-                .parent()
-                .map(|p| p.join("skyglow"))
-                .unwrap_or_else(|| std::path::PathBuf::from("data/skyglow"));
-            let atlas = twilight_skyglow::atlas::artificial_zenith(&cache, lat, lon);
-            let today = (year, month as u32, day as u32);
-            match atlas {
-                Some(a) => {
-                    let mut mcd = a.zenith_mcd;
-                    match twilight_skyglow::dnb::epoch_ratio(&cache, lat, lon, today, a.year as i32)
-                    {
-                        Some((ratio, now, epoch_nw)) => {
-                            mcd *= ratio;
-                            println!(
-                                "Skyglow:    satellite atlas {} {:.3} mcd/m^2 x DNB trend {:.2} \
-                                 ({:.1} nW now vs {:.1} nW {}) -> {:.3} mcd/m^2",
-                                a.year, a.zenith_mcd, ratio, now.radiance_nw, epoch_nw, a.year, mcd
-                            );
-                        }
-                        None => {
-                            // No same-sensor data at the atlas epoch (the
-                            // GapFilled layers reach back ~1 year). Fall
-                            // back to a ONE-SIDED live cross-check: a
-                            // bright local pixel proves new lights the
-                            // 2024 atlas missed (raise to the DNB-implied
-                            // floor) - but a dim local pixel proves
-                            // nothing, because the atlas value is
-                            // PROPAGATED sky brightness that may come
-                            // from a metro tens of km away (Brondby's sky
-                            // is lit by central Copenhagen, not its own
-                            // pixel). Never darken from a point sample.
-                            let atlas_nw =
-                                twilight_skyglow::bortle::zenith_luminance_to_radiance(mcd);
-                            match twilight_skyglow::dnb::measure(&cache, lat, lon, today, 1) {
-                                Some(s) if s.radiance_nw > 0.05 => {
-                                    let r = s.radiance_nw / atlas_nw.max(1e-6);
-                                    if r > 3.0 {
-                                        mcd = twilight_skyglow::bortle::radiance_to_zenith_luminance(
-                                            s.radiance_nw,
-                                        );
-                                        println!(
-                                            "Skyglow:    atlas {} {:.3} mcd/m^2 raised by live \
-                                             DNB {:.1} nW ({:.1}x brighter than atlas-implied) \
-                                             -> {:.3} mcd/m^2",
-                                            a.year, a.zenith_mcd, s.radiance_nw, r, mcd
-                                        );
-                                    } else {
-                                        println!(
-                                            "Skyglow:    satellite atlas {} {:.3} mcd/m^2 \
-                                             (live DNB cross-check: {:.1} nW local vs {:.1} nW \
-                                             implied - consistent)",
-                                            a.year, a.zenith_mcd, s.radiance_nw, atlas_nw
-                                        );
-                                    }
-                                }
-                                _ => {
-                                    println!(
-                                        "Skyglow:    satellite atlas {} -> artificial zenith \
-                                         {:.3} mcd/m^2 (no live DNB here)",
-                                        a.year, a.zenith_mcd
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    twilight_skyglow::bortle::zenith_luminance_to_radiance(mcd)
-                }
-                None => {
-                    // Atlas gap: live Black Marble alone.
-                    match twilight_skyglow::dnb::measure(&cache, lat, lon, today, 1) {
-                        Some(s) => {
-                            println!(
-                                "Skyglow:    live VIIRS Black Marble {:.1} nW/cm^2/sr \
-                                 (median of {} nights, {})",
-                                s.radiance_nw,
-                                s.dates_used.len(),
-                                s.layer
-                            );
-                            s.radiance_nw
-                        }
-                        None => {
-                            eprintln!(
-                                "Note: no satellite skyglow data here; using Bortle 5 default."
-                            );
-                            twilight_skyglow::bortle::bortle_to_radiance(5)
-                        }
-                    }
-                }
-            }
-        };
-
-        let result = twilight_skyglow::quick_estimate_at_angle(radiance, led_fraction, 10.0);
-        let lum_mcd = twilight_skyglow::bortle::radiance_to_zenith_luminance(radiance);
-        println!(
-            "Skyglow:    Bortle {}, zenith {:.2} mcd/m^2, LED fraction {:.0}%",
-            result.bortle_class,
-            lum_mcd,
-            led_fraction * 100.0
-        );
-        let shift = twilight_skyglow::bortle::estimated_prayer_shift_minutes(lum_mcd);
-        if shift > 0.5 {
-            println!("  Estimated prayer time shift: ~{:.0} minutes", shift);
-        }
-        Some(result)
-    } else {
-        None
-    };
+    let skyglow_result = resolve_skyglow(&args, year, month, day);
 
     // Measured solar activity for the airglow background. F10.7 is a real
     // daily-measured quantity (Penticton/NOAA SWPC) - only fetched when the
     // run is already online (weather mode); offline runs keep the mid-cycle
     // default inside the pipeline.
-    let solar_f107 = if use_weather {
+    let solar_f107 = if args.weather {
         match twilight_weather::f107::fetch_f107() {
             Ok(flux) => {
                 println!(
@@ -1553,47 +1726,15 @@ fn cmd_pray(
 
     println!();
 
-    // When using weather API, pass custom properties directly.
-    // When using manual flags, use the type-based approach.
-    let (aerosol_type, cloud_type, custom_aerosol, custom_cloud, o3_du, no2_density) =
-        if use_weather {
-            let (o3, no2) = weather_gas
-                .map(|gc| (gc.o3_column_du, gc.no2_surface_density))
-                .unwrap_or((None, None));
-            (None, None, weather_aerosol, weather_cloud, o3, no2)
-        } else {
-            let at = aerosol.to_aerosol_type();
-            let ct = cloud.to_cloud_type();
-            (at, ct, None, None, None, None)
-        };
-
-    let input = PrayerTimeInput {
-        latitude: lat,
-        longitude: lon,
-        elevation,
-        year,
-        month,
-        day,
-        timezone: tz,
-        delta_t,
-        surface_albedo: albedo,
-        sza_step,
-        aerosol_type,
-        cloud_type,
-        custom_aerosol,
-        custom_cloud,
-        de440_path: de440_path.map(|s| s.to_string()),
-        scattering_mode,
-        photons_per_wavelength: photons,
-        horizon_profile,
-        skyglow: skyglow_result,
-        o3_column_du: o3_du,
-        no2_surface_density: no2_density,
-        polarized,
-        solar_f107,
+    let input = build_input(
+        &args,
+        (year, month, day),
+        weather,
         cloud_layers,
-        ..Default::default()
-    };
+        horizon_profile,
+        skyglow_result,
+        solar_f107,
+    );
 
     // GPU initialization. GPU is the default compute backend for all modes.
     // Single-scatter benefits from batched dispatch (2.5x faster than serial).
@@ -1601,10 +1742,10 @@ fn cmd_pray(
     // Use --cpu to opt out.
 
     #[cfg(feature = "gpu")]
-    let mut gpu_backend = if force_cpu {
+    let mut gpu_backend = if args.cpu {
         None
     } else {
-        try_init_gpu(gpu_backend_pref, photons)
+        try_init_gpu(args.gpu_backend, args.photons)
     };
 
     let compute_label = {
@@ -1620,7 +1761,8 @@ fn cmd_pray(
         }
         #[cfg(not(feature = "gpu"))]
         {
-            let _ = force_cpu;
+            // gpu feature off: the GPU flags exist but cannot take effect.
+            let _ = (args.cpu, args.gpu_backend);
             "CPU (rayon)"
         }
     };
@@ -1646,6 +1788,14 @@ fn cmd_pray(
         "Done in {} ms (ephemeris: {}, compute: {})",
         output.computation_time_ms, actual_ephemeris, compute_label
     );
+
+    report(&args, &input, &output);
+}
+
+/// All result printing for `pray`: prayer-time blocks, terrain and
+/// skyglow adjustments, the khayt and legacy methods, the conventional
+/// fixed-angle comparison, the verbose analysis table and the notes.
+fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
     println!();
 
     // Print results
@@ -1719,6 +1869,13 @@ fn cmd_pray(
             println!("     Twilight never fully ends on this date at this latitude.");
             println!();
         }
+    }
+
+    // Threshold refloat on the measured celestial background (moonlit
+    // nights, strong airglow): the pipeline computes the note, the CLI
+    // reports it.
+    if let Some(ref note) = output.celestial_refloat {
+        println!("  {}", note);
     }
 
     // ── PRIMARY: the khayt al-abyad criterion (Quran 2:187) ──
@@ -1835,24 +1992,16 @@ fn cmd_pray(
     println!("Comparison with conventional fixed-angle methods:");
     println!("{:-<65}", "");
 
-    let base_input = SpaInput {
-        year,
-        month,
-        day,
-        hour: 0,
-        minute: 0,
-        second: 0,
-        timezone: tz,
-        latitude: lat,
-        longitude: lon,
-        elevation,
-        pressure: 1013.25,
-        temperature: 15.0,
-        delta_t,
-        slope: 0.0,
-        azm_rotation: 0.0,
-        atmos_refract: 0.5667,
-    };
+    let base_input = spa_input_for(
+        input.latitude,
+        input.longitude,
+        input.elevation,
+        input.timezone,
+        input.delta_t,
+        input.year,
+        input.month,
+        input.day,
+    );
 
     let conventions = [
         ("Fajr 18° (MWL/ISNA)", 108.0, true),
@@ -1894,7 +2043,7 @@ fn cmd_pray(
     println!("{:-<65}", "");
 
     // Verbose: print full twilight analysis
-    if verbose {
+    if input.verbose {
         println!();
         println!("Detailed Twilight Analysis:");
         println!("{:-<100}", "");
@@ -1931,7 +2080,7 @@ fn cmd_pray(
     println!();
     println!("Notes:");
     println!("  - These times are computed from first-principles radiative transfer (MCRT).");
-    match scattering_mode {
+    match input.scattering_mode {
         ScatteringMode::Single => {
             println!("  - Current model: US Standard 1976 atmosphere, single scattering.");
         }
@@ -1948,9 +2097,9 @@ fn cmd_pray(
             );
         }
     }
-    let has_aerosol = aerosol_type.is_some() || custom_aerosol.is_some();
-    let has_cloud = cloud_type.is_some() || custom_cloud.is_some();
-    if use_weather {
+    let has_aerosol = input.aerosol_type.is_some() || input.custom_aerosol.is_some();
+    let has_cloud = input.cloud_type.is_some() || input.custom_cloud.is_some();
+    if args.weather {
         println!("  - Atmosphere configured from live Open-Meteo weather data.");
         if has_aerosol {
             println!("  - Aerosol optical properties derived from measured AOD.");
@@ -1958,7 +2107,7 @@ fn cmd_pray(
         if has_cloud {
             println!("  - Cloud layer derived from observed cloud cover.");
         }
-        if o3_du.is_some() || no2_density.is_some() {
+        if input.o3_column_du.is_some() || input.no2_surface_density.is_some() {
             println!("  - Gas absorption scaled from live O3/NO2 measurements.");
         }
     } else if has_aerosol || has_cloud {
@@ -2221,62 +2370,8 @@ fn main() {
         } => {
             cmd_render(sza, width, height, rays, &out);
         }
-        Commands::Pray {
-            lat,
-            lon,
-            date,
-            tz,
-            elevation,
-            albedo,
-            delta_t,
-            sza_step,
-            aerosol,
-            cloud,
-            de440,
-            scattering,
-            photons,
-            verbose,
-            weather,
-            terrain,
-            dem_dir,
-            horizon_radius,
-            skyglow,
-            bortle,
-            radiance,
-            led_fraction,
-            cpu,
-            gpu_backend,
-            fast,
-            cloud3d,
-        } => {
-            cmd_pray(
-                lat,
-                lon,
-                &date,
-                tz,
-                elevation,
-                albedo,
-                delta_t,
-                sza_step,
-                aerosol,
-                cloud,
-                de440.as_deref(),
-                scattering,
-                photons,
-                verbose,
-                weather,
-                terrain,
-                &dem_dir,
-                horizon_radius,
-                skyglow,
-                bortle,
-                radiance,
-                led_fraction,
-                cpu,
-                gpu_backend,
-                fast,
-                cloud3d.as_deref(),
-            );
+        Commands::Pray(args) => {
+            cmd_pray(args);
         }
         Commands::Compare {
             lat,

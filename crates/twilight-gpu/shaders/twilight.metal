@@ -48,7 +48,16 @@ constant uint SIMD_WIDTH = 32;
 constant uint NUM_SIMD_GROUPS = HYBRID_THREADGROUP_SIZE / SIMD_WIDTH; // 8
 constant uint HYBRID_V2_NUM_SIMD_GROUPS = HYBRID_V2_THREADGROUP_SIZE / SIMD_WIDTH; // 2
 
-// Buffer header magic
+// Buffer header. buffers.rs packs the u32 magic/version words bit-for-bit
+// into f32 slots via f32::from_bits, so the shader compares bit patterns
+// with as_type<uint>, never float values (the version word is a denormal).
+constant uint ATM_HEADER_MAGIC          = 0;
+constant uint ATM_HEADER_VERSION        = 1;
+constant uint BUFFER_MAGIC              = 0x544C5754u; // "TWLT"
+constant uint BUFFER_VERSION            = 3u;
+// Written to output[0] when the header gate fails. Radiance and per-photon
+// weights are never negative, so the host detects this unambiguously.
+constant float HEADER_SENTINEL          = -1.0f;
 // Atmosphere buffer offsets (must match buffers.rs atm_offsets exactly)
 constant uint ATM_NUM_SHELLS            = 2;
 constant uint ATM_NUM_WAVELENGTHS       = 3;
@@ -121,6 +130,15 @@ struct ShellOptics {
     float asymmetry;
     float rayleigh_fraction;
 };
+
+// Magic/version gate: every kernel that takes the atmosphere buffer must
+// call this before reading any payload word and abort with HEADER_SENTINEL
+// on mismatch, so stale or mispacked buffers fail loudly instead of
+// producing plausible-looking garbage.
+inline bool atm_header_valid(device const float* atm) {
+    return as_type<uint>(atm[ATM_HEADER_MAGIC]) == BUFFER_MAGIC
+        && as_type<uint>(atm[ATM_HEADER_VERSION]) == BUFFER_VERSION;
+}
 
 inline uint atm_num_shells(device const float* atm) {
     return uint(atm[ATM_NUM_SHELLS]);
@@ -973,6 +991,10 @@ kernel void single_scatter_spectrum(
     device float*       output    [[buffer(2)]],
     uint                tid       [[thread_position_in_grid]]
 ) {
+    if (!atm_header_valid(atm)) {
+        if (tid == 0) output[0] = HEADER_SENTINEL;
+        return;
+    }
     uint num_wl = atm_num_wavelengths(atm);
     if (tid >= num_wl) return;
 
@@ -1090,6 +1112,10 @@ kernel void mcrt_trace_photon(
     device float*       output    [[buffer(2)]],
     uint                tid       [[thread_position_in_grid]]
 ) {
+    if (!atm_header_valid(atm)) {
+        if (tid == 0) output[0] = HEADER_SENTINEL;
+        return;
+    }
     uint num_wl = atm_num_wavelengths(atm);
     uint photons_per_wl = read_photons_per_wl(params);
     uint total_threads = num_wl * photons_per_wl;
@@ -1742,6 +1768,11 @@ kernel void hybrid_scatter(
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_id   [[simdgroup_index_in_threadgroup]]
 ) {
+    // Uniform across the grid: all threads return before any barrier.
+    if (!atm_header_valid(atm)) {
+        if (wl_idx == 0 && step_idx == 0) output[0] = HEADER_SENTINEL;
+        return;
+    }
     uint num_wl = atm_num_wavelengths(atm);
     if (wl_idx >= num_wl) return;
 
@@ -1949,6 +1980,12 @@ kernel void hybrid_los_prefix(
     device float*       tau_prefix  [[buffer(2)]],
     uint wl_idx [[thread_position_in_grid]]
 ) {
+    // Sentinel overlaps the -1.0 "step beyond LOS end" marker, which is
+    // acceptable: the host treats both as no-data for slot 0.
+    if (!atm_header_valid(atm)) {
+        if (wl_idx == 0) tau_prefix[0] = HEADER_SENTINEL;
+        return;
+    }
     uint num_wl = atm_num_wavelengths(atm);
     if (wl_idx >= num_wl) return;
 
@@ -2030,6 +2067,12 @@ kernel void hybrid_scatter_v2(
     uint wl_idx = tg_pos.x;
     uint step_idx = tg_pos.y;
     uint ray_lane = tid_in_tg.x;
+
+    // Uniform across the grid: all threads return before any barrier.
+    if (!atm_header_valid(atm)) {
+        if (wl_idx == 0 && step_idx == 0 && ray_lane == 0) output[0] = HEADER_SENTINEL;
+        return;
+    }
     uint num_wl = atm_num_wavelengths(atm);
 
     float3 observer_pos = read_observer(params);

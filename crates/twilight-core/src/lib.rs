@@ -1,3 +1,8 @@
+// Parallel-array indexing (radiance[w], optics[s][w]) is the dominant
+// data layout in this kernel; indexed loops are deliberate and often
+// clearer than zipped iterators across 3+ arrays.
+#![allow(clippy::needless_range_loop)]
+
 #![no_std]
 #![forbid(unsafe_code)]
 

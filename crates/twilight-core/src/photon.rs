@@ -5137,6 +5137,7 @@ impl McRng {
 }
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)] // constant-coupling pin tests
 mod tests {
     use super::*;
 
@@ -6432,7 +6433,7 @@ mod tests {
             }
 
             for w in 0..3 {
-                let mut rng_perwl = (base as u64)
+                let mut rng_perwl = base
                     .wrapping_add(w as u64)
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1);
@@ -7385,13 +7386,13 @@ mod tests {
                 let xi_sign = xorshift_f64(&mut rng);
                 let (cos_z, phi) = dwivedi_sample(xi1, xi2, xi_sign, beta);
                 assert!(
-                    cos_z >= -1.0 && cos_z <= 1.0,
+                    (-1.0..=1.0).contains(&cos_z),
                     "cos_z = {} out of [-1,1] at beta={}",
                     cos_z,
                     beta
                 );
                 assert!(
-                    phi >= 0.0 && phi <= 2.0 * core::f64::consts::PI + 1e-10,
+                    (0.0..=2.0 * core::f64::consts::PI + 1e-10).contains(&phi),
                     "phi = {} out of [0,2*pi] at beta={}",
                     phi,
                     beta

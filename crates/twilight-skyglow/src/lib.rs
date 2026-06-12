@@ -9,10 +9,18 @@
 //!
 //! # Architecture (current reality)
 //!
-//! The only implemented input path is **manual**: the caller supplies either
-//! a Bortle class (1-9) or a VIIRS-style radiance value (nW/cm^2/sr) for the
-//! observer's location. There is no embedded VIIRS lookup, no remote tile
-//! fetch, and no ground-source photon tracer.
+//! Two automatic satellite input paths exist alongside the manual one:
+//! - [`atlas`]: the David Lorenz 2024 light-pollution atlas (VIIRS-based,
+//!   PROPAGATED artificial zenith sky brightness - already the observer-sky
+//!   quantity the engine needs), fetched as remote binary tiles and cached
+//!   on disk.
+//! - [`dnb`]: daily VIIRS Black Marble nighttime-lights radiance (GIBS,
+//!   gap-filled and BRDF-corrected), used to scale the atlas from its 2024
+//!   epoch to the present, or standing alone where the atlas has no data.
+//!
+//! The **manual** path (caller supplies a Bortle class 1-9 or a VIIRS-style
+//! radiance in nW/cm^2/sr) remains as the override and offline fallback.
+//! There is still no ground-source photon tracer.
 //!
 //! A Garstang (1986)-style single-scatter integration exists in [`garstang`]
 //! but is NOT currently wired into the prayer-time pipeline; the pipeline
@@ -26,13 +34,18 @@
 //! - **White LED**: Broad spectrum with blue peak ~450nm and phosphor peak ~580nm
 //! - Mix ratio is configurable (pre-2015 cities mostly HPS, post-2020 mostly LED)
 
+#![allow(clippy::needless_range_loop)] // parallel spectral arrays
+
 pub mod angular;
 pub mod atlas;
 pub mod bortle;
 pub mod dnb;
 pub mod dnb_colormap;
+pub mod error;
 pub mod garstang;
 pub mod spectrum;
+
+pub use error::SkyglowError;
 
 /// Skyglow computation configuration.
 #[derive(Debug, Clone)]

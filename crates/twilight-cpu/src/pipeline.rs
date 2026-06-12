@@ -101,6 +101,10 @@ pub struct PrayerTimeInput {
     /// ~2.4x from solar minimum (~70 sfu) to maximum (~200 sfu).
     /// None = mid-cycle default (130).
     pub solar_f107: Option<f64>,
+    /// Print scan progress and diagnostics to stderr. Default false: the
+    /// pipeline is a library and must stay silent; everything a caller
+    /// needs to display travels in [`PrayerTimeOutput`] fields.
+    pub verbose: bool,
 }
 
 impl Default for PrayerTimeInput {
@@ -131,9 +135,85 @@ impl Default for PrayerTimeInput {
             no2_surface_density: None,
             polarized: true,
             solar_f107: None,
+            verbose: false,
         }
     }
 }
+
+// ── Scan constants ─────────────────────────────────────────────────
+//
+// The coarse/fine scan, the crossing fits, and the background model are
+// coupled through these values; each comment states the constraint that
+// keeps them consistent.
+
+/// Coarse scan floor [deg SZA]: the sun's upper limb at the horizon.
+/// No twilight threshold sits above it.
+const SCAN_FLOOR_SZA: f64 = 90.0;
+
+/// Coarse scan ceiling [deg SZA] (18 deg depression, astronomical dark).
+/// Deliberately 2 deg DEEPER than [`PERSISTENT_TWILIGHT_SZA`]: the deepest
+/// absolute threshold crosses near 105-106 deg, and scanning past it
+/// (a) samples the dark night floor that the relative mode and the
+/// celestial refloat float their thresholds on, and (b) keeps the
+/// [`FIT_WINDOW_DEG`] fit window of a deep crossing inside the scan.
+const SCAN_CEILING_SZA: f64 = 108.0;
+
+/// Persistent-twilight cutoff [deg SZA]: when the nightly maximum SZA
+/// stays below this, the sky never reaches full darkness and the
+/// absolute thresholds may never cross. Distinct from
+/// [`SCAN_CEILING_SZA`] (see there); a night peaking between the two is
+/// NOT flagged persistent yet is still scanned in full.
+const PERSISTENT_TWILIGHT_SZA: f64 = 106.0;
+
+/// View zenith [deg] of the MCRT patch: 5 deg above the horizon toward
+/// the sun, inside the twilight arch. The celestial-background refloat
+/// must evaluate the night sky for this SAME patch - both feed the same
+/// threshold comparison.
+const VIEW_ZENITH_DEG: f64 = 85.0;
+
+/// Independent seed-salted MC estimates per SZA (forced to 1 for
+/// deterministic Single mode). Production noise control: the threshold
+/// search runs on the MEAN curve and the per-SZA standard error feeds a
+/// confidence interval on the prayer minute.
+const K_SEEDS: usize = 4;
+
+/// Fine scan step [deg] around each coarse crossing.
+const FINE_STEP_DEG: f64 = 0.1;
+
+/// Duplicate tolerance [deg] when merging coarse and fine results: half
+/// a fine step, so re-scanned points replace their coarse versions while
+/// genuine fine-grid neighbors survive.
+const DEDUP_TOL_DEG: f64 = FINE_STEP_DEG / 2.0;
+
+/// Half-width [deg] of the standard-error lookup window around a fitted
+/// crossing. Must exceed [`FINE_STEP_DEG`] so at least one fine-scan
+/// sample always falls inside, and stay below [`FIT_WINDOW_DEG`] so the
+/// SE describes the same neighborhood the fit used.
+const SE_WINDOW_DEG: f64 = 0.35;
+
+/// Half-width [deg] of the local log-linear crossing-fit window. Must
+/// not exceed the refine margin (`sza_step + FINE_STEP_DEG`, = 0.6 at
+/// the default 0.5 deg coarse step) or the window would reach past the
+/// fine-scanned region into coarse-only samples.
+const FIT_WINDOW_DEG: f64 = 0.6;
+
+/// Night-sky V-band extinction [mag/airmass]: gas-only component
+/// (Rayleigh + ozone) of the zenith extinction coefficient.
+const EXTINCTION_K_GAS: f64 = 0.16;
+
+/// Aerosol V-band extinction per unit AOD at 550 nm [mag/airmass]; the
+/// measured AOD from the weather feed converts through this slope.
+const EXTINCTION_K_PER_AOD: f64 = 1.2;
+
+/// Assumed aerosol extinction term [mag/airmass] when no measured AOD
+/// is available (clear continental background).
+const EXTINCTION_K_DEFAULT_AEROSOL: f64 = 0.05;
+
+/// Celestial-background refloat trigger: re-float the detection
+/// thresholds when the physical background at a crossing differs from
+/// the dark-sky constant by more than this fraction (moonlit nights,
+/// strong airglow, Milky Way pointing).
+const REFLOAT_TRIGGER_FRACTION: f64 = 0.25;
 
 /// Which solar position engine was used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +292,10 @@ pub struct PrayerTimeOutput {
     pub skyglow_bortle: Option<u8>,
     /// Estimated prayer time shift due to light pollution (minutes).
     pub skyglow_shift_minutes: Option<f64>,
+    /// Note describing the celestial-background threshold refloat when it
+    /// triggered (moonlit nights, strong airglow). None when the physical
+    /// background matched the dark-sky constant within the trigger margin.
+    pub celestial_refloat: Option<String>,
     /// The khayt al-abyad (Quran 2:187) contrast-criterion times - the
     /// PRIMARY determination: Fajr = white thread distinct WITH lateral
     /// spread; Isha = shafaq distinctness disappears (ahmar primary).
@@ -266,7 +350,14 @@ impl SolarEngine {
     }
 
     /// Civil-date day increment (handles month/year rollover, leap years).
+    ///
+    /// One of three hand-rolled date implementations in the workspace
+    /// (the others: `twilight-weather/satellite.rs date_minus` and the
+    /// SPA calendar in `twilight-solar/spa.rs julian_day`); a future
+    /// shared calendar helper should absorb all three.
     fn next_civil_day(year: i32, month: i32, day: i32) -> (i32, i32, i32) {
+        debug_assert!((1..=12).contains(&month), "month out of range: {month}");
+        let month = month.clamp(1, 12);
         let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
         let month_len = match month {
             1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
@@ -278,7 +369,8 @@ impl SolarEngine {
                     28
                 }
             }
-            _ => 30,
+            // Clamped to 1..=12 above.
+            _ => unreachable!(),
         };
         if day < month_len {
             (year, month, day + 1)
@@ -289,14 +381,30 @@ impl SolarEngine {
         }
     }
 
+    /// SPA input for a local fractional hour, rolling hours >= 24 into the
+    /// NEXT civil day - required because at high latitudes the night's
+    /// threshold crossings (Isha under persistent twilight) can fall
+    /// after local midnight.
+    fn spa_input_at(&self, fractional_hour: f64) -> SpaInput {
+        let mut input = self.spa_input.clone();
+        let mut h = fractional_hour;
+        while h >= 24.0 {
+            let (y, m, d) = Self::next_civil_day(input.year, input.month, input.day);
+            input.year = y;
+            input.month = m;
+            input.day = d;
+            h -= 24.0;
+        }
+        set_time_from_fractional_hour(&mut input, h);
+        input
+    }
+
     /// Get solar zenith angle at a fractional hour (local time).
-    ///
-    /// Hours >= 24 roll into the NEXT civil day - required because at high
-    /// latitudes the night's threshold crossings (Isha under persistent
-    /// twilight) can fall after local midnight.
     fn zenith_at_hour(&mut self, fractional_hour: f64) -> Option<f64> {
         if let Some(ref mut de) = self.de440 {
-            // Convert local fractional hour to UTC
+            // Local -> UTC can go negative (east timezones) or past 24;
+            // the DE440 path resolves both through pure Julian-day
+            // arithmetic, no calendar rollover needed.
             let utc_hour = fractional_hour - self.spa_input.timezone;
             de.zenith_at_hour(
                 self.spa_input.year,
@@ -310,32 +418,25 @@ impl SolarEngine {
             )
             .ok()
         } else {
-            let mut input = self.spa_input.clone();
-            let mut h = fractional_hour;
-            while h >= 24.0 {
-                let (y, m, d) = Self::next_civil_day(input.year, input.month, input.day);
-                input.year = y;
-                input.month = m;
-                input.day = d;
-                h -= 24.0;
-            }
-            set_time_from_fractional_hour(&mut input, h);
+            let input = self.spa_input_at(fractional_hour);
             spa::solar_position(&input).ok().map(|o| o.zenith)
         }
     }
 
     /// Get solar azimuth angle at a fractional hour (local time).
+    ///
+    /// Same civil-day handling as [`Self::zenith_at_hour`]: the DE440
+    /// path keeps the fractional hour (seconds included) and lets the
+    /// Julian-day conversion absorb negative / past-24 values; the SPA
+    /// path rolls past-24 hours into the next civil day.
     fn azimuth_at_hour(&mut self, fractional_hour: f64) -> Option<f64> {
         if let Some(ref mut de) = self.de440 {
             let utc_hour = fractional_hour - self.spa_input.timezone;
-            de.solar_position(
+            de.solar_position_at_hour(
                 self.spa_input.year,
                 self.spa_input.month,
                 self.spa_input.day,
-                // Convert fractional UTC hour to h/m/s
-                (utc_hour as i32).max(0),
-                (((utc_hour - (utc_hour as i32) as f64) * 60.0) as i32).max(0),
-                0,
+                utc_hour,
                 self.spa_input.delta_t,
                 self.spa_input.latitude,
                 self.spa_input.longitude,
@@ -344,8 +445,7 @@ impl SolarEngine {
             .ok()
             .map(|t| t.azimuth)
         } else {
-            let mut input = self.spa_input.clone();
-            set_time_from_fractional_hour(&mut input, fractional_hour);
+            let input = self.spa_input_at(fractional_hour);
             spa::solar_position(&input).ok().map(|o| o.azimuth)
         }
     }
@@ -564,10 +664,12 @@ pub fn compute_prayer_times_gpu(
 
     // Upload atmosphere to GPU. On failure, fall back to CPU entirely.
     if let Err(e) = gpu.upload_atmosphere(&atm) {
-        eprintln!(
-            "Warning: GPU atmosphere upload failed ({}), falling back to CPU",
-            e
-        );
+        if input.verbose {
+            eprintln!(
+                "Warning: GPU atmosphere upload failed ({}), falling back to CPU",
+                e
+            );
+        }
         let scan = |atm: &twilight_core::atmosphere::AtmosphereModel,
                     config: &SimulationConfig,
                     start: f64,
@@ -587,10 +689,12 @@ pub fn compute_prayer_times_gpu(
                 step: f64| {
         gpu_dispatch::simulate_twilight_scan_gpu(gpu_ref, atm, config, start, end, step)
             .unwrap_or_else(|e| {
-                eprintln!(
-                    "Warning: GPU dispatch error ({}), CPU fallback for this scan",
-                    e
-                );
+                if input.verbose {
+                    eprintln!(
+                        "Warning: GPU dispatch error ({}), CPU fallback for this scan",
+                        e
+                    );
+                }
                 simulation::simulate_twilight_scan(atm, config, start, end, step)
             })
     };
@@ -599,10 +703,12 @@ pub fn compute_prayer_times_gpu(
                      sza_values: &[f64]| {
         gpu_dispatch::simulate_twilight_szalist_gpu(gpu_ref, atm, config, sza_values)
             .unwrap_or_else(|e| {
-                eprintln!(
-                    "Warning: GPU batch dispatch error ({}), CPU fallback for fine pass",
-                    e
-                );
+                if input.verbose {
+                    eprintln!(
+                        "Warning: GPU batch dispatch error ({}), CPU fallback for fine pass",
+                        e
+                    );
+                }
                 let mut out = Vec::with_capacity(sza_values.len());
                 for &sza in sza_values {
                     out.push(simulation::simulate_at_sza(atm, config, sza));
@@ -613,11 +719,24 @@ pub fn compute_prayer_times_gpu(
     compute_prayer_times_inner(input, &atm, &scan, Some(&scan_list))
 }
 
-/// Inner pipeline implementation parameterized by scan function.
-///
-/// Both `compute_prayer_times` (CPU) and `compute_prayer_times_gpu` delegate
-/// to this function. The only difference is the `scan` closure that produces
-/// `Vec<SpectralResult>` for a given SZA range.
+
+/// Scan closure: simulate a SZA range (start, end, step) for one config.
+type ScanFn<'a> = dyn Fn(
+        &twilight_core::atmosphere::AtmosphereModel,
+        &SimulationConfig,
+        f64,
+        f64,
+        f64,
+    ) -> Vec<SpectralResult>
+    + 'a;
+
+/// Batched scan closure: simulate an explicit SZA list for one config.
+type ScanListFn<'a> = dyn Fn(
+        &twilight_core::atmosphere::AtmosphereModel,
+        &SimulationConfig,
+        &[f64],
+    ) -> Vec<SpectralResult>
+    + 'a;
 
 /// Per-SZA statistics from K independent seed-salted MC runs.
 struct SzaStats {
@@ -640,20 +759,8 @@ fn scan_szas_with_stats(
     config: &SimulationConfig,
     szas: &[f64],
     k: usize,
-    scan: &dyn Fn(
-        &twilight_core::atmosphere::AtmosphereModel,
-        &SimulationConfig,
-        f64,
-        f64,
-        f64,
-    ) -> Vec<SpectralResult>,
-    scan_list: Option<
-        &dyn Fn(
-            &twilight_core::atmosphere::AtmosphereModel,
-            &SimulationConfig,
-            &[f64],
-        ) -> Vec<SpectralResult>,
-    >,
+    scan: &ScanFn,
+    scan_list: Option<&ScanListFn>,
 ) -> SzaStats {
     let k = if matches!(config.scattering_mode, ScatteringMode::Single) {
         1
@@ -748,7 +855,11 @@ fn night_sky_total(
         view_zenith_deg,
         view_azimuth_deg: az,
         solar_f107: input.solar_f107.unwrap_or(130.0),
-        extinction_k: 0.16 + input.custom_aerosol.map(|a| 1.2 * a.aod_550).unwrap_or(0.05),
+        extinction_k: EXTINCTION_K_GAS
+            + input
+                .custom_aerosol
+                .map(|a| EXTINCTION_K_PER_AOD * a.aod_550)
+                .unwrap_or(EXTINCTION_K_DEFAULT_AEROSOL),
     };
     // Real JPL ephemeris for the Moon when the BSP is loaded; truncated
     // Meeus series otherwise.
@@ -806,20 +917,8 @@ fn khayt_pass(
     input: &PrayerTimeInput,
     atm: &twilight_core::atmosphere::AtmosphereModel,
     base_config: &SimulationConfig,
-    scan: &dyn Fn(
-        &twilight_core::atmosphere::AtmosphereModel,
-        &SimulationConfig,
-        f64,
-        f64,
-        f64,
-    ) -> Vec<SpectralResult>,
-    scan_list: Option<
-        &dyn Fn(
-            &twilight_core::atmosphere::AtmosphereModel,
-            &SimulationConfig,
-            &[f64],
-        ) -> Vec<SpectralResult>,
-    >,
+    scan: &ScanFn,
+    scan_list: Option<&ScanListFn>,
     engine: &mut SolarEngine,
     max_sza: f64,
 ) -> KhaytTimes {
@@ -1018,135 +1117,201 @@ fn khayt_pass(
     out
 }
 
-fn compute_prayer_times_inner(
-    input: &PrayerTimeInput,
-    atm: &twilight_core::atmosphere::AtmosphereModel,
-    scan: &dyn Fn(
-        &twilight_core::atmosphere::AtmosphereModel,
-        &SimulationConfig,
-        f64,
-        f64,
-        f64,
-    ) -> Vec<SpectralResult>,
-    scan_list: Option<
-        &dyn Fn(
-            &twilight_core::atmosphere::AtmosphereModel,
-            &SimulationConfig,
-            &[f64],
-        ) -> Vec<SpectralResult>,
-    >,
-) -> PrayerTimeOutput {
-    let start = std::time::Instant::now();
+// ── Pipeline stages ────────────────────────────────────────────────
+//
+// `compute_prayer_times_inner` runs these in order; the data handed
+// between stages travels in the small structs below.
 
-    // Step 2: Initialize solar engine (DE440 primary, SPA fallback)
-    let (mut engine, ephemeris) = SolarEngine::new(input);
+/// Sunrise/sunset clock times with terrain diagnostics.
+struct SunEvents {
+    sunrise_time: Option<f64>,
+    sunset_time: Option<f64>,
+    /// Horizon elevation at the sunrise/sunset azimuth [deg]; None
+    /// without a terrain profile.
+    sunrise_horizon_deg: Option<f64>,
+    sunset_horizon_deg: Option<f64>,
+    /// Effective SZA after terrain adjustment [deg]; None when terrain
+    /// does not obstruct.
+    sunrise_sza_effective: Option<f64>,
+    sunset_sza_effective: Option<f64>,
+}
 
-    // Step 3: Find sunrise/sunset times, adjusted for terrain if available
-    //
-    // Standard SZA for sunrise/sunset = 90.8333 degrees (refraction + semi-diameter).
-    // When terrain blocks the horizon, the sun must be higher to clear it,
-    // so the effective SZA is smaller (sun clears terrain later at sunrise, earlier at sunset).
-    //
-    // We first find approximate sunrise/sunset with standard SZA to determine
-    // the sun's azimuth, then look up terrain horizon angle at that azimuth,
-    // and re-find sunrise/sunset with the adjusted SZA.
+/// Maximum solar depth of the night and the scan bound derived from it.
+struct TwilightExtent {
+    /// Maximum SZA reached on this date; None when the probe never saw
+    /// the sun.
+    max_sza_deg: Option<f64>,
+    /// Sun never reaches full darkness (max SZA < [`PERSISTENT_TWILIGHT_SZA`]).
+    persistent_twilight: bool,
+    /// Upper bound of the SZA scan.
+    sza_upper: f64,
+}
+
+/// Combined coarse + fine MCRT scan output.
+struct ScanData {
+    /// Spectral results sorted by SZA, near-duplicates removed
+    /// (fine-scan points replace their coarse versions).
+    results: Vec<SpectralResult>,
+    /// (SZA, relative standard error of the mesopic luminance) for every
+    /// scanned point, coarse and fine.
+    se_by_sza: Vec<(f64, f64)>,
+}
+
+/// Threshold-crossing SZAs [deg] for the three absolute-threshold events.
+#[derive(Clone, Copy, Default)]
+struct CrossingSzas {
+    fajr: Option<f64>,
+    isha_abyad: Option<f64>,
+    isha_ahmar: Option<f64>,
+}
+
+/// 1-sigma uncertainties [deg] on the crossing SZAs from MC noise.
+#[derive(Clone, Copy, Default)]
+struct CrossingSigmas {
+    fajr: Option<f64>,
+    isha_abyad: Option<f64>,
+    isha_ahmar: Option<f64>,
+}
+
+/// Clock times [local fractional hours] for the three events.
+#[derive(Clone, Copy, Default)]
+struct PrayerClockTimes {
+    fajr: Option<f64>,
+    isha_abyad: Option<f64>,
+    isha_ahmar: Option<f64>,
+}
+
+/// Outcome of the celestial-background refloat: possibly updated
+/// crossings plus the human-readable note for the caller.
+struct CelestialRefloat {
+    szas: CrossingSzas,
+    times: PrayerClockTimes,
+    note: String,
+}
+
+/// 1-sigma uncertainties on the prayer minutes [min].
+struct UncertaintyMinutes {
+    fajr: Option<f64>,
+    isha_abyad: Option<f64>,
+    isha_ahmar: Option<f64>,
+}
+
+/// Find sunrise/sunset, adjusted for terrain when a horizon profile is
+/// present.
+///
+/// Standard SZA for sunrise/sunset = 90.8333 degrees (refraction +
+/// semi-diameter). When terrain blocks the horizon, the sun must be
+/// higher to clear it, so the effective SZA is smaller (sun clears
+/// terrain later at sunrise, earlier at sunset). The standard-SZA
+/// crossing fixes the sun's azimuth, the terrain profile gives the
+/// horizon angle at that azimuth, and the crossing is re-found at the
+/// adjusted SZA.
+fn sun_events_with_terrain(input: &PrayerTimeInput, engine: &mut SolarEngine) -> SunEvents {
     let standard_sunrise = engine.find_zenith_crossing(90.8333, 0.0, 12.0, 0.0001);
     let standard_sunset = engine.find_zenith_crossing(90.8333, 12.0, 24.0, 0.0001);
 
-    let (
+    let Some(profile) = &input.horizon_profile else {
+        return SunEvents {
+            sunrise_time: standard_sunrise,
+            sunset_time: standard_sunset,
+            sunrise_horizon_deg: None,
+            sunset_horizon_deg: None,
+            sunrise_sza_effective: None,
+            sunset_sza_effective: None,
+        };
+    };
+
+    // One side: standard crossing -> sun azimuth -> terrain angle ->
+    // crossing re-found at the terrain-adjusted SZA.
+    let mut adjust = |standard: Option<f64>,
+                      lo: f64,
+                      hi: f64,
+                      default_az: f64|
+     -> (Option<f64>, Option<f64>, Option<f64>) {
+        let Some(h) = standard else {
+            return (standard, None, None);
+        };
+        let az = engine.azimuth_at_hour(h).unwrap_or(default_az);
+        let hz = profile.angle_at(az);
+        if hz > 0.01 {
+            let eff_sza = horizon::effective_sunrise_sza(hz);
+            let adjusted = engine.find_zenith_crossing(eff_sza, lo, hi, 0.0001);
+            (adjusted.or(standard), Some(hz), Some(eff_sza))
+        } else {
+            (standard, Some(hz), None)
+        }
+    };
+
+    let (sunrise_time, sunrise_horizon_deg, sunrise_sza_effective) =
+        adjust(standard_sunrise, 0.0, 12.0, 90.0);
+    let (sunset_time, sunset_horizon_deg, sunset_sza_effective) =
+        adjust(standard_sunset, 12.0, 24.0, 270.0);
+
+    SunEvents {
         sunrise_time,
         sunset_time,
-        sunrise_horizon,
-        sunset_horizon,
-        sunrise_sza_eff,
-        sunset_sza_eff,
-    ) = if let Some(ref profile) = input.horizon_profile {
-        // Get sun's azimuth at standard sunrise/sunset to look up terrain angle
-        let (sr, sr_hz, sr_sza) = if let Some(sr_h) = standard_sunrise {
-            let az = engine.azimuth_at_hour(sr_h).unwrap_or(90.0);
-            let hz = profile.angle_at(az);
-            if hz > 0.01 {
-                let eff_sza = horizon::effective_sunrise_sza(hz);
-                let adjusted = engine.find_zenith_crossing(eff_sza, 0.0, 12.0, 0.0001);
-                (adjusted.or(standard_sunrise), Some(hz), Some(eff_sza))
-            } else {
-                (standard_sunrise, Some(hz), None)
-            }
-        } else {
-            (standard_sunrise, None, None)
-        };
+        sunrise_horizon_deg,
+        sunset_horizon_deg,
+        sunrise_sza_effective,
+        sunset_sza_effective,
+    }
+}
 
-        let (ss, ss_hz, ss_sza) = if let Some(ss_h) = standard_sunset {
-            let az = engine.azimuth_at_hour(ss_h).unwrap_or(270.0);
-            let hz = profile.angle_at(az);
-            if hz > 0.01 {
-                let eff_sza = horizon::effective_sunrise_sza(hz);
-                let adjusted = engine.find_zenith_crossing(eff_sza, 12.0, 24.0, 0.0001);
-                (adjusted.or(standard_sunset), Some(hz), Some(eff_sza))
-            } else {
-                (standard_sunset, Some(hz), None)
-            }
-        } else {
-            (standard_sunset, None, None)
-        };
-
-        (sr, ss, sr_hz, ss_hz, sr_sza, ss_sza)
-    } else {
-        (standard_sunrise, standard_sunset, None, None, None, None)
-    };
-
-    // Step 4: Check maximum SZA to detect persistent twilight
+/// Probe the night's maximum solar depth: persistent-twilight flag and
+/// the scan ceiling.
+fn twilight_extent(engine: &mut SolarEngine) -> TwilightExtent {
     let max_sza_deg = engine.compute_max_sza();
-    let persistent_twilight = max_sza_deg.map(|sza| sza < 106.0).unwrap_or(false);
+    TwilightExtent {
+        max_sza_deg,
+        persistent_twilight: max_sza_deg
+            .map(|sza| sza < PERSISTENT_TWILIGHT_SZA)
+            .unwrap_or(false),
+        sza_upper: max_sza_deg
+            .map(|s| s.min(SCAN_CEILING_SZA))
+            .unwrap_or(SCAN_CEILING_SZA),
+    }
+}
 
-    // Step 5: Determine solar azimuth at sunset for view direction
-    let solar_azimuth_evening = if let Some(sunset_h) = sunset_time {
-        engine.azimuth_at_hour(sunset_h).unwrap_or(270.0)
+/// MCRT Pass 1 + 2: coarse scan at `sza_step` over the full twilight
+/// range, threshold search on the coarse curve to select refine regions,
+/// fine scan at [`FINE_STEP_DEG`] inside them, then merge and dedup.
+#[allow(clippy::type_complexity)]
+fn run_adaptive_scan(
+    input: &PrayerTimeInput,
+    atm: &twilight_core::atmosphere::AtmosphereModel,
+    config: &SimulationConfig,
+    scan: &ScanFn,
+    scan_list: Option<&ScanListFn>,
+    sza_upper: f64,
+) -> ScanData {
+    let seeds_label = if matches!(config.scattering_mode, ScatteringMode::Single) {
+        1
     } else {
-        270.0
+        K_SEEDS
     };
 
-    // Step 6: Determine the upper bound of the scan based on max SZA
-    let sza_upper = max_sza_deg.map(|s| s.min(108.0)).unwrap_or(108.0);
-
-    // Step 7: MCRT Pass 1 -- Coarse scan to locate threshold regions
-    let config = SimulationConfig {
-        latitude: input.latitude,
-        longitude: input.longitude,
-        elevation: input.elevation,
-        solar_azimuth: solar_azimuth_evening,
-        view_zenith: 85.0,
-        view_azimuth: None,
-        apply_solar_irradiance: true,
-        scattering_mode: input.scattering_mode,
-        photons_per_wavelength: input.photons_per_wavelength,
-        polarized: input.polarized,
-        seed_salt: 0,
-    };
-
-    // K independent seed-salted estimates per SZA for MC modes (forced to
-    // 1 for deterministic Single). Production noise control: the threshold
-    // search runs on the MEAN curve and the per-SZA standard error feeds a
-    // confidence interval on the prayer minute.
-    const K_SEEDS: usize = 4;
-
+    // Pass 1: coarse scan to locate threshold regions.
     let coarse_t0 = std::time::Instant::now();
     let mut coarse_szas = Vec::new();
     {
-        let mut sza = 90.0;
+        let mut sza = SCAN_FLOOR_SZA;
         while sza <= sza_upper + 1e-6 {
             coarse_szas.push(sza);
             sza += input.sza_step;
         }
     }
-    eprint!(
-        "Coarse scan: {} points x {} seeds ... ",
-        coarse_szas.len(),
-        if matches!(config.scattering_mode, ScatteringMode::Single) { 1 } else { K_SEEDS }
-    );
-    let _ = std::io::Write::flush(&mut std::io::stderr());
-    let coarse_stats = scan_szas_with_stats(atm, &config, &coarse_szas, K_SEEDS, scan, scan_list);
-    eprintln!("{:.1?}", coarse_t0.elapsed());
+    if input.verbose {
+        eprint!(
+            "Coarse scan: {} points x {} seeds ... ",
+            coarse_szas.len(),
+            seeds_label
+        );
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+    }
+    let coarse_stats = scan_szas_with_stats(atm, config, &coarse_szas, K_SEEDS, scan, scan_list);
+    if input.verbose {
+        eprintln!("{:.1?}", coarse_t0.elapsed());
+    }
     let mut se_by_sza: Vec<(f64, f64)> = coarse_szas
         .iter()
         .zip(coarse_stats.rel_se.iter())
@@ -1163,200 +1328,211 @@ fn compute_prayer_times_inner(
                 &sr.radiance,
                 &input.threshold_config,
             );
-            eprintln!(
-                "  SZA {:.1}: mesopic={:.4e} total_rad={:.4e}",
-                sr.sza_deg,
-                analysis.luminance_mesopic,
-                sr.radiance.iter().sum::<f64>()
-            );
+            if input.verbose {
+                eprintln!(
+                    "  SZA {:.1}: mesopic={:.4e} total_rad={:.4e}",
+                    sr.sza_deg,
+                    analysis.luminance_mesopic,
+                    sr.radiance.iter().sum::<f64>()
+                );
+            }
             analysis
         })
         .collect();
 
-    // Find approximate crossing regions from coarse scan
-    let coarse_prayer =
-        threshold::determine_prayer_times(coarse_analyses.clone(), &input.threshold_config);
+    // Approximate crossing regions from the coarse curve.
+    let coarse_prayer = threshold::determine_prayer_times(coarse_analyses, &input.threshold_config);
 
-    // Step 8: MCRT Pass 2 -- Fine scan around each crossing
+    // Pass 2: fine scan around each coarse crossing. The margin spans
+    // one coarse step plus one fine step so the fit window around the
+    // refined crossing stays inside fine-scanned territory.
     let mut refine_regions: Vec<(f64, f64)> = Vec::new();
-    let margin = input.sza_step + 0.1;
+    let margin = input.sza_step + FINE_STEP_DEG;
+    for sza in [
+        coarse_prayer.fajr_sza_deg,
+        coarse_prayer.isha_abyad_sza_deg,
+        coarse_prayer.isha_ahmar_sza_deg,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        add_refine_region(&mut refine_regions, sza - margin, sza + margin, sza_upper);
+    }
 
-    if let Some(sza) = coarse_prayer.fajr_sza_deg {
-        add_refine_region(&mut refine_regions, sza - margin, sza + margin, sza_upper);
-    }
-    if let Some(sza) = coarse_prayer.isha_abyad_sza_deg {
-        add_refine_region(&mut refine_regions, sza - margin, sza + margin, sza_upper);
-    }
-    if let Some(sza) = coarse_prayer.isha_ahmar_sza_deg {
-        add_refine_region(&mut refine_regions, sza - margin, sza + margin, sza_upper);
-    }
-
-    let fine_step = 0.1;
     let mut fine_results: Vec<SpectralResult> = Vec::new();
-
     if !refine_regions.is_empty() {
         let mut fine_szas = Vec::new();
         for (lo, hi) in &refine_regions {
             let mut sza = *lo;
             while sza <= *hi + 1e-6 {
                 fine_szas.push(sza);
-                sza += fine_step;
+                sza += FINE_STEP_DEG;
             }
         }
 
         let fine_t0 = std::time::Instant::now();
-        eprint!("Fine scan: {} points x {} seeds ... ", fine_szas.len(),
-            if matches!(config.scattering_mode, ScatteringMode::Single) { 1 } else { K_SEEDS });
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        let fine_stats = scan_szas_with_stats(atm, &config, &fine_szas, K_SEEDS, scan, scan_list);
-        eprintln!("{:.1?}", fine_t0.elapsed());
+        if input.verbose {
+            eprint!(
+                "Fine scan: {} points x {} seeds ... ",
+                fine_szas.len(),
+                seeds_label
+            );
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+        let fine_stats = scan_szas_with_stats(atm, config, &fine_szas, K_SEEDS, scan, scan_list);
+        if input.verbose {
+            eprintln!("{:.1?}", fine_t0.elapsed());
+        }
         for (i, r) in fine_stats.results.into_iter().enumerate() {
             se_by_sza.push((r.sza_deg, fine_stats.rel_se[i]));
             fine_results.push(r);
         }
     }
 
-    // Combine coarse + fine results, sort by SZA, deduplicate
-    let mut all_results: Vec<SpectralResult> = coarse_results;
+    // Merge coarse + fine, sort by SZA, drop near-duplicates. The sort
+    // is stable, so at equal SZA the fine point follows its coarse twin
+    // and the pop-then-push keeps the fine one.
+    let mut all_results = coarse_results;
     all_results.extend(fine_results);
-    all_results.sort_by(|a, b| a.sza_deg.partial_cmp(&b.sza_deg).unwrap());
+    all_results.sort_by(|a, b| a.sza_deg.total_cmp(&b.sza_deg));
 
-    let mut deduped_results: Vec<SpectralResult> = Vec::new();
+    let mut results: Vec<SpectralResult> = Vec::new();
     for r in all_results {
-        if let Some(last) = deduped_results.last() {
-            if (r.sza_deg - last.sza_deg).abs() < 0.05 {
-                deduped_results.pop();
+        if let Some(last) = results.last() {
+            if (r.sza_deg - last.sza_deg).abs() < DEDUP_TOL_DEG {
+                results.pop();
             }
         }
-        deduped_results.push(r);
+        results.push(r);
     }
 
-    // Step 9: Inject skyglow (light pollution) if configured.
-    // Add artificial spectral radiance to the MCRT-computed natural radiance.
-    // This shifts the threshold crossings to account for urban sky brightness.
-    if let Some(ref sg) = input.skyglow {
-        for sr in &mut deduped_results {
-            let n = sr.radiance.len().min(sg.num_wavelengths);
-            for i in 0..n {
-                sr.radiance[i] += sg.spectral_radiance[i];
-            }
+    ScanData { results, se_by_sza }
+}
+
+/// Inject artificial skyglow radiance into the natural MCRT spectra,
+/// shifting the threshold crossings for urban sky brightness.
+fn inject_skyglow(results: &mut [SpectralResult], sg: &SkyglowResult) {
+    for sr in results.iter_mut() {
+        let n = sr.radiance.len().min(sg.num_wavelengths);
+        for i in 0..n {
+            sr.radiance[i] += sg.spectral_radiance[i];
         }
     }
+}
 
-    // Re-analyze with combined high-resolution data (now including skyglow if set)
-    let all_analyses: Vec<TwilightAnalysis> = deduped_results
+/// HIGH-LATITUDE RELATIVE-DETECTION MODE.
+///
+/// The engine's observable is SKY BRIGHTNESS, not a depression-angle
+/// convention. The absolute thresholds are themselves derived as
+/// detection_factor x dark-night background (see ThresholdConfig docs).
+/// Under persistent twilight the sky never reaches the dark background,
+/// but it still has a luminance MINIMUM at solar midnight and then
+/// measurably brightens - an SQM records it, an observer sees the glow
+/// spread. The general law, valid at every latitude, is therefore
+///
+///   threshold = (L_min_tonight + L_dark_background) x detection_factor
+///
+/// At normal latitudes L_min ~ 0 and this reduces exactly to the
+/// absolute constants; at high latitudes it floats on tonight's bright
+/// floor and Fajr = the moment the dawn brightening becomes detectable
+/// above it (al-fajr al-sadiq as a physical event, not a convention).
+/// The fiqh question of whether to follow this or a substitute rule
+/// (aqrab al-ayyam etc.) is the user's; the engine reports the physics.
+///
+/// Returns the relative-threshold result and `true` when the mode
+/// engaged; otherwise hands `base` back unchanged.
+fn apply_high_latitude_relative_mode(
+    input: &PrayerTimeInput,
+    base: threshold::PrayerTimeResult,
+) -> (threshold::PrayerTimeResult, bool) {
+    if base.fajr_sza_deg.is_some() || base.analyses.len() < 3 {
+        return (base, false);
+    }
+    // Tonight's floor: the dimmest scanned point (solar-midnight side).
+    let l_min_mesopic = base
+        .analyses
         .iter()
-        .map(|sr| {
-            threshold::analyze_twilight(
-                sr.sza_deg,
-                &sr.wavelengths_nm,
-                &sr.radiance,
-                &input.threshold_config,
-            )
-        })
-        .collect();
-
-    let mut prayer_result =
-        threshold::determine_prayer_times(all_analyses, &input.threshold_config);
-
-    // Step 9a-bis: HIGH-LATITUDE RELATIVE-DETECTION MODE.
-    //
-    // The engine's observable is SKY BRIGHTNESS, not a depression-angle
-    // convention. The absolute thresholds are themselves derived as
-    // detection_factor x dark-night background (see ThresholdConfig docs).
-    // Under persistent twilight the sky never reaches the dark background,
-    // but it still has a luminance MINIMUM at solar midnight and then
-    // measurably brightens - an SQM records it, an observer sees the glow
-    // spread. The general law, valid at every latitude, is therefore
-    //
-    //   threshold = (L_min_tonight + L_dark_background) x detection_factor
-    //
-    // At normal latitudes L_min ~ 0 and this reduces exactly to the
-    // absolute constants; at high latitudes it floats on tonight's bright
-    // floor and Fajr = the moment the dawn brightening becomes detectable
-    // above it (al-fajr al-sadiq as a physical event, not a convention).
-    // The fiqh question of whether to follow this or a substitute rule
-    // (aqrab al-ayyam etc.) is the user's; the engine reports the physics.
-    let mut used_relative_thresholds = false;
-    if prayer_result.fajr_sza_deg.is_none() && prayer_result.analyses.len() >= 3 {
-        // Tonight's floor: the dimmest scanned point (solar-midnight side).
-        let l_min_mesopic = prayer_result
-            .analyses
-            .iter()
-            .map(|a| a.luminance_mesopic)
-            .fold(f64::MAX, f64::min);
-        let l_min_red = prayer_result
-            .analyses
-            .iter()
-            .map(|a| a.luminance_red)
-            .fold(f64::MAX, f64::min);
-        if l_min_mesopic.is_finite() && l_min_mesopic > 0.0 {
-            let bg = threshold::NIGHT_SKY_LUMINANCE;
-            // TVI contrast detection at the eye's actual adaptation level
-            // (the spectral->mesopic chain models the eye's response; the
-            // TVI models its CONTRAST sensitivity, which improves sharply
-            // against brighter skies - Blackwell-anchored, dark-site limit
-            // bit-compatible with the absolute constants).
-            let floor_mesopic = l_min_mesopic + bg;
-            let floor_red = l_min_red.max(0.0) + bg;
-            let relative_config = threshold::ThresholdConfig {
-                fajr_luminance: threshold::detection_threshold(
-                    floor_mesopic,
-                    input.threshold_config.fajr_luminance,
-                ),
-                isha_abyad_luminance: threshold::detection_threshold(
-                    floor_mesopic,
-                    input.threshold_config.isha_abyad_luminance,
-                ),
-                isha_ahmar_red_luminance: threshold::detection_threshold(
-                    floor_red,
-                    input.threshold_config.isha_ahmar_red_luminance,
-                ),
-                ..input.threshold_config.clone()
-            };
-            let relative_result = threshold::determine_prayer_times(
-                prayer_result.analyses.clone(),
-                &relative_config,
-            );
-            if relative_result.fajr_sza_deg.is_some() {
-                eprintln!(
-                    "High-latitude mode: TVI contrast detection on tonight's sky \
-                     floor (L_min mesopic = {:.3e} cd/m^2 -> Fajr threshold \
-                     {:.3e} cd/m^2, a {:.0}% rise).",
-                    l_min_mesopic,
-                    relative_config.fajr_luminance,
-                    (relative_config.fajr_luminance / floor_mesopic - 1.0) * 100.0
-                );
-                prayer_result = relative_result;
-                used_relative_thresholds = true;
-            }
-        }
+        .map(|a| a.luminance_mesopic)
+        .fold(f64::MAX, f64::min);
+    let l_min_red = base
+        .analyses
+        .iter()
+        .map(|a| a.luminance_red)
+        .fold(f64::MAX, f64::min);
+    if !(l_min_mesopic.is_finite() && l_min_mesopic > 0.0) {
+        return (base, false);
     }
+    let bg = threshold::NIGHT_SKY_LUMINANCE;
+    // TVI contrast detection at the eye's actual adaptation level
+    // (the spectral->mesopic chain models the eye's response; the
+    // TVI models its CONTRAST sensitivity, which improves sharply
+    // against brighter skies - Blackwell-anchored, dark-site limit
+    // bit-compatible with the absolute constants).
+    let floor_mesopic = l_min_mesopic + bg;
+    let floor_red = l_min_red.max(0.0) + bg;
+    let relative_config = threshold::ThresholdConfig {
+        fajr_luminance: threshold::detection_threshold(
+            floor_mesopic,
+            input.threshold_config.fajr_luminance,
+        ),
+        isha_abyad_luminance: threshold::detection_threshold(
+            floor_mesopic,
+            input.threshold_config.isha_abyad_luminance,
+        ),
+        isha_ahmar_red_luminance: threshold::detection_threshold(
+            floor_red,
+            input.threshold_config.isha_ahmar_red_luminance,
+        ),
+        ..input.threshold_config.clone()
+    };
+    let relative_result =
+        threshold::determine_prayer_times(base.analyses.clone(), &relative_config);
+    if relative_result.fajr_sza_deg.is_none() {
+        return (base, false);
+    }
+    if input.verbose {
+        eprintln!(
+            "High-latitude mode: TVI contrast detection on tonight's sky \
+             floor (L_min mesopic = {:.3e} cd/m^2 -> Fajr threshold \
+             {:.3e} cd/m^2, a {:.0}% rise).",
+            l_min_mesopic,
+            relative_config.fajr_luminance,
+            (relative_config.fajr_luminance / floor_mesopic - 1.0) * 100.0
+        );
+    }
+    (relative_result, true)
+}
 
-    // Step 9b: Crossing-on-fit + confidence interval.
-    //
-    // Refine each pairwise crossing with a local log-linear least-squares
-    // fit (robust to single noisy MC samples), and propagate the per-SZA
-    // standard error into a sigma on the crossing SZA:
-    //   sigma_sza = rel_SE(luminance) / |d(lnL)/dSZA|.
+/// Crossing-on-fit + confidence interval.
+///
+/// Refine each pairwise crossing with a local log-linear least-squares
+/// fit (robust to single noisy MC samples), and propagate the per-SZA
+/// standard error into a sigma on the crossing SZA:
+///   sigma_sza = rel_SE(luminance) / |d(lnL)/dSZA|.
+fn fit_crossings(
+    input: &PrayerTimeInput,
+    result: &threshold::PrayerTimeResult,
+    se_by_sza: &[(f64, f64)],
+    used_relative_thresholds: bool,
+) -> (CrossingSzas, CrossingSigmas) {
     let lookup_rel_se = |sza: f64| -> f64 {
         se_by_sza
             .iter()
-            .filter(|(s, _)| (s - sza).abs() <= 0.35)
+            .filter(|(s, _)| (s - sza).abs() <= SE_WINDOW_DEG)
             .map(|(_, e)| *e)
             .fold(0.0f64, f64::max)
     };
     let fit_window = |pick: &dyn Fn(&TwilightAnalysis) -> f64, around: f64| -> Vec<(f64, f64)> {
-        prayer_result
+        result
             .analyses
             .iter()
-            .filter(|a| (a.sza_deg - around).abs() <= 0.6)
+            .filter(|a| (a.sza_deg - around).abs() <= FIT_WINDOW_DEG)
             .map(|a| (a.sza_deg, pick(a)))
             .collect()
     };
     let refine = |sza_opt: Option<f64>,
-                      pick: &dyn Fn(&TwilightAnalysis) -> f64,
-                      thresh: f64|
+                  pick: &dyn Fn(&TwilightAnalysis) -> f64,
+                  thresh: f64|
      -> (Option<f64>, Option<f64>) {
         let Some(sza0) = sza_opt else {
             return (None, None);
@@ -1370,199 +1546,296 @@ fn compute_prayer_times_inner(
             None => (Some(sza0), None),
         }
     };
-    // (Under high-latitude mode the fit must target the floated thresholds.)
+    // Under high-latitude mode the fit must target the floated thresholds.
     let floor_of = |pick: &dyn Fn(&TwilightAnalysis) -> f64| -> f64 {
-        prayer_result
+        result
             .analyses
             .iter()
-            .map(|a| pick(a))
+            .map(pick)
             .fold(f64::MAX, f64::min)
             .max(0.0)
             + threshold::NIGHT_SKY_LUMINANCE
     };
-    let eff_fajr_thresh = if used_relative_thresholds {
-        threshold::detection_threshold(
-            floor_of(&|a| a.luminance_mesopic),
-            input.threshold_config.fajr_luminance,
-        )
-    } else {
-        input.threshold_config.fajr_luminance
+    let effective = |dark_anchor: f64, pick: &dyn Fn(&TwilightAnalysis) -> f64| -> f64 {
+        if used_relative_thresholds {
+            threshold::detection_threshold(floor_of(pick), dark_anchor)
+        } else {
+            dark_anchor
+        }
     };
-    let eff_abyad_thresh = if used_relative_thresholds {
-        threshold::detection_threshold(
-            floor_of(&|a| a.luminance_mesopic),
-            input.threshold_config.isha_abyad_luminance,
-        )
-    } else {
-        input.threshold_config.isha_abyad_luminance
-    };
-    let eff_ahmar_thresh = if used_relative_thresholds {
-        threshold::detection_threshold(
-            floor_of(&|a| a.luminance_red),
-            input.threshold_config.isha_ahmar_red_luminance,
-        )
-    } else {
-        input.threshold_config.isha_ahmar_red_luminance
-    };
-    let (fajr_sza_fit, fajr_sigma) = refine(
-        prayer_result.fajr_sza_deg,
+    let cfg = &input.threshold_config;
+    let (fajr, fajr_sigma) = refine(
+        result.fajr_sza_deg,
         &|a| a.luminance_mesopic,
-        eff_fajr_thresh,
+        effective(cfg.fajr_luminance, &|a| a.luminance_mesopic),
     );
-    let (abyad_sza_fit, abyad_sigma) = refine(
-        prayer_result.isha_abyad_sza_deg,
+    let (isha_abyad, abyad_sigma) = refine(
+        result.isha_abyad_sza_deg,
         &|a| a.luminance_mesopic,
-        eff_abyad_thresh,
+        effective(cfg.isha_abyad_luminance, &|a| a.luminance_mesopic),
     );
-    let (ahmar_sza_fit, ahmar_sigma) = refine(
-        prayer_result.isha_ahmar_sza_deg,
+    let (isha_ahmar, ahmar_sigma) = refine(
+        result.isha_ahmar_sza_deg,
         &|a| a.luminance_red,
-        eff_ahmar_thresh,
+        effective(cfg.isha_ahmar_red_luminance, &|a| a.luminance_red),
     );
-    prayer_result.fajr_sza_deg = fajr_sza_fit;
-    prayer_result.isha_abyad_sza_deg = abyad_sza_fit;
-    prayer_result.isha_ahmar_sza_deg = ahmar_sza_fit;
+    (
+        CrossingSzas {
+            fajr,
+            isha_abyad,
+            isha_ahmar,
+        },
+        CrossingSigmas {
+            fajr: fajr_sigma,
+            isha_abyad: abyad_sigma,
+            isha_ahmar: ahmar_sigma,
+        },
+    )
+}
 
-    // Step 10: Convert threshold SZAs to clock times (slope-aware: the
-    // morning crossing is on the DESCENDING zenith branch, the evening
-    // on the ASCENDING - required when the crossing lies near solar
-    // midnight, where plain endpoint-bracketing bisection fails).
-    let fajr_time = prayer_result
-        .fajr_sza_deg
-        .and_then(|sza| engine.find_zenith_crossing_robust(sza, 0.0, 12.0, 0.0001, true));
+/// Convert threshold SZAs to clock times (slope-aware: the morning
+/// crossing is on the DESCENDING zenith branch, the evening on the
+/// ASCENDING - required when the crossing lies near solar midnight,
+/// where plain endpoint-bracketing bisection fails).
+fn crossings_to_times(engine: &mut SolarEngine, szas: CrossingSzas) -> PrayerClockTimes {
+    PrayerClockTimes {
+        fajr: szas
+            .fajr
+            .and_then(|sza| engine.find_zenith_crossing_robust(sza, 0.0, 12.0, 0.0001, true)),
+        isha_abyad: szas
+            .isha_abyad
+            .and_then(|sza| engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false)),
+        isha_ahmar: szas
+            .isha_ahmar
+            .and_then(|sza| engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false)),
+    }
+}
 
-    let isha_abyad_time = prayer_result
-        .isha_abyad_sza_deg
-        .and_then(|sza| engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false));
-
-    let isha_ahmar_time = prayer_result
-        .isha_ahmar_sza_deg
-        .and_then(|sza| engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false));
-
-    // Step 10b: CELESTIAL-BACKGROUND REFINEMENT (hyperaccuracy pass).
-    //
-    // The TVI floor so far used the constant dark-sky background. The real
-    // background at the crossing instant varies with airglow (solar
-    // activity), zodiacal light, integrated starlight, and - dominantly,
-    // when the moon is up - scattered moonlight (Krisciunas & Schaefer
-    // 1991): a bright moon near dawn raises the detection floor and
-    // physically delays the perceptible fajr al-sadiq. One refinement
-    // pass: evaluate the physical background at each crossing time with
-    // the actual view geometry, re-float the thresholds, re-determine the
-    // crossings, and re-convert the times.
-    let night_sky_at = |engine: &mut SolarEngine, t_local: Option<f64>| -> Option<f64> {
+/// CELESTIAL-BACKGROUND REFINEMENT (hyperaccuracy pass).
+///
+/// The TVI floor so far used the constant dark-sky background. The real
+/// background at the crossing instant varies with airglow (solar
+/// activity), zodiacal light, integrated starlight, and - dominantly,
+/// when the moon is up - scattered moonlight (Krisciunas & Schaefer
+/// 1991): a bright moon near dawn raises the detection floor and
+/// physically delays the perceptible fajr al-sadiq. One refinement
+/// pass: evaluate the physical background at each crossing time with
+/// the actual view geometry, re-float the thresholds, re-determine the
+/// crossings, and re-convert the times.
+///
+/// Returns None when the physical background matches the dark-sky
+/// constant within [`REFLOAT_TRIGGER_FRACTION`] (no refloat needed).
+fn refloat_on_celestial_background(
+    input: &PrayerTimeInput,
+    engine: &mut SolarEngine,
+    analyses: &[TwilightAnalysis],
+    szas: CrossingSzas,
+    times: PrayerClockTimes,
+) -> Option<CelestialRefloat> {
+    let mut night_sky_at = |t_local: Option<f64>| -> Option<f64> {
         let t = t_local?;
-        Some(night_sky_total(input, engine, t, 85.0, None))
+        Some(night_sky_total(input, engine, t, VIEW_ZENITH_DEG, None))
     };
-    let bg_fajr = night_sky_at(&mut engine, fajr_time);
-    let bg_isha = night_sky_at(&mut engine, isha_abyad_time);
-    let scan_floor = prayer_result
-        .analyses
+    let bgf = night_sky_at(times.fajr)?;
+    let bgi = night_sky_at(times.isha_abyad)?;
+
+    // Only re-float when the physical background differs materially from
+    // the constant the first pass assumed: moonlit nights, strong
+    // airglow, Milky Way pointing, etc.
+    let bg0 = threshold::NIGHT_SKY_LUMINANCE;
+    if (bgf - bg0).abs() / bg0 <= REFLOAT_TRIGGER_FRACTION
+        && (bgi - bg0).abs() / bg0 <= REFLOAT_TRIGGER_FRACTION
+    {
+        return None;
+    }
+
+    let note = format!(
+        "Celestial background: fajr-side {:.3e} cd/m^2, isha-side {:.3e} \
+         (dark-sky const {:.3e}) - re-floating thresholds.",
+        bgf, bgi, bg0
+    );
+    if input.verbose {
+        eprintln!("{}", note);
+    }
+
+    let scan_floor = analyses
         .iter()
         .map(|a| a.luminance_mesopic)
         .fold(f64::MAX, f64::min)
         .max(0.0);
-    let scan_floor_red = prayer_result
-        .analyses
+    let scan_floor_red = analyses
         .iter()
         .map(|a| a.luminance_red)
         .fold(f64::MAX, f64::min)
         .max(0.0);
 
-    let mut fajr_time = fajr_time;
-    let mut isha_abyad_time = isha_abyad_time;
-    let mut isha_ahmar_time = isha_ahmar_time;
-    if let (Some(bgf), Some(bgi)) = (bg_fajr, bg_isha) {
-        // Only re-float when the physical background differs materially
-        // from the constant the first pass assumed (>25%): moonlit nights,
-        // strong airglow, Milky Way pointing, etc.
-        let bg0 = threshold::NIGHT_SKY_LUMINANCE;
-        if (bgf - bg0).abs() / bg0 > 0.25 || (bgi - bg0).abs() / bg0 > 0.25 {
-            eprintln!(
-                "Celestial background: fajr-side {:.3e} cd/m^2, isha-side {:.3e} \
-                 (dark-sky const {:.3e}) - re-floating thresholds.",
-                bgf, bgi, bg0
-            );
-            let refined_config = threshold::ThresholdConfig {
-                fajr_luminance: threshold::detection_threshold(
-                    scan_floor + bgf,
-                    input.threshold_config.fajr_luminance,
-                ),
-                isha_abyad_luminance: threshold::detection_threshold(
-                    scan_floor + bgi,
-                    input.threshold_config.isha_abyad_luminance,
-                ),
-                isha_ahmar_red_luminance: threshold::detection_threshold(
-                    scan_floor_red + bgi,
-                    input.threshold_config.isha_ahmar_red_luminance,
-                ),
-                ..input.threshold_config.clone()
-            };
-            let refined = threshold::determine_prayer_times(
-                prayer_result.analyses.clone(),
-                &refined_config,
-            );
-            if refined.fajr_sza_deg.is_some() || refined.isha_abyad_sza_deg.is_some() {
-                prayer_result.fajr_sza_deg =
-                    refined.fajr_sza_deg.or(prayer_result.fajr_sza_deg);
-                prayer_result.isha_abyad_sza_deg = refined
-                    .isha_abyad_sza_deg
-                    .or(prayer_result.isha_abyad_sza_deg);
-                prayer_result.isha_ahmar_sza_deg = refined
-                    .isha_ahmar_sza_deg
-                    .or(prayer_result.isha_ahmar_sza_deg);
-                fajr_time = prayer_result.fajr_sza_deg.and_then(|sza| {
-                    engine.find_zenith_crossing_robust(sza, 0.0, 12.0, 0.0001, true)
-                });
-                isha_abyad_time = prayer_result.isha_abyad_sza_deg.and_then(|sza| {
-                    engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false)
-                });
-                isha_ahmar_time = prayer_result.isha_ahmar_sza_deg.and_then(|sza| {
-                    engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false)
-                });
-            }
-        }
+    let refined_config = threshold::ThresholdConfig {
+        fajr_luminance: threshold::detection_threshold(
+            scan_floor + bgf,
+            input.threshold_config.fajr_luminance,
+        ),
+        isha_abyad_luminance: threshold::detection_threshold(
+            scan_floor + bgi,
+            input.threshold_config.isha_abyad_luminance,
+        ),
+        isha_ahmar_red_luminance: threshold::detection_threshold(
+            scan_floor_red + bgi,
+            input.threshold_config.isha_ahmar_red_luminance,
+        ),
+        ..input.threshold_config.clone()
+    };
+    let refined = threshold::determine_prayer_times(analyses.to_vec(), &refined_config);
+    if refined.fajr_sza_deg.is_none() && refined.isha_abyad_sza_deg.is_none() {
+        // Trigger fired but the refloated thresholds found no crossings:
+        // keep the first-pass values, still report the note.
+        return Some(CelestialRefloat { szas, times, note });
     }
+    let new_szas = CrossingSzas {
+        fajr: refined.fajr_sza_deg.or(szas.fajr),
+        isha_abyad: refined.isha_abyad_sza_deg.or(szas.isha_abyad),
+        isha_ahmar: refined.isha_ahmar_sza_deg.or(szas.isha_ahmar),
+    };
+    let new_times = crossings_to_times(engine, new_szas);
+    Some(CelestialRefloat {
+        szas: new_szas,
+        times: new_times,
+        note,
+    })
+}
 
-    // Convert crossing-SZA sigmas to minutes using the local dt/dSZA slope
-    // (about 3-5 min/deg depending on latitude/season).
+/// Convert crossing-SZA sigmas to minutes using the local dt/dSZA slope
+/// (about 3-5 min/deg depending on latitude/season).
+fn propagate_uncertainty(
+    engine: &mut SolarEngine,
+    szas: CrossingSzas,
+    times: PrayerClockTimes,
+    sigmas: CrossingSigmas,
+) -> UncertaintyMinutes {
     let mut sigma_minutes = |sza: Option<f64>,
                              t: Option<f64>,
                              sigma: Option<f64>,
                              lo: f64,
-                             hi: f64|
+                             hi: f64,
+                             descending: bool|
      -> Option<f64> {
         let (Some(s0), Some(t0), Some(sig)) = (sza, t, sigma) else {
             return None;
         };
-        let descending = lo < 11.9; // morning window
         let t1 = engine.find_zenith_crossing_robust(s0 + 0.25, lo, hi, 0.0001, descending)?;
         let dtdsza = ((t1 - t0) / 0.25).abs() * 60.0; // minutes per degree
         Some(sig * dtdsza)
     };
-    let fajr_uncertainty_min =
-        sigma_minutes(prayer_result.fajr_sza_deg, fajr_time, fajr_sigma, 0.0, 12.0);
-    let isha_abyad_uncertainty_min = sigma_minutes(
-        prayer_result.isha_abyad_sza_deg,
-        isha_abyad_time,
-        abyad_sigma,
-        12.0,
-        24.0,
-    );
-    let isha_ahmar_uncertainty_min = sigma_minutes(
-        prayer_result.isha_ahmar_sza_deg,
-        isha_ahmar_time,
-        ahmar_sigma,
-        12.0,
-        24.0,
-    );
+    UncertaintyMinutes {
+        fajr: sigma_minutes(szas.fajr, times.fajr, sigmas.fajr, 0.0, 12.0, true),
+        isha_abyad: sigma_minutes(
+            szas.isha_abyad,
+            times.isha_abyad,
+            sigmas.isha_abyad,
+            12.0,
+            24.0,
+            false,
+        ),
+        isha_ahmar: sigma_minutes(
+            szas.isha_ahmar,
+            times.isha_ahmar,
+            sigmas.isha_ahmar,
+            12.0,
+            24.0,
+            false,
+        ),
+    }
+}
+
+/// Inner pipeline implementation parameterized by scan function.
+///
+/// Both `compute_prayer_times` (CPU) and `compute_prayer_times_gpu`
+/// delegate to this function. The only difference is the `scan` closure
+/// that produces `Vec<SpectralResult>` for a given SZA range.
+fn compute_prayer_times_inner(
+    input: &PrayerTimeInput,
+    atm: &twilight_core::atmosphere::AtmosphereModel,
+    scan: &ScanFn,
+    scan_list: Option<&ScanListFn>,
+) -> PrayerTimeOutput {
+    let start = std::time::Instant::now();
+
+    // Solar engine (DE440 primary, SPA fallback).
+    let (mut engine, ephemeris) = SolarEngine::new(input);
+
+    let sun = sun_events_with_terrain(input, &mut engine);
+    let extent = twilight_extent(&mut engine);
+
+    // View direction: toward the sun's azimuth at sunset.
+    let solar_azimuth_evening = sun
+        .sunset_time
+        .and_then(|h| engine.azimuth_at_hour(h))
+        .unwrap_or(270.0);
+
+    let config = SimulationConfig {
+        latitude: input.latitude,
+        longitude: input.longitude,
+        elevation: input.elevation,
+        solar_azimuth: solar_azimuth_evening,
+        view_zenith: VIEW_ZENITH_DEG,
+        view_azimuth: None,
+        apply_solar_irradiance: true,
+        scattering_mode: input.scattering_mode,
+        photons_per_wavelength: input.photons_per_wavelength,
+        polarized: input.polarized,
+        seed_salt: 0,
+    };
+
+    // MCRT passes 1 + 2.
+    let ScanData {
+        results: mut spectral_results,
+        se_by_sza,
+    } = run_adaptive_scan(input, atm, &config, scan, scan_list, extent.sza_upper);
+
+    if let Some(ref sg) = input.skyglow {
+        inject_skyglow(&mut spectral_results, sg);
+    }
+
+    // Threshold analysis on the combined high-resolution data (now
+    // including skyglow if set).
+    let all_analyses: Vec<TwilightAnalysis> = spectral_results
+        .iter()
+        .map(|sr| {
+            threshold::analyze_twilight(
+                sr.sza_deg,
+                &sr.wavelengths_nm,
+                &sr.radiance,
+                &input.threshold_config,
+            )
+        })
+        .collect();
+    let base_result = threshold::determine_prayer_times(all_analyses, &input.threshold_config);
+
+    let (prayer_result, used_relative_thresholds) =
+        apply_high_latitude_relative_mode(input, base_result);
+
+    let (fitted_szas, sigmas) =
+        fit_crossings(input, &prayer_result, &se_by_sza, used_relative_thresholds);
+    let fitted_times = crossings_to_times(&mut engine, fitted_szas);
+
+    let (final_szas, final_times, celestial_refloat) = match refloat_on_celestial_background(
+        input,
+        &mut engine,
+        &prayer_result.analyses,
+        fitted_szas,
+        fitted_times,
+    ) {
+        Some(r) => (r.szas, r.times, Some(r.note)),
+        None => (fitted_szas, fitted_times, None),
+    };
+
+    let uncertainty = propagate_uncertainty(&mut engine, final_szas, final_times, sigmas);
 
     // ── THE KHAYT AL-ABYAD PASS (primary criterion) ────────────────
     // Simulate the horizon fan and detect the Quranic contrast events:
     // the white thread distinct from the black with lateral spread
     // (Fajr sadiq), the narrow wedge alone (fajr kadhib), and the
     // mirrored disappearances for Isha (ahmar primary).
-    let khayt = match max_sza_deg {
+    let khayt = match extent.max_sza_deg {
         Some(ms) => khayt_pass(input, atm, &config, scan, scan_list, &mut engine, ms),
         None => KhaytTimes::default(),
     };
@@ -1571,31 +1844,31 @@ fn compute_prayer_times_inner(
 
     PrayerTimeOutput {
         khayt,
-        fajr_time,
-        isha_abyad_time,
-        isha_ahmar_time,
-        sunrise_time,
-        sunset_time,
-        fajr_sza_deg: prayer_result.fajr_sza_deg,
-        isha_abyad_sza_deg: prayer_result.isha_abyad_sza_deg,
-        isha_ahmar_sza_deg: prayer_result.isha_ahmar_sza_deg,
-        fajr_uncertainty_min,
-        isha_abyad_uncertainty_min,
-        isha_ahmar_uncertainty_min,
-        fajr_depression_deg: prayer_result.fajr_sza_deg.map(|s| s - 90.0),
-        isha_abyad_depression_deg: prayer_result.isha_abyad_sza_deg.map(|s| s - 90.0),
-        isha_ahmar_depression_deg: prayer_result.isha_ahmar_sza_deg.map(|s| s - 90.0),
-        persistent_twilight,
+        fajr_time: final_times.fajr,
+        isha_abyad_time: final_times.isha_abyad,
+        isha_ahmar_time: final_times.isha_ahmar,
+        sunrise_time: sun.sunrise_time,
+        sunset_time: sun.sunset_time,
+        fajr_sza_deg: final_szas.fajr,
+        isha_abyad_sza_deg: final_szas.isha_abyad,
+        isha_ahmar_sza_deg: final_szas.isha_ahmar,
+        fajr_uncertainty_min: uncertainty.fajr,
+        isha_abyad_uncertainty_min: uncertainty.isha_abyad,
+        isha_ahmar_uncertainty_min: uncertainty.isha_ahmar,
+        fajr_depression_deg: final_szas.fajr.map(|s| s - 90.0),
+        isha_abyad_depression_deg: final_szas.isha_abyad.map(|s| s - 90.0),
+        isha_ahmar_depression_deg: final_szas.isha_ahmar.map(|s| s - 90.0),
+        persistent_twilight: extent.persistent_twilight,
         high_latitude_relative_thresholds: used_relative_thresholds,
-        max_sza_deg,
+        max_sza_deg: extent.max_sza_deg,
         twilight_analyses: prayer_result.analyses,
-        spectral_results: deduped_results,
+        spectral_results,
         computation_time_ms: elapsed.as_millis() as u64,
         ephemeris,
-        sunrise_horizon_deg: sunrise_horizon,
-        sunset_horizon_deg: sunset_horizon,
-        sunrise_sza_effective: sunrise_sza_eff,
-        sunset_sza_effective: sunset_sza_eff,
+        sunrise_horizon_deg: sun.sunrise_horizon_deg,
+        sunset_horizon_deg: sun.sunset_horizon_deg,
+        sunrise_sza_effective: sun.sunrise_sza_effective,
+        sunset_sza_effective: sun.sunset_sza_effective,
         terrain_source: input
             .horizon_profile
             .as_ref()
@@ -1609,6 +1882,7 @@ fn compute_prayer_times_inner(
                 twilight_skyglow::bortle::radiance_to_zenith_luminance(sg.integrated_radiance);
             twilight_skyglow::bortle::estimated_prayer_shift_minutes(lum)
         }),
+        celestial_refloat,
     }
 }
 
@@ -1636,7 +1910,7 @@ fn compute_max_sza(spa_input: &SpaInput) -> Option<f64> {
 
 /// Add a refinement region, clamping to valid bounds and merging overlaps.
 fn add_refine_region(regions: &mut Vec<(f64, f64)>, lo: f64, hi: f64, max_sza: f64) {
-    let lo = lo.max(90.0);
+    let lo = lo.max(SCAN_FLOOR_SZA);
     let hi = hi.min(max_sza);
     if hi <= lo {
         return;
@@ -1685,21 +1959,46 @@ pub fn format_time(h: f64) -> String {
 mod tests {
     use super::*;
 
-    // ── PrayerTimeInput defaults ──
+    // ── SolarEngine date/hour handling ──
 
     #[test]
-    fn default_input_mecca() {
-        let input = PrayerTimeInput::default();
-        assert!((input.latitude - 21.4225).abs() < 0.01);
-        assert!((input.longitude - 39.8262).abs() < 0.01);
-        assert!((input.elevation - 0.0).abs() < 0.01);
-        assert_eq!(input.year, 2024);
-        assert_eq!(input.month, 1);
-        assert_eq!(input.day, 1);
-        assert!((input.timezone - 3.0).abs() < 0.01);
-        assert!((input.delta_t - 69.184).abs() < 0.01);
-        assert!((input.surface_albedo - 0.15).abs() < 0.01);
-        assert!((input.sza_step - 0.5).abs() < 0.01);
+    fn next_civil_day_rollovers() {
+        assert_eq!(SolarEngine::next_civil_day(2024, 6, 15), (2024, 6, 16));
+        assert_eq!(SolarEngine::next_civil_day(2024, 4, 30), (2024, 5, 1));
+        assert_eq!(SolarEngine::next_civil_day(2024, 12, 31), (2025, 1, 1));
+        assert_eq!(SolarEngine::next_civil_day(2024, 2, 28), (2024, 2, 29)); // leap
+        assert_eq!(SolarEngine::next_civil_day(2023, 2, 28), (2023, 3, 1));
+        assert_eq!(SolarEngine::next_civil_day(2100, 2, 28), (2100, 3, 1)); // century non-leap
+    }
+
+    /// Past-midnight hours must address the NEXT civil day: azimuth at
+    /// 25.5h on day N equals azimuth at 1.5h on day N+1 (SPA path; the
+    /// DE440 path is covered in twilight-solar).
+    #[test]
+    fn azimuth_at_hour_rolls_past_midnight() {
+        let input = PrayerTimeInput {
+            latitude: 59.91,
+            longitude: 10.75,
+            year: 2024,
+            month: 6,
+            day: 1,
+            timezone: 2.0,
+            ..PrayerTimeInput::default()
+        };
+        let (mut engine, _) = SolarEngine::new(&input);
+        let rolled = engine.azimuth_at_hour(25.5).expect("azimuth");
+
+        let next_day = PrayerTimeInput {
+            day: 2,
+            ..input.clone()
+        };
+        let (mut engine_next, _) = SolarEngine::new(&next_day);
+        let direct = engine_next.azimuth_at_hour(1.5).expect("azimuth");
+
+        assert!(
+            (rolled - direct).abs() < 1e-9,
+            "rolled {rolled} vs direct {direct}"
+        );
     }
 
     // ── Polar day (midnight sun) - regression for the empty-scan panic ──

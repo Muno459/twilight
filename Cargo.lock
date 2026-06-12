@@ -1230,6 +1230,7 @@ dependencies = [
  "clap",
  "image",
  "rayon",
+ "serde_json",
  "twilight-core",
  "twilight-cpu",
  "twilight-data",
@@ -1302,6 +1303,7 @@ dependencies = [
  "png 0.17.16",
  "twilight-core",
  "twilight-data",
+ "twilight-weather",
  "ureq",
 ]
 
