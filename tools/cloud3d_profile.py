@@ -278,10 +278,22 @@ def main():
             if 0 <= ii < w_ and 0 <= jj < h_:
                 path.append({"km": km, "iwc_g_m3": col_mean(jj, ii, 2).tolist()})
 
+    # The ACTUAL scan time from the granule name (_sYYYYDDDHHMMSSt) — the
+    # requested twilight hour is usually in the future; never label model
+    # output with a time the satellite did not observe.
+    mscan = re.search(r"_s(\d{4})(\d{3})(\d{2})(\d{2})", key)
+    if mscan:
+        from datetime import datetime, timedelta as _td
+        d0 = datetime(int(mscan.group(1)), 1, 1) + _td(days=int(mscan.group(2)) - 1)
+        scan_time = f"{d0:%Y-%m-%d}T{mscan.group(3)}:{mscan.group(4)}Z"
+    else:
+        scan_time = "unknown"
+
     result = {
         "satellite": bucket,
         "granule": key,
-        "time_utc": f"{args.date}T{int(args.hour):02d}:{int(args.hour % 1 * 60):02d}",
+        "time_utc": scan_time,
+        "requested_utc": f"{args.date}T{int(args.hour):02d}:{int(args.hour % 1 * 60):02d}",
         "model": args.model,
         "heights_m": heights.tolist(),
         "cloud_fraction": cloud_fraction,

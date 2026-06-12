@@ -4,10 +4,18 @@
 //! Each shell has uniform optical properties (extinction coefficient,
 //! single scattering albedo, asymmetry parameter) at a given wavelength.
 
-/// Earth mean radius in meters.
-pub const EARTH_RADIUS_M: f64 = 6_371_000.0;
+/// Earth mean radius in meters — the exact IUGG R1 (arithmetic mean
+/// radius, (2a+b)/3 of the WGS84 ellipsoid). The atmosphere model is a
+/// sphere of this radius; the local geocentric radius varies from it by
+/// at most ±11 km (±0.17%) between equator and poles, which changes
+/// near-horizon path lengths by <0.1% — below the engine's MC noise and
+/// the libRadtran cross-validation agreement. The ephemeris/geodesy side
+/// (twilight-solar) uses the full WGS84 ellipsoid where it matters.
+pub const EARTH_RADIUS_M: f64 = 6_371_008.7714;
 
-/// Top of atmosphere altitude in meters (100 km).
+/// Fallback top-of-atmosphere altitude in meters, used ONLY for empty
+/// models ([`AtmosphereModel::toa_radius`] reads the real top shell —
+/// 150 km for the production USSA-76 + thermosphere profile).
 pub const TOA_ALTITUDE_M: f64 = 100_000.0;
 
 /// Maximum number of atmospheric shells.
@@ -469,8 +477,11 @@ mod tests {
 
     #[test]
     fn earth_radius_matches_iugg() {
-        // IUGG mean Earth radius: 6,371,000 m
-        assert!((EARTH_RADIUS_M - 6_371_000.0).abs() < EPSILON);
+        // Exact IUGG R1 = (2a+b)/3 of WGS84: a = 6378137.0,
+        // b = 6356752.314245 -> 6371008.7714... m
+        let a = 6_378_137.0_f64;
+        let b = 6_356_752.314_245_f64;
+        assert!((EARTH_RADIUS_M - (2.0 * a + b) / 3.0).abs() < 0.1);
     }
 
     #[test]

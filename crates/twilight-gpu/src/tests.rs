@@ -609,7 +609,18 @@ mod layer4_metal {
             preferred_backend: Some(BackendKind::Metal),
             ..Default::default()
         };
-        crate::try_init(&config).ok()
+        match crate::try_init(&config) {
+            Ok(gpu) => Some(gpu),
+            Err(e) => {
+                // No device -> legitimate skip (headless CI). Device
+                // present but init failed -> the shader doesn't compile;
+                // fail loudly instead of skipping the whole GPU suite.
+                if objc2_metal::MTLCreateSystemDefaultDevice().is_some() {
+                    panic!("Metal device present but backend init failed: {e}");
+                }
+                None
+            }
+        }
     }
 
     #[test]
@@ -929,40 +940,60 @@ mod layer4_metal {
         let obs = [EARTH_RADIUS_M + 1.0, 0.0, 0.0];
         let view = [0.0, 1.0, 0.0];
         let szas = [93.0, 96.0, 100.0, 105.0, 108.0];
+        // Deep-twilight radiance (SZA >= 105) is 1e-9..1e-8, where a
+        // single 50-ray seed has CV ~0.3-0.5. Assert the monotonicity
+        // invariant on a K-seed AVERAGE — a single draw can fluctuate
+        // 2-3x without any physics being wrong. (CPU/GPU transport
+        // equality is covered by the parity tests.)
+        const SEEDS: u64 = 6;
 
         let requests: Vec<BatchRequest> = szas
             .iter()
-            .map(|&sza| {
+            .flat_map(|&sza| {
                 let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
+                (0..SEEDS).map(move |k| BatchRequest {
                     observer_pos: obs,
                     view_dir: view,
                     sun_dir: [sun.x, sun.y, sun.z],
                     kernel: BatchKernel::Hybrid {
                         secondary_rays: 50,
-                        seed: sza.to_bits(),
+                        seed: sza.to_bits() ^ (0x9e37_79b9_7f4a_7c15u64.wrapping_mul(k + 1)),
                     },
-                }
+                })
             })
             .collect();
 
         let results = gpu.scan_batch(&requests).unwrap();
-        assert_eq!(results.len(), szas.len());
+        assert_eq!(results.len(), szas.len() * SEEDS as usize);
 
         for (i, r) in results.iter().enumerate() {
             for (w, &v) in r.radiance.iter().enumerate() {
                 assert!(
                     v >= 0.0 && v.is_finite(),
                     "Metal hybrid batch SZA={} wl={}: invalid {:.4e}",
-                    szas[i],
+                    szas[i / SEEDS as usize],
                     w,
                     v,
                 );
             }
         }
 
-        // Radiance should generally decrease with SZA
-        let totals: Vec<f64> = results.iter().map(|r| r.radiance.iter().sum()).collect();
+        // Radiance should generally decrease with SZA (seed-averaged)
+        let totals: Vec<f64> = szas
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                (0..SEEDS as usize)
+                    .map(|k| {
+                        results[i * SEEDS as usize + k]
+                            .radiance
+                            .iter()
+                            .sum::<f64>()
+                    })
+                    .sum::<f64>()
+                    / SEEDS as f64
+            })
+            .collect();
         for pair in totals.windows(2) {
             if pair[0] > 1e-20 {
                 assert!(
@@ -1121,8 +1152,18 @@ fn init_all_backends() -> Vec<(crate::BackendKind, Box<dyn crate::GpuBackend>)> 
             preferred_backend: Some(crate::BackendKind::Metal),
             ..Default::default()
         };
-        if let Ok(gpu) = crate::try_init(&config) {
-            backends.push((crate::BackendKind::Metal, gpu));
+        match crate::try_init(&config) {
+            Ok(gpu) => backends.push((crate::BackendKind::Metal, gpu)),
+            Err(e) => {
+                // Skip ONLY when no Metal device exists (headless CI).
+                // A present device that fails to init means the shader
+                // does not compile — that must FAIL the suite, not
+                // silently skip it (a broken shader once hid behind
+                // this skip while 135 'GPU' tests passed vacuously).
+                if objc2_metal::MTLCreateSystemDefaultDevice().is_some() {
+                    panic!("Metal device present but backend init failed: {e}");
+                }
+            }
         }
     }
 
@@ -1200,8 +1241,14 @@ fn metal_hybrid_split_dispatch_boundaries_match_cpu_statistics() {
         preferred_backend: Some(crate::BackendKind::Metal),
         ..Default::default()
     };
-    let Ok(mut gpu) = crate::try_init(&config) else {
-        return;
+    let mut gpu = match crate::try_init(&config) {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            if objc2_metal::MTLCreateSystemDefaultDevice().is_some() {
+                panic!("Metal device present but backend init failed: {e}");
+            }
+            return;
+        }
     };
 
     let atm = twilight_data::builder::build_clear_sky(
@@ -1680,25 +1727,35 @@ fn batch_hybrid_physics_invariants() {
     let view = [0.0, 1.0, 0.0];
     let szas = [90.0, 93.0, 96.0, 100.0, 105.0, 108.0];
 
+    // Single 50-ray seeds at deep SZA carry CV ~0.3-0.5: average K seeds
+    // before asserting the SZA-monotonicity invariant (see
+    // metal_batch_hybrid_valid for rationale).
+    const SEEDS: u64 = 6;
+
     for (kind, gpu) in backends.iter() {
         let requests: Vec<BatchRequest> = szas
             .iter()
-            .map(|&sza| {
+            .flat_map(|&sza| {
                 let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-                BatchRequest {
+                (0..SEEDS).map(move |k| BatchRequest {
                     observer_pos: obs,
                     view_dir: view,
                     sun_dir: [sun.x, sun.y, sun.z],
                     kernel: BatchKernel::Hybrid {
                         secondary_rays: 50,
-                        seed: sza.to_bits(),
+                        seed: sza.to_bits() ^ (0x9e37_79b9_7f4a_7c15u64.wrapping_mul(k + 1)),
                     },
-                }
+                })
             })
             .collect();
 
         let results = gpu.scan_batch(&requests).unwrap();
-        assert_eq!(results.len(), szas.len(), "{}: wrong result count", kind);
+        assert_eq!(
+            results.len(),
+            szas.len() * SEEDS as usize,
+            "{}: wrong result count",
+            kind
+        );
 
         // Non-negative radiance
         for (i, r) in results.iter().enumerate() {
@@ -1708,14 +1765,28 @@ fn batch_hybrid_physics_invariants() {
                     "{}: negative radiance {:.4e} at SZA={} wl={}",
                     kind,
                     v,
-                    szas[i],
+                    szas[i / SEEDS as usize],
                     w,
                 );
             }
         }
 
-        // Total radiance should generally decrease with SZA
-        let totals: Vec<f64> = results.iter().map(|r| r.radiance.iter().sum()).collect();
+        // Total radiance should generally decrease with SZA (seed-averaged)
+        let totals: Vec<f64> = szas
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                (0..SEEDS as usize)
+                    .map(|k| {
+                        results[i * SEEDS as usize + k]
+                            .radiance
+                            .iter()
+                            .sum::<f64>()
+                    })
+                    .sum::<f64>()
+                    / SEEDS as f64
+            })
+            .collect();
         for pair in totals.windows(2) {
             // Allow some MC noise: second value should not be > 2x the first
             if pair[0] > 1e-20 {

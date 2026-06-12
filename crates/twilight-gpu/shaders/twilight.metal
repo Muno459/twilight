@@ -25,8 +25,12 @@ using namespace metal;
 // Constants
 // ============================================================================
 
-constant float PI = 3.14159265358979323846f;
-constant float EARTH_RADIUS_M = 6371000.0f;
+constant float PI = M_PI_F;
+constant float INV_4PI = 1.0f / (4.0f * PI); // isotropic phase pdf
+// Exact IUGG R1 mean radius, matching twilight-core. Fallback only: all
+// kernels derive surface/TOA radii from the packed shells (see
+// atm_surface_radius / atm_toa_radius).
+constant float EARTH_RADIUS_M = 6371008.7714f;
 constant float TOA_ALTITUDE_M = 100000.0f;
 
 constant uint MAX_WAVELENGTHS = 64;
@@ -405,6 +409,24 @@ inline int shell_index_binary(device const float* atm, float r) {
         }
     }
     return (lo == 0) ? -1 : int(lo - 1);
+}
+
+// Surface and top-of-atmosphere radii from the PACKED SHELLS — the single
+// source of truth, exactly matching the CPU's AtmosphereModel accessors
+// (surface_radius = r_inner of shell 0, toa_radius = r_outer of the last
+// shell). The old hardcoded EARTH_RADIUS_M + TOA_ALTITUDE_M (100 km)
+// silently truncated the 150 km USSA-76 thermosphere extension — the very
+// layer that carries the deep-twilight (SZA >= 104) signal.
+inline float atm_surface_radius(device const float* atm) {
+    uint ns = atm_num_shells(atm);
+    return (ns == 0) ? (EARTH_RADIUS_M)
+                     : atm[ATM_SHELLS_START];
+}
+
+inline float atm_toa_radius(device const float* atm) {
+    uint ns = atm_num_shells(atm);
+    return (ns == 0) ? (EARTH_RADIUS_M + TOA_ALTITUDE_M)
+                     : atm[ATM_SHELLS_START + (ns - 1) * ATM_SHELL_STRIDE + 1];
 }
 
 // ============================================================================
@@ -945,8 +967,8 @@ kernel void single_scatter_spectrum(
     float3 view_dir     = read_view_dir(params);
     float3 sun_dir      = read_sun_dir(params);
 
-    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
-    float surface_radius = EARTH_RADIUS_M;
+    float toa_radius = atm_toa_radius(atm);
+    float surface_radius = atm_surface_radius(atm);
 
     // Find LOS extent
     RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
@@ -1074,7 +1096,7 @@ kernel void mcrt_trace_photon(
     rng *= 2862933555777941757ul;
     rng += 1ul;
 
-    float surface_radius = EARTH_RADIUS_M;
+    float surface_radius = atm_surface_radius(atm);
 
     float3 pos = observer_pos;
     float3 dir = view_dir;
@@ -1343,7 +1365,7 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                              SecondarySetup setup,
                              uint ray_idx, uint total_rays,
                              thread ulong &rng) {
-    float surface_radius = EARTH_RADIUS_M;
+    float surface_radius = atm_surface_radius(atm);
 
     // Unbiased one-sample-MIS seed (port of the CPU estimator): sample
     // omega from the 3-component mixture, weight by
@@ -1699,8 +1721,8 @@ kernel void hybrid_scatter(
     float3 sun_dir      = read_sun_dir(params);
     uint secondary_rays = read_secondary_rays(params);
 
-    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
-    float surface_radius = EARTH_RADIUS_M;
+    float toa_radius = atm_toa_radius(atm);
+    float surface_radius = atm_surface_radius(atm);
 
     // ── LOS geometry (all threads compute same values) ──────────────────
     RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
@@ -1904,8 +1926,8 @@ kernel void hybrid_los_prefix(
     float3 observer_pos = read_observer(params);
     float3 view_dir     = read_view_dir(params);
 
-    float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
-    float surface_radius = EARTH_RADIUS_M;
+    float toa_radius = atm_toa_radius(atm);
+    float surface_radius = atm_surface_radius(atm);
 
     RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
     if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
@@ -1996,12 +2018,13 @@ kernel void hybrid_scatter_v2(
 
     if (ray_lane == 0) {
         bool valid = (wl_idx < num_wl);
-        float toa_radius = EARTH_RADIUS_M + TOA_ALTITUDE_M;
-        float surface_radius = EARTH_RADIUS_M;
+        float toa_radius = atm_toa_radius(atm);
+        float surface_radius = atm_surface_radius(atm);
         float ds = 0.0f;
         float3 scatter_pos = float3(0.0f);
         ShellOptics my_op = {};
         float my_beta_scat = 0.0f;
+        int my_sidx = -1;
         float t_obs = 0.0f;
         SecondarySetup setup = {};
 
@@ -2028,11 +2051,11 @@ kernel void hybrid_scatter_v2(
                         if (r > toa_radius || r < surface_radius) {
                             valid = false;
                         } else {
-                            int sidx = shell_index_binary(atm, r);
-                            if (sidx < 0) {
+                            my_sidx = shell_index_binary(atm, r);
+                            if (my_sidx < 0) {
                                 valid = false;
                             } else {
-                                my_op = read_optics(atm, uint(sidx), wl_idx);
+                                my_op = read_optics(atm, uint(my_sidx), wl_idx);
                                 my_beta_scat = my_op.extinction * my_op.ssa;
                                 if (my_beta_scat < 1e-30f) {
                                     valid = false;

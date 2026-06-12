@@ -257,7 +257,7 @@ pub fn refract_at_boundary(dir: Vec3, boundary_pos: Vec3, n_from: f64, n_to: f64
 pub fn geographic_to_ecef(lat_deg: f64, lon_deg: f64, altitude_m: f64) -> Vec3 {
     use libm::{cos, sin};
 
-    const EARTH_RADIUS_M: f64 = 6_371_000.0;
+    const EARTH_RADIUS_M: f64 = crate::atmosphere::EARTH_RADIUS_M;
     let lat = lat_deg * core::f64::consts::PI / 180.0;
     let lon = lon_deg * core::f64::consts::PI / 180.0;
     let r = EARTH_RADIUS_M + altitude_m;
@@ -551,7 +551,7 @@ mod tests {
     fn ray_sphere_large_radius_earth() {
         // Observer on Earth's surface looking up: origin at (R_earth, 0, 0), dir = (+1,0,0)
         // Intersect with sphere of radius R_earth + 100km
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let r_toa = r_earth + 100_000.0;
         let origin = Vec3::new(r_earth, 0.0, 0.0);
         let dir = Vec3::new(1.0, 0.0, 0.0);
@@ -592,7 +592,7 @@ mod tests {
     #[test]
     fn ecef_equator_prime_meridian() {
         // (0°N, 0°E, 0m) → (R, 0, 0)
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let pos = geographic_to_ecef(0.0, 0.0, 0.0);
         assert!((pos.x - r_earth).abs() < 1.0);
         assert!(pos.y.abs() < 1.0);
@@ -602,7 +602,7 @@ mod tests {
     #[test]
     fn ecef_north_pole() {
         // (90°N, 0°E, 0m) → (0, 0, R)
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let pos = geographic_to_ecef(90.0, 0.0, 0.0);
         assert!(pos.x.abs() < 1.0);
         assert!(pos.y.abs() < 1.0);
@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn ecef_south_pole() {
         // (-90°N, 0°E, 0m) → (0, 0, -R)
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let pos = geographic_to_ecef(-90.0, 0.0, 0.0);
         assert!(pos.x.abs() < 1.0);
         assert!(pos.y.abs() < 1.0);
@@ -622,7 +622,7 @@ mod tests {
     #[test]
     fn ecef_equator_90e() {
         // (0°N, 90°E, 0m) → (0, R, 0)
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let pos = geographic_to_ecef(0.0, 90.0, 0.0);
         assert!(pos.x.abs() < 1.0);
         assert!((pos.y - r_earth).abs() < 1.0);
@@ -641,7 +641,7 @@ mod tests {
     #[test]
     fn ecef_all_points_have_correct_radius() {
         // Any point should be at distance R + altitude from origin
-        let r_earth = 6_371_000.0;
+        let r_earth = crate::atmosphere::EARTH_RADIUS_M;
         let alt = 500.0;
         for lat in &[-90.0, -45.0, 0.0, 30.0, 60.0, 90.0] {
             for lon in &[-180.0, -90.0, 0.0, 90.0, 180.0] {
