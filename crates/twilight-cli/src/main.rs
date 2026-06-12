@@ -194,9 +194,11 @@ struct PrayArgs {
     /// Date in YYYY-MM-DD format
     #[arg(short, long)]
     date: String,
-    /// Timezone offset from UTC (hours)
-    #[arg(short, long, default_value = "0")]
-    tz: f64,
+    /// Timezone offset from UTC (hours). Determined automatically from
+    /// the coordinates when omitted (IANA tzdb: correct zone AND the
+    /// DST state for the specific date). Set only to override.
+    #[arg(short, long)]
+    tz: Option<f64>,
     /// Elevation above sea level in meters
     #[arg(short, long, default_value = "0")]
     elevation: f64,
@@ -1540,9 +1542,11 @@ fn resolve_skyglow(args: &PrayArgs, year: i32, month: i32, day: i32) -> Option<S
 /// Assemble the pipeline input from the resolved pieces. Weather-derived
 /// properties travel in the custom_* slots; manual flags go through the
 /// type-based path.
+#[allow(clippy::too_many_arguments)] // independently resolved inputs
 fn build_input(
     args: &PrayArgs,
     date: (i32, i32, i32),
+    tz_offset: f64,
     weather: Option<WeatherBlock>,
     cloud_layers: Option<Vec<CloudProperties>>,
     horizon_profile: Option<HorizonProfile>,
@@ -1572,7 +1576,7 @@ fn build_input(
         year,
         month,
         day,
-        timezone: args.tz,
+        timezone: tz_offset,
         delta_t: args.delta_t,
         surface_albedo: args.albedo,
         sza_step: args.sza_step,
@@ -1595,15 +1599,106 @@ fn build_input(
     }
 }
 
+/// Timezone resolved for a location and date.
+struct ResolvedTz {
+    /// Engine offset [hours east of UTC], fixed for the run (the zone's
+    /// offset at the date's UTC noon).
+    offset_hours: f64,
+    /// IANA zone for exact per-instant wall-clock conversion (None when
+    /// the user forced a manual offset or the lookup failed).
+    zone: Option<chrono_tz::Tz>,
+    /// Human-readable provenance for the header line.
+    label: String,
+}
+
+fn fmt_utc_offset(hours: f64) -> String {
+    let total_min = (hours * 60.0).round() as i64;
+    let sign = if total_min < 0 { '-' } else { '+' };
+    let a = total_min.abs();
+    format!("UTC{}{:02}:{:02}", sign, a / 60, a % 60)
+}
+
+/// Coordinates + date -> timezone. A wrong fixed offset is the largest
+/// possible error in this program (a full hour, 30x anything the physics
+/// can do), so the default is the IANA database: polygon lookup for the
+/// zone name, then the zone's real offset for THIS date (DST-aware).
+fn resolve_timezone(lat: f64, lon: f64, year: i32, month: i32, day: i32, manual: Option<f64>) -> ResolvedTz {
+    if let Some(t) = manual {
+        return ResolvedTz {
+            offset_hours: t,
+            zone: None,
+            label: format!("{} (manual --tz)", fmt_utc_offset(t)),
+        };
+    }
+    let finder = tzf_rs::DefaultFinder::default();
+    let name = finder.get_tz_name(lon, lat);
+    if let Ok(zone) = name.parse::<chrono_tz::Tz>() {
+        use chrono::{NaiveDate, Offset, TimeZone};
+        if let Some(noon_utc) = NaiveDate::from_ymd_opt(year, month as u32, day as u32)
+            .and_then(|d| d.and_hms_opt(12, 0, 0))
+        {
+            let off =
+                zone.offset_from_utc_datetime(&noon_utc).fix().local_minus_utc() as f64 / 3600.0;
+            return ResolvedTz {
+                offset_hours: off,
+                zone: Some(zone),
+                label: format!("{} ({}, IANA tzdb)", name, fmt_utc_offset(off)),
+            };
+        }
+    }
+    // Lookup failed (ocean, unparseable zone): longitude estimate, loudly.
+    let off = (lon / 15.0).round();
+    eprintln!(
+        "Warning: timezone lookup failed for {lat:.3},{lon:.3}; using longitude estimate {} - pass --tz to override.",
+        fmt_utc_offset(off)
+    );
+    ResolvedTz {
+        offset_hours: off,
+        zone: None,
+        label: format!("{} (longitude estimate)", fmt_utc_offset(off)),
+    }
+}
+
+/// Convert an engine-local fractional hour to the WALL-CLOCK fractional
+/// hour via the zone rules at that exact instant. Identical to the input
+/// almost always; differs exactly on DST-transition nights, where a fixed
+/// offset cannot express the correct local time (transitions happen at
+/// 02:00-03:00 - where Fajr lives).
+fn wall_fractional_hour(
+    h_local: f64,
+    year: i32,
+    month: i32,
+    day: i32,
+    engine_offset: f64,
+    zone: Option<chrono_tz::Tz>,
+) -> f64 {
+    let Some(z) = zone else { return h_local };
+    use chrono::{Datelike, Duration, NaiveDate, TimeZone, Timelike};
+    let Some(base) = NaiveDate::from_ymd_opt(year, month as u32, day as u32) else {
+        return h_local;
+    };
+    let utc = base.and_hms_opt(0, 0, 0).unwrap()
+        - Duration::milliseconds((engine_offset * 3.6e6).round() as i64)
+        + Duration::milliseconds((h_local * 3.6e6).round() as i64);
+    let wall = z.from_utc_datetime(&utc);
+    let days = (wall.date_naive() - base).num_days() as f64;
+    let _ = wall.year();
+    days * 24.0
+        + wall.hour() as f64
+        + wall.minute() as f64 / 60.0
+        + wall.second() as f64 / 3600.0
+}
+
 fn cmd_pray(args: PrayArgs) {
     let (year, month, day) = resolve_date(&args.date);
+    let tz = resolve_timezone(args.lat, args.lon, year, month, day, args.tz);
 
     println!("Twilight MCRT Prayer Time Calculator");
     println!("====================================");
     println!("Date:       {}-{:02}-{:02}", year, month, day);
     println!("Location:   {:.4}°N, {:.4}°E", args.lat, args.lon);
     println!("Elevation:  {:.0} m", args.elevation);
-    println!("Timezone:   UTC{:+.1}", args.tz);
+    println!("Timezone:   {}", tz.label);
     println!("Albedo:     {:.2}", args.albedo);
     println!("SZA step:   {:.2}°", args.sza_step);
 
@@ -1729,6 +1824,7 @@ fn cmd_pray(args: PrayArgs) {
     let input = build_input(
         &args,
         (year, month, day),
+        tz.offset_hours,
         weather,
         cloud_layers,
         horizon_profile,
@@ -1789,13 +1885,24 @@ fn cmd_pray(args: PrayArgs) {
         output.computation_time_ms, actual_ephemeris, compute_label
     );
 
-    report(&args, &input, &output);
+    report(&args, &input, &output, tz.zone);
 }
 
 /// All result printing for `pray`: prayer-time blocks, terrain and
 /// skyglow adjustments, the khayt and legacy methods, the conventional
 /// fixed-angle comparison, the verbose analysis table and the notes.
-fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
+fn report(
+    args: &PrayArgs,
+    input: &PrayerTimeInput,
+    output: &PrayerTimeOutput,
+    zone: Option<chrono_tz::Tz>,
+) {
+    // Wall-clock conversion: exact per-instant zone rules (DST-transition
+    // nights differ from the fixed engine offset precisely where Fajr
+    // lives). Identity when no zone is known.
+    let wall = |h: f64| -> f64 {
+        wall_fractional_hour(h, input.year, input.month, input.day, input.timezone, zone)
+    };
     println!();
 
     // Print results
@@ -1807,14 +1914,14 @@ fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
         "  Sunrise:              {}",
         output
             .sunrise_time
-            .map(format_fractional_hour)
+            .map(|h| format_fractional_hour(wall(h)))
             .unwrap_or("N/A".to_string())
     );
     println!(
         "  Sunset:               {}",
         output
             .sunset_time
-            .map(format_fractional_hour)
+            .map(|h| format_fractional_hour(wall(h)))
             .unwrap_or("N/A".to_string())
     );
 
@@ -1883,7 +1990,7 @@ fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
     if let (Some(time), Some(sza)) = (kh.fajr_time, kh.fajr_sza_deg) {
         println!(
             "  Fajr (khayt al-abyad): {}  (SZA {:.2}°, depression {:.2}°)",
-            format_fractional_hour(time),
+            format_fractional_hour(wall(time)),
             sza,
             sza - 90.0
         );
@@ -1893,7 +2000,7 @@ fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
         if let Some(kt) = kh.kadhib_time {
             println!(
                 "    └ false dawn (al-fajr al-kadhib) visible from {} - do not pray Fajr yet",
-                format_fractional_hour(kt)
+                format_fractional_hour(wall(kt))
             );
         }
     } else {
@@ -1902,7 +2009,7 @@ fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
     if let (Some(time), Some(sza)) = (kh.isha_ahmar_time, kh.isha_ahmar_sza_deg) {
         println!(
             "  Isha (shafaq ahmar):   {}  (SZA {:.2}°, depression {:.2}°)",
-            format_fractional_hour(time),
+            format_fractional_hour(wall(time)),
             sza,
             sza - 90.0
         );
@@ -1913,7 +2020,7 @@ fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
     if let (Some(time), Some(sza)) = (kh.isha_abyad_time, kh.isha_abyad_sza_deg) {
         println!(
             "  Isha (shafaq abyad):   {}  (SZA {:.2}°, depression {:.2}°)",
-            format_fractional_hour(time),
+            format_fractional_hour(wall(time)),
             sza,
             sza - 90.0
         );
@@ -1930,7 +2037,7 @@ fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
     ) {
         println!(
             "  Fajr (true dawn):     {}{}  (SZA {:.2}°, depression {:.2}°)",
-            format_fractional_hour(time),
+            format_fractional_hour(wall(time)),
             format_uncertainty(output.fajr_uncertainty_min),
             sza,
             dep
@@ -1957,7 +2064,7 @@ fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
     ) {
         println!(
             "  Isha (al-abyad):      {}{}  (SZA {:.2}°, depression {:.2}°)",
-            format_fractional_hour(time),
+            format_fractional_hour(wall(time)),
             format_uncertainty(output.isha_abyad_uncertainty_min),
             sza,
             dep
@@ -1975,7 +2082,7 @@ fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
     ) {
         println!(
             "  Isha (al-ahmar):      {}{}  (SZA {:.2}°, depression {:.2}°)",
-            format_fractional_hour(time),
+            format_fractional_hour(wall(time)),
             format_uncertainty(output.isha_ahmar_uncertainty_min),
             sza,
             dep
@@ -2027,7 +2134,7 @@ fn report(args: &PrayArgs, input: &PrayerTimeInput, output: &PrayerTimeOutput) {
         };
 
         let time_str = time
-            .map(format_fractional_hour)
+            .map(|h| format_fractional_hour(wall(h)))
             .unwrap_or("N/A".to_string());
 
         let diff_str = match (time, mcrt_time) {

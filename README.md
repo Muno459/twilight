@@ -47,13 +47,14 @@ and thicknesses, not a guessed average.
 ```bash
 cargo build --release
 
-# Clear-sky prayer times, anywhere on Earth
-./target/release/twilight-cli pray --lat 21.4225 --lon 39.8262 \
-  --date 2026-06-13 --tz 3
+# Clear-sky prayer times, anywhere on Earth. The timezone (including
+# whether DST is active on that date) is determined automatically from
+# the coordinates via the IANA database; --tz overrides if needed.
+./target/release/twilight-cli pray --lat 21.4225 --lon 39.8262 --date 2026-06-13
 
 # Production: live weather at the prayer hour, satellite clouds, measured
 # skyglow, JPL ephemeris, multi-scatter transport
-./target/release/twilight-cli pray --lat 54.82 --lon 9.36 --date 2026-06-13 --tz 2 \
+./target/release/twilight-cli pray --lat 54.82 --lon 9.36 --date 2026-06-13 \
   --weather --skyglow --de440 data/de440.bsp --scattering hybrid
 ```
 
@@ -278,8 +279,8 @@ established local calendars. Known limits, stated plainly:
   is detectable tonight; most fiqh defines the times by what would be
   visible absent obstruction (clear-sky runs give that). Rulings belong to
   the people of knowledge, not to this engine.
-- Timezone is a fixed UTC offset (no DST database yet); terrain masking
-  applies to sunrise and sunset, not yet to the dawn band itself.
+- Terrain masking applies to sunrise and sunset, not yet to the dawn
+  band itself.
 
 ## Reproduce the validation
 
@@ -291,9 +292,9 @@ python3 tools/validate_libradtran.py --tier 1b --shape-only
 
 # Field-campaign checks
 ./target/release/twilight-cli pray --lat 21.4225 --lon 39.8262 --date 2026-06-13 \
-  --tz 3 --de440 data/de440.bsp --scattering hybrid   # Mecca: 14.85/17.46/15.50
+  --de440 data/de440.bsp --scattering hybrid   # Mecca: 14.85/17.46/15.50
 ./target/release/twilight-cli pray --lat 52.44 --lon=-1.93 --date 2026-06-13 \
-  --tz 1 --de440 data/de440.bsp --scattering hybrid   # Birmingham June: 12.50
+  --de440 data/de440.bsp --scattering hybrid   # Birmingham June: 12.50
 
 # Full test suite (including the Metal GPU parity gates)
 cargo test --workspace --release
