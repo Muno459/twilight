@@ -89,7 +89,7 @@ pub struct SimulationConfig {
     pub polarized: bool,
     /// Extra entropy mixed into MC seeds. Salt 0 reproduces historical
     /// runs; distinct salts give statistically independent estimates of
-    /// the same radiance — the basis for K-seed averaging and standard-
+    /// the same radiance - the basis for K-seed averaging and standard-
     /// error estimation in the prayer pipeline.
     pub seed_salt: u64,
 }
@@ -404,7 +404,7 @@ mod tests {
     // ── 150 km ceiling (regression for the deep-twilight zero) ──
 
     /// With the old 100 km ceiling, single-scatter radiance was EXACTLY
-    /// zero for SZA >= ~104 deg — yet prayer-time crossings live at
+    /// zero for SZA >= ~104 deg - yet prayer-time crossings live at
     /// 104-106 deg (verified against MYSTIC spherical, which still sees
     /// signal there). The thermospheric shells (100-150 km) carry that
     /// signal: it must be nonzero and decreasing in SZA.

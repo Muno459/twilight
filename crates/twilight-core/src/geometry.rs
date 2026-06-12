@@ -167,7 +167,7 @@ pub fn next_shell_boundary(
                 // ON-BOUNDARY DEGENERACY: a ray starting exactly on (or
                 // within numerical fuzz of) the INNER sphere moving
                 // inward has inner t_near ~ 0, which the > 1e-10 guard
-                // rejects — the old code then returned the OUTER far
+                // rejects - the old code then returned the OUTER far
                 // root, teleporting the walk straight through everything
                 // below (through the planet, for a shadow ray: a
                 // verified T~1 sunlight leak). The signature: the ray

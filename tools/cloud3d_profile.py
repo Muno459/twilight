@@ -5,27 +5,27 @@ geostationary imagery.
 Runs the csaybar/cloud3d TorchScript model (SegFormer trained on the
 Cloud3DTACO dataset, ESA FDL Earth Systems Lab 2025, arXiv:2511.04773) on
 a window of near-real-time GOES ABI imagery and emits the 80-level
-ice-water-content profile around an observer — real measured 3D cloud
+ice-water-content profile around an observer - real measured 3D cloud
 structure for the twilight radiative-transfer engine.
 
 Verified facts about the model (probed + dataset cross-check):
-  input  : [B, 11, H, W] — the 11 SEVIRI narrow-band channels in
+  input  : [B, 11, H, W] - the 11 SEVIRI narrow-band channels in
            wavelength-ascending order; on GOES ABI the nearest-wavelength
            set is C02,C03,C05 (solar) + C07,C08,C10,C11,C12,C13,C14,C16
            (thermal). Solar bands: TOA reflectance in PERCENT clipped to
            [0,100] then min-max to [-1,1]; thermal: BT in K clipped to
            [180,350] then min-max to [-1,1]; NaN -> 0 after normalization.
-  output : [B, 80, H, W] — log-normalized IWC on the CloudSat bin grid,
+  output : [B, 80, H, W] - log-normalized IWC on the CloudSat bin grid,
            channel 0 = ~18,945 m (top), channel 79 = ~0 m, ~240 m bins.
            IWC [g/m^3] = 10 ** (((y+1)/2)*6 - 5); y=-1 means clear.
 
 Data source: NOAA GOES on AWS Open Data, anonymous access. Lazy chunked
-reads via s3fs/h5netcdf — only the chunks covering the requested window
+reads via s3fs/h5netcdf - only the chunks covering the requested window
 are downloaded (tens of MB, not the 244 MB granule).
 
 Coverage: GOES-19 (East, 75.2W) and GOES-18 (West, 137.0W) full disks.
 Locations outside (Europe/Africa/Asia) need EUMETSAT SEVIRI/FCI
-credentials — not implemented here; the engine falls back to the GIBS
+credentials - not implemented here; the engine falls back to the GIBS
 MODIS COT+CTH route.
 
 Usage:
@@ -135,7 +135,7 @@ def normalize(stack):
     """[11,H,W] raw (refl % / BT K) -> [-1,1] with NaN->0, per the dataset.
 
     Channel order is wavelength-ascending (SEVIRI convention), so the
-    first three slots are always the solar/reflectance channels — true
+    first three slots are always the solar/reflectance channels - true
     for ABI, AHI and SEVIRI alike.
     """
     out = np.empty_like(stack, dtype=np.float32)
@@ -169,7 +169,7 @@ def render_3d(png_path, iwc, heights, km_e, km_s, jc_w, ic_w,
     altitude; the dense core is drawn solid white.
 
     texture: in the window's row/col orientation (rows north->south,
-    the GOES convention — SEVIRI callers must pre-flip): either
+    the GOES convention - SEVIRI callers must pre-flip): either
     grayscale [H,W] in [0,1] or RGB [H,W,3] (e.g. the SEVIRI natural
     color composite by day).
     """
@@ -270,7 +270,7 @@ def render_3d(png_path, iwc, heights, km_e, km_s, jc_w, ic_w,
     ax.view_init(elev=26, azim=-75)
     vexag = z_disp / 16.0
     ax.set_title(
-        f"cloud3d — 3D cloud reconstruction over {place}\n"
+        f"cloud3d - 3D cloud reconstruction over {place}\n"
         f"{scan_label} · isosurface envelope colored by altitude, dense core white · "
         f"ground = actual satellite image · vertical ~{vexag:.0f}x exaggerated",
         fontsize=13)
@@ -371,7 +371,7 @@ def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
              va="top", transform=ax4.transAxes)
 
     place = args.place or f"{args.lat:.2f}N {args.lon:.2f}E"
-    fig.suptitle(f"cloud3d — satellite 3D cloud reconstruction over {place}",
+    fig.suptitle(f"cloud3d - satellite 3D cloud reconstruction over {place}",
                  fontsize=15, y=0.99)
     fig.savefig(png_path, dpi=140, bbox_inches="tight",
                 facecolor="white")
@@ -523,7 +523,7 @@ def main():
                 cols.append(iwc[:, jj, ii])
                 kms.append(km)
 
-    # The ACTUAL scan time from the granule name (_sYYYYDDDHHMMSSt) — the
+    # The ACTUAL scan time from the granule name (_sYYYYDDDHHMMSSt) - the
     # requested twilight hour is usually in the future; never label model
     # output with a time the satellite did not observe.
     mscan = re.search(r"_s(\d{4})(\d{3})(\d{2})(\d{2})", key)

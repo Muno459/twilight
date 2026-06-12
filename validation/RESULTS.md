@@ -7,7 +7,7 @@ Harness: `tools/validate_libradtran.py` (matched US-Standard-1976 atmosphere,
 shape-normalized at 550 nm; twilight side = `twilight-cli compare`
 hybrid/scalar, all scattering orders).
 
-## Tier 1a — twilight hybrid vs DISORT (pseudospherical, 16 streams)
+## Tier 1a - twilight hybrid vs DISORT (pseudospherical, 16 streams)
 
 Sky radiance, 401 wavelengths × {zenith, 75°} view × {0°, 90°, 180°} relative
 azimuth. Median / p90 relative error per SZA (2026-06-12 run):
@@ -24,10 +24,10 @@ azimuth. Median / p90 relative error per SZA (2026-06-12 run):
 **Conclusion:** twilight's full transport agrees with DISORT at the few-percent
 level everywhere DISORT itself is trustworthy (≤90°). The SZA 95 row is
 dominated by pseudospherical DISORT's own breakdown past the terminator
-(plane-parallel heritage), not necessarily by twilight — the spherical
+(plane-parallel heritage), not necessarily by twilight - the spherical
 referee for that regime is tier 1b.
 
-## Tier 1b — twilight hybrid vs MYSTIC (spherical 1D MC)
+## Tier 1b - twilight hybrid vs MYSTIC (spherical 1D MC)
 
 Zenith radiance at 450/550/650 nm (550 = shape anchor), `mc_spherical 1D`,
 2×10⁶ photons + VROOM, twilight with `--no-refraction` (MYSTIC traces
@@ -40,14 +40,14 @@ straight shadow rays) and the 150 km atmosphere (the 100 km ceiling fix):
 | 100° | +12% | −64% | noise-dominated |
 | 102° | −91% | (n/a) | noise-dominated |
 | 104° | anchor only | | MYSTIC at its photon limit |
-| 106° | — | — | MYSTIC zero at 2M photons |
+| 106° | - | - | MYSTIC zero at 2M photons |
 
 **Validated through SZA 95.** Beyond 98° the signal is 10⁻⁷–10⁻⁹ of TOA
-and the residuals flip sign between bands and SZAs — the statistical
+and the residuals flip sign between bands and SZAs - the statistical
 signature of MC noise on BOTH sides (twilight: 500 rays single-seed in
 the compare hook; MYSTIC: 2×10⁶ photons), not of a systematic. Closing
 the deep tier requires the planned ~10⁸-photon overnight MYSTIC runs
-plus K-seed averaging on the twilight side of the comparison — compute
+plus K-seed averaging on the twilight side of the comparison - compute
 budget, not unknown physics. The 100 km ceiling question itself is
 RESOLVED: the atmosphere now extends to 150 km (USSA-76 thermosphere)
 and single-scatter is nonzero and monotone through SZA 107

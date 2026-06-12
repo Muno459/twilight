@@ -22,7 +22,7 @@ pub const ALTITUDE_GRID_KM: [f64; 46] = [
 /// Number of altitude levels in the grid.
 pub const NUM_LEVELS: usize = 46;
 
-/// US Standard Atmosphere 1976 — temperature profile [K]
+/// US Standard Atmosphere 1976 - temperature profile [K]
 pub const US_STD_TEMPERATURE_K: [f64; 46] = [
     288.15, 281.65, 275.15, 268.65, 262.15, 255.65, 249.15, 242.65, 236.15, 229.65, 223.15, 216.65,
     216.65, 216.65, 216.65, 216.65, 216.65, 216.65, 216.65, 216.65, 216.65, 217.65, 218.65, 219.65,
@@ -32,7 +32,7 @@ pub const US_STD_TEMPERATURE_K: [f64; 46] = [
     240.00, 360.00, 469.27, 559.63, 634.39,
 ];
 
-/// US Standard Atmosphere 1976 — pressure profile [hPa]
+/// US Standard Atmosphere 1976 - pressure profile [hPa]
 pub const US_STD_PRESSURE_HPA: [f64; 46] = [
     1013.25, 898.76, 795.01, 701.21, 616.60, 540.48, 472.17, 411.05, 356.51, 308.00, 264.99,
     226.99, 194.02, 165.79, 141.70, 121.11, 103.52, 88.497, 75.652, 64.674, 55.293, 47.289, 40.475,
@@ -42,7 +42,7 @@ pub const US_STD_PRESSURE_HPA: [f64; 46] = [
     7.1042e-5, 2.5382e-5, 1.2505e-5, 7.2028e-6, 4.5422e-6,
 ];
 
-/// US Standard Atmosphere 1976 — number density profile [molecules/cm³]
+/// US Standard Atmosphere 1976 - number density profile [molecules/cm³]
 pub const US_STD_NUMBER_DENSITY: [f64; 46] = [
     2.547e19, 2.311e19, 2.093e19, 1.891e19, 1.703e19, 1.532e19, 1.373e19, 1.227e19, 1.093e19,
     9.711e18, 8.598e18, 7.585e18, 6.486e18, 5.543e18, 4.738e18, 4.049e18, 3.462e18, 2.960e18,
@@ -53,7 +53,7 @@ pub const US_STD_NUMBER_DENSITY: [f64; 46] = [
     2.144e12, 5.107e11, 1.930e11, 9.322e10, 5.186e10,
 ];
 
-/// US Standard Atmosphere 1976 — ozone number density [molecules/cm³]
+/// US Standard Atmosphere 1976 - ozone number density [molecules/cm³]
 pub const US_STD_OZONE_DENSITY: [f64; 46] = [
     5.40e11, 5.40e11, 5.40e11, 5.00e11, 4.60e11, 4.20e11, 3.90e11, 3.60e11, 3.20e11, 2.90e11,
     2.64e11, 2.40e11, 2.34e11, 2.67e11, 3.24e11, 4.07e11, 5.00e11, 5.95e11, 6.87e11, 7.37e11,

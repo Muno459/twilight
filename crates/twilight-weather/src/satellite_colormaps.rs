@@ -1,4 +1,4 @@
-//! Generated file — do not edit. Regenerate with
+//! Generated file - do not edit. Regenerate with
 //! `python3 tools/gen_gibs_colormaps.py`.
 
 /// RGB -> cloud water path [g/m^2].

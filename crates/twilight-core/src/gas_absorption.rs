@@ -905,7 +905,7 @@ mod tests {
         let prof = standard_gas_profile(&atm);
         let du = o3_column_du(&prof, &atm);
         // The RAW embedded profile integrates to ~546 DU (too fat vs the
-        // US Standard 1976 value of ~345 DU) — which is why the builder
+        // US Standard 1976 value of ~345 DU) - which is why the builder
         // normalizes to STANDARD_O3_COLUMN_DU after building the profile.
         // This test documents the raw value so a silent data change is
         // caught. (Tolerance is wide-ish because the test atmosphere grid

@@ -10,7 +10,7 @@
 //!   milliarcsecond-level vs JPL Horizons, but the delivered topocentric
 //!   zenith/azimuth chain uses UT1≈UTC and simplified precession-nutation,
 //!   so end-to-end accuracy is arcsecond-level (tens of arcseconds worst
-//!   case) — far more than sufficient for prayer times.
+//!   case) - far more than sufficient for prayer times.
 //!   Coverage: 1550 to 2650 CE.
 //!
 //! The SPA backend is always available and serves as the default. The DE440

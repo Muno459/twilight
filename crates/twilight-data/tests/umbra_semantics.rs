@@ -1,5 +1,5 @@
 //! Documents the shadow-ray semantics for chords whose STRAIGHT-LINE
-//! perigee dips below the surface — the reference for the GPU's O(1)
+//! perigee dips below the surface - the reference for the GPU's O(1)
 //! umbra pre-cull. With piecewise-constant Snell refraction (Bouguer:
 //! n r sin(theta) = const), a descending ray's perigee is LOWER than the
 //! straight chord's (by <= R*(n0-1) ~ 1.9 km), so any chord already
@@ -14,7 +14,7 @@ fn straight_chord_below_surface_is_blocked_on_cpu() {
         0.15,
     );
     let re = twilight_core::atmosphere::EARTH_RADIUS_M;
-    // 80 km is EXACTLY a shell boundary — the historical leak trigger.
+    // 80 km is EXACTLY a shell boundary - the historical leak trigger.
     let p = Vec3::new(re + 80_000.0, 0.0, 0.0);
     for dip_km in [-30.0_f64, -10.0, -2.0, 0.0, 2.0, 5.0, 10.0, 30.0] {
         let b = re + dip_km * 1000.0;

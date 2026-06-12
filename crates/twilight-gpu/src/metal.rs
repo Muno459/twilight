@@ -289,7 +289,7 @@ impl GpuBackend for MetalBackend {
 
                 // Fold the FULL 64-bit seed into the low 32 bits before
                 // packing (splitmix64 finalizer). The previous
-                // `seed & 0xFFFF_FFFF` discarded the high word — and
+                // `seed & 0xFFFF_FFFF` discarded the high word - and
                 // `sza_deg.to_bits()` for SZAs on a 0.5-degree grid has
                 // all-zero low bits, so every SZA in a prayer scan ran
                 // with base_seed = 0 (identical RNG streams).

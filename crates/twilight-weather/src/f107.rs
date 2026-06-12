@@ -107,7 +107,7 @@ mod tests {
         assert!(flux.ninety_day_mean_sfu.is_none(), "9999 must be rejected");
     }
 
-    // Live network test — run with `cargo test -- --ignored`.
+    // Live network test - run with `cargo test -- --ignored`.
     #[test]
     #[ignore]
     fn live_fetch() {

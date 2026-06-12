@@ -112,7 +112,7 @@ pub fn fetch_atmospheric_params(lat: f64, lon: f64) -> Result<AtmosphericParams,
 }
 
 /// Like [`fetch_atmospheric_params`] but samples the HOURLY FORECAST at a
-/// specific UTC date and hour — the conditions at the actual prayer hour,
+/// specific UTC date and hour - the conditions at the actual prayer hour,
 /// not "now". This is the production path: Fajr weather is fetched for the
 /// morning-twilight hour and Isha weather for the evening-twilight hour.
 pub fn fetch_atmospheric_params_at(

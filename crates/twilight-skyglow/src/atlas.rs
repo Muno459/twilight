@@ -3,7 +3,7 @@
 //! Fetches and decodes the David Lorenz world light-pollution atlas
 //! (VIIRS-based, propagated artificial ZENITH sky brightness; the 2024
 //! edition; <https://djlorenz.github.io/astronomy/lp/>), which models
-//! upward radiance through atmospheric scattering — i.e. it is already
+//! upward radiance through atmospheric scattering - i.e. it is already
 //! the observer-sky quantity the engine needs, unlike raw VIIRS DNB.
 //!
 //! Tile format (documented in the atlas viewer source):

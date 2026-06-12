@@ -112,7 +112,7 @@ pub struct SpaOutput {
     pub delta: f64,
     /// Observer hour angle (degrees)
     pub h: f64,
-    /// Topocentric zenith angle (degrees) — THE KEY OUTPUT
+    /// Topocentric zenith angle (degrees) - THE KEY OUTPUT
     pub zenith: f64,
     /// Topocentric azimuth angle (degrees, clockwise from north)
     pub azimuth: f64,
@@ -876,7 +876,7 @@ mod tests {
             output.r
         );
 
-        // Zenith angle — the key output
+        // Zenith angle - the key output
         // NREL reference: 50.11162° (topocentric zenith with refraction)
         let zenith_expected = 50.11162;
         assert!(
@@ -886,7 +886,7 @@ mod tests {
             output.zenith
         );
 
-        // Azimuth — NREL reference: 194.34024°
+        // Azimuth - NREL reference: 194.34024°
         let azimuth_expected = 194.34024;
         assert!(
             fabs(output.azimuth - azimuth_expected) < 0.01,

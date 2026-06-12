@@ -10,7 +10,7 @@ use twilight_solar::spa::{self, SpaInput};
 use twilight_terrain::horizon;
 use twilight_threshold::threshold::TwilightColor;
 
-/// Twilight — Monte Carlo Radiative Transfer engine for Fajr/Isha prayer times.
+/// Twilight - Monte Carlo Radiative Transfer engine for Fajr/Isha prayer times.
 #[derive(Parser)]
 #[command(name = "twilight")]
 #[command(about = "Compute solar position and twilight times for any location and date")]
@@ -250,7 +250,7 @@ enum Commands {
         /// Override O3 total column in Dobson Units (matched to mol_modify O3)
         #[arg(long)]
         o3_du: Option<f64>,
-        /// Scattering mode (default: single — deterministic, f64, the
+        /// Scattering mode (default: single - deterministic, f64, the
         /// apples-to-apples baseline vs DISORT single-scattering output)
         #[arg(long, value_enum, default_value = "single")]
         scattering: CliScattering,
@@ -357,7 +357,7 @@ impl CliScattering {
 /// CLI GPU backend selector.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliGpuBackend {
-    /// Apple Metal (macOS / iOS) — the only implemented GPU backend
+    /// Apple Metal (macOS / iOS) - the only implemented GPU backend
     Metal,
 }
 
@@ -466,7 +466,7 @@ fn format_fractional_hour(h: f64) -> String {
         return "N/A".to_string();
     }
     // Hours >= 24 are past-midnight events (high-latitude Isha can fall on
-    // the next civil day) — display wrapped with a +1d marker.
+    // the next civil day) - display wrapped with a +1d marker.
     let (h, next_day) = if h >= 24.0 { (h - 24.0, true) } else { (h, false) };
     let hours = h as u32;
     let minutes = ((h - hours as f64) * 60.0) as u32;
@@ -1051,7 +1051,7 @@ fn cmd_pray(
     //
     // Production weather sampling: prayer times happen at specific twilight
     // hours, so the hourly FORECAST is sampled at the evening-twilight hour
-    // (sunset + 45 min) for the scan — the best data the API offers — with
+    // (sunset + 45 min) for the scan - the best data the API offers - with
     // a fallback to current conditions if the forecast fetch fails.
     let twilight_hour_utc: Option<f64> = {
         // Quick SPA sunset for the forecast hour (UTC fractional hours).
@@ -1092,7 +1092,7 @@ fn cmd_pray(
         };
         // SATELLITE CLOUD ENHANCEMENT: sample the GIBS MODIS cloud field
         // (COT + cloud-top height) at the observer and along the sun
-        // azimuth ("2.5D" — the twilight shadow path crosses the cloud
+        // azimuth ("2.5D" - the twilight shadow path crosses the cloud
         // field tens to hundreds of km sunward). When the satellite saw
         // cloud, it overrides the model forecast's cloud layer: measured
         // optical depth at measured altitude beats a model cover fraction.
@@ -1210,8 +1210,8 @@ fn cmd_pray(
 
     // 3D CLOUDS (cloud3d): an 80-level ice-water-content profile
     // reconstructed from live geostationary imagery by the cloud3d model
-    // (trained on CloudSat radar). Real measured VERTICAL STRUCTURE —
-    // multiple independent layers — replacing any single-slab source.
+    // (trained on CloudSat radar). Real measured VERTICAL STRUCTURE -
+    // multiple independent layers - replacing any single-slab source.
     let cloud_layers: Option<Vec<twilight_data::cloud::CloudProperties>> =
         cloud3d.and_then(|spec| {
             let json_path: std::path::PathBuf = if spec == "auto" {
@@ -1296,7 +1296,7 @@ fn cmd_pray(
                     }
                     if layers.is_empty() {
                         println!(
-                            "Cloud3D:    {} {} — clear column (window cloud fraction {:.0}%)",
+                            "Cloud3D:    {} {} - clear column (window cloud fraction {:.0}%)",
                             p.satellite,
                             p.time_utc,
                             p.cloud_fraction * 100.0
@@ -1408,7 +1408,7 @@ fn cmd_pray(
         } else if let Some(b) = bortle {
             twilight_skyglow::bortle::bortle_to_radiance(b)
         } else {
-            // SATELLITE AUTO MODE — two independent satellite feeds:
+            // SATELLITE AUTO MODE - two independent satellite feeds:
             //  1. Lorenz atlas: PROPAGATED artificial zenith brightness
             //     (the right observable), frozen at its 2024 epoch.
             //  2. VIIRS Black Marble (GIBS, daily): CURRENT upward
@@ -1441,7 +1441,7 @@ fn cmd_pray(
                             // back to a ONE-SIDED live cross-check: a
                             // bright local pixel proves new lights the
                             // 2024 atlas missed (raise to the DNB-implied
-                            // floor) — but a dim local pixel proves
+                            // floor) - but a dim local pixel proves
                             // nothing, because the atlas value is
                             // PROPAGATED sky brightness that may come
                             // from a metro tens of km away (Brondby's sky
@@ -1466,7 +1466,7 @@ fn cmd_pray(
                                         println!(
                                             "Skyglow:    satellite atlas {} {:.3} mcd/m^2 \
                                              (live DNB cross-check: {:.1} nW local vs {:.1} nW \
-                                             implied — consistent)",
+                                             implied - consistent)",
                                             a.year, a.zenith_mcd, s.radiance_nw, atlas_nw
                                         );
                                     }
@@ -1525,7 +1525,7 @@ fn cmd_pray(
     };
 
     // Measured solar activity for the airglow background. F10.7 is a real
-    // daily-measured quantity (Penticton/NOAA SWPC) — only fetched when the
+    // daily-measured quantity (Penticton/NOAA SWPC) - only fetched when the
     // run is already online (weather mode); offline runs keep the mid-cycle
     // default inside the pipeline.
     let solar_f107 = if use_weather {
@@ -1735,7 +1735,7 @@ fn cmd_pray(
         );
         if let Some(kt) = kh.kadhib_time {
             println!(
-                "    └ false dawn (al-fajr al-kadhib) visible from {} — do not pray Fajr yet",
+                "    └ false dawn (al-fajr al-kadhib) visible from {} - do not pray Fajr yet",
                 format_fractional_hour(kt)
             );
         }
@@ -1749,7 +1749,7 @@ fn cmd_pray(
             sza,
             sza - 90.0
         );
-        println!("    └ red band no longer distinct — Shafi'i/Maliki/Hanbali (primary)");
+        println!("    └ red band no longer distinct - Shafi'i/Maliki/Hanbali (primary)");
     } else {
         println!("  Isha (shafaq ahmar):   N/A (contrast criterion not crossed in scan)");
     }
@@ -1760,7 +1760,7 @@ fn cmd_pray(
             sza,
             sza - 90.0
         );
-        println!("    └ white band no longer distinct — Hanafi");
+        println!("    └ white band no longer distinct - Hanafi");
     }
     println!();
     println!("  Legacy absolute-threshold method (comparison):");
@@ -1787,7 +1787,7 @@ fn cmd_pray(
             );
         }
     } else if output.persistent_twilight {
-        println!("  Fajr (true dawn):     N/A (no night at all — midnight sun)");
+        println!("  Fajr (true dawn):     N/A (no night at all - midnight sun)");
     } else {
         println!("  Fajr (true dawn):     N/A (threshold not crossed in scan range)");
     }
@@ -1805,7 +1805,7 @@ fn cmd_pray(
             sza,
             dep
         );
-        println!("    └ Hanafi school — white twilight disappears");
+        println!("    └ Hanafi school - white twilight disappears");
     } else {
         println!("  Isha (al-abyad):      N/A (threshold not crossed in scan range)");
     }
@@ -1823,7 +1823,7 @@ fn cmd_pray(
             sza,
             dep
         );
-        println!("    └ Shafi'i/Maliki/Hanbali — red glow disappears");
+        println!("    └ Shafi'i/Maliki/Hanbali - red glow disappears");
     } else {
         println!("  Isha (al-ahmar):      N/A (threshold not crossed in scan range)");
     }

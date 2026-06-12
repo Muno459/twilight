@@ -52,7 +52,7 @@ pub fn sample_rayleigh(xi1: f64, xi2: f64) -> f64 {
     if xi2 * 1.5 < p {
         mu
     } else {
-        // Rare rejection — try deterministic fallback
+        // Rare rejection - try deterministic fallback
         // In practice we'd loop, but in no_std we use the analytic CDF inverse
         sample_rayleigh_analytic(xi1)
     }
@@ -747,7 +747,7 @@ mod tests {
     #[test]
     fn sample_rayleigh_analytic_endpoints() {
         // The CDF inversion maps xi=0 → mu=+1 and xi=1 → mu=-1
-        // (inverted convention but valid — the Rayleigh phase function
+        // (inverted convention but valid - the Rayleigh phase function
         // is symmetric P(μ) = P(-μ), so this doesn't affect physics)
         let mu_low = sample_rayleigh_analytic(0.0);
         let mu_high = sample_rayleigh_analytic(1.0 - 1e-15);

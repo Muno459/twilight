@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 const GIBS_BASE: &str = "https://gibs.earthdata.nasa.gov/wmts/epsg4326/best";
 const COT_LAYER: &str = "MODIS_Aqua_Cloud_Optical_Thickness";
 const CTH_LAYER: &str = "MODIS_Aqua_Cloud_Top_Height_Day";
-/// Cloud water path [g/m^2] and particle effective radius [um] — the
+/// Cloud water path [g/m^2] and particle effective radius [um] - the
 /// MICROPHYSICS feeds (current through today on GIBS). r_eff types the
 /// cloud (droplets ~5-20 um = water; large crystals 20-60 um = ice) and
 /// CWP/r_eff yields an independent optical depth (tau = 3 CWP / 2 rho
@@ -550,7 +550,7 @@ pub struct SatelliteCloud {
     pub cloud_top_m: Option<f64>,
     /// Cloud water path [g/m^2] (liquid or ice, per the retrieval phase).
     pub cwp_g_m2: Option<f64>,
-    /// Particle effective radius [um] — measured microphysics: ~5-20 um
+    /// Particle effective radius [um] - measured microphysics: ~5-20 um
     /// means liquid droplets, larger means ice crystals.
     pub r_eff_um: Option<f64>,
     /// Age of the product in days (0 = today's overpass).
@@ -681,7 +681,7 @@ fn lut_lookup(lut: &[(u8, u8, u8, f32)], r: u8, g: u8, b: u8) -> Option<f64> {
     best.and_then(|(d, v)| if d <= 12 { Some(v as f64) } else { None })
 }
 
-/// Outcome of sampling one layer pixel — distinguishes "this pixel is
+/// Outcome of sampling one layer pixel - distinguishes "this pixel is
 /// clear" from "this date's tile has no data at all" (GIBS serves a fully
 /// transparent tile before the daily product is ingested; conflating the
 /// two froze the date-fallback loop on the empty tile).
@@ -806,7 +806,7 @@ pub fn sample_cloud(
         match sample_layer(cache_dir, COT_LAYER, &COT_COLORMAP, &d, lat, lon) {
             Ok(LayerSample::Value(cot)) => return Some(attach(cot)),
             Ok(LayerSample::ClearPixel) => {
-                // COT clear/missing at this pixel — the microphysics pair
+                // COT clear/missing at this pixel - the microphysics pair
                 // can still measure the cloud (PCL pixels have CWP+r_eff
                 // but no COT). Derive tau from them before declaring clear.
                 let s = attach(0.0);

@@ -6,7 +6,7 @@
 //! arXiv:2511.04773) on live GOES imagery and emits an 80-level
 //! ice-water-content profile (~240 m bins, top ~18.9 km). This module
 //! reads that JSON and collapses the profile into contiguous cloud
-//! layers for the radiative-transfer builder — real measured vertical
+//! layers for the radiative-transfer builder - real measured vertical
 //! cloud STRUCTURE instead of a single assumed slab.
 //!
 //! IWC -> visible extinction: for ice particles with effective radius

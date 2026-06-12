@@ -129,7 +129,7 @@ mod tests {
             0,
             42,
         );
-        // 0.0 / 0 = NaN, which is fine — caller should not pass 0
+        // 0.0 / 0 = NaN, which is fine - caller should not pass 0
         assert!(
             result.is_nan(),
             "0 photons should produce NaN, got {}",
@@ -326,7 +326,7 @@ mod tests {
         if mean_s.abs() > 1e-20 && mean_l.abs() > 1e-20 {
             let cv_s = var_s.sqrt() / mean_s.abs();
             let cv_l = var_l.sqrt() / mean_l.abs();
-            // Allow generous margin — just verify more photons isn't wildly noisier
+            // Allow generous margin - just verify more photons isn't wildly noisier
             assert!(
                 cv_l < cv_s * 3.0 || cv_l < 0.5,
                 "More photons should not dramatically increase noise: CV(50)={:.4}, CV(500)={:.4}",

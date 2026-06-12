@@ -1,7 +1,7 @@
 //! Low-precision lunar ephemeris (Meeus, Astronomical Algorithms ch. 47,
 //! truncated series).
 //!
-//! Accuracy ~0.3 deg in position — far more than sufficient for sky-
+//! Accuracy ~0.3 deg in position - far more than sufficient for sky-
 //! brightness modeling (the Krisciunas-Schaefer moonlight model's own
 //! scatter is ~20%). Provides geocentric ecliptic coordinates, topocentric
 //! altitude/azimuth, phase angle and illuminated fraction.
@@ -23,7 +23,7 @@ pub struct MoonState {
     pub illuminated_fraction: f64,
     /// Distance to the Moon [km]. Geocentric in this Meeus path;
     /// topocentric (observer-to-moon) when produced by the DE440
-    /// ephemeris — the difference is bounded by Earth's radius (<1.8%)
+    /// ephemeris - the difference is bounded by Earth's radius (<1.8%)
     /// and the topocentric value is the physically correct one for
     /// received moonlight.
     pub distance_km: f64,
@@ -59,7 +59,7 @@ fn moon_ecliptic(jd: f64) -> (f64, f64, f64) {
 
     let (d, m, mp, f) = (d * DEG, m * DEG, mp * DEG, f * DEG);
 
-    // Principal longitude terms (units 1e-6 deg) — Meeus Table 47.A truncated
+    // Principal longitude terms (units 1e-6 deg) - Meeus Table 47.A truncated
     let sum_l = 6288774.0 * sin(mp)
         + 1274027.0 * sin(2.0 * d - mp)
         + 658314.0 * sin(2.0 * d)
@@ -74,7 +74,7 @@ fn moon_ecliptic(jd: f64) -> (f64, f64, f64) {
         - 34720.0 * sin(d)
         - 30383.0 * sin(m + mp);
 
-    // Principal latitude terms (1e-6 deg) — Table 47.B truncated
+    // Principal latitude terms (1e-6 deg) - Table 47.B truncated
     let sum_b = 5128122.0 * sin(f)
         + 280602.0 * sin(mp + f)
         + 277693.0 * sin(mp - f)
@@ -84,7 +84,7 @@ fn moon_ecliptic(jd: f64) -> (f64, f64, f64) {
         + 32573.0 * sin(2.0 * d + f)
         + 17198.0 * sin(2.0 * mp + f);
 
-    // Distance terms (1e-3 km) — Table 47.A
+    // Distance terms (1e-3 km) - Table 47.A
     let sum_r = -20905355.0 * cos(mp)
         - 3699111.0 * cos(2.0 * d - mp)
         - 2955968.0 * cos(2.0 * d)

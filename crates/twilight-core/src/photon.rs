@@ -1,4 +1,4 @@
-//! Single photon trace logic — the core MCRT pure function.
+//! Single photon trace logic - the core MCRT pure function.
 //!
 //! This module contains the backward Monte Carlo photon tracing algorithm.
 //! The trace function is a pure function with no platform dependencies,
@@ -290,7 +290,7 @@ pub fn trace_photon(
         let shell_idx = match atm.shell_index(r) {
             Some(idx) => idx,
             None => {
-                // Outside atmosphere — photon escaped
+                // Outside atmosphere - photon escaped
                 result.terminated = true;
                 break;
             }
@@ -369,7 +369,7 @@ pub fn trace_photon(
         // Apply single scattering albedo BEFORE next-event estimation: an
         // NEE connection is a scattering interaction at this vertex, so its
         // radiometric weight must carry the scattering (not just extinction)
-        // coefficient — the reference single-scatter integrand uses
+        // coefficient - the reference single-scatter integrand uses
         // beta_scat = extinction * ssa. Applying SSA only after NEE
         // overestimated each NEE contribution by 1/ssa (the hybrid secondary
         // chains already apply SSA first).
@@ -1738,7 +1738,7 @@ fn trace_light_subpath(
         let one_minus_exp_h = 1.0 - exp_neg_tau_h;
         hero_weight *= one_minus_exp_h;
 
-        // NO per-wavelength truncation-normalization ratio here — the
+        // NO per-wavelength truncation-normalization ratio here - the
         // hero factor above plus the density ratio at the scatter site
         // are already the exact likelihood ratio (see the identical
         // note in the ALIS chain; the former extra factor spectrally
@@ -2623,7 +2623,7 @@ fn trace_secondary_chain(
     //
     //   w0 = [P(omega.view)/4pi] / q(omega)
     //
-    // identically for every branch — the balance-heuristic estimator, which
+    // identically for every branch - the balance-heuristic estimator, which
     // is unbiased for any q > 0 on the integrand's support. The samplers
     // and RNG consumption order are unchanged; only the weights are fixed.
     let dir = if xi_mix < alpha_p {
@@ -2661,7 +2661,7 @@ fn trace_secondary_chain(
     // the Mueller matrix of the (omega -> view) seed scatter; multiply-
     // scattered light is weakly polarized and the I-error of this
     // approximation is sub-percent. (The previous code applied a Mueller
-    // scatter for the WRONG geometry — sun->omega — then normalized it away.)
+    // scatter for the WRONG geometry - sun->omega - then normalized it away.)
     let mut stokes = StokesVector::unpolarized(1.0);
 
     let mut pos = start_pos;
@@ -3145,7 +3145,7 @@ fn trace_secondary_chain_scalar(
                                         libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
                                 }
                                 // Chain deck crossings: cloud absorption
-                                // only — single-representation convention
+                                // only - single-representation convention
                                 // (see polarized-chain note; the former
                                 // per-crossing T_diff over-attenuated
                                 // 13-74% and diverged from forced mode
@@ -3667,7 +3667,7 @@ fn trace_secondary_chain_alis(
     // Hero seed weight w0 = P_hero(omega.view)/4pi / q_hero(omega).
     // NOTE: the ALIS mixture is sampled with the HERO wavelength's phase
     // component, so q for every wavelength is q_hero (the proposal is one
-    // distribution regardless of which wavelength we score) — the per-
+    // distribution regardless of which wavelength we score) - the per-
     // wavelength ratio only carries the numerator P_w(omega.view)/P_hero.
     let cos_seed_view = dir.dot(view_dir);
     let q_seed = seed_mixture_pdf(
@@ -3827,7 +3827,7 @@ fn trace_secondary_chain_alis(
                 // sigma_h e^{-tau_h}/(1-e^{-tau_h,max}) against the
                 // integrand sigma_w e^{-tau_w} gives the EXACT ratio
                 // (1-e^{-tau_h,max}) * (sigma_w/sigma_h) e^{-(tau_w-tau_h)}
-                // — the first factor is on hero_weight above, the second
+                // - the first factor is on hero_weight above, the second
                 // is applied at the scatter site below. An extra
                 // normalization ratio multiplied here double-counted the
                 // truncation and suppressed red-channel multiple scatter

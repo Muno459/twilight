@@ -24,7 +24,7 @@ The spectral dimension matters: LED streetlights (strong blue peak at 450nm) sca
 
 **`angular`**. Directional skyglow variation. Azimuthal enhancement near bright sources (city centers), zenith-to-horizon brightness gradient, and twilight observation geometry factors. The enhancement decays with angular distance from the source and increases toward the horizon.
 
-**`bortle`**. Bortle Dark-Sky Scale (1-9) mapping. Converts between Bortle class, zenith luminance (mcd/m2), sky quality meter readings (mag/arcsec2), naked-eye limiting magnitude, and VIIRS nighttime radiance (nW/cm2/sr). Includes a rough heuristic for the prayer-time shift from zenith luminance; this heuristic is uncalibrated and disconnected from the RT pipeline — use the full pipeline (skyglow radiance added before threshold crossing) for any real estimate.
+**`bortle`**. Bortle Dark-Sky Scale (1-9) mapping. Converts between Bortle class, zenith luminance (mcd/m2), sky quality meter readings (mag/arcsec2), naked-eye limiting magnitude, and VIIRS nighttime radiance (nW/cm2/sr). Includes a rough heuristic for the prayer-time shift from zenith luminance; this heuristic is uncalibrated and disconnected from the RT pipeline - use the full pipeline (skyglow radiance added before threshold crossing) for any real estimate.
 
 ## Usage
 

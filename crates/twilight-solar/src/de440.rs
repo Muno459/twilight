@@ -108,13 +108,13 @@ impl De440 {
     ///
     /// DE440 stores Moon(301) and Earth(399) relative to the Earth-Moon
     /// barycenter (3); the segment chain resolves the geocentric vector.
-    /// The DE440 lunar orbit is fit to laser ranging — sub-meter accuracy,
+    /// The DE440 lunar orbit is fit to laser ranging - sub-meter accuracy,
     /// vs ~0.3 deg for the truncated Meeus series.
     pub fn moon_position_icrf(&mut self, tdb_seconds: f64) -> Result<[f64; 3], De440Error> {
         Ok(self.spk.position_chain(MOON, EARTH, tdb_seconds)?)
     }
 
-    /// Topocentric lunar state from the real JPL ephemeris — drop-in
+    /// Topocentric lunar state from the real JPL ephemeris - drop-in
     /// replacement for the Meeus-based [`crate::moon::moon_state`].
     ///
     /// The topocentric conversion subtracts the observer's WGS84 position
@@ -382,7 +382,7 @@ mod tests {
     fn test_de440_moon_agrees_with_meeus() {
         // The truncated Meeus series is good to ~0.3 deg geocentric; the
         // topocentric Meeus path adds a simplified parallax. DE440 must
-        // agree with it within those error bars at several epochs — any
+        // agree with it within those error bars at several epochs - any
         // larger discrepancy means a frame/chain bug, not series error.
         let path = match get_de440_path() {
             Some(p) => p,
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn test_de440_moon_known_phases() {
-        // 2026-01-03 full moon, 2026-01-18 new moon (UTC) — the real
+        // 2026-01-03 full moon, 2026-01-18 new moon (UTC) - the real
         // ephemeris must reproduce the almanac.
         let path = match get_de440_path() {
             Some(p) => p,

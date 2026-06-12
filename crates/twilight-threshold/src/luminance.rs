@@ -4,7 +4,7 @@
 //! using CIE photopic V(λ), scotopic V'(λ), and a simplified mesopic blend.
 //!
 //! NOTE: the mesopic blend is a photopic-luminance-driven log-blend in the
-//! spirit of (but NOT the full iterative MES2 system of) CIE 191:2010 —
+//! spirit of (but NOT the full iterative MES2 system of) CIE 191:2010 -
 //! the published system solves m iteratively from mesopic luminance and
 //! uses per-source S/P ratios. The simplification is documented and its
 //! coefficient breakpoints follow the CIE mesopic range (0.005-5 cd/m^2).
@@ -167,7 +167,7 @@ pub fn spectral_centroid(wavelengths_nm: &[f64], radiance: &[f64]) -> f64 {
 
 /// Compute luminance in the red band only (λ > 600nm).
 ///
-/// Used for shafaq al-ahmar detection — tracks the red glow specifically.
+/// Used for shafaq al-ahmar detection - tracks the red glow specifically.
 pub fn red_band_luminance(wavelengths_nm: &[f64], radiance: &[f64]) -> f64 {
     if wavelengths_nm.len() < 2 || wavelengths_nm.len() != radiance.len() {
         return 0.0;

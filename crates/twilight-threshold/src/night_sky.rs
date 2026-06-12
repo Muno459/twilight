@@ -1,7 +1,7 @@
 //! Physical night-sky background luminance model.
 //!
 //! Replaces a constant dark-sky number with the actual celestial
-//! background for a given place, time and view direction — the floor that
+//! background for a given place, time and view direction - the floor that
 //! the TVI contrast detection (and therefore Fajr/Isha) is measured
 //! against:
 //!
@@ -11,19 +11,19 @@
 //!   ~90 km emitting shell, scaled by the MEASURED daily solar F10.7
 //!   radio flux (NOAA SWPC feed via the CLI) through the Walker relation.
 //!   Airglow has ~25% intrinsic night-to-night variability that no public
-//!   feed resolves — this is the one component that must stay a
+//!   feed resolves - this is the one component that must stay a
 //!   measurement-driven model.
 //! - **Zodiacal light**: bilinear lookup in the measured Leinert et al.
 //!   (1998) Table 16 (ground photometry + Helios A/B + rocket data).
 //! - **Integrated starlight**: bilinear lookup in the measured Pioneer
-//!   10/11 sky map (Toller 1981; Leinert Table 35) — real galactic
+//!   10/11 sky map (Toller 1981; Leinert Table 35) - real galactic
 //!   lon x lat structure, taken beyond 2.8 AU where zodiacal light
 //!   vanishes.
 //! - **Moonlight**: Krisciunas & Schaefer (1991) scattered-moonlight
 //!   model (the observatory standard), fed the REAL lunar state from the
 //!   JPL DE440 ephemeris when available (exact parallax, true phase
-//!   angle, actual distance — a perigee full moon is ~30% brighter).
-//!   A full moon raises the sky background 10-100x — which physically
+//!   angle, actual distance - a perigee full moon is ~30% brighter).
+//!   A full moon raises the sky background 10-100x - which physically
 //!   delays the detectable dawn (and classically, moonlit nights
 //!   confounded twilight observation for the same reason).
 //!
@@ -137,7 +137,7 @@ fn grid_locate(grid: &[f64], x: f64) -> (usize, f64) {
 
 /// Zodiacal light toward the view direction [cd/m^2].
 ///
-/// Bilinear lookup in the MEASURED Leinert et al. (1998) Table 16 —
+/// Bilinear lookup in the MEASURED Leinert et al. (1998) Table 16 -
 /// annually averaged zodiacal brightness at 500 nm in S10_sun on the
 /// helioecliptic grid (ground photometry extended sunward with Helios
 /// A/B + rocket data; the authors endorse smooth interpolation between
@@ -161,8 +161,8 @@ fn zodiacal_cd(helio_dlon_deg: f64, ecl_lat_deg: f64, view_zenith_deg: f64, k: f
 /// Bilinear lookup in the MEASURED Pioneer 10/11 background-starlight
 /// sky map (Toller 1981; Leinert 1998 Table 35): S10_sun per square
 /// degree on a galactic lon x lat grid, observed beyond 2.8 AU where
-/// zodiacal light vanishes. The real Milky Way structure — inner-Galaxy
-/// bulge, Carina/Cygnus enhancements, even the LMC — instead of a
+/// zodiacal light vanishes. The real Milky Way structure - inner-Galaxy
+/// bulge, Carina/Cygnus enhancements, even the LMC - instead of a
 /// latitude-only falloff. Stars brighter than ~6.5 mag were removed by
 /// Pioneer's processing; for the integrated TVI background floor their
 /// omission is conservative (the handful of bright stars are seen as
@@ -198,7 +198,7 @@ fn moonlight_cd(
     let alpha = moon.phase_angle_deg.abs();
     // KS91 eq. 9: stellar magnitude factor of the Moon vs phase.
     // The formula is normalized to the MEAN lunar distance; scale by
-    // (a/d)^2 for the actual distance — a perigee full moon delivers
+    // (a/d)^2 for the actual distance - a perigee full moon delivers
     // ~30% more illuminance than an apogee one.
     let mean_dist_km = 385000.56;
     let dist_factor = (mean_dist_km / moon.distance_km) * (mean_dist_km / moon.distance_km);
@@ -311,7 +311,7 @@ fn view_coords(
 ///
 /// When a JPL DE440 ephemeris is available, prefer
 /// [`night_sky_luminance_with_moon`] with the DE440-computed
-/// [`MoonState`] — real ephemeris data instead of a truncated series.
+/// [`MoonState`] - real ephemeris data instead of a truncated series.
 pub fn night_sky_luminance(input: &NightSkyInput) -> NightSkyLuminance {
     let moon = moon_state(
         input.year,
@@ -375,7 +375,7 @@ mod tests {
     fn moonless_dark_sky_matches_published_range() {
         // The canonical dark-site zenith sky is 21.6-22.1 mag/arcsec^2
         // = 1.55e-4 .. 2.45e-4 cd/m^2. The model (moonless, zenith) must
-        // land in that range — this anchors the whole TVI floor.
+        // land in that range - this anchors the whole TVI floor.
         let n = night_sky_luminance(&dark_input());
         assert!(n.moonlight < 2e-5, "moon should be near-new: {:?}", n);
         assert!(

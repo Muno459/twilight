@@ -4,17 +4,17 @@
 //! Each shell has uniform optical properties (extinction coefficient,
 //! single scattering albedo, asymmetry parameter) at a given wavelength.
 
-/// Earth mean radius in meters — the exact IUGG R1 (arithmetic mean
+/// Earth mean radius in meters - the exact IUGG R1 (arithmetic mean
 /// radius, (2a+b)/3 of the WGS84 ellipsoid). The atmosphere model is a
 /// sphere of this radius; the local geocentric radius varies from it by
 /// at most ±11 km (±0.17%) between equator and poles, which changes
-/// near-horizon path lengths by <0.1% — below the engine's MC noise and
+/// near-horizon path lengths by <0.1% - below the engine's MC noise and
 /// the libRadtran cross-validation agreement. The ephemeris/geodesy side
 /// (twilight-solar) uses the full WGS84 ellipsoid where it matters.
 pub const EARTH_RADIUS_M: f64 = 6_371_008.7714;
 
 /// Fallback top-of-atmosphere altitude in meters, used ONLY for empty
-/// models ([`AtmosphereModel::toa_radius`] reads the real top shell —
+/// models ([`AtmosphereModel::toa_radius`] reads the real top shell -
 /// 150 km for the production USSA-76 + thermosphere profile).
 pub const TOA_ALTITUDE_M: f64 = 100_000.0;
 
@@ -93,7 +93,7 @@ pub struct AtmosphereModel {
     /// in the visible). Zero for shells without cloud. Used by the LOS and
     /// shadow-ray integrators to treat the cloud portion of a path with
     /// Eddington DIFFUSE transmission instead of Beer-Lambert direct
-    /// extinction — a diffusing layer transmits ~20-50%, not e^{-tau}.
+    /// extinction - a diffusing layer transmits ~20-50%, not e^{-tau}.
     pub cloud_extinction: [f64; MAX_SHELLS],
     /// Delta-Eddington scaled asymmetry parameter g* of the cloud phase
     /// function (g* = g/(1+g)); 0.0 when no cloud is present.
@@ -206,14 +206,14 @@ impl AtmosphereModel {
     /// (and the twilight sky illumination) receives multiply-forward-
     /// scattered light, which exponential extinction misrepresents by
     /// orders of magnitude. OD-10 stratus (g = 0.85): delta-scaled
-    /// tau' ~ 2.8, g* ~ 0.46, so T_diff = 1/(1 + 0.75*2.8*0.54) ~ 0.47 —
+    /// tau' ~ 2.8, g* ~ 0.46, so T_diff = 1/(1 + 0.75*2.8*0.54) ~ 0.47 -
     /// vs Beer-Lambert e^{-10.8} ~ 2e-5.
     ///
     /// CONVENTION (single representation): this factor is applied once
     /// per DETERMINISTIC leg (eye LOS, NEE shadow rays, BDPT
     /// connections). MC chain segments crossing decks carry only the
-    /// cloud's absorption (already folded into shell `optics`) — never
-    /// this factor — identically on CPU and GPU.
+    /// cloud's absorption (already folded into shell `optics`) - never
+    /// this factor - identically on CPU and GPU.
     #[inline]
     pub fn cloud_diffuse_transmittance(&self, tau_cloud: f64) -> f64 {
         if tau_cloud <= 0.0 {

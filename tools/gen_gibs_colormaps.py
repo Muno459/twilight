@@ -4,7 +4,7 @@
 Closes the provenance gap flagged in review: embedded colormaps must be
 regenerable from their authoritative source. Downloads the v1.3 XMLs and
 emits per-crate generated files. Bin VALUE = midpoint of the entry's
-range; open-ended top bins use the lower edge (a floor — honest for
+range; open-ended top bins use the lower edge (a floor - honest for
 saturated city cores / very thick cloud).
 
 Usage: python3 tools/gen_gibs_colormaps.py
@@ -84,14 +84,14 @@ def main():
     root = os.path.dirname(HERE)
 
     url, entries = parse(TARGETS[0][0])
-    body = ("//! Generated file — do not edit. Regenerate with\n"
+    body = ("//! Generated file - do not edit. Regenerate with\n"
             "//! `python3 tools/gen_gibs_colormaps.py`.\n\n"
             + rust_indexed("DNB_RADIANCE_LUT", url, entries, TARGETS[0][3]) + "\n")
     path = os.path.join(root, TARGETS[0][2])
     open(path, "w").write(body)
     print(f"wrote {TARGETS[0][2]} ({len(entries)} bins)")
 
-    chunks = ["//! Generated file — do not edit. Regenerate with",
+    chunks = ["//! Generated file - do not edit. Regenerate with",
               "//! `python3 tools/gen_gibs_colormaps.py`.", ""]
     for xml_name, const, _, doc in TARGETS[1:]:
         url, entries = parse(xml_name)

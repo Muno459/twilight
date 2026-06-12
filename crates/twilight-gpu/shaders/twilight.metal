@@ -165,7 +165,7 @@ inline float read_cloud_extinction(device const float* atm, uint shell_idx) {
 
 // Eddington diffuse transmittance of accumulated (delta-scaled) cloud
 // optical depth: T = 1/(1 + 0.75 tau (1 - g*)). Mirrors the CPU's
-// AtmosphereModel::cloud_diffuse_transmittance — a diffusing deck
+// AtmosphereModel::cloud_diffuse_transmittance - a diffusing deck
 // transmits ~20-50%, which Beer-Lambert misrepresents by orders of
 // magnitude (single-representation cloud transport).
 inline float cloud_diffuse_transmittance(device const float* atm, float tau_cloud) {
@@ -411,11 +411,11 @@ inline int shell_index_binary(device const float* atm, float r) {
     return (lo == 0) ? -1 : int(lo - 1);
 }
 
-// Surface and top-of-atmosphere radii from the PACKED SHELLS — the single
+// Surface and top-of-atmosphere radii from the PACKED SHELLS - the single
 // source of truth, exactly matching the CPU's AtmosphereModel accessors
 // (surface_radius = r_inner of shell 0, toa_radius = r_outer of the last
 // shell). The old hardcoded EARTH_RADIUS_M + TOA_ALTITUDE_M (100 km)
-// silently truncated the 150 km USSA-76 thermosphere extension — the very
+// silently truncated the 150 km USSA-76 thermosphere extension - the very
 // layer that carries the deep-twilight (SZA >= 104) signal.
 inline float atm_surface_radius(device const float* atm) {
     uint ns = atm_num_shells(atm);
@@ -890,7 +890,7 @@ ZenithSample sample_zenith_biased(float3 normal, float n, thread ulong &rng) {
 // upper hemisphere about the axis, 0 below. (The GPU sampler is
 // untruncated; this pdf matches it exactly. Unbiasedness needs only
 // sampler == pdf; weight boundedness comes from the mixture's phase
-// component, NOT from truncation — so no weight clamps and no NaN-prone
+// component, NOT from truncation - so no weight clamps and no NaN-prone
 // unbounded importance ratios, the root cause of the old v2 fireflies.)
 inline float power_cos_pdf(float cos_theta, float n) {
     if (cos_theta <= 0.0f) return 0.0f;
@@ -1161,7 +1161,7 @@ kernel void mcrt_trace_photon(
                 float albedo = read_albedo(atm, wl_idx);
                 float3 normal = normalize(boundary_pos);
                 // Ground-bounce NEE (Lambertian albedo/pi), BEFORE the
-                // albedo is folded into the continuing weight — mirrors
+                // albedo is folded into the continuing weight - mirrors
                 // the CPU chain exactly; this path family was simply
                 // missing from the GPU mcrt estimator (audit 2026-06-12).
                 float cos_sun_g = dot(sun_dir, normal);
@@ -1194,7 +1194,7 @@ kernel void mcrt_trace_photon(
         // Scattering event
         pos = pos + dir * free_path;
 
-        // Apply SSA for this scatter event BEFORE NEE — the vertex is a
+        // Apply SSA for this scatter event BEFORE NEE - the vertex is a
         // scattering event, so the survival probability multiplies every
         // contribution from it (CPU convention, photon.rs SSA-before-NEE;
         // the old order overcounted NEE by 1/ssa per order).
@@ -1399,7 +1399,7 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
     // Unbiased one-sample-MIS seed (port of the CPU estimator): sample
     // omega from the 3-component mixture, weight by
     //   w0 = P(omega.view)/4pi / q(omega)
-    // identically for every branch — the balance-heuristic estimator.
+    // identically for every branch - the balance-heuristic estimator.
     // Samplers and RNG consumption order unchanged. This replaces the old
     // per-branch heuristic weights whose unbounded importance ratios were
     // the v2 firefly/NaN source.
@@ -1435,14 +1435,14 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
     // Seed polarization: unpolarized (the exact treatment would Mueller-
     // rotate the omega->view seed scatter; multiply-scattered light is
-    // weakly polarized and the I-error is sub-percent — same approximation
+    // weakly polarized and the I-error is sub-percent - same approximation
     // as the CPU chain).
     float4 stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
 
     float3 pos = start_pos;
     float3 current_dir = dir;
     float3 prev_dir = sun_dir; // direction before current propagation segment
-    // NOTE: no start_optics.ssa factor — the host-side integrator's
+    // NOTE: no start_optics.ssa factor - the host-side integrator's
     // beta_scat at the seed point already carries it (double-count removed,
     // mirroring the CPU fix).
     float weight = w0;

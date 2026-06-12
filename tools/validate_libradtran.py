@@ -10,7 +10,7 @@ Tiers
 1a. Rayleigh-only sky radiance vs DISORT (pseudospherical), SZA 60-95.
     Isolates geometry + Rayleigh phase + optics. Target |rel err| < 5%.
 1b. Rayleigh-only sky radiance vs MYSTIC (spherical 1D MC), SZA 90-108.
-    The twilight regime proper — DISORT plane-parallel/PS is not valid much
+    The twilight regime proper - DISORT plane-parallel/PS is not valid much
     past SZA ~95; only a spherical solver is. Target |rel err| < 10%
     (MYSTIC MC noise + twilight sensitivity). THIS TIER ANSWERS THE
     100-km-CEILING QUESTION: if twilight's radiance collapses at SZA >= 104
@@ -20,7 +20,7 @@ Tiers
     O3 in {220, 347, 546} DU and aerosol on/off. Tests gas absorption and
     aerosol extinction. Target < 5% (clear), < 10% (aerosol).
 3.  Full field with aerosol vs MYSTIC, then V(lambda) luminance vs SZA and
-    the implied threshold-crossing SZAs — the photometric bottom line.
+    the implied threshold-crossing SZAs - the photometric bottom line.
 
 Install libRadtran (not packaged for brew; build from source):
     curl -LO http://www.libradtran.org/download/libRadtran-2.0.6.tar.gz
@@ -42,7 +42,7 @@ Conventions (verified against the libRadtran 2.x manual):
     plane), 180 anti-solar. twilight's rel_azimuth maps to phi = phi0 +
     rel_azimuth.
   - uvspec radiance output `uu` is in mW/m^2/nm/sr when `source solar` is in
-    mW/m^2/nm (the default for most bundled solar files) — the script
+    mW/m^2/nm (the default for most bundled solar files) - the script
     normalizes both codes to W/m^2/sr/nm and ALSO offers --shape-only to
     compare shapes when the solar files differ.
   - Solar spectrum: twilight uses TSIS-1 HSRS. Pass --solar-file to point
@@ -75,7 +75,7 @@ ALBEDO = 0.15
 
 # Default O3 column: twilight's *actual* standard-profile column. The
 # docstring value "~347 DU" in twilight-weather is known to disagree with
-# the integral of the embedded profile (~546 DU) — pass the value you want
+# the integral of the embedded profile (~546 DU) - pass the value you want
 # tested; the tier-2 sweep covers both.
 O3_DU_DEFAULT = None  # None = leave both codes on their native defaults
 
@@ -228,7 +228,7 @@ def parse_uvspec_radiance(text: str, umus: list[float], phis: list[float]) -> di
             continue
         i += 1
     if not out:
-        sys.exit("Could not parse uvspec radiance output — inspect validation/*.out "
+        sys.exit("Could not parse uvspec radiance output - inspect validation/*.out "
                  "and adapt parse_uvspec_radiance() to your libRadtran version.")
     return out
 
@@ -283,7 +283,7 @@ def compare_tier1(lrt, solver, szas, tol, shape_only, solar_file):
                     rows.append((sza, vz, ra, wl, v_t * scale, v_l, rel, ok))
 
     if lrt is None:
-        print(f"  uvspec not found — decks written to {OUT_DIR}/ (run with "
+        print(f"  uvspec not found - decks written to {OUT_DIR}/ (run with "
               f"LIBRADTRAN_DIR set to compare)")
         return True
     _report(rows, n_pass, n_fail, tol)
@@ -307,7 +307,7 @@ def compare_tier1b_mystic(lrt, szas, tol, shape_only, solar_file):
         return True
 
     common = deck_common(lrt, solar_file, None, rayleigh_only=True)
-    # Straight shadow rays: MYSTIC mc_spherical does not refract — remove
+    # Straight shadow rays: MYSTIC mc_spherical does not refract - remove
     # twilight's refraction for the apples-to-apples run.
     tw = run_twilight_compare(szas, [0.0], [0.0], True, None,
                               scattering="hybrid", photons=500,
@@ -407,7 +407,7 @@ def main():
                                         tol=0.10, shape_only=args.shape_only,
                                         solar_file=args.solar_file)
         elif tier in ("2", "3"):
-            print(f"Tier {tier}: deck templates not yet automated — "
+            print(f"Tier {tier}: deck templates not yet automated - "
                   "see module docstring for the design.")
     sys.exit(0 if ok else 1)
 

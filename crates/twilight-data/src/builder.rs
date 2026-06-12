@@ -397,7 +397,7 @@ pub fn build_full_with_gas(
     )
 }
 
-/// Build an atmosphere with an arbitrary VERTICAL CLOUD PROFILE — multiple
+/// Build an atmosphere with an arbitrary VERTICAL CLOUD PROFILE - multiple
 /// independent layers (e.g. the 80-level ice-water-content profile
 /// reconstructed by the cloud3d satellite model, collapsed into its
 /// contiguous layers).
@@ -458,7 +458,7 @@ pub fn build_full_with_gas_layers(
 /// US Standard Atmosphere 1976 corresponds to ~345 DU. The embedded WMO-ish
 /// O3 profile in `gas_absorption_data` actually integrates to ~546 DU
 /// (verified by trapezoid integration), so without normalization every
-/// "standard" run carried ~58% too much ozone — and a real measured column
+/// "standard" run carried ~58% too much ozone - and a real measured column
 /// of ~300 DU passed as an override would *reduce* absorption by 45%
 /// instead of roughly matching the default.
 pub const STANDARD_O3_COLUMN_DU: f64 = 345.0;
@@ -537,7 +537,7 @@ fn add_cloud_layer(atm: &mut AtmosphereModel, cloud_props: &CloudProperties, clo
         //
         // Absorption is preserved exactly: (1-ssa*)ext* = (1-ssa)ext.
         // For OD-10 stratus this gives an effective OD of ~2.8 with
-        // g* ~ 0.46 — physically equivalent transport that (a) lets the
+        // g* ~ 0.46 - physically equivalent transport that (a) lets the
         // backward-MC chains actually diffuse through the layer instead
         // of dying in a 10000-step forward-peak walk, and (b) makes the
         // direct-beam transmittances (T_sun, t_obs) represent
@@ -553,7 +553,7 @@ fn add_cloud_layer(atm: &mut AtmosphereModel, cloud_props: &CloudProperties, clo
         // SINGLE-REPRESENTATION cloud transport: the closed-form Eddington
         // diffuse transmission (cloud_diffuse_transmittance, driven by the
         // per-shell cloud_extinction recorded here) owns ALL cloud
-        // scattering — on eye paths, shadow rays, and chain NEE alike. The
+        // scattering - on eye paths, shadow rays, and chain NEE alike. The
         // mixed shell optics therefore receive ONLY the cloud's absorption
         // (exact, conserved); cloud scattering is NOT added to the optics,
         // so the MC chains never explicitly scatter in cloud. Putting the

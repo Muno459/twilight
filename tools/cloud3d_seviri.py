@@ -8,7 +8,7 @@ window around the observer in the NATIVE geostationary projection (the
 model was trained on native MSG patches), runs the cloud3d IWC model and
 emits the same JSON/PNG as the GOES sidecar.
 
-SEVIRI is the instrument the model was TRAINED on — unlike GOES/AHI no
+SEVIRI is the instrument the model was TRAINED on - unlike GOES/AHI no
 channel-mapping approximation is involved. Caveat for north-European
 observers: from 45.5E the view zenith angle at e.g. Padborg is ~70 deg,
 so native pixels are smeared to roughly 3.3 x 9.9 km; the reconstruction
@@ -47,7 +47,7 @@ from cloud3d_profile import (
 
 COLLECTION = "EO:EUM:DAT:MSG:HRSEVIRI-IODC"
 SAT_LON = 45.5  # Meteosat-9 IODC sub-satellite longitude
-# The 11 narrow-band channels in wavelength-ascending order — exactly the
+# The 11 narrow-band channels in wavelength-ascending order - exactly the
 # training order; first three are solar/reflectance channels.
 CHANNELS = ["VIS006", "VIS008", "IR_016", "IR_039", "WV_062", "WV_073",
             "IR_087", "IR_097", "IR_108", "IR_120", "IR_134"]
@@ -82,7 +82,7 @@ def run_model_isolated(x_in, model_path):
 def get_token():
     path = os.path.expanduser("~/.eumdac/credentials")
     if not os.path.exists(path):
-        raise SystemExit("no ~/.eumdac/credentials — register (free) at "
+        raise SystemExit("no ~/.eumdac/credentials - register (free) at "
                          "eoportal.eumetsat.int and run "
                          "`eumdac set-credentials <key> <secret>`")
     import eumdac
@@ -179,7 +179,7 @@ def main():
     i0, i1 = max(0, ic - half_x), min(shape[1], ic + half_x)
 
     # Grid orientation + ground sampling at the observer. satpy's native
-    # SEVIRI grid is SOUTH-UP (row index increases northward) — the
+    # SEVIRI grid is SOUTH-UP (row index increases northward) - the
     # opposite of the GOES convention all the renderers use, so the
     # window is flipped to rows-north-to-south right after extraction.
     # One grid step moves in both lon and lat this far off-nadir; take
@@ -280,7 +280,7 @@ def main():
         from cloud3d_profile import render_3d
         # Ground texture: the standard SEVIRI NATURAL COLOR composite by
         # day (R = IR_016, G = VIS008, B = VIS006, 0-90% reflectance,
-        # gamma-brightened) — land green, sea dark, water cloud white,
+        # gamma-brightened) - land green, sea dark, water cloud white,
         # ice cloud cyan. Inverted 10.8 um BT by night.
         if np.nanmax(raw[0]) > 8.0:
             tex = np.stack([np.clip(raw[2] / 90.0, 0, 1),

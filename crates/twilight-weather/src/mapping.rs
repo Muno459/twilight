@@ -110,7 +110,7 @@ pub fn map_aerosol(conditions: &WeatherConditions) -> Option<AerosolProperties> 
 pub fn map_cloud(conditions: &WeatherConditions) -> Option<CloudProperties> {
     let is_fog = conditions.weather_code == 45 || conditions.weather_code == 48;
 
-    // (cover %, type) per band — low band type refined by cover/visibility.
+    // (cover %, type) per band - low band type refined by cover/visibility.
     let low_cover = if is_fog {
         100.0_f64.min(conditions.cloud_cover_low.max(80.0))
     } else {
@@ -220,8 +220,8 @@ pub fn map_cloud_satellite(
     let base_km = (top_km - thickness_m / 1000.0).max(0.15);
 
     // Particle optics: MEASURED effective radius (MODIS microphysics
-    // feed) decides phase when available — droplets retrieve at
-    // ~5-20 um, ice crystals at ~20-60 um (Platnick et al. 2017) —
+    // feed) decides phase when available - droplets retrieve at
+    // ~5-20 um, ice crystals at ~20-60 um (Platnick et al. 2017) -
     // with the measured top height as fallback proxy.
     let r_eff = sat.observer.and_then(|s| s.r_eff_um);
     let (ssa, g) = match r_eff {
@@ -267,7 +267,7 @@ const AVOGADRO: f64 = 6.022e23;
 /// and governed by latitude/season/dynamics. The previous code invented a
 /// linear surface-to-column proxy; it has been removed. Open-Meteo's air
 /// quality API provides surface O3 only, so no column override is produced
-/// — the engine keeps its standard-atmosphere column (345 DU) unless a
+/// - the engine keeps its standard-atmosphere column (345 DU) unless a
 /// real measured column is supplied by the caller.
 
 /// Convert NO2 surface concentration from ug/m3 to molecules/m3.
@@ -289,7 +289,7 @@ fn no2_ug_m3_to_molecules_m3(no2_ug_m3: f64) -> f64 {
 /// quality API into values usable by the MCRT gas absorption model:
 ///
 /// - **O3**: surface concentration is reported for display but produces
-///   NO column override — a surface reading does not determine the column
+///   NO column override - a surface reading does not determine the column
 ///   (see note above). The engine keeps its standard 345 DU column.
 ///
 /// - **NO2**: Surface concentration is converted to number density
@@ -774,7 +774,7 @@ mod tests {
 
     #[test]
     fn gas_composition_never_invents_o3_column() {
-        // Any surface O3 value — tiny or extreme — must produce no column
+        // Any surface O3 value - tiny or extreme - must produce no column
         // override. The old code mapped these through an invented linear
         // proxy clamped to [220, 450] DU.
         for o3 in [1.0, 30.0, 100.0, 500.0] {

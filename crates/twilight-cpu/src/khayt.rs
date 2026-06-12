@@ -1,12 +1,12 @@
-//! The khayt al-abyad criterion — the Quranic definition of dawn,
+//! The khayt al-abyad criterion - the Quranic definition of dawn,
 //! implemented as the contrast-detection task it literally describes.
 //!
 //! "حتى يتبين لكم الخيط الأبيض من الخيط الأسود من الفجر" (2:187):
 //! Fajr enters when the WHITE THREAD (the band of dawn light low on the
 //! eastern horizon) becomes DISTINCT TO YOU from the BLACK THREAD (the
-//! adjacent dark sky) — a differential, human-visual criterion, further
+//! adjacent dark sky) - a differential, human-visual criterion, further
 //! qualified by the sunnah: the true dawn spreads LATERALLY along the
-//! horizon (mustatir), while the false dawn (al-fajr al-kadhib — the
+//! horizon (mustatir), while the false dawn (al-fajr al-kadhib - the
 //! zodiacal light cone) stands narrow and tilted "like the wolf's tail"
 //! and does NOT spread.
 //!
@@ -19,14 +19,14 @@
 //!   azimuth (the black thread);
 //! - per scan step, the Weber contrast of each band patch against the
 //!   reference, compared to the adaptation-dependent contrast threshold
-//!   (Blackwell TVI — the same psychophysics used elsewhere in the
+//!   (Blackwell TVI - the same psychophysics used elsewhere in the
 //!   engine, applied here to the differential task the ayah specifies);
 //! - FAJR SADIQ when the contrast holds across the lateral extent
 //!   (spread test); AL-FAJR AL-KADHIB when only the central patches are
 //!   distinct (the zodiacal wedge passes the contrast test but fails the
 //!   spread test);
 //! - the mirrored disappearance criteria for Isha: shafaq al-ahmar (red
-//!   band, Shafi'i/Maliki/Hanbali — the red channel of the same patches)
+//!   band, Shafi'i/Maliki/Hanbali - the red channel of the same patches)
 //!   and shafaq al-abyad (white, Hanafi).
 //!
 //! Being a RATIO of two simulated patches, the criterion cancels most
@@ -96,13 +96,13 @@ impl Default for KhaytParams {
             ref_offsets_deg: vec![-100.0, 100.0],
             // Extended-source psychophysics (Blackwell 1946 large-disc
             // rows; Crumey 2014 asymptote): a degrees-wide band is
-            // EASIER to see than the reference disc — pure size factor
+            // EASIER to see than the reference disc - pure size factor
             // 0.08-0.26 at scotopic adaptation, clawed back ~2x by the
             // soft edge. Recommended k ~ 0.4 (range 0.25-0.6) on the
             // disc thresholds the TVI table encodes.
             k_contrast: 0.4,
             k_contrast_red: 0.4,
-            // EDGE-DISCERNIBILITY factors — the honest calibration layer.
+            // EDGE-DISCERNIBILITY factors - the honest calibration layer.
             // Static-disc psychophysics says a 100% excess over the night
             // sky should be visible (k ~ 0.4); every field campaign says
             // the eye sees NOTHING at depression 17-18 even though SQMs
@@ -110,12 +110,12 @@ impl Default for KhaytParams {
             // documented ~2.5 deg instrument-vs-eye gap). The dawn at
             // that depth is a degrees-scale gradient with no border; the
             // ayah's tabayyun happens when the arch develops a
-            // discernible edge — at an excess ~11x the night reference.
+            // discernible edge - at an excess ~11x the night reference.
             // APPEARANCE (Fajr: noticing a new glow) is calibrated so
             // clear-sky Mecca lands at the desert-campaign cluster
             // (KACST 14.6+-0.3, Hail 14.0+-0.3, Aswan camera 14.9):
             // 45 x 0.4 ~ excess/L_ref ~ 10.8 at threshold.
-            // DISAPPEARANCE (Isha: tracking a known fading band — an
+            // DISAPPEARANCE (Isha: tracking a known fading band - an
             // easier task; classical muwaqqit mode for white-shafaq end
             // is 17 deg, SQM twilight end 17.99+-0.16) calibrates ~4x.
             // Out-of-sample check: Padborg/UK June should land at
@@ -155,7 +155,7 @@ pub struct PatchLum {
 }
 
 /// The full fan at every scanned SZA, one side (morning or evening) at a
-/// time — the celestial background differs between sides even though the
+/// time - the celestial background differs between sides even though the
 /// MCRT radiance is shared.
 #[derive(Debug, Clone)]
 pub struct KhaytScan {
@@ -194,7 +194,7 @@ pub struct KhaytSolution {
 ///
 /// Primary: LOCAL log-linear fit over the points bracketing the
 /// crossing (a global fit is biased by the bright-twilight plateau and
-/// can extrapolate outside the scan — verified at Mecca). Fallback for
+/// can extrapolate outside the scan - verified at Mecca). Fallback for
 /// cliff-shaped curves (the red cone gate zeroes the channel abruptly):
 /// log/linear interpolation across the bracketing pair itself.
 fn solve_crossing(curve: &[(f64, f64)]) -> Option<KhaytCrossing> {
@@ -255,15 +255,15 @@ fn ref_mean(refs: &[PatchLum]) -> PatchLum {
 ///
 /// The "black thread" is BOTH spatial and temporal: the adjacent dark
 /// sky (reference patches) sets the eye's adaptation, while the standing
-/// night structure of the dawn direction itself — zodiacal cone,
-/// Milky Way, skyglow dome — is part of the night the dawn must become
+/// night structure of the dawn direction itself - zodiacal cone,
+/// Milky Way, skyglow dome - is part of the night the dawn must become
 /// distinct FROM. At a desert site the zodiacal base keeps the dawn
 /// azimuth photometrically brighter than the ±100° sky ALL night
 /// (verified at Mecca: spatial-only margins never drop below ~4), and
 /// field campaigns resolve exactly this by judging the NEW horizontal
 /// light that supersedes the standing column (OpenFajr's criterion).
 ///
-/// So: `margin[j] = (L_j - L_j^night) / L_ref / (k * C_thr(L_ref))` —
+/// So: `margin[j] = (L_j - L_j^night) / L_ref / (k * C_thr(L_ref))` -
 /// the GROWTH of patch j above its own deep-night baseline, judged
 /// against the adaptation set by the reference sky. Margin > 1 means
 /// the new light of dawn in patch `j` is distinct.
@@ -289,7 +289,7 @@ fn margins(
             };
             // RED is a cone percept: below the cone threshold
             // (~1e-3 cd/m^2, Hecht-Shlaer-Pirenne lineage) the band may
-            // be VISIBLE but not COLORED — rods see no red. Shafaq
+            // be VISIBLE but not COLORED - rods see no red. Shafaq
             // al-ahmar requires the color, so the red channel is gated.
             if red && p.red < 1e-3 {
                 return 0.0;
@@ -326,7 +326,7 @@ pub fn detect(scan: &KhaytScan, params: &KhaytParams) -> KhaytSolution {
     // Deep-night baseline per band patch: the median over the deepest
     // three scanned SZAs (the scan is ascending in SZA). At high
     // latitudes where the night never deepens, this floor still carries
-    // residual twilight — the criterion then measures brightening above
+    // residual twilight - the criterion then measures brightening above
     // tonight's actual minimum, which is exactly the right high-latitude
     // semantics.
     let n_band = scan.band[0].len();
@@ -368,7 +368,7 @@ pub fn detect(scan: &KhaytScan, params: &KhaytParams) -> KhaytSolution {
         spread_curve.push((scan.szas[i], kth_largest(&m, params.spread_required)));
         central_curve.push((scan.szas[i], m[center]));
         // Red band: the sunset/dawn red glow is broad but narrower than
-        // the white spread — require a majority of the fan (3 of 5) so
+        // the white spread - require a majority of the fan (3 of 5) so
         // the narrow zodiacal core (also reddish) cannot satisfy it.
         let _ = center;
         ahmar_curve.push((
@@ -399,7 +399,7 @@ pub fn detect(scan: &KhaytScan, params: &KhaytParams) -> KhaytSolution {
     let ahmar = solve_crossing(&ahmar_curve);
 
     // Kadhib: the central column becomes distinct DEEPER than (or
-    // without) the spread verdict — an interval where only the narrow
+    // without) the spread verdict - an interval where only the narrow
     // wedge is visible. Central-distinct with NO spread at all is the
     // purest wolf's-tail case.
     let kadhib = match (central, sadiq) {

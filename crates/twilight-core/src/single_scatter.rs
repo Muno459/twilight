@@ -80,7 +80,7 @@ pub fn ray_path_through_shell(
 
     match inner_interval {
         None => {
-            // Ray doesn't enter the inner sphere — full path through shell
+            // Ray doesn't enter the inner sphere - full path through shell
             outer_end - outer_start
         }
         Some((inner_start, inner_end)) => {
@@ -225,7 +225,7 @@ pub fn single_scatter_radiance(
         // Scattering angle between the incoming solar ray (propagating along
         // -sun_dir) and the scattered ray toward the observer (propagating
         // along -view_dir): cos(θ) = (-sun_dir)·(-view_dir) = sun_dir·view_dir.
-        // θ = 0 (forward peak) when looking at the sun — the standard sky-
+        // θ = 0 (forward peak) when looking at the sun - the standard sky-
         // radiance convention (Chandrasekhar; DISORT/libRadtran).
         let cos_theta = sun_dir.dot(view_dir);
 
@@ -855,7 +855,7 @@ mod tests {
         // In a Rayleigh-only atmosphere at small SZA (short path lengths),
         // blue scatters more than red (λ⁻⁴ law dominates).
         // At deeper twilight, blue gets attenuated MORE along the long LOS path,
-        // so red can dominate — this is the correct physics of why twilight turns red!
+        // so red can dominate - this is the correct physics of why twilight turns red!
         //
         // Test at SZA=80° (sun above horizon, short paths) where blue should win.
         // But our test atmosphere has high enough extinction that even at SZA=80°,

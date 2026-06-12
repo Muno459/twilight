@@ -1,4 +1,4 @@
-//! Generated file — do not edit. Regenerate with
+//! Generated file - do not edit. Regenerate with
 //! `python3 tools/gen_gibs_colormaps.py`.
 
 /// Palette-index -> nighttime-lights radiance [nW/(cm^2 sr)]. Index 0 = nodata (-1.0).

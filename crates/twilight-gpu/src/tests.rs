@@ -942,7 +942,7 @@ mod layer4_metal {
         let szas = [93.0, 96.0, 100.0, 105.0, 108.0];
         // Deep-twilight radiance (SZA >= 105) is 1e-9..1e-8, where a
         // single 50-ray seed has CV ~0.3-0.5. Assert the monotonicity
-        // invariant on a K-seed AVERAGE — a single draw can fluctuate
+        // invariant on a K-seed AVERAGE - a single draw can fluctuate
         // 2-3x without any physics being wrong. (CPU/GPU transport
         // equality is covered by the parity tests.)
         const SEEDS: u64 = 6;
@@ -1157,7 +1157,7 @@ fn init_all_backends() -> Vec<(crate::BackendKind, Box<dyn crate::GpuBackend>)> 
             Err(e) => {
                 // Skip ONLY when no Metal device exists (headless CI).
                 // A present device that fails to init means the shader
-                // does not compile — that must FAIL the suite, not
+                // does not compile - that must FAIL the suite, not
                 // silently skip it (a broken shader once hid behind
                 // this skip while 135 'GPU' tests passed vacuously).
                 if objc2_metal::MTLCreateSystemDefaultDevice().is_some() {
@@ -1317,7 +1317,7 @@ fn metal_hybrid_split_dispatch_boundaries_match_cpu_statistics() {
 
         // Ray-count-aware tolerance: CPU and GPU draw INDEPENDENT MC
         // samples, so at 1 ray the ratio of two heavy-tailed draws is
-        // nearly unbounded — but at >=255 rays the means concentrate and
+        // nearly unbounded - but at >=255 rays the means concentrate and
         // a systematic (e.g. an SSA-ordering or transmittance bug) must
         // show up. The old flat 20x band hid a non-compiling shader and
         // several proven kernel divergences (audit 2026-06-12).

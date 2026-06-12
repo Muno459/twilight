@@ -68,7 +68,7 @@ pub struct PrayerTimeInput {
     /// Full vertical cloud profile as independent layers (overrides both
     /// `custom_cloud` and `cloud_type` when set). Produced by the cloud3d
     /// satellite reconstruction (80-level IWC profile collapsed into
-    /// contiguous layers) — real measured 3D cloud structure.
+    /// contiguous layers) - real measured 3D cloud structure.
     pub cloud_layers: Option<Vec<CloudProperties>>,
     /// Threshold configuration
     pub threshold_config: ThresholdConfig,
@@ -97,7 +97,7 @@ pub struct PrayerTimeInput {
     /// When false (`--fast` mode), uses scalar phase function only.
     pub polarized: bool,
     /// Solar 10.7 cm radio flux (sfu) for the airglow background. The real
-    /// measured value from NOAA SWPC (fetched by the CLI) — airglow scales
+    /// measured value from NOAA SWPC (fetched by the CLI) - airglow scales
     /// ~2.4x from solar minimum (~70 sfu) to maximum (~200 sfu).
     /// None = mid-cycle default (130).
     pub solar_f107: Option<f64>,
@@ -182,7 +182,7 @@ pub struct PrayerTimeOutput {
     /// mode: the sky never reached the dark-night background, so the
     /// detection thresholds were floated on tonight's actual sky-brightness
     /// minimum (threshold = (L_min + background) x detection_factor). Fajr
-    /// is then the physically detectable onset of dawn brightening — the
+    /// is then the physically detectable onset of dawn brightening - the
     /// engine reports the physics; substitute fiqh rules remain the
     /// user's choice.
     pub high_latitude_relative_thresholds: bool,
@@ -212,7 +212,7 @@ pub struct PrayerTimeOutput {
     pub skyglow_bortle: Option<u8>,
     /// Estimated prayer time shift due to light pollution (minutes).
     pub skyglow_shift_minutes: Option<f64>,
-    /// The khayt al-abyad (Quran 2:187) contrast-criterion times — the
+    /// The khayt al-abyad (Quran 2:187) contrast-criterion times - the
     /// PRIMARY determination: Fajr = white thread distinct WITH lateral
     /// spread; Isha = shafaq distinctness disappears (ahmar primary).
     /// The absolute-threshold times above remain as the legacy
@@ -291,7 +291,7 @@ impl SolarEngine {
 
     /// Get solar zenith angle at a fractional hour (local time).
     ///
-    /// Hours >= 24 roll into the NEXT civil day — required because at high
+    /// Hours >= 24 roll into the NEXT civil day - required because at high
     /// latitudes the night's threshold crossings (Isha under persistent
     /// twilight) can fall after local midnight.
     fn zenith_at_hour(&mut self, fractional_hour: f64) -> Option<f64> {
@@ -400,7 +400,7 @@ impl SolarEngine {
     /// Plain bisection needs the endpoints to bracket the target; near
     /// high-latitude solar midnight the target SZA is reached only INSIDE
     /// the window (the zenith rises through it and falls back), so the
-    /// endpoint test fails and the crossing is lost — exactly the case for
+    /// endpoint test fails and the crossing is lost - exactly the case for
     /// brightness-based Fajr under persistent twilight. This scans the
     /// window at 6-minute resolution, picks the bracketing segment whose
     /// slope matches the requested phase (descending zenith = morning/
@@ -559,7 +559,7 @@ pub fn compute_prayer_times_gpu(
 
     // Cloud fields (cloud_extinction / cloud_g_scaled) ship in the v3
     // packed buffers and the Metal kernels apply the Eddington diffuse
-    // transmission — GPU and CPU share the single-representation cloud
+    // transmission - GPU and CPU share the single-representation cloud
     // transport.
 
     // Upload atmosphere to GPU. On failure, fall back to CPU entirely.
@@ -735,7 +735,7 @@ fn night_sky_total(
     // Raw UTC hour, deliberately NOT wrapped into [0,24): both the Meeus
     // and DE440 paths convert through pure Julian-day arithmetic, so
     // hour 25.5 lands on the correct NEXT civil day. (Wrapping would put
-    // a past-midnight Isha moon a full day early — a 13 deg lunar
+    // a past-midnight Isha moon a full day early - a 13 deg lunar
     // position error.)
     let hour_utc = t_local - input.timezone;
     let inp = twilight_threshold::night_sky::NightSkyInput {
@@ -783,11 +783,11 @@ pub struct KhaytTimes {
     /// Al-fajr al-kadhib: central distinctness without spread (the
     /// zodiacal wedge), when it precedes sadiq.
     pub kadhib_time: Option<f64>,
-    /// Isha per shafaq al-ahmar (red-band distinctness disappears) —
+    /// Isha per shafaq al-ahmar (red-band distinctness disappears) -
     /// Shafi'i/Maliki/Hanbali.
     pub isha_ahmar_time: Option<f64>,
     pub isha_ahmar_sza_deg: Option<f64>,
-    /// Isha per shafaq al-abyad (white distinctness disappears) — Hanafi.
+    /// Isha per shafaq al-abyad (white distinctness disappears) - Hanafi.
     pub isha_abyad_time: Option<f64>,
     pub isha_abyad_sza_deg: Option<f64>,
     /// Contrast margin per band azimuth at the Fajr crossing (diagnostic).
@@ -1266,7 +1266,7 @@ fn compute_prayer_times_inner(
     // detection_factor x dark-night background (see ThresholdConfig docs).
     // Under persistent twilight the sky never reaches the dark background,
     // but it still has a luminance MINIMUM at solar midnight and then
-    // measurably brightens — an SQM records it, an observer sees the glow
+    // measurably brightens - an SQM records it, an observer sees the glow
     // spread. The general law, valid at every latitude, is therefore
     //
     //   threshold = (L_min_tonight + L_dark_background) x detection_factor
@@ -1295,7 +1295,7 @@ fn compute_prayer_times_inner(
             // TVI contrast detection at the eye's actual adaptation level
             // (the spectral->mesopic chain models the eye's response; the
             // TVI models its CONTRAST sensitivity, which improves sharply
-            // against brighter skies — Blackwell-anchored, dark-site limit
+            // against brighter skies - Blackwell-anchored, dark-site limit
             // bit-compatible with the absolute constants).
             let floor_mesopic = l_min_mesopic + bg;
             let floor_red = l_min_red.max(0.0) + bg;
@@ -1425,7 +1425,7 @@ fn compute_prayer_times_inner(
 
     // Step 10: Convert threshold SZAs to clock times (slope-aware: the
     // morning crossing is on the DESCENDING zenith branch, the evening
-    // on the ASCENDING — required when the crossing lies near solar
+    // on the ASCENDING - required when the crossing lies near solar
     // midnight, where plain endpoint-bracketing bisection fails).
     let fajr_time = prayer_result
         .fajr_sza_deg
@@ -1443,8 +1443,8 @@ fn compute_prayer_times_inner(
     //
     // The TVI floor so far used the constant dark-sky background. The real
     // background at the crossing instant varies with airglow (solar
-    // activity), zodiacal light, integrated starlight, and — dominantly,
-    // when the moon is up — scattered moonlight (Krisciunas & Schaefer
+    // activity), zodiacal light, integrated starlight, and - dominantly,
+    // when the moon is up - scattered moonlight (Krisciunas & Schaefer
     // 1991): a bright moon near dawn raises the detection floor and
     // physically delays the perceptible fajr al-sadiq. One refinement
     // pass: evaluate the physical background at each crossing time with
@@ -1480,7 +1480,7 @@ fn compute_prayer_times_inner(
         if (bgf - bg0).abs() / bg0 > 0.25 || (bgi - bg0).abs() / bg0 > 0.25 {
             eprintln!(
                 "Celestial background: fajr-side {:.3e} cd/m^2, isha-side {:.3e} \
-                 (dark-sky const {:.3e}) — re-floating thresholds.",
+                 (dark-sky const {:.3e}) - re-floating thresholds.",
                 bgf, bgi, bg0
             );
             let refined_config = threshold::ThresholdConfig {
@@ -1702,7 +1702,7 @@ mod tests {
         assert!((input.sza_step - 0.5).abs() < 0.01);
     }
 
-    // ── Polar day (midnight sun) — regression for the empty-scan panic ──
+    // ── Polar day (midnight sun) - regression for the empty-scan panic ──
 
     /// Tromsø (69.6°N) at the June solstice: the sun never sets, the coarse
     /// scan never starts, and the pipeline previously panicked with

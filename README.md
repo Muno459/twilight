@@ -3,203 +3,305 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/rust-pure_%23!%5Bno__std%5D_core-orange?style=flat-square" alt="rust"/></a>
+  <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/rust-workspace-orange?style=flat-square" alt="rust"/></a>
   <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/GPU-Metal-blueviolet?style=flat-square" alt="gpu"/></a>
+  <a href="#validation"><img src="https://img.shields.io/badge/validated-libRadtran%20%2B%20field%20campaigns-green?style=flat-square" alt="validation"/></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=flat-square" alt="license"/></a>
 </p>
 
 <h3 align="center">A physically-based dawn and dusk calculator.</h3>
-<p align="center">Computing Fajr and Isha from atmospheric radiative transfer instead of fixed depression angles.</p>
+<p align="center">Fajr and Isha computed the way the Quran defines them, not from a fixed angle.</p>
 
 <br/>
 
-`twilight` computes Fajr and Isha prayer times by simulating how sunlight scatters through the atmosphere: Monte Carlo radiative transfer through a 50-shell spherical atmosphere with Rayleigh scattering, five-species molecular gas absorption (O3, O2, H2O, NO2, O4 CIA from HITRAN/Serdyuchenko data), OPAC-style aerosols, cloud layers, full Stokes polarization, terrain masking from Copernicus GLO-30 DEM, a light-pollution estimate, and optional live weather from Open-Meteo. Optional JPL DE440 ephemeris for solar positioning. Metal GPU acceleration on Apple Silicon.
+> *"...and eat and drink until the **white thread** of dawn becomes **distinct to you** from the **black thread** of night..."* (al-Baqarah 2:187)
 
-## Project status — read this first
+## What this is
 
-This engine is under an active correctness overhaul (`overhaul` branch). A
-full two-model multi-agent review (2026-06) found real physics bugs and
-overstated claims in earlier versions of this README; this version states
-what the code actually does. Until the items below are closed, treat all
-computed prayer times as **experimental** — do not use them for worship
-without cross-checking against established calendars.
+Prayer apps compute Fajr with a fixed solar depression angle: MWL uses 18
+degrees, Egypt 15, Umm al-Qura uses offsets. They disagree because "when
+does dawn become visible?" is not a single number. It depends on the
+atmosphere, the clouds, the moon, the city lights, and the human eye.
 
-Progress so far (see git log on this branch):
+The ayah describes something more specific than an angle: a band of light
+on the horizon becoming *distinct to you* from the night beside it. That is
+a visual detection event, and it can be computed.
 
-1. ~~Phase-function scattering angle bug~~ FIXED (all 14 sites + regression test)
-2. ~~MS estimator seed bias / chain boundary-kill / SSA ordering~~ FIXED
-   (unbiased one-sample-MIS seed; chains traverse shells; suites green).
-   Measured deep-twilight CV (500 seeds, hybrid): 0.12-0.30 at SZA 96-102
-   with ZERO negative samples (previously negative radiance seeds occurred);
-   rare tail outliers remain at SZA >= 104 (~1 seed in 500 at 20-100x) —
-   K-seed averaging + crossing-on-fit in the pipeline is the tracked next
-   step for sub-minute crossing stability
-3. ~~Cloudy-sky collapse~~ FIXED: delta-Eddington scaled cloud optics +
-   Eddington diffuse transmission for the cloud portion of eye/sun paths.
-   OD-10 stratus now gives Fajr at depression ~13.7° (clear sky ~15.9°)
-   instead of degenerating to sunrise.
-4. Thresholds re-anchored to published photometry (night-sky background
-   2.2e-4 cd/m² per Patat 2008; mesopic/cone-threshold boundaries) with the
-   derivation documented — field SQM calibration still pending
-5. **Externally validated (libRadtran)**: full transport agrees with
-   DISORT to **2.6-3.5% median at SZA 60-90** and with MYSTIC spherical
-   to **3-7% at SZA 95** (Rayleigh, shape-normalized; validation/
-   RESULTS.md). Deeper SZAs are noise-limited on both sides of the
-   comparison (a ~1e8-photon overnight MYSTIC campaign closes them —
-   compute budget, not unknown physics)
-6. **Atmosphere extends to 150 km** (USSA-76 thermosphere): the former
-   100 km ceiling silently zeroed the deep-twilight single-scatter signal
-   at SZA >= 104; now nonzero and monotone through 107 (regression test)
-7. **Metal fully ported**: unbiased mixture-MIS estimator, SSA-before-NEE,
-   exact phase mixture, v3 buffers with cloud diffuse-transmission fields
-   (cloudy GPU/CPU parity < 0.5%), and the GPU-watchdog kill fixed
-   (250-ray command buffers) — the full Metal suite passes with zero
-   ignored hybrid tests
-8. **High latitudes**: brightness-based prayer times via TVI contrast
-   detection on tonight's actual sky floor (see Project status above) —
-   Fajr/Isha exist wherever the sky physically brightens/darkens
-   detectably, conventions nowhere in the chain
+`twilight` simulates the night sky for your location and date, models a
+dark-adapted human observer watching the eastern horizon, and reports the
+moment the white thread of dawn becomes distinct and spreads, exactly as
+the verse and the sunnah describe it. It also reports the false dawn (the
+narrow "wolf's tail" that rises before the true dawn) and both Isha
+definitions (the disappearance of the red and the white twilight).
 
-## Why
-
-Every prayer app hardcodes a solar depression angle. MWL says 18 degrees.
-Egypt says 15 degrees. Umm al-Qura uses fixed offsets. They disagree because
-"when does twilight end?" depends on the atmosphere, not on a single number.
-Aerosols, ozone, clouds, terrain, and light pollution all shift the moment
-the sky actually darkens. A radiative-transfer engine can model that — once
-its physics is verified. That verification (against libRadtran/DISORT/MYSTIC
-and published twilight photometry) is the current focus of this project.
+The sky it simulates is tonight's sky, not a textbook one: the forecast at
+the prayer hour, satellite-measured cloud cover and city light, the real
+moon from the JPL ephemeris, and an **AI 3D cloud reconstruction**: a
+neural network trained on spaceborne cloud radar rebuilds the actual
+three-dimensional cloud field over your head from the latest geostationary
+satellite scan, so the light transport sees clouds at their true heights
+and thicknesses, not a guessed average.
 
 ## Quick start
 
 ```bash
 cargo build --release
 
-# Prayer times (clear sky)
-./target/release/twilight-cli pray \
-  --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0
+# Clear-sky prayer times, anywhere on Earth
+./target/release/twilight-cli pray --lat 21.4225 --lon 39.8262 \
+  --date 2026-06-13 --tz 3
 
-# With live weather (AOD, cloud cover, O3/NO2 from Open-Meteo)
-./target/release/twilight-cli pray \
-  --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --weather
-
-# With terrain masking (Copernicus GLO-30 DEM, auto-downloaded)
-# NOTE: terrain currently adjusts sunrise/sunset only, not Fajr/Isha
-./target/release/twilight-cli pray \
-  --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --terrain
-
-# With a light-pollution estimate (Bortle class)
-./target/release/twilight-cli pray \
-  --lat 55.653 --lon 12.412 --date 2026-03-06 --bortle 7
-
-# Manual aerosols and/or clouds (thick clouds use delta-Eddington diffuse
-# transmission; see Project status)
-./target/release/twilight-cli pray \
-  --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 \
-  --aerosol urban --cloud thin-cirrus
-
-# Multi-scatter hybrid mode (exact order 1 + MC orders 2+) — the default
-./target/release/twilight-cli pray \
-  --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 \
-  --scattering hybrid --photons 500
-
-# Force CPU (opt out of Metal GPU)
-./target/release/twilight-cli pray \
-  --lat 21.4225 --lon 39.8262 --date 2024-03-20 --tz 3.0 --cpu
-
-# Scalar mode (skip Stokes polarization for speed)
-./target/release/twilight-cli mcrt \
-  --lat 21.4225 --lon 39.8262 --sza-start 90 --sza-end 108 \
-  --scattering hybrid --fast
-
-# Solar position with JPL DE440 vs SPA comparison
-./target/release/twilight-cli solar \
-  --lat 21.4225 --lon 39.8262 --date 2024-06-15 --tz 3 \
-  --de440 data/de440.bsp
-
-# Raw spectral radiance across twilight
-./target/release/twilight-cli mcrt \
-  --lat 21.4225 --lon 39.8262 --sza-start 90 --sza-end 108
+# Production: live weather at the prayer hour, satellite clouds, measured
+# skyglow, JPL ephemeris, multi-scatter transport
+./target/release/twilight-cli pray --lat 54.82 --lon 9.36 --date 2026-06-13 --tz 2 \
+  --weather --skyglow --de440 data/de440.bsp --scattering hybrid
 ```
 
-Aerosol types: `continental-clean`, `continental-average`, `urban`, `maritime-clean`, `maritime-polluted`, `desert`.
+Output (Mecca, clear sky):
 
-Cloud types: `thin-cirrus`, `thick-cirrus`, `altostratus`, `stratus`, `stratocumulus`, `cumulus`.
+```
+  Fajr (khayt al-abyad): 04:29:09  (SZA 104.85°, depression 14.85°)
+    └ white thread distinct from black + lateral spread (2:187, mustatir)
+    └ false dawn (al-fajr al-kadhib) visible from 04:27:14 - do not pray Fajr yet
+  Isha (shafaq ahmar):   20:15:48  (depression 15.50°)
+    └ red band no longer distinct - Shafi'i/Maliki/Hanbali (primary)
+  Isha (shafaq abyad):   20:25:56  (depression 17.46°)
+    └ white band no longer distinct - Hanafi
+```
 
-`--weather` fetches current conditions from [Open-Meteo](https://open-meteo.com/) (free, no API key). It maps measured AOD at 550nm to aerosol optical properties and cloud cover by altitude to cloud layers. (The surface-O3/NO2 → column mappings are under revision: a surface reading does not determine a column.)
+Conventional fixed-angle times and a legacy absolute-threshold method are
+printed below these for comparison.
+
+## Validation
+
+Two independent kinds of validation: the light transport is checked against
+reference radiative-transfer codes, and the visibility criterion is checked
+against published human dawn-observation campaigns.
+
+**Criterion vs field campaigns** (clear sky, calibrated once at Mecca):
+
+| Event | Engine | Independent measurement |
+|---|---|---|
+| Fajr sadiq, Mecca | **14.85°** | KACST desert campaign 14.6 ± 0.3° · Hail 14.0 ± 0.3° (white-thread bound 14.66°) · Aswan calibrated camera 14.90 ± 0.17° |
+| Isha al-abyad, Mecca | **17.46°** | SQM twilight-end 17.99 ± 0.16° · classical muwaqqit mode 17° |
+| Isha al-ahmar, Mecca | **15.50°** | visual literature 12 to 15° ("colors gone before 15") |
+| **Fajr, Birmingham UK, June** (out-of-sample, zero retuning) | **12.50°** | **OpenFajr (CCD camera + 19-member scholar/observer panel): 12.3 to 12.7°** |
+
+The Birmingham row matters most: the seasonal "summer relaxation" that UK
+scholars apply as a hand-rule (14.5° in winter, about 12.5° in summer)
+emerges from the physics across 31 degrees of latitude with no additional
+tuning.
+
+**Transport vs libRadtran** (Rayleigh, shape-normalized; details in `validation/RESULTS.md`):
+
+| Reference | Regime | Agreement |
+|---|---|---|
+| DISORT (pseudospherical, 16 streams) | SZA 60 to 90° | **2.6 to 3.5 % median** |
+| MYSTIC (spherical Monte Carlo) | SZA 95° | **+6.5 % / +2.9 %** (450/650 nm) |
+| MYSTIC | SZA ≥ 98° | noise-limited on both sides; a large-photon campaign is planned |
+
+## Live data
+
+Everything measurable is measured, fetched automatically, with documented
+fallbacks:
+
+| Quantity | Source | Cadence |
+|---|---|---|
+| Weather, aerosols, cloud cover at the prayer hour | Open-Meteo forecast + CAMS air quality | hourly forecast |
+| Cloud optical thickness and top height | NASA GIBS, MODIS; sampled at the observer and 50 to 300 km along the sun azimuth, where the twilight light path actually crosses the cloud field | daily |
+| Cloud water path and particle size (phase typing, gap filling) | NASA GIBS, MODIS microphysics | daily |
+| 3D ice-cloud vertical profile | cloud3d model on GOES-19/18 (anonymous S3) or Meteosat-9 SEVIRI (EUMETSAT Data Store) | 10 to 15 min scans |
+| Artificial skyglow | Lorenz 2024 propagated atlas, cross-checked by live VIIRS Black Marble nighttime lights | atlas + daily |
+| Solar activity (airglow driver) | NOAA SWPC F10.7 radio flux | daily measured |
+| Sun and Moon | JPL DE440 ephemeris (exact lunar parallax, true phase angle, real distance); NREL SPA fallback | static file |
+| Zodiacal light | Leinert 1998 Table 16, the measured grid, embedded and regenerable | embedded |
+| Integrated starlight | Pioneer 10/11 sky maps (Toller 1981), digitized from the publisher scan | embedded |
+| Moonlight | Krisciunas and Schaefer 1991, fed the DE440 lunar state | computed |
+| Terrain horizon | Copernicus GLO-30 DEM | cached tiles |
+
+## AI 3D cloud reconstruction
+
+Clouds are the single largest physical influence on when dawn becomes
+visible, and a 2D satellite picture cannot say how HIGH or how THICK they
+are. So `twilight` runs the [cloud3d](https://huggingface.co/csaybar/cloud3d)
+neural network (a SegFormer trained on CloudSat's spaceborne cloud radar,
+ESA Cloud3DTACO dataset, arXiv:2511.04773) on the latest geostationary
+satellite scan and reconstructs the full 3D cloud volume: an 80-level
+vertical ice-water-content profile for every pixel, on a 240 m vertical
+grid up to 19 km.
+
+```bash
+# Americas/Pacific: GOES-19/18, no account needed (anonymous AWS S3)
+./target/release/twilight-cli pray ... --cloud3d auto
+
+# Europe/Africa/Asia: Meteosat-9 SEVIRI via a free EUMETSAT account
+pip install eumdac satpy torch
+eumdac set-credentials <consumer-key> <consumer-secret>   # eoportal.eumetsat.int
+python3 tools/cloud3d_seviri.py --lat 54.82 --lon 9.36 --azimuth 45 \
+  --out profile.json --png3d clouds3d.png
+./target/release/twilight-cli pray ... --cloud3d profile.json
+```
+
+The `--png3d` flag renders the reconstructed volume as a true 3D scene:
+cloud isosurfaces colored by altitude, standing on the actual satellite
+image as the ground plane. The engine samples the volume along the sun
+azimuth (where the twilight light path actually crosses the cloud field),
+collapses it into vertical layers at their measured heights, and rescales
+the total amplitude to the MODIS-measured optical thickness when one is
+available: structure from the AI reconstruction, amplitude from direct
+measurement. SEVIRI is the instrument the model was trained on; GOES uses
+the eleven nearest-wavelength channels.
+
+### More options
+
+```bash
+twilight-cli pray ... --terrain               # Copernicus DEM horizon masking
+twilight-cli pray ... --bortle 7              # manual skyglow (or --radiance)
+twilight-cli pray ... --aerosol urban --cloud thin-cirrus
+twilight-cli pray ... --photons 500           # more MC rays per LOS step
+twilight-cli pray ... --cpu                   # skip the Metal GPU
+twilight-cli pray ... --fast                  # scalar mode, skip polarization
+twilight-cli mcrt  --lat 21.42 --lon 39.83 --sza-start 90 --sza-end 108
+twilight-cli solar --lat 21.42 --lon 39.83 --date 2026-06-15 --tz 3 --de440 data/de440.bsp
+```
 
 ## How it works
 
-<details>
-<summary>Full pipeline</summary>
+### The criterion
 
-**1. Solar position.** NREL SPA (VSOP87) as default. Optional JPL DE440 ephemeris backend with a pure Rust DAF/SPK reader, Chebyshev interpolation, and IAU precession-nutation. Geometric ICRF positions are mm-level vs Horizons; the delivered topocentric chain is arcsecond-level (UT1≈UTC, simplified nutation), far more than sufficient for prayer times. Binary search for sunrise/sunset.
+For every scanned solar depression the engine simulates seven sky patches:
+five across the dawn band at 3° altitude spanning ±18° of the solar azimuth,
+plus dark reference patches at ±100°. The geometry comes from measurement:
+the twilight arch sits at 2.66 ± 0.23° altitude (Aswan camera campaign), the
+true-dawn band is roughly 30 to 40° wide at the moment of distinctness
+(Ilyas; the Hail observers), and the false dawn's zodiacal wedge is about
+20° wide at its base (Sultan).
 
-**2. Atmosphere.** 50 concentric spherical shells, 0 to 100 km, non-uniform spacing. Rayleigh scattering via Bodhaine (1999). Five-species molecular gas absorption from prebaked tables generated offline from HITRAN/Serdyuchenko data by `tools/gen_gas_xsec.py` (O3 11-temperature, O2/H2O bilinear P-T grids, NO2 two-temperature, O4 CIA). OPAC-style aerosol climatology (6 types) with Henyey-Greenstein phase function. Cloud layers (6 types; single-term HG — a known limitation, Mie phase functions pending). Lambertian ground reflection. Snell's-law refraction at shell boundaries (enabled in production; surface n = 1.000293). Optically thick clouds use delta-Eddington scaled optics with Eddington diffuse transmission for the cloud portion of eye/sun paths.
+Each patch's brightness is the sum of simulated twilight, the
+direction-dependent celestial background (zodiacal light, starlight,
+airglow, moonlight), and skyglow. Detection asks the question the ayah
+asks: has the growth of each band patch above its own deep-night baseline
+become distinct, as a Weber contrast against the reference-sky adaptation,
+simultaneously across the full lateral extent? When only the central
+patches pass, that is the false dawn; when the whole band passes, that is
+Fajr sadiq. Isha mirrors the test as a disappearance, with the red channel
+gated at the cone threshold (below about 10⁻³ cd/m² rods see no color, so
+there is no red shafaq to lose).
 
-**3. Radiative transfer.** Three modes: (a) single-scatter LOS integration with analytical shadow rays (deterministic); (b) backward Monte Carlo with next-event estimation; (c) hybrid: exact single-scatter + MC secondary chains for orders 2+. Full Stokes polarized RT (default; `--fast` for scalar). 41 wavelengths, 380-780 nm. The orders-2+ seed is an unbiased one-sample-MIS estimator (balance heuristic over a phase/zenith/terminator mixture); chains traverse shell boundaries with memoryless resampling.
+A relative criterion has a quiet superpower: systematic errors that
+multiply both patches (absolute radiometric scale, uniform cloud cover,
+uniform skyglow) largely cancel in the ratio. It also needs no special
+handling at high latitudes: the test is already relative to tonight's sky,
+so brightness-based times exist wherever the sky physically brightens
+(Padborg at 54.8° N in June: Fajr 02:55 inside persistent twilight).
 
-**4. Terrain masking.** Copernicus GLO-30 DEM tiles (auto-downloaded). Computes a 360-point horizon profile. Currently adjusts sunrise/sunset only; horizon-aware Fajr/Isha is an open task.
+One calibration layer is stated openly. Laboratory psychophysics predicts
+the eye should already see the dawn's photometric excess at depression 17
+to 18°; every field campaign shows it does not, because the dawn at that
+depth is a borderless gradient spread over tens of degrees (photometers
+detect it, people do not). The factor bridging that gap is calibrated once
+against the Mecca campaign cluster and then held fixed worldwide. The
+Birmingham row in the validation table is the test of that choice.
 
-**5. Light pollution.** Bortle class or VIIRS-style radiance input → spectral LED/HPS skyglow estimate added to the twilight signal. A Garstang RT integration exists in the codebase but is not yet wired in or validated.
+Set `TWILIGHT_KHAYT_DEBUG=1` to dump the per-azimuth contrast-margin curves
+of any run.
 
-**6. Vision model.** CIE photopic/scotopic luminance with a simplified mesopic blend. Spectral centroid classifies twilight color: blue, white (*shafaq al-abyad*), orange, red (*shafaq al-ahmar*), dark.
+### The transport
 
-**7. Threshold search.** Coarse scan then fine scan around crossings. Fajr/Isha thresholds are provisional constants pending calibration against published twilight photometry. SZA converted to clock time via SPA binary search.
+The sky itself is computed by backward Monte Carlo radiative transfer
+through a 56-shell spherical atmosphere reaching 150 km: Rayleigh
+scattering, five-species molecular absorption (O3, NO2, O2, H2O, O4 CIA
+from HITRAN/Serdyuchenko data), OPAC-style aerosols, delta-Eddington cloud
+transport, full Stokes polarization, and Snell refraction at shell
+boundaries, at 41 wavelengths from 380 to 780 nm.
 
-**8. GPU acceleration.** Metal backend (Apple Silicon) with hand-written MSL shaders, f32 precision engineering (half-b ray-sphere intersection, boundary snapping, Kahan summation), and a CPU f64 oracle test suite. The hybrid kernel currently has known watchdog/variance issues being fixed.
+First-order scattering is evaluated as an exact deterministic integral.
+The entire Monte Carlo budget goes to the multiple-scattering field, which
+is all that exists at Fajr depth, where the line of sight lies fully inside
+Earth's shadow. The estimator stack (next-event estimation, one-sample-MIS
+seeding, forced collisions, exponential transform, Dwivedi sampling, weight
+windows, splitting, bidirectional subpaths, hero-wavelength spectral MIS)
+is exactly unbiased and held to that standard by an adversarial audit
+process and regression-gated CPU/GPU parity tests.
 
-</details>
+A full computed day runs about 430 million photon chains: roughly 520 sky
+patches (depression scan × view fan × independent seeds), each tracing
+20,000 chains per wavelength across 41 wavelengths, with every scattering
+event firing a refracted shadow ray toward the sun. On an Apple-Silicon
+GPU (Metal) this takes minutes.
 
-## Crates
+## Architecture
 
 ```
-twilight/
-  crates/
-    twilight-core/       Physics kernel (#![no_std], zero heap)
-    twilight-solar/      SPA + DE440 ephemeris
-    twilight-data/       Profiles, cross-sections, atmosphere builder
-    twilight-threshold/  CIE vision, twilight color, prayer thresholds
-    twilight-cpu/        Rayon parallel driver, adaptive pipeline
-    twilight-gpu/        Metal backend
-    twilight-weather/    Live weather from Open-Meteo
-    twilight-terrain/    Copernicus GLO-30 DEM, horizon masking
-    twilight-skyglow/    Light pollution estimate
-    twilight-ffi/        C FFI (currently a single SPA function)
-    twilight-cli/        CLI: solar, mcrt, pray, render
+crates/
+  twilight-core       MC transport kernel (#![no_std])
+  twilight-data       atmosphere builder: USSA-76 + thermosphere to 150 km,
+                      prebaked cross-sections, aerosols, cloud optics
+  twilight-solar      NREL SPA, pure-Rust JPL DE440 SPK reader, lunar
+                      ephemeris, earth rotation
+  twilight-threshold  CIE mesopic/scotopic luminance, contrast thresholds,
+                      night-sky background from measured tables, crossing fits
+  twilight-cpu        pipeline: K-seed scans, the khayt fan, crossing to time
+  twilight-gpu        Metal port of the full estimator, parity-gated
+  twilight-weather    Open-Meteo, GIBS satellite layers, cloud3d, F10.7
+  twilight-skyglow    Lorenz atlas, VIIRS Black Marble, Garstang model
+  twilight-terrain    Copernicus DEM horizon profiles
+  twilight-ffi        C FFI (minimal)
+  twilight-cli        the twilight-cli binary
+tools/
+  validate_libradtran.py   DISORT/MYSTIC cross-validation harness
+  cloud3d_profile.py       GOES to cloud3d 3D profiles (+ 3D renders)
+  cloud3d_seviri.py        Meteosat SEVIRI to cloud3d (EUMETSAT Data Store)
+  gen_*.py                 every embedded data table is regenerable from source
 ```
 
-See [crates/README.md](crates/README.md) for per-crate detail and the
-dependency graph. `twilight-core` is `no_std` with no `Vec`, `String`, or
-`Box` — the same physics code can run on a phone or in a browser.
+## Limitations
 
-## Tests
+Treat computed times as **experimental for worship**; cross-check against
+established local calendars. Known limits, stated plainly:
 
-`cargo test --workspace` runs the suite (several minutes; the MC convergence
-tests are slow). GPU integration tests skip silently when no Metal device is
-present. Verified external anchors include the NREL SPA reference case and
-US Standard Atmosphere values; a libRadtran comparison harness is being added
-as the primary physics anchor.
+- **No field calibration of this engine's own output yet.** The criterion
+  is calibrated against published campaigns; an SQM and observer campaign
+  validating this engine end-to-end at its own sites is the most important
+  open task.
+- **Transport is 1D-spherical.** The 3D cloud field is measured in 3D but
+  transported as horizontally uniform layers sampled along the sunlight's
+  path. Cloud internal scattering is closed-form two-stream, not
+  path-traced.
+- **Absolute radiance is validated shape-only**, and external validation
+  stops at SZA 95° while the events live at 99 to 108°. The khayt criterion
+  is a ratio and cancels most of this; the legacy absolute method does not.
+- **Shafaq al-ahmar** rests on the weakest observational dataset (no
+  color-resolved modern campaign exists); the evening calibration leans on
+  instrumental rather than panel data.
+- **Fiqh semantics are the user's.** Under clouds the engine reports what
+  is detectable tonight; most fiqh defines the times by what would be
+  visible absent obstruction (clear-sky runs give that). Rulings belong to
+  the people of knowledge, not to this engine.
+- Timezone is a fixed UTC offset (no DST database yet); terrain masking
+  applies to sunrise and sunset, not yet to the dawn band itself.
 
-## Roadmap
+## Reproduce the validation
 
-- [x] Solar position (SPA + DE440), atmosphere model, single-scatter engine
-- [x] CIE vision model, threshold scan pipeline
-- [x] Surface albedo, OPAC-style aerosols (6 types), cloud layers (6 types)
-- [x] Backward MC + hybrid multi-scatter (correctness rewrite IN PROGRESS)
-- [x] Live weather via Open-Meteo (AOD, cloud cover)
-- [x] Terrain masking for sunrise/sunset (Copernicus GLO-30)
-- [x] Metal GPU backend
-- [ ] libRadtran/DISORT/MYSTIC validation harness  ← current focus
-- [x] Unbiased multiple-scattering estimator (CPU; Metal port pending)
-- [x] Cloud transport that survives optical depth > 1 (delta-Eddington coupling)
-- [ ] Atmosphere ceiling above 100 km for deep-twilight radiance
-- [x] Refraction enabled in the production pipeline
-- [ ] Thresholds: anchored to published photometry (done); field SQM calibration pending
-- [ ] Horizon-aware Fajr/Isha (terrain)
-- [ ] Garstang skyglow wired into the pipeline and validated
-- [ ] Mobile SDKs (iOS/Android), WASM demo
+```bash
+# libRadtran cross-validation (needs a libRadtran build; see tool docstring)
+export LIBRADTRAN_DIR=~/tools-build/libRadtran-2.0.6
+python3 tools/validate_libradtran.py --tier 1a --shape-only
+python3 tools/validate_libradtran.py --tier 1b --shape-only
+
+# Field-campaign checks
+./target/release/twilight-cli pray --lat 21.4225 --lon 39.8262 --date 2026-06-13 \
+  --tz 3 --de440 data/de440.bsp --scattering hybrid   # Mecca: 14.85/17.46/15.50
+./target/release/twilight-cli pray --lat 52.44 --lon=-1.93 --date 2026-06-13 \
+  --tz 1 --de440 data/de440.bsp --scattering hybrid   # Birmingham June: 12.50
+
+# Full test suite (including the Metal GPU parity gates)
+cargo test --workspace --release
+cargo test -p twilight-gpu --release --features metal
+```
 
 ## License
 
-MIT OR Apache-2.0
+MIT OR Apache-2.0, at your option.
+
+ولله الحمد. For the ummah.

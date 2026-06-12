@@ -2,7 +2,7 @@
 //!
 //! Second, CURRENT satellite skyglow source complementing the static
 //! Lorenz 2024 atlas: the `VIIRS_*_GapFilled_BRDF_Corrected_DayNightBand_
-//! Radiance` GIBS layers serve the daily Black Marble VNP46A2 product —
+//! Radiance` GIBS layers serve the daily Black Marble VNP46A2 product -
 //! upward nighttime-lights radiance with moonlight REMOVED, BRDF/seasonal
 //! effects corrected and cloud gaps filled. That makes it directly usable
 //! without lunar gating (the raw At_Sensor product is moon- and
@@ -10,7 +10,7 @@
 //!
 //! Tiles are paletted PNGs whose palette INDEX is the bin reference into
 //! the official radiance colormap (embedded as [`DNB_RADIANCE_LUT`],
-//! regenerable via tools/gen_gibs_colormaps.py). Units: nW/(cm^2 sr) —
+//! regenerable via tools/gen_gibs_colormaps.py). Units: nW/(cm^2 sr) -
 //! the same unit the Garstang/Bortle conversions in [`crate::bortle`]
 //! consume, so a measured current-month radiance plugs straight into the
 //! existing skyglow model.
@@ -19,8 +19,8 @@
 //! PROPAGATED artificial zenith brightness (the right observable, but
 //! frozen at its 2024 epoch); the DNB provides the CURRENT upward
 //! radiance. We fetch DNB at both epochs (the GIBS time dimension goes
-//! back years) and scale the atlas by the same-sensor temporal ratio —
-//! lighting growth/decline since 2024 — rather than re-deriving
+//! back years) and scale the atlas by the same-sensor temporal ratio -
+//! lighting growth/decline since 2024 - rather than re-deriving
 //! propagation from scratch.
 
 use std::path::Path;
