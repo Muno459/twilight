@@ -11,3 +11,7 @@ data/*.bsp
 # DEM tile cache (downloaded on first use)
 data/dem/
 validation/
+randomseed
+mc.rad*
+mc.flx*
+*.spcrad

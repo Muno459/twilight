@@ -48,9 +48,29 @@ pub fn map_aerosol(conditions: &WeatherConditions) -> Option<AerosolProperties> 
         return None;
     }
 
-    // Select type based on composition indicators
+    // Select type based on composition indicators.
+    //
+    // Maritime detection heuristic (no land/sea mask in the API): clean
+    // marine air has low dust, low fine-particle load relative to AOD
+    // (sea salt is coarse: PM2.5/PM10 ratio low), and high humidity. The
+    // sea-salt Angstrom exponent (~0.3) vs continental (~1.3) materially
+    // changes the blue/red extinction split at twilight, so reaching the
+    // maritime types matters; previously they were unreachable from
+    // weather data.
+    let pm_ratio = if conditions.pm10_ug_m3 > 1.0 {
+        conditions.pm2_5_ug_m3 / conditions.pm10_ug_m3
+    } else {
+        1.0
+    };
+    let maritime_like = conditions.dust_ug_m3 < 5.0
+        && conditions.relative_humidity > 70.0
+        && pm_ratio < 0.55;
     let base_type = if conditions.dust_ug_m3 > DUST_THRESHOLD {
         AerosolType::Desert
+    } else if maritime_like && aod <= 0.15 {
+        AerosolType::MaritimeClean
+    } else if maritime_like {
+        AerosolType::MaritimePolluted
     } else if aod > 0.20 {
         AerosolType::Urban
     } else if aod > 0.08 {
@@ -71,96 +91,94 @@ pub fn map_aerosol(conditions: &WeatherConditions) -> Option<AerosolProperties> 
 
 /// Map weather observations to cloud layer properties.
 ///
-/// Uses the low/mid/high cloud cover breakdown from the weather API to
-/// select the dominant cloud layer type and scale its optical depth by
-/// the coverage fraction.
+/// Uses ALL THREE altitude bands (low/mid/high) from the API, combined via
+/// the independent-column approximation: each band transmits
 ///
-/// Priority: low clouds > mid clouds > high clouds (low clouds have the
-/// largest radiative impact on twilight).
+///   T_band = (1 - f) + f * T_diff(OD_band)
 ///
-/// The optical depth is scaled by (cover_fraction)^0.7 to account for
-/// the fact that partial cloud cover doesn't linearly reduce the mean
-/// optical depth (cloud edges contribute, and horizontal transport of
-/// light through gaps matters).
+/// where f is the band's cover fraction and T_diff is the Eddington diffuse
+/// transmission of the band's type OD (matching the engine's cloud
+/// transport). The bands' transmissions multiply (independent overlap), and
+/// the combined transmission is inverted back into one EFFECTIVE optical
+/// depth. This replaces two earlier defects: a priority early-return where
+/// 10% scattered low cloud completely masked 90% high overcast, and an
+/// uncited OD*f^0.7 partial-cover fudge.
+///
+/// The effective layer takes the geometry (base/top) and droplet asymmetry
+/// of the band with the largest transmission DEFICIT (the radiatively
+/// dominant band).
 pub fn map_cloud(conditions: &WeatherConditions) -> Option<CloudProperties> {
-    let low = conditions.cloud_cover_low.clamp(0.0, 100.0);
-    let mid = conditions.cloud_cover_mid.clamp(0.0, 100.0);
-    let high = conditions.cloud_cover_high.clamp(0.0, 100.0);
-
-    // Check for fog (WMO codes 45, 48)
     let is_fog = conditions.weather_code == 45 || conditions.weather_code == 48;
 
-    // Determine dominant cloud layer
-    if is_fog || low >= CLOUD_COVER_THRESHOLD {
-        // Low cloud or fog
-        let cover = if is_fog {
-            100.0_f64.min(low.max(80.0))
-        } else {
-            low
-        };
-        let cover_frac = cover / 100.0;
+    // (cover %, type) per band — low band type refined by cover/visibility.
+    let low_cover = if is_fog {
+        100.0_f64.min(conditions.cloud_cover_low.max(80.0))
+    } else {
+        conditions.cloud_cover_low.clamp(0.0, 100.0)
+    };
+    let low_type = if is_fog || conditions.visibility_m < 1000.0 {
+        CloudType::Stratus
+    } else if low_cover > 60.0 {
+        CloudType::Stratocumulus
+    } else {
+        CloudType::Cumulus
+    };
+    let mid_cover = conditions.cloud_cover_mid.clamp(0.0, 100.0);
+    let high_cover = conditions.cloud_cover_high.clamp(0.0, 100.0);
+    let high_type = if high_cover > 60.0 {
+        CloudType::ThickCirrus
+    } else {
+        CloudType::ThinCirrus
+    };
 
-        let base_type = if is_fog || conditions.visibility_m < 1000.0 {
-            // Fog or very low visibility: thick stratus
-            CloudType::Stratus
-        } else if low > 60.0 {
-            CloudType::Stratocumulus
-        } else {
-            // Scattered low clouds
-            CloudType::Cumulus
-        };
+    // Eddington diffuse transmission of a delta-scaled type OD.
+    let t_diff = |ctype: CloudType| -> (f64, CloudProperties) {
+        let p = cloud::default_properties(ctype);
+        let f_peak = p.asymmetry * p.asymmetry;
+        let de_scale = 1.0 - p.ssa * f_peak;
+        let g_scaled = p.asymmetry / (1.0 + p.asymmetry);
+        let tau_star = p.optical_depth * de_scale;
+        (1.0 / (1.0 + 0.75 * tau_star * (1.0 - g_scaled)), p)
+    };
 
-        let defaults = cloud::default_properties(base_type);
-        let scaled_od = defaults.optical_depth * cover_frac.powf(0.7);
-
-        if scaled_od < 0.01 {
-            return None;
+    let mut t_total = 1.0_f64;
+    let mut dominant: Option<(f64, CloudProperties)> = None; // (deficit, props)
+    for (cover, ctype) in [
+        (low_cover, low_type),
+        (mid_cover, CloudType::Altostratus),
+        (high_cover, high_type),
+    ] {
+        if cover < CLOUD_COVER_THRESHOLD {
+            continue;
         }
-
-        return Some(CloudProperties {
-            optical_depth: scaled_od,
-            ..defaults
-        });
+        let f = (cover / 100.0).clamp(0.0, 1.0);
+        let (t_band_cloudy, props) = t_diff(ctype);
+        let t_band = (1.0 - f) + f * t_band_cloudy;
+        t_total *= t_band;
+        let deficit = 1.0 - t_band;
+        if dominant.as_ref().map(|(d, _)| deficit > *d).unwrap_or(true) {
+            dominant = Some((deficit, props));
+        }
     }
 
-    if mid >= CLOUD_COVER_THRESHOLD {
-        let cover_frac = (mid / 100.0).min(1.0);
-        let defaults = cloud::default_properties(CloudType::Altostratus);
-        let scaled_od = defaults.optical_depth * cover_frac.powf(0.7);
-
-        if scaled_od < 0.01 {
-            return None;
-        }
-
-        return Some(CloudProperties {
-            optical_depth: scaled_od,
-            ..defaults
-        });
+    let (_, dom) = dominant?;
+    if t_total >= 0.995 {
+        return None; // optically negligible
     }
 
-    if high >= CLOUD_COVER_THRESHOLD {
-        let cover_frac = (high / 100.0).min(1.0);
+    // Invert the combined diffuse transmission back to one effective
+    // UNSCALED optical depth for the dominant band's droplet properties
+    // (the builder re-applies delta scaling).
+    let f_peak = dom.asymmetry * dom.asymmetry;
+    let de_scale = 1.0 - dom.ssa * f_peak;
+    let g_scaled = dom.asymmetry / (1.0 + dom.asymmetry);
+    let tau_star_eff = (1.0 / t_total - 1.0) / (0.75 * (1.0 - g_scaled));
+    let od_eff = tau_star_eff / de_scale;
 
-        let base_type = if high > 60.0 {
-            CloudType::ThickCirrus
-        } else {
-            CloudType::ThinCirrus
-        };
-
-        let defaults = cloud::default_properties(base_type);
-        let scaled_od = defaults.optical_depth * cover_frac.powf(0.7);
-
-        if scaled_od < 0.01 {
-            return None;
-        }
-
-        return Some(CloudProperties {
-            optical_depth: scaled_od,
-            ..defaults
-        });
-    }
-
-    None
+    Some(CloudProperties {
+        optical_depth: od_eff,
+        ..dom
+    })
 }
 
 // ── Gas composition mapping ─────────────────────────────────────────────
@@ -315,6 +333,23 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maritime_types_reachable_from_marine_conditions() {
+        // Coastal/marine signature: humid, coarse-dominated, low dust.
+        let mut c = base_conditions();
+        c.dust_ug_m3 = 1.0;
+        c.relative_humidity = 85.0;
+        c.pm2_5_ug_m3 = 4.0;
+        c.pm10_ug_m3 = 18.0; // coarse sea salt
+        c.aod_550 = 0.10;
+        let a = map_aerosol(&c).expect("aerosol expected");
+        assert!(
+            a.angstrom_exponent < 0.8,
+            "marine air should select a maritime (low-Angstrom) type, got alpha={}",
+            a.angstrom_exponent
+        );
+    }
     use crate::WeatherConditions;
 
     fn base_conditions() -> WeatherConditions {

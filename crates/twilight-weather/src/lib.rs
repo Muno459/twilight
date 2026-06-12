@@ -104,18 +104,35 @@ pub struct AtmosphericParams {
 /// Returns an error string if the API requests fail.
 pub fn fetch_atmospheric_params(lat: f64, lon: f64) -> Result<AtmosphericParams, String> {
     let conditions = api::fetch_weather(lat, lon)?;
+    Ok(params_from_conditions(conditions))
+}
+
+/// Like [`fetch_atmospheric_params`] but samples the HOURLY FORECAST at a
+/// specific UTC date and hour — the conditions at the actual prayer hour,
+/// not "now". This is the production path: Fajr weather is fetched for the
+/// morning-twilight hour and Isha weather for the evening-twilight hour.
+pub fn fetch_atmospheric_params_at(
+    lat: f64,
+    lon: f64,
+    date: &str,
+    hour_utc: f64,
+) -> Result<AtmosphericParams, String> {
+    let conditions = api::fetch_weather_at(lat, lon, date, hour_utc)?;
+    Ok(params_from_conditions(conditions))
+}
+
+fn params_from_conditions(conditions: WeatherConditions) -> AtmosphericParams {
     let aerosol = mapping::map_aerosol(&conditions);
     let cloud = mapping::map_cloud(&conditions);
     let gas_composition = mapping::map_gas_composition(&conditions);
     let description = mapping::describe(&conditions, &aerosol, &cloud, &gas_composition);
-
-    Ok(AtmosphericParams {
+    AtmosphericParams {
         aerosol,
         cloud,
         gas_composition,
         description,
         conditions,
-    })
+    }
 }
 
 #[cfg(test)]

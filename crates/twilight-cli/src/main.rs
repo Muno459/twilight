@@ -1021,9 +1021,50 @@ fn cmd_pray(
     println!("Albedo:     {:.2}", albedo);
     println!("SZA step:   {:.2}°", sza_step);
 
-    // Resolve atmosphere: weather API or manual flags
+    // Resolve atmosphere: weather API or manual flags.
+    //
+    // Production weather sampling: prayer times happen at specific twilight
+    // hours, so the hourly FORECAST is sampled at the evening-twilight hour
+    // (sunset + 45 min) for the scan — the best data the API offers — with
+    // a fallback to current conditions if the forecast fetch fails.
+    let twilight_hour_utc: Option<f64> = {
+        // Quick SPA sunset for the forecast hour (UTC fractional hours).
+        let spa_in = SpaInput {
+            year,
+            month,
+            day,
+            hour: 12,
+            minute: 0,
+            second: 0,
+            timezone: 0.0,
+            latitude: lat,
+            longitude: lon,
+            elevation,
+            pressure: 1013.25,
+            temperature: 15.0,
+            delta_t,
+            slope: 0.0,
+            azm_rotation: 0.0,
+            atmos_refract: 0.5667,
+        };
+        spa::solar_position(&spa_in)
+            .ok()
+            .map(|o| (o.sunset + 0.75).rem_euclid(24.0))
+    };
+    let date_iso = format!("{}-{:02}-{:02}", year, month, day);
     let (weather_aerosol, weather_cloud, weather_gas, atm_desc) = if use_weather {
-        match twilight_weather::fetch_atmospheric_params(lat, lon) {
+        let fetched = match twilight_hour_utc {
+            Some(h) => twilight_weather::fetch_atmospheric_params_at(lat, lon, &date_iso, h)
+                .map(|p| (p, format!("forecast @ {} {:02}:00 UTC", date_iso, h.round() as u32 % 24)))
+                .or_else(|e| {
+                    eprintln!("Note: hourly forecast unavailable ({}); using current conditions.", e);
+                    twilight_weather::fetch_atmospheric_params(lat, lon)
+                        .map(|p| (p, "current conditions".to_string()))
+                }),
+            None => twilight_weather::fetch_atmospheric_params(lat, lon)
+                .map(|p| (p, "current conditions".to_string())),
+        };
+        match fetched.map(|(p, src)| { println!("Weather src: {}", src); p }) {
             Ok(params) => {
                 let c = &params.conditions;
                 println!(

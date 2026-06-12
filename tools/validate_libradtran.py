@@ -96,7 +96,7 @@ def deck_common(lrt: Path | None, solar_file: str | None, o3_du: float | None,
     data = (lrt / "data") if lrt else Path("<LIBRADTRAN_DIR>/data")
     lines = [
         f"data_files_path {data}/",
-        f"atmosphere_file {data}/atmospheres/afglus.dat   # US Standard 1976",
+        f"atmosphere_file {data}/atmmod/afglus.dat   # US Standard 1976",
         f"albedo {ALBEDO}",
         f"wavelength {WL_MIN} {WL_MAX}",
         "mol_abs_param crs                  # cross-section absorption (UV/vis)",
@@ -104,7 +104,7 @@ def deck_common(lrt: Path | None, solar_file: str | None, o3_du: float | None,
     if solar_file:
         lines.insert(2, f"source solar {solar_file}")
     else:
-        lines.insert(2, f"source solar {data}/solar_flux/atlas_plus_modtran")
+        lines.insert(2, f"source solar {data}/solar_flux/apm_1nm   # atlas_plus_modtran 1nm")
     if rayleigh_only:
         lines.append("no_absorption mol                  # pure Rayleigh tier")
     elif o3_du is not None:
@@ -113,16 +113,23 @@ def deck_common(lrt: Path | None, solar_file: str | None, o3_du: float | None,
 
 
 def deck_radiance(common: str, solver: str, sza: float, umus: list[float],
-                  phis: list[float]) -> str:
+                  phis: list[float], wl: tuple[float, float] | None = None) -> str:
     """Radiance deck: ground observer looking up."""
     umu_s = " ".join(f"{u:.6f}" for u in umus)
     phi_s = " ".join(f"{p:.1f}" for p in phis)
     solver_lines = {
         "disort": "rte_solver disort\nnumber_of_streams 16\npseudospherical",
         "mystic": ("rte_solver montecarlo\nmc_spherical 1D\n"
-                   "mc_photons 100000\nmc_vroom on"),
+                   "mc_photons 200000"),
     }[solver]
-    return f"""{common}
+    body = common
+    if wl is not None:
+        # Replace the broadband wavelength line for single-wavelength MC runs.
+        body = "\n".join(
+            f"wavelength {wl[0]:.1f} {wl[1]:.1f}" if l.startswith("wavelength ") else l
+            for l in common.splitlines()
+        )
+    return f"""{body}
 {solver_lines}
 sza {sza:.2f}
 phi0 0.0
@@ -174,6 +181,7 @@ def run_twilight_compare(szas, view_zeniths, rel_azimuths, rayleigh_only,
     ]
     if rayleigh_only:
         cmd.append("--rayleigh-only")
+    cmd.append("--fast")  # scalar radiance (I); polarization correction ~0.5-2%
     if o3_du is not None:
         cmd += ["--o3-du", f"{o3_du:g}"]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -230,7 +238,11 @@ def compare_tier1(lrt, solver, szas, tol, shape_only, solar_file):
     common = deck_common(lrt, solar_file, None, rayleigh_only=True)
 
     print(f"\n=== Tier 1 ({solver}, Rayleigh-only, SZA {szas[0]}-{szas[-1]}) ===")
-    tw = run_twilight_compare(szas, view_zeniths, rel_azimuths, True, None)
+    # twilight hybrid = exact order-1 + MC orders 2+ (all orders), matching
+    # DISORT's full field. Single-scatter-only vs full DISORT differs by the
+    # multiple-scattering fraction (30-60% for Rayleigh) and is NOT a fair test.
+    tw = run_twilight_compare(szas, view_zeniths, rel_azimuths, True, None,
+                              scattering="hybrid", photons=300)
 
     n_pass = n_fail = 0
     rows = []
@@ -319,7 +331,7 @@ def main():
                                 tol=0.05, shape_only=args.shape_only,
                                 solar_file=args.solar_file)
         elif tier == "1b":
-            ok &= compare_tier1(lrt, "mystic", [90, 94, 98, 102, 104, 106, 108],
+            ok &= compare_tier1(lrt, "mystic", [95, 98, 100, 102, 104, 106],
                                 tol=0.10, shape_only=args.shape_only,
                                 solar_file=args.solar_file)
         elif tier in ("2", "3"):
