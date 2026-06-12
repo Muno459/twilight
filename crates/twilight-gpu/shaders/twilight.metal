@@ -407,9 +407,9 @@ inline float henyey_greenstein_phase(float cos_theta, float g) {
 }
 
 inline float mixed_phase(float cos_theta, ShellOptics op) {
-    if (op.rayleigh_fraction > 0.99f) {
-        return rayleigh_phase(cos_theta);
-    }
+    // Exact mixture, ALWAYS: a former rf > 0.99 pure-Rayleigh shortcut
+    // mismatched the seed sampler (which draws HG with prob 1-rf for any
+    // rf < 1), biasing the mixture-MIS seed weights (mirrors the CPU fix).
     return op.rayleigh_fraction * rayleigh_phase(cos_theta)
          + (1.0f - op.rayleigh_fraction) * henyey_greenstein_phase(cos_theta, op.asymmetry);
 }
@@ -829,11 +829,28 @@ ZenithSample sample_zenith_biased(float3 normal, float n, thread ulong &rng) {
     return ZenithSample{dir, cos_theta};
 }
 
-// Importance weight correction for zenith-biased sampling.
-// w = p_cosine(theta) / p_zenith(theta) = 2/(n+1) * cos^(1-n)(theta)
-inline float zenith_importance_weight(float cos_theta, float n) {
-    float cos_nm1 = pow(cos_theta, n - 1.0f);
-    return 2.0f / ((n + 1.0f) * cos_nm1);
+// PDF over solid angle of the (untruncated) power-cosine lobe drawn by
+// sample_zenith_biased: p(omega) = (n+1) cos^n(theta) / (2 pi) on the
+// upper hemisphere about the axis, 0 below. (The GPU sampler is
+// untruncated; this pdf matches it exactly. Unbiasedness needs only
+// sampler == pdf; weight boundedness comes from the mixture's phase
+// component, NOT from truncation — so no weight clamps and no NaN-prone
+// unbounded importance ratios, the root cause of the old v2 fireflies.)
+inline float power_cos_pdf(float cos_theta, float n) {
+    if (cos_theta <= 0.0f) return 0.0f;
+    return (n + 1.0f) * pow(cos_theta, n) / (2.0f * PI);
+}
+
+// Density of the 3-component seed mixture at omega (mirrors the CPU's
+// seed_mixture_pdf): q = a_p*P(omega.sun)/4pi + a_z*pcos(up) + a_t*pcos(term).
+inline float seed_mixture_pdf(float3 omega, float3 sun_dir, float3 local_up,
+                              float3 term_axis, float alpha_p, float alpha_z,
+                              float alpha_t, float n_zenith, float m_term,
+                              ShellOptics op) {
+    float q = alpha_p * mixed_phase(dot(omega, sun_dir), op) * INV_4PI;
+    if (alpha_z > 1e-6f) q += alpha_z * power_cos_pdf(dot(omega, local_up), n_zenith);
+    if (alpha_t > 1e-6f) q += alpha_t * power_cos_pdf(dot(omega, term_axis), m_term);
+    return q;
 }
 
 // 3-branch direction sampling parameters, SZA-adaptive.
@@ -885,15 +902,6 @@ inline float3 terminator_axis(float3 up, float3 sun_dir, float tilt_rad) {
     return normalize(cos_t * up + sin_t * sun_horiz);
 }
 
-// Shape weight for terminator lobe: corrects cos^m(theta_t) PDF back to
-// cosine-hemisphere reference.
-// w = 2 * cos(theta_z) / ((m+1) * cos^m(theta_t))
-inline float terminator_shape_weight(float cos_z, float cos_t, float m) {
-    if (cos_z <= 0.0f || cos_t <= 0.0f) return 0.0f;
-    float cos_t_m = pow(cos_t, m);
-    if (cos_t_m < 1e-30f) return 0.0f;
-    return 2.0f * cos_z / ((m + 1.0f) * cos_t_m);
-}
 
 // ============================================================================
 // Kernel 1: single_scatter_spectrum
@@ -1308,69 +1316,56 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
                              thread ulong &rng) {
     float surface_radius = EARTH_RADIUS_M;
 
-    // Stratified 3-branch importance sampling with branch probability weights.
+    // Unbiased one-sample-MIS seed (port of the CPU estimator): sample
+    // omega from the 3-component mixture, weight by
+    //   w0 = P(omega.view)/4pi / q(omega)
+    // identically for every branch — the balance-heuristic estimator.
+    // Samplers and RNG consumption order unchanged. This replaces the old
+    // per-branch heuristic weights whose unbounded importance ratios were
+    // the v2 firefly/NaN source.
     float xi_jitter = xorshift_f32(rng);
     float xi_mix = (float(ray_idx) + xi_jitter) / max(float(total_rays), 1.0f);
     float3 dir;
-    float cos_theta_init;
-    float initial_weight;
     if (xi_mix < setup.alpha_p) {
+        float ct;
         if (xorshift_f32(rng) < start_optics.rayleigh_fraction) {
-            cos_theta_init = sample_rayleigh_analytic(xorshift_f32(rng));
+            ct = sample_rayleigh_analytic(xorshift_f32(rng));
         } else {
-            cos_theta_init = sample_henyey_greenstein(xorshift_f32(rng), start_optics.asymmetry);
+            ct = sample_henyey_greenstein(xorshift_f32(rng), start_optics.asymmetry);
         }
         float phi_init = 2.0f * PI * xorshift_f32(rng);
-        dir = scatter_direction(sun_dir, cos_theta_init, phi_init);
-        initial_weight = 0.5f / max(setup.alpha_p, 1e-6f);
+        dir = scatter_direction(sun_dir, ct, phi_init);
     } else if (xi_mix < setup.alpha_p + setup.alpha_z || setup.alpha_t < 1e-6f) {
         ZenithSample zs = sample_zenith_biased(setup.local_up, setup.n_zenith, rng);
         dir = zs.dir;
-        cos_theta_init = dot(sun_dir, dir);
-        float shape_w = zenith_importance_weight(zs.cos_theta, setup.n_zenith);
-        float branch_w = 0.5f / max(setup.alpha_z + setup.alpha_t, 1e-6f);
-        initial_weight = shape_w * branch_w;
     } else {
         ZenithSample zs = sample_zenith_biased(setup.term_axis_dir, setup.m_term, rng);
         dir = zs.dir;
-        cos_theta_init = dot(sun_dir, dir);
-        float cos_z = dot(dir, setup.local_up);
-        float shape_w = terminator_shape_weight(cos_z, zs.cos_theta, setup.m_term);
-        float branch_w = 0.5f / max(setup.alpha_t, 1e-6f);
-        initial_weight = shape_w * branch_w;
     }
-    // No clamp on initial_weight -- that would be bias.
 
-    // Initialize Stokes state: apply first scatter's Mueller to incoming state
-    // The incoming photon from the LOS single-scatter is effectively [1,0,0,0]
-    // at the first secondary bounce. The prev_dir_in -> sun_dir -> dir
-    // rotation gives us the initial Stokes transformation.
-    float4 stokes = float4(1.0f, 0.0f, 0.0f, 0.0f); // normalized (I=1)
+    float q_seed = seed_mixture_pdf(dir, sun_dir, setup.local_up,
+                                    setup.term_axis_dir, setup.alpha_p,
+                                    setup.alpha_z, setup.alpha_t,
+                                    setup.n_zenith, setup.m_term, start_optics);
+    // prev_dir_in is the LOS view direction: the physical seed-scatter
+    // cosine is omega.view (matches the CPU convention).
+    float w0 = (q_seed > 1e-30f)
+        ? mixed_phase(dot(dir, prev_dir_in), start_optics) * INV_4PI / q_seed
+        : 0.0f;
 
-    // Apply initial scatter Mueller to stokes
-    {
-        cos_theta_init = clamp(cos_theta_init, -1.0f, 1.0f);
-        float A0, B0, C0;
-        stokes_ABC(cos_theta_init, start_optics, A0, B0, C0);
-        float cos2phi0, sin2phi0;
-        scattering_plane_rotation(prev_dir_in, sun_dir, dir, cos2phi0, sin2phi0);
-        if (!isfinite(cos2phi0)) { cos2phi0 = 1.0f; sin2phi0 = 0.0f; }
-        stokes = scatter_stokes(A0, B0, C0, cos2phi0, sin2phi0, stokes);
-        if (isfinite(stokes.x) && stokes.x > 1e-30f) {
-            float inv_I = 1.0f / stokes.x;
-            stokes *= inv_I;
-            if (!isfinite(stokes.y)) stokes.y = 0.0f;
-            if (!isfinite(stokes.z)) stokes.z = 0.0f;
-            if (!isfinite(stokes.w)) stokes.w = 0.0f;
-        } else {
-            stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
-        }
-    }
+    // Seed polarization: unpolarized (the exact treatment would Mueller-
+    // rotate the omega->view seed scatter; multiply-scattered light is
+    // weakly polarized and the I-error is sub-percent — same approximation
+    // as the CPU chain).
+    float4 stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
 
     float3 pos = start_pos;
     float3 current_dir = dir;
     float3 prev_dir = sun_dir; // direction before current propagation segment
-    float weight = start_optics.ssa * initial_weight;
+    // NOTE: no start_optics.ssa factor — the host-side integrator's
+    // beta_scat at the seed point already carries it (double-count removed,
+    // mirroring the CPU fix).
+    float weight = w0;
 
     KahanAccum total_I, total_Q, total_U, total_V;
 
@@ -1555,6 +1550,11 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
         ShellOptics op = read_optics(atm, scatter_shell, wl_idx);
 
+        // Apply SSA BEFORE NEE: the NEE connection is a scattering
+        // interaction at this vertex (matches the corrected CPU chains;
+        // SSA-after-NEE overestimated each NEE by 1/ssa).
+        weight *= op.ssa;
+
         // NEE: apply Mueller to photon's actual Stokes state
         if (isfinite(weight) && fabs(weight) > 1e-30f) {
             float t_sun_sec = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
@@ -1584,7 +1584,6 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
             }
         }
 
-        weight *= op.ssa;
         if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
 
         // Sample new direction

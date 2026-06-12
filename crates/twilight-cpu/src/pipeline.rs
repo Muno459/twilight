@@ -425,6 +425,23 @@ pub fn compute_prayer_times_gpu(
 
     let atm = build_atmosphere(input);
 
+    // HONEST CLOUD GATE: the packed GPU buffers do not yet carry the
+    // per-shell cloud_extinction / cloud_g_scaled fields, so the Metal
+    // kernels cannot apply the Eddington diffuse transmission for cloud —
+    // GPU results under cloud would silently lack the dominant transport
+    // term. Route cloudy atmospheres to the (correct) CPU path until the
+    // buffer layout is extended.
+    let has_cloud = atm.cloud_extinction[..atm.num_shells]
+        .iter()
+        .any(|&c| c > 0.0);
+    if has_cloud {
+        eprintln!(
+            "Note: cloud layers present — using CPU transport (GPU buffers \
+             do not yet carry the cloud diffuse-transmission fields)."
+        );
+        return compute_prayer_times(input);
+    }
+
     // Upload atmosphere to GPU. On failure, fall back to CPU entirely.
     if let Err(e) = gpu.upload_atmosphere(&atm) {
         eprintln!(

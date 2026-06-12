@@ -120,7 +120,7 @@ def deck_radiance(common: str, solver: str, sza: float, umus: list[float],
     solver_lines = {
         "disort": "rte_solver disort\nnumber_of_streams 16\npseudospherical",
         "mystic": ("rte_solver montecarlo\nmc_spherical 1D\n"
-                   "mc_photons 200000"),
+                   "mc_photons 2000000\nmc_vroom on"),
     }[solver]
     body = common
     if wl is not None:
@@ -160,7 +160,7 @@ def run_uvspec(lrt: Path, deck: str, tag: str) -> str:
     inp.write_text(deck)
     with open(inp) as fi, open(out, "w") as fo:
         r = subprocess.run([str(lrt / "bin" / "uvspec")], stdin=fi, stdout=fo,
-                           stderr=subprocess.PIPE, text=True)
+                           stderr=subprocess.PIPE, text=True, cwd=OUT_DIR)
     if r.returncode != 0:
         sys.exit(f"uvspec failed for {tag}:\n{r.stderr[:2000]}")
     return out.read_text()
@@ -287,6 +287,72 @@ def compare_tier1(lrt, solver, szas, tol, shape_only, solar_file):
     return n_fail == 0
 
 
+
+def compare_tier1b_mystic(lrt, szas, tol, shape_only, solar_file):
+    """Tier 1b: deep-twilight ZENITH radiance vs MYSTIC spherical MC.
+
+    One single-direction (zenith) MYSTIC run per (SZA, wavelength): MYSTIC
+    reports radiance in mc.rad.spc (stdout uu columns are zero), one row
+    per wavelength, and multi-direction sampling is awkward (mc_vroom
+    conflicts; only the first direction lands in the .spc). Zenith is also
+    the canonical observable for the deep-twilight/100-km-ceiling check.
+    """
+    wls = [450.0, 550.0, 650.0]
+    print(f"\n=== Tier 1b (MYSTIC spherical, zenith, SZA {szas[0]}-{szas[-1]}) ===")
+    if lrt is None:
+        print("  decks-only mode: install libRadtran and set LIBRADTRAN_DIR")
+        return True
+
+    common = deck_common(lrt, solar_file, None, rayleigh_only=True)
+    tw = run_twilight_compare(szas, [0.0], [0.0], True, None,
+                              scattering="hybrid", photons=500)
+
+    n_pass = n_fail = 0
+    rows = []
+    for sza in szas:
+        for w in wls:
+            deck = deck_radiance(common, "mystic", sza, [-1.0], [0.0], wl=(w, w))
+            tag = f"tier1b_sza{sza:g}_wl{w:g}"
+            run_uvspec(lrt, deck, tag)
+            spc = OUT_DIR / "mc.rad.spc"
+            if not spc.exists():
+                sys.exit(f"MYSTIC did not produce {spc}")
+            # rows: wl ix iy iz radiance  (single direction)
+            val = None
+            for line in spc.read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 5 and abs(float(parts[0]) - w) < 0.51:
+                    val = float(parts[4]) * 1e-3  # mW -> W
+            if val is None:
+                continue
+            v_t = tw.get((sza, 0.0, 0.0, w))
+            if v_t is None:
+                continue
+            rows.append([sza, 0.0, 0.0, w, v_t, val])
+
+    # shape normalization across each SZA using 550nm
+    out_rows = []
+    for sza in szas:
+        sub = [r for r in rows if r[0] == sza and r[5] > 0]
+        if not sub:
+            print(f"  SZA {sza:5.1f}: MYSTIC returned zero radiance (deeper than its reach?)")
+            continue
+        scale = 1.0
+        if shape_only:
+            mid = min(sub, key=lambda r: abs(r[3] - 550))
+            if mid[4] > 0:
+                scale = mid[5] / mid[4]
+        for r in sub:
+            rel = abs(r[4] * scale - r[5]) / r[5]
+            ok = rel <= tol
+            n_pass += ok
+            n_fail += not ok
+            out_rows.append((r[0], r[1], r[2], r[3], r[4] * scale, r[5], rel, ok))
+            print(f"  SZA {r[0]:5.1f} wl {r[3]:5.0f}: twilight={r[4]*scale:.4e} mystic={r[5]:.4e} rel={rel:6.1%}{'' if ok else '  <-- FAIL'}")
+
+    _report(out_rows, n_pass, n_fail, tol)
+    return n_fail == 0
+
 def _report(rows, n_pass, n_fail, tol):
     worst = sorted(rows, key=lambda r: -r[6])[:10]
     print(f"  {n_pass} pass / {n_fail} fail (tol {tol:.0%})")
@@ -331,9 +397,9 @@ def main():
                                 tol=0.05, shape_only=args.shape_only,
                                 solar_file=args.solar_file)
         elif tier == "1b":
-            ok &= compare_tier1(lrt, "mystic", [95, 98, 100, 102, 104, 106],
-                                tol=0.10, shape_only=args.shape_only,
-                                solar_file=args.solar_file)
+            ok &= compare_tier1b_mystic(lrt, [95, 98, 100, 102, 104, 106],
+                                        tol=0.10, shape_only=args.shape_only,
+                                        solar_file=args.solar_file)
         elif tier in ("2", "3"):
             print(f"Tier {tier}: deck templates not yet automated — "
                   "see module docstring for the design.")

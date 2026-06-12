@@ -41,11 +41,17 @@ Progress so far (see git log on this branch):
 4. Thresholds re-anchored to published photometry (night-sky background
    2.2e-4 cd/m² per Patat 2008; mesopic/cone-threshold boundaries) with the
    derivation documented — field SQM calibration still pending
-5. OPEN: atmosphere ceiling at 100 km truncates deep-twilight radiance;
-   the libRadtran tier-1b (MYSTIC spherical) harness quantifies this once
-   libRadtran is installed
-6. OPEN: Metal hybrid kernel needs the corrected estimator ported
-   (watchdog/variance root causes identified)
+5. **External validation (libRadtran) is RUNNING**: twilight's full
+   transport agrees with DISORT to **2.6-3.5% median** at SZA 60-90
+   (Rayleigh, shape-normalized; see validation/RESULTS.md). The deep-
+   twilight tier vs MYSTIC spherical is preliminary — known systematics
+   (refraction config, profile granularity, MC noise both sides, and the
+   100 km ceiling at SZA >= 104) are documented there with next steps
+6. Metal: the corrected unbiased estimator IS ported to the shader
+   (mixture-MIS seed, SSA-before-NEE, exact phase mixture, no unbounded
+   importance weights). Cloudy atmospheres route to CPU until the packed
+   buffers carry the cloud diffuse-transmission fields. The 5000-ray
+   split-dispatch watchdog limit remains under investigation
 
 ## Why
 
