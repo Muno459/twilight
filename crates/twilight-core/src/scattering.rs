@@ -458,11 +458,7 @@ pub fn scatter_mueller(
 ) -> MuellerMatrix {
     let rot = rotation_mueller(rotation_angle);
 
-    let scatter = if rayleigh_fraction > 0.99 {
-        rayleigh_mueller(cos_theta)
-    } else if rayleigh_fraction < 0.01 {
-        hg_mueller(cos_theta, asymmetry)
-    } else {
+    let scatter = {
         // Weighted combination of Rayleigh and HG Mueller matrices
         let mr = rayleigh_mueller(cos_theta).scale(rayleigh_fraction);
         let mh = hg_mueller(cos_theta, asymmetry).scale(1.0 - rayleigh_fraction);

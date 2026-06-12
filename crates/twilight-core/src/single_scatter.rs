@@ -204,7 +204,7 @@ pub fn single_scatter_radiance(
         // clear air + Eddington diffuse for the accumulated cloud portion.
         let tau_obs_mid = tau_obs + optics.extinction * ds_base * 0.5;
         let tau_cloud_mid = tau_cloud_obs + atm.cloud_extinction[shell_idx] * ds_base * 0.5;
-        let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid))
+        let t_obs = libm::exp(-tau_obs_mid)
             * atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
         if t_obs < 1e-30 {
@@ -230,13 +230,9 @@ pub fn single_scatter_radiance(
         let cos_theta = sun_dir.dot(view_dir);
 
         // Phase function
-        let phase = if optics.rayleigh_fraction > 0.99 {
-            rayleigh_phase(cos_theta)
-        } else {
-            optics.rayleigh_fraction * rayleigh_phase(cos_theta)
-                + (1.0 - optics.rayleigh_fraction)
-                    * henyey_greenstein_phase(cos_theta, optics.asymmetry)
-        };
+        let phase = optics.rayleigh_fraction * rayleigh_phase(cos_theta)
+            + (1.0 - optics.rayleigh_fraction)
+                * henyey_greenstein_phase(cos_theta, optics.asymmetry);
 
         // Contribution from this step
         // dI = β_scat × P(θ)/(4π) × T_sun × T_obs × ds
@@ -270,7 +266,7 @@ pub fn single_scatter_radiance(
                 let t_sun_ground =
                     shadow_ray_transmittance(atm, ground_pos, sun_dir, wavelength_idx);
                 // Full LOS optical depth to the ground; cloud portion diffuse.
-                let t_obs_ground = libm::exp(-(tau_obs - tau_cloud_obs))
+                let t_obs_ground = libm::exp(-tau_obs)
                     * atm.cloud_diffuse_transmittance(tau_cloud_obs);
 
                 radiance += albedo / core::f64::consts::PI
@@ -361,13 +357,13 @@ pub fn shadow_ray_transmittance(
             None => break,
         }
 
-        if tau - tau_cloud > 50.0 {
+        if tau > 50.0 {
             return 0.0;
         }
     }
 
     // Clear-air part: Beer-Lambert. Cloud part: Eddington diffuse.
-    libm::exp(-(tau - tau_cloud)) * atm.cloud_diffuse_transmittance(tau_cloud)
+    libm::exp(-tau) * atm.cloud_diffuse_transmittance(tau_cloud)
 }
 
 /// Compute single-scattering radiance for all wavelengths simultaneously.
@@ -443,20 +439,16 @@ pub fn single_scatter_spectrum(
             }
 
             let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
-            let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid)) * t_cloud_mid;
+            let t_obs = libm::exp(-tau_obs_mid) * t_cloud_mid;
 
             if t_obs < 1e-30 || t_sun[w] < 1e-30 {
                 tau_obs[w] += optics.extinction * ds;
                 continue;
             }
 
-            let phase = if optics.rayleigh_fraction > 0.99 {
-                rayleigh_phase(cos_theta)
-            } else {
-                optics.rayleigh_fraction * rayleigh_phase(cos_theta)
-                    + (1.0 - optics.rayleigh_fraction)
-                        * henyey_greenstein_phase(cos_theta, optics.asymmetry)
-            };
+            let phase = optics.rayleigh_fraction * rayleigh_phase(cos_theta)
+                + (1.0 - optics.rayleigh_fraction)
+                    * henyey_greenstein_phase(cos_theta, optics.asymmetry);
 
             radiance[w] +=
                 beta_scat * phase / (4.0 * core::f64::consts::PI) * t_sun[w] * t_obs * ds;
@@ -478,7 +470,7 @@ pub fn single_scatter_spectrum(
             for w in 0..num_wl {
                 let albedo = atm.surface_albedo[w];
                 if albedo > 1e-10 && t_sun_ground[w] > 1e-30 {
-                    let t_obs_ground = libm::exp(-(tau_obs[w] - tau_cloud_obs))
+                    let t_obs_ground = libm::exp(-tau_obs[w])
                         * atm.cloud_diffuse_transmittance(tau_cloud_obs);
                     radiance[w] += albedo / core::f64::consts::PI
                         * cos_sun_incidence
@@ -567,7 +559,7 @@ pub fn shadow_ray_transmittance_spectrum(
 
         // Early out if ALL wavelengths are opaque in clear air alone
         let min_tau = tau.iter().take(num_wl).copied().fold(f64::MAX, f64::min);
-        if min_tau - tau_cloud > 50.0 {
+        if min_tau > 50.0 {
             return [0.0f64; 64];
         }
     }
@@ -575,7 +567,7 @@ pub fn shadow_ray_transmittance_spectrum(
     let t_cloud = atm.cloud_diffuse_transmittance(tau_cloud);
     let mut result = [0.0f64; 64];
     for (w, res_w) in result.iter_mut().enumerate().take(num_wl) {
-        let tau_clear = tau[w] - tau_cloud;
+        let tau_clear = tau[w];
         *res_w = if tau_clear > 50.0 {
             0.0
         } else {

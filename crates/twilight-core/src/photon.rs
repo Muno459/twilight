@@ -430,13 +430,9 @@ fn compute_nee(
     // scattered toward the observer.
     let cos_angle = sun_dir.dot(photon_dir);
 
-    let phase = if local_optics.rayleigh_fraction > 0.99 {
-        rayleigh_phase(cos_angle)
-    } else {
-        local_optics.rayleigh_fraction * rayleigh_phase(cos_angle)
-            + (1.0 - local_optics.rayleigh_fraction)
-                * henyey_greenstein_phase(cos_angle, local_optics.asymmetry)
-    };
+    let phase = local_optics.rayleigh_fraction * rayleigh_phase(cos_angle)
+        + (1.0 - local_optics.rayleigh_fraction)
+            * henyey_greenstein_phase(cos_angle, local_optics.asymmetry);
 
     // Contribution = weight × transmittance × phase / (4π)
     weight * transmittance * phase * INV_4PI
@@ -2468,7 +2464,7 @@ pub fn hybrid_scatter_radiance(
 
         let tau_obs_mid = tau_obs + optics.extinction * ds * 0.5;
         let tau_cloud_mid = tau_cloud_obs + atm.cloud_extinction[shell_idx] * ds * 0.5;
-        let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid))
+        let t_obs = libm::exp(-tau_obs_mid)
             * atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
         if t_obs < 1e-30 {
@@ -2483,11 +2479,7 @@ pub fn hybrid_scatter_radiance(
 
             if polarized {
                 // Full Mueller matrix for polarized order-1
-                let mueller_1 = if optics.rayleigh_fraction > 0.99 {
-                    rayleigh_mueller(cos_theta_1)
-                } else if optics.rayleigh_fraction < 0.01 {
-                    hg_mueller(cos_theta_1, optics.asymmetry)
-                } else {
+                let mueller_1 = {
                     let mr = rayleigh_mueller(cos_theta_1).scale(optics.rayleigh_fraction);
                     let mh = hg_mueller(cos_theta_1, optics.asymmetry)
                         .scale(1.0 - optics.rayleigh_fraction);
@@ -2503,13 +2495,9 @@ pub fn hybrid_scatter_radiance(
                 stokes_total = stokes_total.add(&ss_stokes.scale(scale_1));
             } else {
                 // Scalar phase function (no Mueller, no Stokes)
-                let phase = if optics.rayleigh_fraction > 0.99 {
-                    rayleigh_phase(cos_theta_1)
-                } else {
-                    optics.rayleigh_fraction * rayleigh_phase(cos_theta_1)
-                        + (1.0 - optics.rayleigh_fraction)
-                            * henyey_greenstein_phase(cos_theta_1, optics.asymmetry)
-                };
+                let phase = optics.rayleigh_fraction * rayleigh_phase(cos_theta_1)
+                    + (1.0 - optics.rayleigh_fraction)
+                        * henyey_greenstein_phase(cos_theta_1, optics.asymmetry);
                 scalar_total += phase * scale_1;
             }
         }
@@ -3231,13 +3219,9 @@ fn trace_secondary_chain_scalar(
 
                 if t_sun_secondary > 1e-30 {
                     let cos_angle_nee = sun_dir.dot(current_dir);
-                    let phase = if optics.rayleigh_fraction > 0.99 {
-                        rayleigh_phase(cos_angle_nee)
-                    } else {
-                        optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
-                            + (1.0 - optics.rayleigh_fraction)
-                                * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry)
-                    };
+                    let phase = optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
+                        + (1.0 - optics.rayleigh_fraction)
+                            * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry);
 
                     // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
                     // particle, apply the MIS weight (w_back) since BDPT provides
@@ -3384,13 +3368,15 @@ fn trace_secondary_chain_scalar(
 /// the optics at this wavelength. Used by ALIS weight ratio corrections.
 #[inline]
 fn scalar_phase_value(cos_theta: f64, optics: &crate::atmosphere::ShellOptics) -> f64 {
-    if optics.rayleigh_fraction > 0.99 {
-        rayleigh_phase(cos_theta)
-    } else {
-        optics.rayleigh_fraction * rayleigh_phase(cos_theta)
-            + (1.0 - optics.rayleigh_fraction)
-                * henyey_greenstein_phase(cos_theta, optics.asymmetry)
-    }
+    // Exact mixture, ALWAYS. A former `rf > 0.99 -> pure Rayleigh` shortcut
+    // silently mismatched the seed sampler (which draws HG with probability
+    // 1-rf for ANY rf < 1): pdf != sampling density => biased MIS weights in
+    // shells with rf in (0.99, 1), which exist in every aerosol build
+    // (upper-tropospheric aerosol tail). The HG forward peak is ~30x
+    // Rayleigh, so even (1-rf) = 0.005 contributes ~13% there.
+    optics.rayleigh_fraction * rayleigh_phase(cos_theta)
+        + (1.0 - optics.rayleigh_fraction)
+            * henyey_greenstein_phase(cos_theta, optics.asymmetry)
 }
 
 /// Multi-wavelength scout: compute optical depth to boundary for all wavelengths.
@@ -4391,7 +4377,7 @@ pub fn hybrid_scatter_radiance_alis(
         let mut any_visible = false;
         for w in 0..num_wl {
             let tau_mid = tau_obs[w] + atm.optics[shell_idx][w].extinction * ds * 0.5;
-            if libm::exp(-(tau_mid - tau_cloud_mid)) * t_cloud_mid > 1e-30 {
+            if libm::exp(-tau_mid) * t_cloud_mid > 1e-30 {
                 any_visible = true;
                 break;
             }
@@ -4412,7 +4398,7 @@ pub fn hybrid_scatter_radiance_alis(
             }
 
             let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
-            let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid)) * t_cloud_mid;
+            let t_obs = libm::exp(-tau_obs_mid) * t_cloud_mid;
             if t_obs < 1e-30 || t_suns[w] < 1e-30 {
                 continue;
             }
@@ -4497,7 +4483,7 @@ pub fn hybrid_scatter_radiance_alis(
                     continue;
                 }
                 let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
-                let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid)) * t_cloud_mid;
+                let t_obs = libm::exp(-tau_obs_mid) * t_cloud_mid;
                 if t_obs < 1e-30 {
                     continue;
                 }
@@ -4618,7 +4604,7 @@ pub fn hybrid_scatter_radiance_alis(
                 let mut any_visible = false;
                 for w in 0..num_wl {
                     let tau_mid = tau_obs_bdpt[w] + atm.optics[shell_idx][w].extinction * ds * 0.5;
-                    if libm::exp(-(tau_mid - tau_cloud_mid)) * t_cloud_mid > 1e-30 {
+                    if libm::exp(-tau_mid) * t_cloud_mid > 1e-30 {
                         any_visible = true;
                         break;
                     }
@@ -4668,7 +4654,7 @@ pub fn hybrid_scatter_radiance_alis(
                         }
 
                         let tau_obs_mid = tau_obs_bdpt[w] + optics_eye.extinction * ds * 0.5;
-                        let t_obs = libm::exp(-(tau_obs_mid - tau_cloud_mid)) * t_cloud_mid;
+                        let t_obs = libm::exp(-tau_obs_mid) * t_cloud_mid;
                         if t_obs < 1e-30 {
                             continue;
                         }

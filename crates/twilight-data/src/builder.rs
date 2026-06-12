@@ -504,17 +504,25 @@ fn add_cloud_layer(atm: &mut AtmosphereModel, cloud_props: &CloudProperties, clo
         let ssa_c = ((1.0 - f_peak) * cloud_props.ssa / de_scale).clamp(0.0, 1.0);
         let g_c_scaled = g_c / (1.0 + g_c);
 
-        // Record the delta-scaled cloud-only extinction for this shell and
-        // the scaled asymmetry so the LOS/shadow integrators can treat the
-        // cloud portion of a path with Eddington diffuse transmission.
-        atm.cloud_extinction[s] += cloud_ext * overlap_fraction * de_scale;
+        // SINGLE-REPRESENTATION cloud transport: the closed-form Eddington
+        // diffuse transmission (cloud_diffuse_transmittance, driven by the
+        // per-shell cloud_extinction recorded here) owns ALL cloud
+        // scattering — on eye paths, shadow rays, and chain NEE alike. The
+        // mixed shell optics therefore receive ONLY the cloud's absorption
+        // (exact, conserved); cloud scattering is NOT added to the optics,
+        // so the MC chains never explicitly scatter in cloud. Putting the
+        // same physics in both places (as an earlier revision did) double-
+        // counted cloud-diffused sunlight below/inside decks by up to ~2x.
+        // Residual approximation: chain segments crossing a deck are
+        // attenuated by cloud absorption only (their diffusion is already
+        // carried by the T_diff on the deterministic factors).
+        atm.cloud_extinction[s] += cloud_ext * overlap_fraction * de_scale * ssa_c;
         atm.cloud_g_scaled = g_c_scaled;
 
         for w in 0..atm.num_wavelengths {
             let existing = &atm.optics[s][w];
 
             let c_ext = cloud_ext * overlap_fraction * de_scale;
-            let c_scat = c_ext * ssa_c;
             let c_abs = c_ext * (1.0 - ssa_c);
 
             let existing_scat = existing.extinction * existing.ssa;
@@ -522,7 +530,8 @@ fn add_cloud_layer(atm: &mut AtmosphereModel, cloud_props: &CloudProperties, clo
             let existing_nonray_scat = existing_scat * (1.0 - existing.rayleigh_fraction);
             let existing_abs = existing.extinction * (1.0 - existing.ssa);
 
-            let total_scat = existing_ray_scat + existing_nonray_scat + c_scat;
+            // Cloud contributes absorption only (see header comment).
+            let total_scat = existing_ray_scat + existing_nonray_scat;
             let total_abs = existing_abs + c_abs;
             let total_ext = total_scat + total_abs;
 
@@ -533,7 +542,7 @@ fn add_cloud_layer(atm: &mut AtmosphereModel, cloud_props: &CloudProperties, clo
             };
 
             let new_g = if total_scat > 1e-30 {
-                (existing_nonray_scat * existing.asymmetry + c_scat * g_c_scaled) / total_scat
+                (existing_nonray_scat * existing.asymmetry) / total_scat
             } else {
                 0.0
             };
@@ -746,9 +755,16 @@ mod tests {
             let alt_km = clear.shells[s].altitude_mid / 1000.0;
             if alt_km > 2.0 && alt_km < 4.0 {
                 let w = 17; // 550nm
+                // Single-representation: optics gain only cloud ABSORPTION
+                // (small but nonzero); the scattering goes to cloud_extinction.
                 assert!(
-                    cloudy.optics[s][w].extinction > clear.optics[s][w].extinction * 2.0,
-                    "Cloud should increase extinction at {}km",
+                    cloudy.optics[s][w].extinction > clear.optics[s][w].extinction,
+                    "Cloud absorption should increase extinction at {}km",
+                    alt_km
+                );
+                assert!(
+                    cloudy.cloud_extinction[s] > 0.0,
+                    "cloud_extinction should carry the scattering at {}km",
                     alt_km
                 );
             }
@@ -770,9 +786,11 @@ mod tests {
             let alt_km = cloudy.shells[s].altitude_mid / 1000.0;
             if alt_km > 2.0 && alt_km < 4.0 {
                 let w = 17;
+                // Single-representation: cloud scattering is NOT mixed into
+                // the optics, so the (clear-air) rayleigh_fraction is intact.
                 assert!(
-                    cloudy.optics[s][w].rayleigh_fraction < 0.9,
-                    "Cloud should reduce Rayleigh fraction at {}km: got {}",
+                    cloudy.optics[s][w].rayleigh_fraction > 0.9,
+                    "Chain optics keep clear-air scattering at {}km: got {}",
                     alt_km,
                     cloudy.optics[s][w].rayleigh_fraction
                 );
@@ -781,7 +799,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_layer_sets_nonzero_asymmetry() {
+    fn cloud_layer_leaves_chain_asymmetry_clear_sky() {
         let cloudy = build_with_cloud_layer(
             AtmosphereType::UsStandard,
             0.15,
@@ -795,9 +813,11 @@ mod tests {
             let alt_km = cloudy.shells[s].altitude_mid / 1000.0;
             if alt_km > 2.0 && alt_km < 4.0 {
                 let w = 17;
+                // Cloud scattering lives in the closed-form diffuse factor,
+                // not the chain optics: asymmetry stays clear-sky (~0).
                 assert!(
-                    cloudy.optics[s][w].asymmetry > 0.1,
-                    "Cloud should set nonzero asymmetry at {}km: got {}",
+                    cloudy.optics[s][w].asymmetry < 0.1,
+                    "Chain asymmetry should remain clear-sky at {}km: got {}",
                     alt_km,
                     cloudy.optics[s][w].asymmetry
                 );
@@ -1255,21 +1275,18 @@ mod tests {
         let cirrus = build_with_cloud(AtmosphereType::UsStandard, 0.15, CloudType::ThinCirrus);
         let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
 
-        // Both should increase extinction over clear sky, but stratus much more
-        let w = 17;
-        let mut stratus_max_delta = 0.0f64;
-        let mut cirrus_max_delta = 0.0f64;
-        for s in 0..clear.num_shells {
-            let sd = stratus.optics[s][w].extinction - clear.optics[s][w].extinction;
-            let cd = cirrus.optics[s][w].extinction - clear.optics[s][w].extinction;
-            stratus_max_delta = stratus_max_delta.max(sd);
-            cirrus_max_delta = cirrus_max_delta.max(cd);
-        }
+        // Cloud scattering now lives in cloud_extinction (single
+        // representation); stratus must carry much more of it than thin
+        // cirrus, and both more than clear sky (which has none).
+        let stratus_max = stratus.cloud_extinction.iter().cloned().fold(0.0f64, f64::max);
+        let cirrus_max = cirrus.cloud_extinction.iter().cloned().fold(0.0f64, f64::max);
+        let clear_max = clear.cloud_extinction.iter().cloned().fold(0.0f64, f64::max);
+        assert!(clear_max == 0.0, "clear sky must have zero cloud_extinction");
         assert!(
-            stratus_max_delta > cirrus_max_delta * 5.0,
-            "Stratus delta ({:.4e}) should be >> thin cirrus delta ({:.4e})",
-            stratus_max_delta,
-            cirrus_max_delta
+            stratus_max > cirrus_max * 5.0,
+            "Stratus cloud scattering ({:.4e}) should be >> thin cirrus ({:.4e})",
+            stratus_max,
+            cirrus_max
         );
     }
 
@@ -1844,13 +1861,17 @@ mod tests {
     }
 
     #[test]
-    fn cloud_delta_eddington_reduces_effective_od() {
-        // For stratus (OD 10, ssa 0.999, g 0.85): scale = 1 - 0.999*0.7225
-        // ~ 0.278, so the in-cloud extinction added must be ~27.8% of the
-        // unscaled value, and the mixed g must be well below 0.85.
+    fn cloud_single_representation_split() {
+        // Single-representation transport: the mixed optics receive ONLY the
+        // cloud's absorption; ALL cloud scattering lives in cloud_extinction
+        // (consumed by the closed-form Eddington diffuse transmission).
+        // For stratus (OD 10, ssa 0.999, g 0.85): de_scale = 1 - 0.999*0.7225
+        // ~ 0.278; scattering part ~ 0.278 * 0.99647 of the unscaled ext;
+        // absorption part = (1 - 0.999) of the unscaled ext (conserved).
         let clear = build_clear_sky(AtmosphereType::UsStandard, 0.15);
         let props = twilight_data_cloud_props();
         let cloudy = build_with_cloud_properties(AtmosphereType::UsStandard, 0.15, &props);
+        let mut checked = 0;
         for s in 0..cloudy.num_shells {
             let base_km =
                 (cloudy.shells[s].r_inner - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
@@ -1858,23 +1879,34 @@ mod tests {
                 (cloudy.shells[s].r_outer - twilight_core::atmosphere::EARTH_RADIUS_M) / 1000.0;
             if base_km >= props.base_km && top_km <= props.top_km {
                 let w = 17;
-                let added_ext = cloudy.optics[s][w].extinction - clear.optics[s][w].extinction;
                 let cloud_ext_unscaled =
                     props.optical_depth / ((props.top_km - props.base_km) * 1000.0);
-                let ratio = added_ext / cloud_ext_unscaled;
+                // optics gained ONLY absorption: (1 - ssa) * unscaled ext
+                let added_ext = cloudy.optics[s][w].extinction - clear.optics[s][w].extinction;
+                let expected_abs = cloud_ext_unscaled * (1.0 - props.ssa);
                 assert!(
-                    (ratio - 0.278).abs() < 0.01,
-                    "delta-scaled extinction ratio = {:.3}, expected ~0.278",
-                    ratio
+                    (added_ext - expected_abs).abs() / expected_abs < 1e-6,
+                    "optics should gain cloud ABSORPTION only: added={:.3e}, expected={:.3e}",
+                    added_ext,
+                    expected_abs
                 );
-                let g = cloudy.optics[s][w].asymmetry;
+                // scattering (delta-scaled) is recorded in cloud_extinction
+                let de_scale = 1.0 - props.ssa * props.asymmetry * props.asymmetry;
+                let ssa_scaled = (1.0 - props.asymmetry * props.asymmetry) * props.ssa / de_scale;
+                let expected_scat = cloud_ext_unscaled * de_scale * ssa_scaled;
+                let rel = (cloudy.cloud_extinction[s] - expected_scat).abs() / expected_scat;
                 assert!(
-                    g < 0.5,
-                    "mixed asymmetry should use scaled g* ~ 0.46, got {}",
-                    g
+                    rel < 1e-6,
+                    "cloud_extinction should carry the delta-scaled scattering: got {:.4e}, expected {:.4e}",
+                    cloudy.cloud_extinction[s],
+                    expected_scat
                 );
+                // chain optics keep clear-sky scattering/asymmetry untouched
+                assert!((cloudy.optics[s][w].asymmetry - clear.optics[s][w].asymmetry).abs() < 1e-12);
+                checked += 1;
             }
         }
+        assert!(checked > 0);
     }
 
     fn twilight_data_cloud_props() -> crate::cloud::CloudProperties {
