@@ -160,6 +160,100 @@ def iwc_from_output(y):
     return iwc
 
 
+def render_3d(png_path, iwc, heights, km_e, km_s, jc_w, ic_w,
+              texture=None, place="", scan_label="", azimuth=None):
+    """True 3D view of the reconstructed cloud volume: marching-cubes
+    isosurfaces of IWC (outer envelope + dense core) standing on the
+    actual satellite image as the ground plane. Z axis = altitude.
+
+    texture: 2D grayscale [0,1] in the window's row/col orientation
+    (rows north->south), e.g. visible reflectance by day, inverted
+    IR brightness temperature by night.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from scipy.ndimage import gaussian_filter
+    from skimage.measure import marching_cubes
+
+    # Orient volume to (z up, y north, x east); index 0 of iwc is the TOP.
+    vol = iwc[::-1, ::-1, :]  # z ascending, rows ascending northward
+    vol = gaussian_filter(vol, sigma=0.7)
+    nz, ny, nx = vol.shape
+    dz_km = (heights[0] - heights[-1]) / (len(heights) - 1) / 1000.0
+    vmax = float(vol.max())
+
+    # Observer-centered coordinates [km].
+    y_obs = (ny - 1 - jc_w) * km_s
+    x_obs = ic_w * km_e
+    x_ext, y_ext = nx * km_e, ny * km_s
+
+    fig = plt.figure(figsize=(13, 9))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_facecolor("white")
+
+    # ── Ground plane: the real satellite image ──
+    if texture is not None:
+        tex = np.clip(texture[::-1, :], 0.0, 1.0)  # rows -> north ascending
+        step = 2  # 64x64 quads is plenty for a backdrop
+        t = tex[::step, ::step]
+        yy = (np.arange(0, ny, step) * km_s) - y_obs
+        xx = (np.arange(0, nx, step) * km_e) - x_obs
+        xg, yg = np.meshgrid(xx, yy)
+        rgb = plt.cm.gray(0.15 + 0.75 * t)
+        ax.plot_surface(xg, yg, np.zeros_like(xg), facecolors=rgb,
+                        rstride=1, cstride=1, shade=False,
+                        linewidth=0, antialiased=False, zorder=1)
+
+    # ── Cloud isosurfaces ──
+    levels = [
+        (max(8e-4, 0.01 * vmax), "#e3ecf5", 0.35),  # envelope (thin ice)
+        (max(1.0e-2, 0.20 * vmax), "#9fb4cd", 0.90),  # dense core
+    ]
+    drew = 0
+    for level, color, alpha in levels:
+        if level >= vmax:
+            continue
+        verts, faces, _, _ = marching_cubes(
+            vol, level=level, spacing=(dz_km, km_s, km_e), step_size=1)
+        ax.plot_trisurf(verts[:, 2] - x_obs, verts[:, 1] - y_obs, faces,
+                        verts[:, 0], color=color, alpha=alpha,
+                        linewidth=0, antialiased=False, shade=True)
+        drew += 1
+
+    # Observer + sun direction on the ground.
+    ax.scatter([0], [0], [0.3], color="red", marker="*", s=180,
+               depthshade=False, zorder=10)
+    if azimuth is not None:
+        az = math.radians(azimuth)
+        L = 0.35 * max(x_ext, y_ext) / 2
+        ax.plot([0, L * math.sin(az)], [0, L * math.cos(az)], [0.3, 0.3],
+                color="orangered", linewidth=2.5)
+        ax.text(L * math.sin(az), L * math.cos(az), 8.0, "to sun",
+                color="orangered", fontsize=11)
+
+    z_disp = 0.33 * max(x_ext, y_ext)
+    ax.set_box_aspect((x_ext, y_ext, z_disp))
+    ax.set_zlim(0, 16)
+    ax.set_xlim(0 - x_obs, nx * km_e - x_obs)
+    ax.set_ylim(0 - y_obs, ny * km_s - y_obs)
+    ax.set_xlabel("km east")
+    ax.set_ylabel("km north")
+    ax.set_zlabel("altitude [km]")
+    ax.view_init(elev=26, azim=-75)
+    vexag = z_disp / 16.0
+    ax.set_title(
+        f"cloud3d — 3D cloud reconstruction over {place}\n"
+        f"{scan_label} · isosurfaces of ice water content · "
+        f"ground = actual satellite image · vertical ~{vexag:.0f}x exaggerated",
+        fontsize=12)
+    fig.subplots_adjust(left=0.0, right=1.0, bottom=0.0, top=0.93)
+    fig.savefig(png_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"cloud3d: 3D figure -> {png_path} ({drew} isosurfaces)",
+          file=sys.stderr)
+
+
 def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
                xs_win, ys_win, jc_w, ic_w, curtain, curtain_km,
                px_km=(2.0, 2.0)):
@@ -271,6 +365,8 @@ def main():
     ap.add_argument("--window", type=int, default=128)
     ap.add_argument("--png", default=None,
                     help="also render a figure (IWP map + sunward curtain + profiles)")
+    ap.add_argument("--png3d", default=None,
+                    help="true 3D render: IWC isosurfaces over the satellite image")
     ap.add_argument("--place", default=None, help="location label for the figure title")
     args = ap.parse_args()
 
@@ -433,6 +529,20 @@ def main():
         render_png(args.png, iwc, heights, args, scan_time, bucket, sat_lon,
                    None, None, jc_w, ic_w,
                    np.stack(cols, axis=1), np.array(kms))
+
+    if args.png3d:
+        # Ground texture: visible reflectance by day, inverted 10.3 um
+        # brightness temperature by night (cold cloud tops bright).
+        vis = raw[0]
+        if np.nanmax(vis) > 8.0:
+            tex = np.clip(vis / 80.0, 0.0, 1.0)
+        else:
+            tex = np.clip((300.0 - raw[8]) / 110.0, 0.0, 1.0)
+        render_3d(args.png3d, iwc, heights, 2.0, 2.0, jc_w, ic_w,
+                  texture=tex,
+                  place=args.place or f"{args.lat:.2f}N {args.lon:.2f}E",
+                  scan_label=f"{bucket} ABI scan {scan_time}",
+                  azimuth=args.azimuth)
 
     print(f"cloud3d: {bucket} {key.split('/')[-1]}", file=sys.stderr)
     print(f"cloud3d: cloud fraction {cloud_fraction:.2f}, "

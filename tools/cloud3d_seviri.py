@@ -142,6 +142,8 @@ def main():
                     help="UTC ISO time; default = newest available scan")
     ap.add_argument("--out", required=True)
     ap.add_argument("--png", default=None)
+    ap.add_argument("--png3d", default=None,
+                    help="true 3D render: IWC isosurfaces over the satellite image")
     ap.add_argument("--place", default=None)
     ap.add_argument("--model", default="data/cloud3d/iwc.jit.pt")
     ap.add_argument("--window", type=int, default=128)
@@ -237,26 +239,42 @@ def main():
     with open(args.out, "w") as f:
         json.dump(result, f)
 
+    # Ground sampling at the observer from the area's neighbor pixels
+    # (Euclidean ground distance of one grid step; the grid axes are
+    # rotated vs north this far off-nadir, so each step moves in both
+    # lon and lat).
+    lon_e, lat_e = area.get_lonlat(jc, ic + 1)
+    lon_s, lat_s = area.get_lonlat(jc + 1, ic)
+    lon_0, lat_0 = area.get_lonlat(jc, ic)
+    coslat = math.cos(math.radians(lat_0))
+    km_e = math.hypot(111.32 * coslat * (lon_e - lon_0),
+                      110.57 * (lat_e - lat_0))
+    km_s = math.hypot(111.32 * coslat * (lon_s - lon_0),
+                      110.57 * (lat_s - lat_0))
+    # synthesize the fields render_png expects from the GOES namespace
+    args.date = scan_time[:10]
+    args.hour = int(scan_time[11:13]) + int(scan_time[14:16]) / 60.0
+
     if args.png and cols:
-        # Ground sampling at the observer from the area's neighbor pixels
-        # (Euclidean ground distance of one grid step; the grid axes are
-        # rotated vs north this far off-nadir, so each step moves in both
-        # lon and lat).
-        lon_e, lat_e = area.get_lonlat(jc, ic + 1)
-        lon_s, lat_s = area.get_lonlat(jc + 1, ic)
-        lon_0, lat_0 = area.get_lonlat(jc, ic)
-        coslat = math.cos(math.radians(lat_0))
-        km_e = math.hypot(111.32 * coslat * (lon_e - lon_0),
-                          110.57 * (lat_e - lat_0))
-        km_s = math.hypot(111.32 * coslat * (lon_s - lon_0),
-                          110.57 * (lat_s - lat_0))
-        # synthesize the fields render_png expects from the GOES namespace
-        args.date = scan_time[:10]
-        args.hour = int(scan_time[11:13]) + int(scan_time[14:16]) / 60.0
         render_png(args.png, iwc, heights, args, scan_time,
                    "meteosat-9 (IODC 45.5E)", SAT_LON, None, None,
                    jc_w, ic_w, np.stack(cols, axis=1), np.array(kms),
                    px_km=(km_e, km_s))
+
+    if args.png3d:
+        from cloud3d_profile import render_3d
+        # Ground texture: visible reflectance by day, inverted 10.8 um
+        # brightness temperature by night (cold cloud tops bright).
+        vis = raw[0]
+        if np.nanmax(vis) > 8.0:
+            tex = np.clip(vis / 80.0, 0.0, 1.0)
+        else:
+            tex = np.clip((300.0 - raw[8]) / 110.0, 0.0, 1.0)
+        render_3d(args.png3d, iwc, heights, km_e, km_s, jc_w, ic_w,
+                  texture=tex,
+                  place=args.place or f"{args.lat:.2f}N {args.lon:.2f}E",
+                  scan_label=f"Meteosat-9 SEVIRI (IODC) scan {scan_time}",
+                  azimuth=args.azimuth)
 
     print(f"cloud3d-seviri: {pid} scan {scan_time}", file=sys.stderr)
     print(f"cloud3d-seviri: cloud fraction {cloud_fraction:.2f}, "
