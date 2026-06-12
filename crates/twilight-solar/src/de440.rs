@@ -15,7 +15,8 @@
 //! Coverage: 1550 CE to 2650 CE.
 
 use crate::earth_rotation::{self, icrf_to_topocentric, TopocentricPosition};
-use crate::spk::{self, SpkFile, EARTH, EARTH_MOON_BARYCENTER, SUN};
+use crate::moon::MoonState;
+use crate::spk::{self, SpkFile, EARTH, EARTH_MOON_BARYCENTER, MOON, SUN};
 use std::path::Path;
 
 // ── Error type ─────────────────────────────────────────────────────
@@ -101,6 +102,74 @@ impl De440 {
         ];
 
         Ok((pos, vel))
+    }
+
+    /// Get the geocentric position of the Moon in ICRF/J2000 (km).
+    ///
+    /// DE440 stores Moon(301) and Earth(399) relative to the Earth-Moon
+    /// barycenter (3); the segment chain resolves the geocentric vector.
+    /// The DE440 lunar orbit is fit to laser ranging — sub-meter accuracy,
+    /// vs ~0.3 deg for the truncated Meeus series.
+    pub fn moon_position_icrf(&mut self, tdb_seconds: f64) -> Result<[f64; 3], De440Error> {
+        Ok(self.spk.position_chain(MOON, EARTH, tdb_seconds)?)
+    }
+
+    /// Topocentric lunar state from the real JPL ephemeris — drop-in
+    /// replacement for the Meeus-based [`crate::moon::moon_state`].
+    ///
+    /// The topocentric conversion subtracts the observer's WGS84 position
+    /// from the geocentric vector, so the Moon's ~1 deg horizontal
+    /// parallax is handled exactly (for the Sun it is negligible; for the
+    /// Moon it moves the apparent altitude by up to a degree). The phase
+    /// angle is the true Sun-Moon-Earth angle computed from the two ICRF
+    /// vectors, not an ecliptic-elongation approximation.
+    #[allow(clippy::too_many_arguments)] // Calendar components + observer location are all independent
+    pub fn moon_state(
+        &mut self,
+        year: i32,
+        month: i32,
+        day: i32,
+        hour_utc: f64,
+        delta_t: f64,
+        latitude: f64,
+        longitude: f64,
+        elevation: f64,
+    ) -> Result<MoonState, De440Error> {
+        let total_seconds = hour_utc * 3600.0;
+        let hour = (total_seconds / 3600.0) as i32;
+        let minute = ((total_seconds - hour as f64 * 3600.0) / 60.0) as i32;
+        let second = (total_seconds - hour as f64 * 3600.0 - minute as f64 * 60.0) as i32;
+        let jd_utc = earth_rotation::calendar_to_jd(year, month, day, hour, minute, second);
+        let jd_tdb = earth_rotation::utc_jd_to_tdb_jd(jd_utc, delta_t);
+        let tdb_seconds = earth_rotation::jd_to_tdb_seconds(jd_tdb);
+
+        let moon_icrf = self.moon_position_icrf(tdb_seconds)?;
+        let sun_icrf = self.sun_position_icrf(tdb_seconds)?;
+
+        // UT1 ≈ UTC (same convention as solar_position)
+        let topo = icrf_to_topocentric(moon_icrf, jd_utc, jd_tdb, latitude, longitude, elevation);
+
+        // Phase angle at the Moon between the Sun and the Earth (geocentric
+        // observer is sufficient: the topocentric refinement to alpha is
+        // < 0.002 deg).
+        let sm = [
+            sun_icrf[0] - moon_icrf[0],
+            sun_icrf[1] - moon_icrf[1],
+            sun_icrf[2] - moon_icrf[2],
+        ];
+        let em = [-moon_icrf[0], -moon_icrf[1], -moon_icrf[2]];
+        let dot = sm[0] * em[0] + sm[1] * em[1] + sm[2] * em[2];
+        let nsm = libm::sqrt(sm[0] * sm[0] + sm[1] * sm[1] + sm[2] * sm[2]);
+        let nem = libm::sqrt(em[0] * em[0] + em[1] * em[1] + em[2] * em[2]);
+        let alpha = libm::acos((dot / (nsm * nem)).clamp(-1.0, 1.0));
+
+        Ok(MoonState {
+            altitude_deg: topo.elevation,
+            azimuth_deg: topo.azimuth,
+            phase_angle_deg: alpha.to_degrees(),
+            illuminated_fraction: (1.0 + libm::cos(alpha)) / 2.0,
+            distance_km: topo.distance_km,
+        })
     }
 
     /// Compute topocentric solar position for a given observer.
@@ -282,6 +351,107 @@ mod tests {
             let end_jd = earth_rotation::tdb_seconds_to_jd(end);
             println!("Sun coverage: JD {:.1} to JD {:.1}", start_jd, end_jd);
         }
+    }
+
+    #[test]
+    fn test_de440_moon_distance_physical() {
+        let path = match get_de440_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("DE440 not available, skipping");
+                return;
+            }
+        };
+        let mut de = De440::open(&path).expect("failed to open DE440");
+        // Geocentric lunar distance stays within perigee..apogee bounds.
+        for (y, m, d) in [(2026, 1, 3), (2026, 6, 12), (2024, 3, 20)] {
+            let jd = earth_rotation::calendar_to_jd(y, m, d, 0, 0, 0);
+            let tdb = earth_rotation::jd_to_tdb_seconds(
+                earth_rotation::utc_jd_to_tdb_jd(jd, 69.2),
+            );
+            let p = de.moon_position_icrf(tdb).expect("moon position");
+            let r = libm::sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+            assert!(
+                (356_000.0..407_000.0).contains(&r),
+                "{y}-{m}-{d}: lunar distance {r:.0} km out of physical range"
+            );
+        }
+    }
+
+    #[test]
+    fn test_de440_moon_agrees_with_meeus() {
+        // The truncated Meeus series is good to ~0.3 deg geocentric; the
+        // topocentric Meeus path adds a simplified parallax. DE440 must
+        // agree with it within those error bars at several epochs — any
+        // larger discrepancy means a frame/chain bug, not series error.
+        let path = match get_de440_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("DE440 not available, skipping");
+                return;
+            }
+        };
+        let mut de = De440::open(&path).expect("failed to open DE440");
+        for (y, m, d, h) in [
+            (2026, 1, 3, 22.0),
+            (2026, 1, 18, 5.0),
+            (2026, 6, 12, 1.5),
+            (2025, 9, 7, 19.0),
+        ] {
+            let jpl = de
+                .moon_state(y, m, d, h, 69.2, 55.65, 12.41, 0.0)
+                .expect("de440 moon state");
+            let meeus = crate::moon::moon_state(y, m, d, h, 55.65, 12.41);
+            assert!(
+                (jpl.altitude_deg - meeus.altitude_deg).abs() < 1.0,
+                "{y}-{m}-{d} {h}h: altitude JPL {:.2} vs Meeus {:.2}",
+                jpl.altitude_deg,
+                meeus.altitude_deg
+            );
+            // Azimuth comparison only away from the zenith (degenerate there)
+            if jpl.altitude_deg.abs() < 80.0 {
+                let daz = (jpl.azimuth_deg - meeus.azimuth_deg + 540.0).rem_euclid(360.0) - 180.0;
+                assert!(
+                    daz.abs() < 1.5,
+                    "{y}-{m}-{d} {h}h: azimuth JPL {:.2} vs Meeus {:.2}",
+                    jpl.azimuth_deg,
+                    meeus.azimuth_deg
+                );
+            }
+            assert!(
+                (jpl.illuminated_fraction - meeus.illuminated_fraction).abs() < 0.03,
+                "{y}-{m}-{d} {h}h: illum JPL {:.3} vs Meeus {:.3}",
+                jpl.illuminated_fraction,
+                meeus.illuminated_fraction
+            );
+            // JPL distance is TOPOCENTRIC, Meeus is geocentric: they may
+            // differ by up to one Earth radius (parallax) plus the Meeus
+            // series error.
+            assert!(
+                (jpl.distance_km - meeus.distance_km).abs() < 6371.0 + 1500.0,
+                "{y}-{m}-{d} {h}h: distance JPL {:.0} vs Meeus {:.0}",
+                jpl.distance_km,
+                meeus.distance_km
+            );
+        }
+    }
+
+    #[test]
+    fn test_de440_moon_known_phases() {
+        // 2026-01-03 full moon, 2026-01-18 new moon (UTC) — the real
+        // ephemeris must reproduce the almanac.
+        let path = match get_de440_path() {
+            Some(p) => p,
+            None => {
+                eprintln!("DE440 not available, skipping");
+                return;
+            }
+        };
+        let mut de = De440::open(&path).expect("failed to open DE440");
+        let full = de.moon_state(2026, 1, 3, 12.0, 69.2, 0.0, 0.0, 0.0).unwrap();
+        assert!(full.illuminated_fraction > 0.97, "full: {:?}", full);
+        let new = de.moon_state(2026, 1, 18, 12.0, 69.2, 0.0, 0.0, 0.0).unwrap();
+        assert!(new.illuminated_fraction < 0.05, "new: {:?}", new);
     }
 
     #[test]

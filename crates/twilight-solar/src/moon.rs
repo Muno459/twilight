@@ -21,7 +21,11 @@ pub struct MoonState {
     pub phase_angle_deg: f64,
     /// Illuminated fraction of the disk [0..1].
     pub illuminated_fraction: f64,
-    /// Geocentric distance [km].
+    /// Distance to the Moon [km]. Geocentric in this Meeus path;
+    /// topocentric (observer-to-moon) when produced by the DE440
+    /// ephemeris — the difference is bounded by Earth's radius (<1.8%)
+    /// and the topocentric value is the physically correct one for
+    /// received moonlight.
     pub distance_km: f64,
 }
 

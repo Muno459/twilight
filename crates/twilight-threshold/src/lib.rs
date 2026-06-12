@@ -9,5 +9,6 @@
 
 pub mod luminance;
 pub mod night_sky;
+pub mod night_sky_tables;
 pub mod threshold;
 pub mod vision;

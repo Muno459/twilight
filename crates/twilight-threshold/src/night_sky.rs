@@ -5,19 +5,27 @@
 //! the TVI contrast detection (and therefore Fajr/Isha) is measured
 //! against:
 //!
-//! - **Airglow**: van Rhijn zenith-distance enhancement over a ~90 km
-//!   emitting shell, scaled by solar activity (F10.7) — Krisciunas &
-//!   Schaefer (1991) parameterization of the Walker/Garstang values.
-//! - **Zodiacal light**: Leinert et al. (1998) helioecliptic brightness
-//!   table (coarse grid), strongest near the ecliptic toward the Sun.
-//! - **Integrated starlight**: galactic-latitude dependence (Toller/
-//!   Leinert), Milky Way plane ~4-10x the galactic poles.
+//! Built on MEASURED data wherever a measurement exists:
+//!
+//! - **Airglow**: van Rhijn zenith-distance enhancement (geometry) over a
+//!   ~90 km emitting shell, scaled by the MEASURED daily solar F10.7
+//!   radio flux (NOAA SWPC feed via the CLI) through the Walker relation.
+//!   Airglow has ~25% intrinsic night-to-night variability that no public
+//!   feed resolves — this is the one component that must stay a
+//!   measurement-driven model.
+//! - **Zodiacal light**: bilinear lookup in the measured Leinert et al.
+//!   (1998) Table 16 (ground photometry + Helios A/B + rocket data).
+//! - **Integrated starlight**: bilinear lookup in the measured Pioneer
+//!   10/11 sky map (Toller 1981; Leinert Table 35) — real galactic
+//!   lon x lat structure, taken beyond 2.8 AU where zodiacal light
+//!   vanishes.
 //! - **Moonlight**: Krisciunas & Schaefer (1991) scattered-moonlight
-//!   model: phase-angle stellar magnitude, Mie+Rayleigh scattering
-//!   function of lunar separation, airmass attenuation. A full moon can
-//!   raise the sky background 10-100x — which physically delays the
-//!   detectable dawn (and classically, moonlit nights confounded
-//!   twilight observation for the same reason).
+//!   model (the observatory standard), fed the REAL lunar state from the
+//!   JPL DE440 ephemeris when available (exact parallax, true phase
+//!   angle, actual distance — a perigee full moon is ~30% brighter).
+//!   A full moon raises the sky background 10-100x — which physically
+//!   delays the detectable dawn (and classically, moonlit nights
+//!   confounded twilight observation for the same reason).
 //!
 //! Units: component brightnesses are computed in S10 (stars of 10th
 //! visual magnitude per square degree) and nanoLamberts where the source
@@ -110,36 +118,69 @@ fn airglow_cd(view_zenith_deg: f64, f107: f64, k: f64) -> f64 {
     zen_s10 * van_rhijn * atten * S10_TO_CD
 }
 
+/// Index + fraction for linear interpolation on an ascending grid
+/// (clamped at both ends).
+fn grid_locate(grid: &[f64], x: f64) -> (usize, f64) {
+    let n = grid.len();
+    if x <= grid[0] {
+        return (0, 0.0);
+    }
+    if x >= grid[n - 1] {
+        return (n - 2, 1.0);
+    }
+    let mut i = 0;
+    while grid[i + 1] < x {
+        i += 1;
+    }
+    (i, (x - grid[i]) / (grid[i + 1] - grid[i]))
+}
+
 /// Zodiacal light toward the view direction [cd/m^2].
 ///
-/// Coarse fit to the Leinert et al. (1998) Table 17 brightness (S10) in
-/// helioecliptic coordinates (dl = |ecliptic lon - solar lon| in 0..180,
-/// b = |ecliptic latitude|): bright cone toward the Sun along the
-/// ecliptic, ~60 S10 at the ecliptic pole, ~140-200 S10 in the antisolar
-/// gegenschein region handled by the dl term.
+/// Bilinear lookup in the MEASURED Leinert et al. (1998) Table 16 —
+/// annually averaged zodiacal brightness at 500 nm in S10_sun on the
+/// helioecliptic grid (ground photometry extended sunward with Helios
+/// A/B + rocket data; the authors endorse smooth interpolation between
+/// nodes). See `night_sky_tables` for provenance and cross-checks.
 fn zodiacal_cd(helio_dlon_deg: f64, ecl_lat_deg: f64, view_zenith_deg: f64, k: f64) -> f64 {
+    use crate::night_sky_tables::{ZODI_DLON, ZODI_LAT, ZODI_S10};
     let dl = helio_dlon_deg.abs().min(180.0);
     let b = ecl_lat_deg.abs().min(90.0);
-    // In-ecliptic profile (S10): steep rise sunward, gegenschein bump.
-    let in_ecl = 65.0 + 600.0 * libm::exp(-dl / 25.0) + 60.0 * libm::exp(-(180.0 - dl) / 30.0)
-        + 140.0 * libm::exp(-dl / 90.0);
-    // Latitude falloff to the ecliptic-pole floor of ~60 S10.
-    let pole = 60.0;
-    let lat_factor = libm::exp(-b / 22.0);
-    let s10 = pole + (in_ecl - pole).max(0.0) * lat_factor;
+    let (i, fi) = grid_locate(&ZODI_LAT, b);
+    let (j, fj) = grid_locate(&ZODI_DLON, dl);
+    let s10 = ZODI_S10[i][j] * (1.0 - fi) * (1.0 - fj)
+        + ZODI_S10[i + 1][j] * fi * (1.0 - fj)
+        + ZODI_S10[i][j + 1] * (1.0 - fi) * fj
+        + ZODI_S10[i + 1][j + 1] * fi * fj;
     let x = ks_airmass(view_zenith_deg);
     s10 * libm::pow(10.0, -0.4 * k * (x - 1.0)) * S10_TO_CD
 }
 
 /// Integrated starlight + diffuse galactic light [cd/m^2].
 ///
-/// Galactic-latitude profile (Toller 1981 / Leinert 1998 Table 16):
-/// ~30 S10 at the galactic poles rising to ~100-250 S10 in the plane
-/// (stronger toward the inner Galaxy; we use a longitude-averaged value —
-/// the Milky Way's azimuthal detail is below the TVI floor's sensitivity).
-fn starlight_cd(gal_lat_deg: f64, view_zenith_deg: f64, k: f64) -> f64 {
-    let b = gal_lat_deg.abs();
-    let s10 = 30.0 + 170.0 * libm::exp(-b / 12.0);
+/// Bilinear lookup in the MEASURED Pioneer 10/11 background-starlight
+/// sky map (Toller 1981; Leinert 1998 Table 35): S10_sun per square
+/// degree on a galactic lon x lat grid, observed beyond 2.8 AU where
+/// zodiacal light vanishes. The real Milky Way structure — inner-Galaxy
+/// bulge, Carina/Cygnus enhancements, even the LMC — instead of a
+/// latitude-only falloff. Stars brighter than ~6.5 mag were removed by
+/// Pioneer's processing; for the integrated TVI background floor their
+/// omission is conservative (the handful of bright stars are seen as
+/// point sources, not background).
+fn starlight_cd(gal_lon_deg: f64, gal_lat_deg: f64, view_zenith_deg: f64, k: f64) -> f64 {
+    use crate::night_sky_tables::{STAR_LAT, STAR_LON, STAR_S10};
+    let nlon = STAR_LON.len();
+    let l = gal_lon_deg.rem_euclid(360.0);
+    let b = gal_lat_deg.clamp(STAR_LAT[0], STAR_LAT[STAR_LAT.len() - 1]);
+    let (i, fi) = grid_locate(&STAR_LAT, b);
+    // longitude wraparound (grid is 0..350 in 10-deg steps)
+    let j = ((l / 10.0) as usize).min(nlon - 1);
+    let j1 = (j + 1) % nlon;
+    let fj = (l - 10.0 * j as f64) / 10.0;
+    let s10 = STAR_S10[i][j] * (1.0 - fi) * (1.0 - fj)
+        + STAR_S10[i + 1][j] * fi * (1.0 - fj)
+        + STAR_S10[i][j1] * (1.0 - fi) * fj
+        + STAR_S10[i + 1][j1] * fi * fj;
     let x = ks_airmass(view_zenith_deg);
     s10 * libm::pow(10.0, -0.4 * k * (x - 1.0)) * S10_TO_CD
 }
@@ -155,11 +196,17 @@ fn moonlight_cd(
         return 0.0; // moon below horizon: no scattered moonlight
     }
     let alpha = moon.phase_angle_deg.abs();
-    // KS91 eq. 9: stellar magnitude factor of the Moon vs phase
-    let i_star = libm::pow(
-        10.0,
-        -0.4 * (3.84 + 0.026 * alpha + 4.0e-9 * alpha * alpha * alpha * alpha),
-    );
+    // KS91 eq. 9: stellar magnitude factor of the Moon vs phase.
+    // The formula is normalized to the MEAN lunar distance; scale by
+    // (a/d)^2 for the actual distance — a perigee full moon delivers
+    // ~30% more illuminance than an apogee one.
+    let mean_dist_km = 385000.56;
+    let dist_factor = (mean_dist_km / moon.distance_km) * (mean_dist_km / moon.distance_km);
+    let i_star = dist_factor
+        * libm::pow(
+            10.0,
+            -0.4 * (3.84 + 0.026 * alpha + 4.0e-9 * alpha * alpha * alpha * alpha),
+        );
     // angular separation moon-view
     let zv = view_zenith_deg * DEG;
     let zm = (90.0 - moon.altitude_deg) * DEG;
@@ -182,7 +229,12 @@ fn moonlight_cd(
 /// Ecliptic and galactic coordinates of the view direction.
 fn view_coords(
     input: &NightSkyInput,
-) -> (f64 /*helio dlon*/, f64 /*ecl lat*/, f64 /*gal lat*/) {
+) -> (
+    f64, /*helio dlon*/
+    f64, /*ecl lat*/
+    f64, /*gal lon*/
+    f64, /*gal lat*/
+) {
     // local alt/az -> equatorial
     let phi = input.latitude * DEG;
     let alt = (90.0 - input.view_zenith_deg) * DEG;
@@ -234,24 +286,33 @@ fn view_coords(
         dlon = 360.0 - dlon;
     }
 
-    // equatorial -> galactic latitude (NGP at RA 192.86, Dec 27.13)
+    // equatorial -> galactic (NGP at RA 192.86, Dec 27.13; l_NCP 122.932)
     let ngp_ra = 192.859508 * DEG;
     let ngp_dec = 27.128336 * DEG;
+    let l_ncp = 122.93192;
     let gal_lat = libm::asin(
         (libm::sin(dec) * libm::sin(ngp_dec)
             + libm::cos(dec) * libm::cos(ngp_dec) * libm::cos(ra - ngp_ra))
             .clamp(-1.0, 1.0),
     );
+    let gal_lon = (l_ncp
+        - libm::atan2(
+            libm::cos(dec) * libm::sin(ra - ngp_ra),
+            libm::sin(dec) * libm::cos(ngp_dec)
+                - libm::cos(dec) * libm::sin(ngp_dec) * libm::cos(ra - ngp_ra),
+        ) / DEG)
+        .rem_euclid(360.0);
 
-    (dlon, ecl_lat / DEG, gal_lat / DEG)
+    (dlon, ecl_lat / DEG, gal_lon, gal_lat / DEG)
 }
 
-/// Evaluate the full night-sky background toward the view direction.
+/// Evaluate the full night-sky background toward the view direction,
+/// computing the lunar state internally from the Meeus series.
+///
+/// When a JPL DE440 ephemeris is available, prefer
+/// [`night_sky_luminance_with_moon`] with the DE440-computed
+/// [`MoonState`] — real ephemeris data instead of a truncated series.
 pub fn night_sky_luminance(input: &NightSkyInput) -> NightSkyLuminance {
-    let (dlon, ecl_lat, gal_lat) = view_coords(input);
-    let airglow = airglow_cd(input.view_zenith_deg, input.solar_f107, input.extinction_k);
-    let zodiacal = zodiacal_cd(dlon, ecl_lat, input.view_zenith_deg, input.extinction_k);
-    let starlight = starlight_cd(gal_lat, input.view_zenith_deg, input.extinction_k);
     let moon = moon_state(
         input.year,
         input.month,
@@ -260,8 +321,21 @@ pub fn night_sky_luminance(input: &NightSkyInput) -> NightSkyLuminance {
         input.latitude,
         input.longitude,
     );
+    night_sky_luminance_with_moon(input, &moon)
+}
+
+/// Evaluate the full night-sky background with an externally supplied
+/// lunar state (e.g. from the JPL DE440 ephemeris).
+pub fn night_sky_luminance_with_moon(
+    input: &NightSkyInput,
+    moon: &MoonState,
+) -> NightSkyLuminance {
+    let (dlon, ecl_lat, gal_lon, gal_lat) = view_coords(input);
+    let airglow = airglow_cd(input.view_zenith_deg, input.solar_f107, input.extinction_k);
+    let zodiacal = zodiacal_cd(dlon, ecl_lat, input.view_zenith_deg, input.extinction_k);
+    let starlight = starlight_cd(gal_lon, gal_lat, input.view_zenith_deg, input.extinction_k);
     let moonlight = moonlight_cd(
-        &moon,
+        moon,
         input.view_zenith_deg,
         input.view_azimuth_deg,
         input.extinction_k,
@@ -347,16 +421,40 @@ mod tests {
         let far = zodiacal_cd(140.0, 0.0, 0.0, 0.2);
         let pole = zodiacal_cd(90.0, 85.0, 0.0, 0.2);
         assert!(near > far && far > pole);
-        // pole floor ~ 60 S10 ~ 4.1e-5
+        // ecliptic pole = 60 +/- 3 S10 (Leinert Table 16 caption) ~ 4.1e-5
         assert!((2e-5..=8e-5).contains(&pole), "pole = {pole:.2e}");
     }
 
     #[test]
+    fn zodiacal_matches_published_nodes() {
+        // Exact table nodes (no extinction): dlon=40, beta=0 -> 925 S10;
+        // gegenschein dlon=180, beta=0 -> 180 S10.
+        let near = zodiacal_cd(40.0, 0.0, 0.0, 0.0) / S10_TO_CD;
+        assert!((near - 925.0).abs() < 1.0, "near = {near}");
+        let gegen = zodiacal_cd(180.0, 0.0, 0.0, 0.0) / S10_TO_CD;
+        assert!((gegen - 180.0).abs() < 1.0, "gegenschein = {gegen}");
+    }
+
+    #[test]
     fn starlight_peaks_in_galactic_plane() {
-        let plane = starlight_cd(0.0, 0.0, 0.2);
-        let pole = starlight_cd(90.0, 0.0, 0.2);
+        // Cygnus region in the plane vs the north galactic pole.
+        let plane = starlight_cd(80.0, 0.0, 0.0, 0.2);
+        let pole = starlight_cd(0.0, 90.0, 0.0, 0.2);
         assert!(plane > 3.0 * pole);
-        // pole ~30 S10 ~ 2.1e-5
-        assert!((1.5e-5..=3e-5).contains(&pole), "pole = {pole:.2e}");
+        // pole rows measure ~25-33 S10 ~ 2e-5
+        assert!((1.4e-5..=3e-5).contains(&pole), "pole = {pole:.2e}");
+    }
+
+    #[test]
+    fn starlight_shows_real_galactic_structure() {
+        // The Pioneer map resolves longitude structure a |b|-only fit
+        // cannot: the inner Galaxy (l~0) outshines the anticenter (l~180)
+        // in the plane.
+        let inner = starlight_cd(0.0, 0.0, 0.0, 0.0);
+        let anticenter = starlight_cd(180.0, 0.0, 0.0, 0.0);
+        assert!(
+            inner > 1.3 * anticenter,
+            "inner {inner:.2e} vs anticenter {anticenter:.2e}"
+        );
     }
 }

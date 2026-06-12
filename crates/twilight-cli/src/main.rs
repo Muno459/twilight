@@ -200,6 +200,13 @@ enum Commands {
         /// at the cost of ~0.5-2% polarization correction to intensity.
         #[arg(long)]
         fast: bool,
+        /// 3D cloud vertical profile from the cloud3d satellite model
+        /// (SegFormer trained on CloudSat radar profiles). Pass "auto" to
+        /// run tools/cloud3d_profile.py on live GOES imagery (needs
+        /// python3+torch; Americas/Pacific coverage), or a path to a
+        /// sidecar-produced JSON. Overrides single-layer cloud sources.
+        #[arg(long)]
+        cloud3d: Option<String>,
     },
     /// Emit machine-readable spectral radiance for external RT comparison
     /// (e.g. libRadtran/uvspec). CSV to stdout:
@@ -1016,6 +1023,7 @@ fn cmd_pray(
     force_cpu: bool,
     gpu_backend_pref: Option<CliGpuBackend>,
     fast: bool,
+    cloud3d: Option<&str>,
 ) {
     // Suppress unused warnings when gpu feature is disabled
     #[cfg(not(feature = "gpu"))]
@@ -1200,6 +1208,108 @@ fn cmd_pray(
         (ap, cp, None, desc)
     };
 
+    // 3D CLOUDS (cloud3d): an 80-level ice-water-content profile
+    // reconstructed from live geostationary imagery by the cloud3d model
+    // (trained on CloudSat radar). Real measured VERTICAL STRUCTURE —
+    // multiple independent layers — replacing any single-slab source.
+    let cloud_layers: Option<Vec<twilight_data::cloud::CloudProperties>> =
+        cloud3d.and_then(|spec| {
+            let json_path: std::path::PathBuf = if spec == "auto" {
+                let out = std::path::PathBuf::from("data/cloud3d/profile.json");
+                let _ = std::fs::create_dir_all("data/cloud3d");
+                let model = std::env::var("CLOUD3D_MODEL")
+                    .unwrap_or_else(|_| "data/cloud3d/iwc.jit.pt".to_string());
+                let hour = twilight_hour_utc.unwrap_or(21.0);
+                // Sun azimuth at the twilight hour for the sunward path samples.
+                let sun_az = {
+                    let mut inp = SpaInput {
+                        year,
+                        month,
+                        day,
+                        hour: 12,
+                        minute: 0,
+                        second: 0,
+                        timezone: 0.0,
+                        latitude: lat,
+                        longitude: lon,
+                        elevation,
+                        pressure: 1013.25,
+                        temperature: 15.0,
+                        delta_t,
+                        slope: 0.0,
+                        azm_rotation: 0.0,
+                        atmos_refract: 0.5667,
+                    };
+                    let total = (hour * 3600.0).round() as i32;
+                    inp.hour = total / 3600;
+                    inp.minute = (total % 3600) / 60;
+                    inp.second = total % 60;
+                    spa::solar_position(&inp).ok().map(|o| o.azimuth).unwrap_or(270.0)
+                };
+                eprintln!("Cloud3D:    running sidecar on live GOES imagery...");
+                let status = std::process::Command::new("python3")
+                    .arg("tools/cloud3d_profile.py")
+                    .args(["--lat", &lat.to_string(), "--lon", &lon.to_string()])
+                    .args(["--date", &date_iso, "--hour", &format!("{hour:.2}")])
+                    .args(["--azimuth", &format!("{sun_az:.1}")])
+                    .args(["--model", &model])
+                    .arg("--out")
+                    .arg(&out)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => out,
+                    Ok(_) => {
+                        eprintln!(
+                            "Note: cloud3d sidecar found no usable imagery here \
+                             (outside GOES coverage?); continuing without 3D profile."
+                        );
+                        return None;
+                    }
+                    Err(e) => {
+                        eprintln!("Note: cloud3d sidecar failed to launch ({e}); continuing.");
+                        return None;
+                    }
+                }
+            } else {
+                std::path::PathBuf::from(spec)
+            };
+            match twilight_weather::cloud3d::load(&json_path) {
+                Ok(p) => {
+                    let layers = p.to_cloud_layers(None);
+                    if layers.is_empty() {
+                        println!(
+                            "Cloud3D:    {} {} — clear column (window cloud fraction {:.0}%)",
+                            p.satellite,
+                            p.time_utc,
+                            p.cloud_fraction * 100.0
+                        );
+                        None
+                    } else {
+                        let tau: f64 = layers.iter().map(|l| l.optical_depth).sum();
+                        println!(
+                            "Cloud3D:    {} {}: {} layer(s), total tau {:.2}, window cloud fraction {:.0}%",
+                            p.satellite,
+                            p.time_utc,
+                            layers.len(),
+                            tau,
+                            p.cloud_fraction * 100.0
+                        );
+                        for l in &layers {
+                            println!(
+                                "            {:.1}-{:.1} km, tau {:.2} (g {:.2})",
+                                l.base_km, l.top_km, l.optical_depth, l.asymmetry
+                            );
+                        }
+                        Some(layers)
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Note: cloud3d profile load failed ({e}); continuing.");
+                    None
+                }
+            }
+        });
+
     println!("Atmosphere: {}", atm_desc);
     let ephemeris_label = if de440_path.is_some() {
         "JPL DE440"
@@ -1321,6 +1431,33 @@ fn cmd_pray(
         None
     };
 
+    // Measured solar activity for the airglow background. F10.7 is a real
+    // daily-measured quantity (Penticton/NOAA SWPC) — only fetched when the
+    // run is already online (weather mode); offline runs keep the mid-cycle
+    // default inside the pipeline.
+    let solar_f107 = if use_weather {
+        match twilight_weather::f107::fetch_f107() {
+            Ok(flux) => {
+                println!(
+                    "Solar flux: F10.7 = {:.0} sfu measured {} (90d mean {}) -> airglow input {:.0} sfu",
+                    flux.latest_sfu,
+                    flux.time_tag,
+                    flux.ninety_day_mean_sfu
+                        .map(|m| format!("{:.0}", m))
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    flux.effective_sfu()
+                );
+                Some(flux.effective_sfu())
+            }
+            Err(e) => {
+                eprintln!("Note: F10.7 fetch failed ({}); using mid-cycle 130 sfu.", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     println!();
 
     // When using weather API, pass custom properties directly.
@@ -1360,6 +1497,8 @@ fn cmd_pray(
         o3_column_du: o3_du,
         no2_surface_density: no2_density,
         polarized,
+        solar_f107,
+        cloud_layers,
         ..Default::default()
     };
 
@@ -1971,6 +2110,7 @@ fn main() {
             cpu,
             gpu_backend,
             fast,
+            cloud3d,
         } => {
             cmd_pray(
                 lat,
@@ -1998,6 +2138,7 @@ fn main() {
                 cpu,
                 gpu_backend,
                 fast,
+                cloud3d.as_deref(),
             );
         }
         Commands::Compare {

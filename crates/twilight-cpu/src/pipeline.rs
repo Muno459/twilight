@@ -65,6 +65,11 @@ pub struct PrayerTimeInput {
     /// Custom cloud properties (overrides cloud_type when set).
     /// Used by the weather API integration to pass derived cloud params.
     pub custom_cloud: Option<CloudProperties>,
+    /// Full vertical cloud profile as independent layers (overrides both
+    /// `custom_cloud` and `cloud_type` when set). Produced by the cloud3d
+    /// satellite reconstruction (80-level IWC profile collapsed into
+    /// contiguous layers) — real measured 3D cloud structure.
+    pub cloud_layers: Option<Vec<CloudProperties>>,
     /// Threshold configuration
     pub threshold_config: ThresholdConfig,
     /// Path to DE440 BSP file. When provided, the pipeline uses JPL DE440
@@ -91,6 +96,11 @@ pub struct PrayerTimeInput {
     /// Enable full Stokes [I,Q,U,V] polarization tracking (default: true).
     /// When false (`--fast` mode), uses scalar phase function only.
     pub polarized: bool,
+    /// Solar 10.7 cm radio flux (sfu) for the airglow background. The real
+    /// measured value from NOAA SWPC (fetched by the CLI) — airglow scales
+    /// ~2.4x from solar minimum (~70 sfu) to maximum (~200 sfu).
+    /// None = mid-cycle default (130).
+    pub solar_f107: Option<f64>,
 }
 
 impl Default for PrayerTimeInput {
@@ -110,6 +120,7 @@ impl Default for PrayerTimeInput {
             cloud_type: None,
             custom_aerosol: None,
             custom_cloud: None,
+            cloud_layers: None,
             threshold_config: ThresholdConfig::default(),
             de440_path: None,
             scattering_mode: ScatteringMode::Single,
@@ -119,6 +130,7 @@ impl Default for PrayerTimeInput {
             o3_column_du: None,
             no2_surface_density: None,
             polarized: true,
+            solar_f107: None,
         }
     }
 }
@@ -462,6 +474,20 @@ fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::Atmos
     let aerosol_props = input
         .custom_aerosol
         .or_else(|| input.aerosol_type.map(aerosol::default_properties));
+
+    // Full vertical profile (cloud3d satellite reconstruction) wins over
+    // any single-layer description.
+    if let Some(layers) = &input.cloud_layers {
+        return builder::build_full_with_gas_layers(
+            AtmosphereType::UsStandard,
+            input.surface_albedo,
+            aerosol_props.as_ref(),
+            layers,
+            input.o3_column_du,
+            input.no2_surface_density,
+        );
+    }
+
     let cloud_props = input
         .custom_cloud
         .or_else(|| input.cloud_type.map(cloud::default_properties));
@@ -1023,7 +1049,7 @@ fn compute_prayer_times_inner(
             .map(|a| (a.sza_deg, pick(a)))
             .collect()
     };
-    let mut refine = |sza_opt: Option<f64>,
+    let refine = |sza_opt: Option<f64>,
                       pick: &dyn Fn(&TwilightAnalysis) -> f64,
                       thresh: f64|
      -> (Option<f64>, Option<f64>) {
@@ -1122,20 +1148,46 @@ fn compute_prayer_times_inner(
     let night_sky_at = |engine: &mut SolarEngine, t_local: Option<f64>| -> Option<f64> {
         let t = t_local?;
         let az = engine.azimuth_at_hour(t).unwrap_or(270.0);
+        // Raw UTC hour, deliberately NOT wrapped into [0,24): both the
+        // Meeus and DE440 paths convert through pure Julian-day
+        // arithmetic, so hour 25.5 lands on the correct NEXT civil day.
+        // (Wrapping would put a past-midnight Isha moon a full day early —
+        // a 13 deg lunar position error.)
+        let hour_utc = t - input.timezone;
         let inp = twilight_threshold::night_sky::NightSkyInput {
             latitude: input.latitude,
             longitude: input.longitude,
             year: input.year,
             month: input.month,
             day: input.day,
-            hour_utc: (t - input.timezone).rem_euclid(24.0),
+            hour_utc,
             view_zenith_deg: 85.0,
             view_azimuth_deg: az,
-            solar_f107: 130.0,
+            solar_f107: input.solar_f107.unwrap_or(130.0),
             extinction_k: 0.16
                 + input.custom_aerosol.map(|a| 1.2 * a.aod_550).unwrap_or(0.05),
         };
-        Some(twilight_threshold::night_sky::night_sky_luminance(&inp).total)
+        // Real JPL ephemeris for the Moon when the BSP is loaded;
+        // truncated Meeus series otherwise.
+        let lum = match engine.de440.as_mut() {
+            Some(de) => match de.moon_state(
+                input.year,
+                input.month,
+                input.day,
+                hour_utc,
+                input.delta_t,
+                input.latitude,
+                input.longitude,
+                input.elevation,
+            ) {
+                Ok(moon) => twilight_threshold::night_sky::night_sky_luminance_with_moon(
+                    &inp, &moon,
+                ),
+                Err(_) => twilight_threshold::night_sky::night_sky_luminance(&inp),
+            },
+            None => twilight_threshold::night_sky::night_sky_luminance(&inp),
+        };
+        Some(lum.total)
     };
     let bg_fajr = night_sky_at(&mut engine, fajr_time);
     let bg_isha = night_sky_at(&mut engine, isha_abyad_time);

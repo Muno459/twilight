@@ -386,12 +386,40 @@ pub fn build_full_with_gas(
     o3_column_du: Option<f64>,
     no2_surface_density: Option<f64>,
 ) -> AtmosphereModel {
+    let layers: Vec<CloudProperties> = cloud_props.into_iter().copied().collect();
+    build_full_with_gas_layers(
+        profile,
+        surface_albedo,
+        aerosol_props,
+        &layers,
+        o3_column_du,
+        no2_surface_density,
+    )
+}
+
+/// Build an atmosphere with an arbitrary VERTICAL CLOUD PROFILE — multiple
+/// independent layers (e.g. the 80-level ice-water-content profile
+/// reconstructed by the cloud3d satellite model, collapsed into its
+/// contiguous layers).
+///
+/// `add_cloud_layer` accumulates per shell, so layers stack naturally.
+/// The single global `cloud_g_scaled` used by the closed-form Eddington
+/// diffuse transmittance is set to the scattering-optical-depth-weighted
+/// mean asymmetry across all layers.
+pub fn build_full_with_gas_layers(
+    profile: AtmosphereType,
+    surface_albedo: f64,
+    aerosol_props: Option<&AerosolProperties>,
+    cloud_layers: &[CloudProperties],
+    o3_column_du: Option<f64>,
+    no2_surface_density: Option<f64>,
+) -> AtmosphereModel {
     let mut atm = match aerosol_props {
         Some(props) => build_with_aerosol_properties(profile, surface_albedo, props),
         None => build_clear_sky(profile, surface_albedo),
     };
 
-    if let Some(cloud_props) = cloud_props {
+    for cloud_props in cloud_layers {
         if cloud_props.optical_depth > 0.0 {
             let cloud_thickness_m = (cloud_props.top_km - cloud_props.base_km) * 1000.0;
             if cloud_thickness_m > 0.0 {
@@ -399,6 +427,21 @@ pub fn build_full_with_gas(
                 add_cloud_layer(&mut atm, cloud_props, cloud_ext);
             }
         }
+    }
+
+    // cloud_g_scaled is one global (add_cloud_layer leaves the last
+    // layer's value): replace with the scattering-tau-weighted mean.
+    let (mut wsum, mut gsum) = (0.0f64, 0.0f64);
+    for c in cloud_layers {
+        if c.optical_depth > 0.0 && c.top_km > c.base_km {
+            let w = c.optical_depth * c.ssa;
+            wsum += w;
+            gsum += w * c.asymmetry;
+        }
+    }
+    if wsum > 0.0 {
+        let g = gsum / wsum;
+        atm.cloud_g_scaled = g / (1.0 + g);
     }
 
     apply_gas_absorption_standard(&mut atm, o3_column_du, no2_surface_density);

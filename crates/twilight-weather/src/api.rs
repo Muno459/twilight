@@ -241,7 +241,7 @@ pub fn fetch_weather_at(
 }
 
 /// Fetch and deserialize JSON from a URL.
-fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
+pub(crate) fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)))
         .build()

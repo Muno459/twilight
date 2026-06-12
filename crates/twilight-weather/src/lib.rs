@@ -18,6 +18,8 @@
 //! physics are more complex than what a weather API can provide.
 
 pub mod api;
+pub mod cloud3d;
+pub mod f107;
 pub mod mapping;
 pub mod satellite;
 
