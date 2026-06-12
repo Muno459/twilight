@@ -59,6 +59,61 @@ pub struct TwilightAnalysis {
 /// sinks to roughly this level.
 pub const NIGHT_SKY_LUMINANCE: f64 = 2.2e-4;
 
+
+/// Weber contrast-detection fraction C = dL/L at adaptation luminance
+/// `l_adapt` [cd/m^2], for a large, long-duration stimulus (the spreading
+/// dawn glow). Piecewise log-log interpolation anchored on the classical
+/// threshold-vs-intensity data (Blackwell 1946 large-target thresholds,
+/// as tabulated in the visibility literature):
+///
+///   L_b [cd/m^2]:  1e-4   1e-3   1e-2   1e-1    1     >=10
+///   C   (dL/L)  :  0.70   0.35   0.12   0.05  0.025  0.017
+///
+/// The eye detects a much SMALLER relative brightening against a brighter
+/// night sky — this is what makes a brightness-based fajr al-sadiq well
+/// defined even under high-latitude persistent twilight.
+pub fn contrast_threshold_weber(l_adapt: f64) -> f64 {
+    const LB: [f64; 6] = [1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0];
+    const C: [f64; 6] = [0.70, 0.35, 0.12, 0.05, 0.025, 0.017];
+    if l_adapt <= LB[0] {
+        return C[0];
+    }
+    if l_adapt >= LB[5] {
+        return C[5];
+    }
+    let x = libm::log10(l_adapt);
+    for i in 0..5 {
+        let x0 = libm::log10(LB[i]);
+        let x1 = libm::log10(LB[i + 1]);
+        if x >= x0 && x <= x1 {
+            let t = (x - x0) / (x1 - x0);
+            let y0 = libm::log10(C[i]);
+            let y1 = libm::log10(C[i + 1]);
+            return libm::pow(10.0, y0 + t * (y1 - y0));
+        }
+    }
+    C[5]
+}
+
+/// Detection threshold for the dawn/dusk glow against an adaptation floor.
+///
+/// Returns the luminance at which the brightening becomes a CLEARLY
+/// PERCEPTIBLE event for an observer adapted to `l_floor`:
+///
+///   L_th = l_floor * (1 + F * C(l_floor))
+///
+/// where C is the Weber TVI fraction above and F is a conservatism/field
+/// factor CALIBRATED from the dark-sky anchor: at l_floor =
+/// NIGHT_SKY_LUMINANCE this reproduces `dark_anchor` exactly (e.g. the
+/// documented Fajr constant 1e-3 cd/m^2), so low-latitude behavior is
+/// bit-compatible with the absolute thresholds while high latitudes get
+/// the physiologically correct (smaller) relative criterion.
+pub fn detection_threshold(l_floor: f64, dark_anchor: f64) -> f64 {
+    let c0 = contrast_threshold_weber(NIGHT_SKY_LUMINANCE);
+    let f = (dark_anchor / NIGHT_SKY_LUMINANCE - 1.0) / c0;
+    l_floor * (1.0 + f * contrast_threshold_weber(l_floor))
+}
+
 /// Threshold configuration for prayer time determination.
 ///
 /// PROVENANCE (honest accounting): these constants are NOT calibrated
@@ -411,6 +466,49 @@ mod tests {
     fn fit_crossing_rejects_rising_luminance() {
         let pts: Vec<(f64, f64)> = (0..5).map(|i| (100.0 + i as f64 * 0.1, 1e-4 * (i + 1) as f64)).collect();
         assert!(fit_crossing_loglinear(&pts, 2e-4).is_none());
+    }
+
+    // ── TVI contrast model ──
+
+    #[test]
+    fn tvi_dark_anchor_reproduces_absolute_constants() {
+        // At the dark night-sky floor the TVI detection threshold must equal
+        // the documented absolute constants exactly (regime continuity).
+        let c = ThresholdConfig::default();
+        let t = detection_threshold(NIGHT_SKY_LUMINANCE, c.fajr_luminance);
+        assert!(
+            (t - c.fajr_luminance).abs() / c.fajr_luminance < 1e-12,
+            "dark anchor: {} vs {}",
+            t,
+            c.fajr_luminance
+        );
+    }
+
+    #[test]
+    fn tvi_weber_fraction_decreases_with_adaptation() {
+        // The eye detects smaller relative changes against brighter skies.
+        let c_dark = contrast_threshold_weber(2e-4);
+        let c_mesopic = contrast_threshold_weber(0.2);
+        let c_photopic = contrast_threshold_weber(50.0);
+        assert!(c_dark > c_mesopic && c_mesopic > c_photopic);
+        assert!((0.4..=1.0).contains(&c_dark), "c_dark = {}", c_dark);
+        assert!((0.02..=0.08).contains(&c_mesopic), "c_mesopic = {}", c_mesopic);
+    }
+
+    #[test]
+    fn tvi_bright_floor_needs_small_relative_rise() {
+        // Padborg June floor ~0.2 cd/m^2: dawn detection should require only
+        // a ~10-40% rise over the floor, NOT the dark-site 4.5x.
+        let c = ThresholdConfig::default();
+        let floor = 0.2;
+        let t = detection_threshold(floor, c.fajr_luminance);
+        let rel_rise = t / floor - 1.0;
+        assert!(
+            (0.05..=0.6).contains(&rel_rise),
+            "relative rise at bright floor = {} (threshold {})",
+            rel_rise,
+            t
+        );
     }
 
     // ── Threshold provenance (anchored to published photometry) ──

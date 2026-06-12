@@ -451,13 +451,20 @@ fn format_uncertainty(min: Option<f64>) -> String {
 }
 
 fn format_fractional_hour(h: f64) -> String {
-    if !(0.0..=24.0).contains(&h) {
+    if !(0.0..=48.0).contains(&h) {
         return "N/A".to_string();
     }
+    // Hours >= 24 are past-midnight events (high-latitude Isha can fall on
+    // the next civil day) — display wrapped with a +1d marker.
+    let (h, next_day) = if h >= 24.0 { (h - 24.0, true) } else { (h, false) };
     let hours = h as u32;
     let minutes = ((h - hours as f64) * 60.0) as u32;
     let seconds = ((h - hours as f64 - minutes as f64 / 60.0) * 3600.0) as u32;
-    format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    if next_day {
+        format!("{:02}:{:02}:{:02} (+1d)", hours, minutes, seconds)
+    } else {
+        format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
+    }
 }
 
 fn cmd_solar(
@@ -1393,8 +1400,16 @@ fn cmd_pray(
             sza,
             dep
         );
+        if output.high_latitude_relative_thresholds {
+            println!(
+                "    └ high-latitude mode: sky never reaches full darkness; this is the"
+            );
+            println!(
+                "      TVI-detectable onset of dawn brightening above tonight's sky floor"
+            );
+        }
     } else if output.persistent_twilight {
-        println!("  Fajr (true dawn):     N/A (persistent twilight — sky never fully dark)");
+        println!("  Fajr (true dawn):     N/A (no night at all — midnight sun)");
     } else {
         println!("  Fajr (true dawn):     N/A (threshold not crossed in scan range)");
     }

@@ -166,6 +166,14 @@ pub struct PrayerTimeOutput {
     pub isha_ahmar_depression_deg: Option<f64>,
     /// Whether persistent twilight was detected (sun never drops below threshold)
     pub persistent_twilight: bool,
+    /// True when prayer times were determined in HIGH-LATITUDE RELATIVE
+    /// mode: the sky never reached the dark-night background, so the
+    /// detection thresholds were floated on tonight's actual sky-brightness
+    /// minimum (threshold = (L_min + background) x detection_factor). Fajr
+    /// is then the physically detectable onset of dawn brightening — the
+    /// engine reports the physics; substitute fiqh rules remain the
+    /// user's choice.
+    pub high_latitude_relative_thresholds: bool,
     /// Maximum solar zenith angle reached on this date (for persistent twilight)
     pub max_sza_deg: Option<f64>,
     /// Full twilight analysis data (for diagnostics)
@@ -239,7 +247,35 @@ impl SolarEngine {
         (SolarEngine { de440, spa_input }, ephemeris)
     }
 
+    /// Civil-date day increment (handles month/year rollover, leap years).
+    fn next_civil_day(year: i32, month: i32, day: i32) -> (i32, i32, i32) {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        let month_len = match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if leap {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 30,
+        };
+        if day < month_len {
+            (year, month, day + 1)
+        } else if month < 12 {
+            (year, month + 1, 1)
+        } else {
+            (year + 1, 1, 1)
+        }
+    }
+
     /// Get solar zenith angle at a fractional hour (local time).
+    ///
+    /// Hours >= 24 roll into the NEXT civil day — required because at high
+    /// latitudes the night's threshold crossings (Isha under persistent
+    /// twilight) can fall after local midnight.
     fn zenith_at_hour(&mut self, fractional_hour: f64) -> Option<f64> {
         if let Some(ref mut de) = self.de440 {
             // Convert local fractional hour to UTC
@@ -257,7 +293,15 @@ impl SolarEngine {
             .ok()
         } else {
             let mut input = self.spa_input.clone();
-            set_time_from_fractional_hour(&mut input, fractional_hour);
+            let mut h = fractional_hour;
+            while h >= 24.0 {
+                let (y, m, d) = Self::next_civil_day(input.year, input.month, input.day);
+                input.year = y;
+                input.month = m;
+                input.day = d;
+                h -= 24.0;
+            }
+            set_time_from_fractional_hour(&mut input, h);
             spa::solar_position(&input).ok().map(|o| o.zenith)
         }
     }
@@ -330,6 +374,62 @@ impl SolarEngine {
                 tolerance,
             )
         }
+    }
+
+    /// Robust zenith-crossing finder for windows that may CONTAIN the
+    /// nightly zenith maximum (solar midnight).
+    ///
+    /// Plain bisection needs the endpoints to bracket the target; near
+    /// high-latitude solar midnight the target SZA is reached only INSIDE
+    /// the window (the zenith rises through it and falls back), so the
+    /// endpoint test fails and the crossing is lost — exactly the case for
+    /// brightness-based Fajr under persistent twilight. This scans the
+    /// window at 6-minute resolution, picks the bracketing segment whose
+    /// slope matches the requested phase (descending zenith = morning/
+    /// Fajr side, ascending = evening/Isha side), then bisects inside
+    /// that locally monotone segment.
+    fn find_zenith_crossing_robust(
+        &mut self,
+        target_zenith: f64,
+        start_hour: f64,
+        end_hour: f64,
+        tolerance: f64,
+        descending: bool,
+    ) -> Option<f64> {
+        let step = 0.1;
+        let mut prev_h = start_hour;
+        let mut prev_z = self.zenith_at_hour(prev_h)?;
+        let mut h = start_hour + step;
+        while h <= end_hour + 1e-9 {
+            let z = self.zenith_at_hour(h)?;
+            let crossed = (prev_z - target_zenith) * (z - target_zenith) <= 0.0;
+            let slope_ok = if descending { z < prev_z } else { z > prev_z };
+            if crossed && slope_ok {
+                // In-engine bisection over zenith_at_hour (which handles
+                // past-midnight hours), locally monotone on this segment.
+                let (mut lo, mut hi) = (prev_h, h);
+                let mut z_lo = prev_z;
+                for _ in 0..64 {
+                    let mid = 0.5 * (lo + hi);
+                    let z_mid = self.zenith_at_hour(mid)?;
+                    if (z_mid - target_zenith).abs() < tolerance {
+                        return Some(mid);
+                    }
+                    if (z_lo - target_zenith) * (z_mid - target_zenith) < 0.0 {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                        z_lo = z_mid;
+                    }
+                }
+                return Some(0.5 * (lo + hi));
+            }
+            prev_h = h;
+            prev_z = z;
+            h += step;
+        }
+        // Fall back to the plain bracketing search over the whole window.
+        self.find_zenith_crossing(target_zenith, start_hour, end_hour, tolerance)
     }
 
     /// Compute the maximum solar zenith angle on this date.
@@ -840,6 +940,80 @@ fn compute_prayer_times_inner(
     let mut prayer_result =
         threshold::determine_prayer_times(all_analyses, &input.threshold_config);
 
+    // Step 9a-bis: HIGH-LATITUDE RELATIVE-DETECTION MODE.
+    //
+    // The engine's observable is SKY BRIGHTNESS, not a depression-angle
+    // convention. The absolute thresholds are themselves derived as
+    // detection_factor x dark-night background (see ThresholdConfig docs).
+    // Under persistent twilight the sky never reaches the dark background,
+    // but it still has a luminance MINIMUM at solar midnight and then
+    // measurably brightens — an SQM records it, an observer sees the glow
+    // spread. The general law, valid at every latitude, is therefore
+    //
+    //   threshold = (L_min_tonight + L_dark_background) x detection_factor
+    //
+    // At normal latitudes L_min ~ 0 and this reduces exactly to the
+    // absolute constants; at high latitudes it floats on tonight's bright
+    // floor and Fajr = the moment the dawn brightening becomes detectable
+    // above it (al-fajr al-sadiq as a physical event, not a convention).
+    // The fiqh question of whether to follow this or a substitute rule
+    // (aqrab al-ayyam etc.) is the user's; the engine reports the physics.
+    let mut used_relative_thresholds = false;
+    if prayer_result.fajr_sza_deg.is_none() && prayer_result.analyses.len() >= 3 {
+        // Tonight's floor: the dimmest scanned point (solar-midnight side).
+        let l_min_mesopic = prayer_result
+            .analyses
+            .iter()
+            .map(|a| a.luminance_mesopic)
+            .fold(f64::MAX, f64::min);
+        let l_min_red = prayer_result
+            .analyses
+            .iter()
+            .map(|a| a.luminance_red)
+            .fold(f64::MAX, f64::min);
+        if l_min_mesopic.is_finite() && l_min_mesopic > 0.0 {
+            let bg = threshold::NIGHT_SKY_LUMINANCE;
+            // TVI contrast detection at the eye's actual adaptation level
+            // (the spectral->mesopic chain models the eye's response; the
+            // TVI models its CONTRAST sensitivity, which improves sharply
+            // against brighter skies — Blackwell-anchored, dark-site limit
+            // bit-compatible with the absolute constants).
+            let floor_mesopic = l_min_mesopic + bg;
+            let floor_red = l_min_red.max(0.0) + bg;
+            let relative_config = threshold::ThresholdConfig {
+                fajr_luminance: threshold::detection_threshold(
+                    floor_mesopic,
+                    input.threshold_config.fajr_luminance,
+                ),
+                isha_abyad_luminance: threshold::detection_threshold(
+                    floor_mesopic,
+                    input.threshold_config.isha_abyad_luminance,
+                ),
+                isha_ahmar_red_luminance: threshold::detection_threshold(
+                    floor_red,
+                    input.threshold_config.isha_ahmar_red_luminance,
+                ),
+                ..input.threshold_config.clone()
+            };
+            let relative_result = threshold::determine_prayer_times(
+                prayer_result.analyses.clone(),
+                &relative_config,
+            );
+            if relative_result.fajr_sza_deg.is_some() {
+                eprintln!(
+                    "High-latitude mode: TVI contrast detection on tonight's sky \
+                     floor (L_min mesopic = {:.3e} cd/m^2 -> Fajr threshold \
+                     {:.3e} cd/m^2, a {:.0}% rise).",
+                    l_min_mesopic,
+                    relative_config.fajr_luminance,
+                    (relative_config.fajr_luminance / floor_mesopic - 1.0) * 100.0
+                );
+                prayer_result = relative_result;
+                used_relative_thresholds = true;
+            }
+        }
+    }
+
     // Step 9b: Crossing-on-fit + confidence interval.
     //
     // Refine each pairwise crossing with a local log-linear least-squares
@@ -877,37 +1051,74 @@ fn compute_prayer_times_inner(
             None => (Some(sza0), None),
         }
     };
+    // (Under high-latitude mode the fit must target the floated thresholds.)
+    let floor_of = |pick: &dyn Fn(&TwilightAnalysis) -> f64| -> f64 {
+        prayer_result
+            .analyses
+            .iter()
+            .map(|a| pick(a))
+            .fold(f64::MAX, f64::min)
+            .max(0.0)
+            + threshold::NIGHT_SKY_LUMINANCE
+    };
+    let eff_fajr_thresh = if used_relative_thresholds {
+        threshold::detection_threshold(
+            floor_of(&|a| a.luminance_mesopic),
+            input.threshold_config.fajr_luminance,
+        )
+    } else {
+        input.threshold_config.fajr_luminance
+    };
+    let eff_abyad_thresh = if used_relative_thresholds {
+        threshold::detection_threshold(
+            floor_of(&|a| a.luminance_mesopic),
+            input.threshold_config.isha_abyad_luminance,
+        )
+    } else {
+        input.threshold_config.isha_abyad_luminance
+    };
+    let eff_ahmar_thresh = if used_relative_thresholds {
+        threshold::detection_threshold(
+            floor_of(&|a| a.luminance_red),
+            input.threshold_config.isha_ahmar_red_luminance,
+        )
+    } else {
+        input.threshold_config.isha_ahmar_red_luminance
+    };
     let (fajr_sza_fit, fajr_sigma) = refine(
         prayer_result.fajr_sza_deg,
         &|a| a.luminance_mesopic,
-        input.threshold_config.fajr_luminance,
+        eff_fajr_thresh,
     );
     let (abyad_sza_fit, abyad_sigma) = refine(
         prayer_result.isha_abyad_sza_deg,
         &|a| a.luminance_mesopic,
-        input.threshold_config.isha_abyad_luminance,
+        eff_abyad_thresh,
     );
     let (ahmar_sza_fit, ahmar_sigma) = refine(
         prayer_result.isha_ahmar_sza_deg,
         &|a| a.luminance_red,
-        input.threshold_config.isha_ahmar_red_luminance,
+        eff_ahmar_thresh,
     );
     prayer_result.fajr_sza_deg = fajr_sza_fit;
     prayer_result.isha_abyad_sza_deg = abyad_sza_fit;
     prayer_result.isha_ahmar_sza_deg = ahmar_sza_fit;
 
-    // Step 10: Convert threshold SZAs to clock times
+    // Step 10: Convert threshold SZAs to clock times (slope-aware: the
+    // morning crossing is on the DESCENDING zenith branch, the evening
+    // on the ASCENDING — required when the crossing lies near solar
+    // midnight, where plain endpoint-bracketing bisection fails).
     let fajr_time = prayer_result
         .fajr_sza_deg
-        .and_then(|sza| engine.find_zenith_crossing(sza, 0.0, 12.0, 0.0001));
+        .and_then(|sza| engine.find_zenith_crossing_robust(sza, 0.0, 12.0, 0.0001, true));
 
     let isha_abyad_time = prayer_result
         .isha_abyad_sza_deg
-        .and_then(|sza| engine.find_zenith_crossing(sza, 12.0, 24.0, 0.0001));
+        .and_then(|sza| engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false));
 
     let isha_ahmar_time = prayer_result
         .isha_ahmar_sza_deg
-        .and_then(|sza| engine.find_zenith_crossing(sza, 12.0, 24.0, 0.0001));
+        .and_then(|sza| engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false));
 
     // Convert crossing-SZA sigmas to minutes using the local dt/dSZA slope
     // (about 3-5 min/deg depending on latitude/season).
@@ -920,7 +1131,8 @@ fn compute_prayer_times_inner(
         let (Some(s0), Some(t0), Some(sig)) = (sza, t, sigma) else {
             return None;
         };
-        let t1 = engine.find_zenith_crossing(s0 + 0.25, lo, hi, 0.0001)?;
+        let descending = lo < 11.9; // morning window
+        let t1 = engine.find_zenith_crossing_robust(s0 + 0.25, lo, hi, 0.0001, descending)?;
         let dtdsza = ((t1 - t0) / 0.25).abs() * 60.0; // minutes per degree
         Some(sig * dtdsza)
     };
@@ -959,6 +1171,7 @@ fn compute_prayer_times_inner(
         isha_abyad_depression_deg: prayer_result.isha_abyad_sza_deg.map(|s| s - 90.0),
         isha_ahmar_depression_deg: prayer_result.isha_ahmar_sza_deg.map(|s| s - 90.0),
         persistent_twilight,
+        high_latitude_relative_thresholds: used_relative_thresholds,
         max_sza_deg,
         twilight_analyses: prayer_result.analyses,
         spectral_results: deduped_results,
