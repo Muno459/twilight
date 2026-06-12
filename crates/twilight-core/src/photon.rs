@@ -2788,6 +2788,11 @@ fn trace_secondary_chain(
                             if alpha_et > 0.0 {
                                 weight *= libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
                             }
+                            // Deck crossing: diffuse attenuation (cloud
+                            // transport is closed-form; see scalar chain).
+                            weight *= atm.cloud_diffuse_transmittance(
+                                atm.cloud_extinction[shell_idx] * boundary_dist,
+                            );
 
                             let (np, nd) = cross_boundary(
                                 pos,
@@ -3138,6 +3143,16 @@ fn trace_secondary_chain_scalar(
                                     weight *=
                                         libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
                                 }
+                                // Cloud decks are transported in closed form
+                                // (Eddington); a chain segment crossing a
+                                // deck must carry the same diffuse
+                                // attenuation or it over-transmits. Per-
+                                // segment factors slightly over-attenuate
+                                // vs the whole-deck factor (1/(1+a)(1+b)
+                                // <= 1/(1+a+b)) — conservative.
+                                weight *= atm.cloud_diffuse_transmittance(
+                                    atm.cloud_extinction[shell_idx] * boundary_dist,
+                                );
 
                                 let (np, nd) = cross_boundary(
                                     pos,
@@ -3826,6 +3841,12 @@ fn trace_secondary_chain_alis(
                                     hero_weight *=
                                         libm::exp(-alpha_et * sigma_h * cos_bias * boundary_dist);
                                 }
+                                // Deck crossing: diffuse attenuation (see
+                                // Stokes chain note). Broadband — applies
+                                // to the hero weight; wr ratios unchanged.
+                                hero_weight *= atm.cloud_diffuse_transmittance(
+                                    atm.cloud_extinction[shell_idx] * boundary_dist,
+                                );
                                 for w in 0..num_wl {
                                     let sigma_w = atm.optics[shell_idx][w].extinction;
                                     wr[w] *= libm::exp(-(sigma_w - sigma_h) * boundary_dist);

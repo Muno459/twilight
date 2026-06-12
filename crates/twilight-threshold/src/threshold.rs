@@ -290,6 +290,56 @@ pub fn determine_prayer_times(
     }
 }
 
+/// Weighted least-squares fit of ln(luminance) vs SZA over a local window,
+/// returning `(crossing_sza, slope)` where the fitted line crosses
+/// `ln(threshold)`.
+///
+/// Twilight luminance decays close to exponentially in SZA, so a local
+/// log-linear fit over several scan points is far more robust to Monte
+/// Carlo noise than interpolating between the two adjacent samples: a
+/// single noisy point can no longer masquerade as the crossing. The
+/// returned slope d(lnL)/dSZA also feeds the confidence interval on the
+/// prayer minute (sigma_sza = relative_SE / |slope|).
+///
+/// Returns None when fewer than 3 usable (positive-luminance) points are
+/// supplied, the fitted slope is not decreasing, or the crossing falls
+/// outside the window (padded by 0.3 deg).
+pub fn fit_crossing_loglinear(points: &[(f64, f64)], threshold: f64) -> Option<(f64, f64)> {
+    if threshold <= 0.0 {
+        return None;
+    }
+    let usable: Vec<(f64, f64)> = points
+        .iter()
+        .filter(|(_, l)| *l > 0.0)
+        .map(|&(s, l)| (s, libm::log(l)))
+        .collect();
+    if usable.len() < 3 {
+        return None;
+    }
+    let n = usable.len() as f64;
+    let sx: f64 = usable.iter().map(|(s, _)| s).sum();
+    let sy: f64 = usable.iter().map(|(_, y)| y).sum();
+    let sxx: f64 = usable.iter().map(|(s, _)| s * s).sum();
+    let sxy: f64 = usable.iter().map(|(s, y)| s * y).sum();
+    let denom = n * sxx - sx * sx;
+    if denom.abs() < 1e-12 {
+        return None;
+    }
+    let b = (n * sxy - sx * sy) / denom; // d(lnL)/dSZA
+    let a = (sy - b * sx) / n;
+    if b >= -1e-6 {
+        // Luminance must DECREASE with SZA for a twilight crossing.
+        return None;
+    }
+    let crossing = (libm::log(threshold) - a) / b;
+    let lo = usable.iter().map(|(s, _)| *s).fold(f64::MAX, f64::min) - 0.3;
+    let hi = usable.iter().map(|(s, _)| *s).fold(f64::MIN, f64::max) + 0.3;
+    if crossing < lo || crossing > hi {
+        return None;
+    }
+    Some((crossing, b))
+}
+
 /// Linear interpolation to find exact SZA where luminance crosses threshold.
 fn interpolate_crossing(sza0: f64, lum0: f64, sza1: f64, lum1: f64, threshold: f64) -> f64 {
     if (lum1 - lum0).abs() < 1e-30 {
@@ -315,6 +365,53 @@ fn interpolate_crossing(sza0: f64, lum0: f64, sza1: f64, lum1: f64, threshold: f
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── fit_crossing_loglinear ──
+
+    #[test]
+    fn fit_crossing_recovers_exact_exponential() {
+        // L(sza) = exp(a + b*sza) with known crossing.
+        let a = 10.0;
+        let b = -2.3; // one decade per degree
+        let pts: Vec<(f64, f64)> = (0..7)
+            .map(|i| {
+                let s = 100.0 + 0.1 * i as f64;
+                (s, libm::exp(a + b * s))
+            })
+            .collect();
+        let thresh = libm::exp(a + b * 100.33);
+        let (crossing, slope) = fit_crossing_loglinear(&pts, thresh).unwrap();
+        assert!((crossing - 100.33).abs() < 1e-9, "crossing = {}", crossing);
+        assert!((slope - b).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fit_crossing_robust_to_single_noisy_point() {
+        // One sample 3x too bright must not move the fit much (the pairwise
+        // interpolator would latch onto it).
+        let a = 10.0;
+        let b = -2.3;
+        let mut pts: Vec<(f64, f64)> = (0..7)
+            .map(|i| {
+                let s = 100.0 + 0.1 * i as f64;
+                (s, libm::exp(a + b * s))
+            })
+            .collect();
+        pts[3].1 *= 3.0;
+        let thresh = libm::exp(a + b * 100.33);
+        let (crossing, _) = fit_crossing_loglinear(&pts, thresh).unwrap();
+        assert!(
+            (crossing - 100.33).abs() < 0.12,
+            "fit should absorb a single outlier: crossing = {}",
+            crossing
+        );
+    }
+
+    #[test]
+    fn fit_crossing_rejects_rising_luminance() {
+        let pts: Vec<(f64, f64)> = (0..5).map(|i| (100.0 + i as f64 * 0.1, 1e-4 * (i + 1) as f64)).collect();
+        assert!(fit_crossing_loglinear(&pts, 2e-4).is_none());
+    }
 
     // ── Threshold provenance (anchored to published photometry) ──
 

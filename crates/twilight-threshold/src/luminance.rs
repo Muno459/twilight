@@ -1,7 +1,13 @@
 //! Luminance computation from spectral radiance using CIE vision functions.
 //!
 //! Converts spectral radiance I(λ) [W/m²/sr/nm] to photometric luminance [cd/m²]
-//! using CIE photopic V(λ), scotopic V'(λ), and mesopic blending per CIE 191:2010.
+//! using CIE photopic V(λ), scotopic V'(λ), and a simplified mesopic blend.
+//!
+//! NOTE: the mesopic blend is a photopic-luminance-driven log-blend in the
+//! spirit of (but NOT the full iterative MES2 system of) CIE 191:2010 —
+//! the published system solves m iteratively from mesopic luminance and
+//! uses per-source S/P ratios. The simplification is documented and its
+//! coefficient breakpoints follow the CIE mesopic range (0.005-5 cd/m^2).
 
 use crate::vision::{PHOTOPIC_V, SCOTOPIC_V_PRIME};
 
@@ -78,7 +84,8 @@ pub fn scotopic_luminance(wavelengths_nm: &[f64], radiance: &[f64]) -> f64 {
     KM_SCOTOPIC * integral
 }
 
-/// Compute mesopic luminance using CIE 191:2010 adapted model.
+/// Compute mesopic luminance using a simplified, CIE-191:2010-inspired blend
+/// (see module note: NOT the full iterative MES2 system).
 ///
 /// The mesopic luminance blends between photopic and scotopic based on
 /// adaptation level. During twilight, vision transitions from photopic
@@ -99,7 +106,7 @@ pub fn mesopic_luminance(wavelengths_nm: &[f64], radiance: &[f64]) -> f64 {
 
 /// Compute the mesopic adaptation coefficient m from photopic luminance.
 ///
-/// Based on CIE 191:2010:
+/// Breakpoints per the CIE mesopic range:
 /// - L >= 5.0 cd/m²: m = 1.0 (fully photopic)
 /// - L <= 0.005 cd/m²: m = 0.0 (fully scotopic)
 /// - Between: logarithmic interpolation

@@ -613,6 +613,10 @@ pub fn transmittance_between_points_spectrum(
     // path lengths. O(num_shells) with two ray-sphere intersections per
     // shell, giving exact results without stepping artifacts.
     let mut tau = [0.0f64; 64];
+    // Cloud scattering crossed by the connection gets Eddington diffuse
+    // transmission, consistent with the shadow-ray and LOS integrators
+    // (single-representation cloud transport).
+    let mut tau_cloud = 0.0f64;
 
     for s in 0..atm.num_shells {
         let shell = &atm.shells[s];
@@ -621,15 +625,17 @@ pub fn transmittance_between_points_spectrum(
             for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
                 *tau_w += atm.optics[s][w].extinction * path_len;
             }
+            tau_cloud += atm.cloud_extinction[s] * path_len;
         }
     }
 
+    let t_cloud = atm.cloud_diffuse_transmittance(tau_cloud);
     let mut result = [0.0f64; 64];
     for (w, res_w) in result.iter_mut().enumerate().take(num_wl) {
         *res_w = if tau[w] > 50.0 {
             0.0
         } else {
-            libm::exp(-tau[w])
+            libm::exp(-tau[w]) * t_cloud
         };
     }
     result

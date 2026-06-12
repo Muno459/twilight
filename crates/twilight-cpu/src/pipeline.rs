@@ -145,6 +145,13 @@ pub struct PrayerTimeOutput {
     pub sunrise_time: Option<f64>,
     /// Sunset time (fractional hour, local time)
     pub sunset_time: Option<f64>,
+    /// 1-sigma statistical uncertainty on the Fajr minute from MC noise
+    /// (None for deterministic runs or when no fit was possible).
+    pub fajr_uncertainty_min: Option<f64>,
+    /// 1-sigma uncertainty on the Isha al-abyad minute.
+    pub isha_abyad_uncertainty_min: Option<f64>,
+    /// 1-sigma uncertainty on the Isha al-ahmar minute.
+    pub isha_ahmar_uncertainty_min: Option<f64>,
     /// Solar zenith angle at Fajr threshold
     pub fajr_sza_deg: Option<f64>,
     /// Solar zenith angle at Isha al-abyad threshold
@@ -474,6 +481,107 @@ pub fn compute_prayer_times_gpu(
 /// Both `compute_prayer_times` (CPU) and `compute_prayer_times_gpu` delegate
 /// to this function. The only difference is the `scan` closure that produces
 /// `Vec<SpectralResult>` for a given SZA range.
+
+/// Per-SZA statistics from K independent seed-salted MC runs.
+struct SzaStats {
+    /// Mean spectra (one per requested SZA, in order).
+    results: Vec<SpectralResult>,
+    /// Relative standard error of the mean mesopic luminance per SZA
+    /// (0.0 for deterministic runs or K = 1).
+    rel_se: Vec<f64>,
+}
+
+/// Run the scan over `szas` K times with independent seed salts and return
+/// per-SZA mean spectra plus the relative standard error of the mesopic
+/// luminance. For `ScatteringMode::Single` (deterministic) K is forced
+/// to 1. This is the production noise control: a single MC estimate per
+/// SZA previously fed the threshold search directly, so one firefly seed
+/// could shift the prayer minute.
+#[allow(clippy::type_complexity)]
+fn scan_szas_with_stats(
+    atm: &twilight_core::atmosphere::AtmosphereModel,
+    config: &SimulationConfig,
+    szas: &[f64],
+    k: usize,
+    scan: &dyn Fn(
+        &twilight_core::atmosphere::AtmosphereModel,
+        &SimulationConfig,
+        f64,
+        f64,
+        f64,
+    ) -> Vec<SpectralResult>,
+    scan_list: Option<
+        &dyn Fn(
+            &twilight_core::atmosphere::AtmosphereModel,
+            &SimulationConfig,
+            &[f64],
+        ) -> Vec<SpectralResult>,
+    >,
+) -> SzaStats {
+    let k = if matches!(config.scattering_mode, ScatteringMode::Single) {
+        1
+    } else {
+        k.max(1)
+    };
+
+    let run_once = |salt: u64| -> Vec<SpectralResult> {
+        let mut cfg = config.clone();
+        cfg.seed_salt = salt;
+        if let Some(f) = scan_list {
+            f(atm, &cfg, szas)
+        } else {
+            // The range-based scan closure evaluated point-wise.
+            szas.iter()
+                .flat_map(|&sza| scan(atm, &cfg, sza, sza, 1.0))
+                .collect()
+        }
+    };
+
+    let runs: Vec<Vec<SpectralResult>> = (0..k as u64).map(run_once).collect();
+    let n_sza = runs[0].len();
+
+    let mut results = Vec::with_capacity(n_sza);
+    let mut rel_se = Vec::with_capacity(n_sza);
+    for i in 0..n_sza {
+        let mut mean = runs[0][i].clone();
+        let num_wl = mean.radiance.len();
+        for run in runs.iter().skip(1) {
+            for w in 0..num_wl {
+                mean.radiance[w] += run[i].radiance[w];
+            }
+        }
+        for w in 0..num_wl {
+            mean.radiance[w] /= k as f64;
+        }
+
+        // Mesopic luminance per run -> SE of the mean.
+        let se = if k > 1 {
+            let lums: Vec<f64> = runs
+                .iter()
+                .map(|run| {
+                    twilight_threshold::luminance::mesopic_luminance(
+                        &run[i].wavelengths_nm,
+                        &run[i].radiance,
+                    )
+                })
+                .collect();
+            let m: f64 = lums.iter().sum::<f64>() / k as f64;
+            if m > 1e-300 {
+                let var: f64 =
+                    lums.iter().map(|l| (l - m) * (l - m)).sum::<f64>() / (k as f64 - 1.0);
+                (var.sqrt() / (k as f64).sqrt()) / m
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        results.push(mean);
+        rel_se.push(se);
+    }
+    SzaStats { results, rel_se }
+}
+
 fn compute_prayer_times_inner(
     input: &PrayerTimeInput,
     atm: &twilight_core::atmosphere::AtmosphereModel,
@@ -577,29 +685,38 @@ fn compute_prayer_times_inner(
         scattering_mode: input.scattering_mode,
         photons_per_wavelength: input.photons_per_wavelength,
         polarized: input.polarized,
+        seed_salt: 0,
     };
 
+    // K independent seed-salted estimates per SZA for MC modes (forced to
+    // 1 for deterministic Single). Production noise control: the threshold
+    // search runs on the MEAN curve and the per-SZA standard error feeds a
+    // confidence interval on the prayer minute.
+    const K_SEEDS: usize = 4;
+
     let coarse_t0 = std::time::Instant::now();
-    let coarse_results = if let Some(scan_list_fn) = scan_list {
-        // ONE batch for ALL coarse SZAs -- no chunking, no GPU idle gaps.
-        let mut coarse_szas = Vec::new();
+    let mut coarse_szas = Vec::new();
+    {
         let mut sza = 90.0;
         while sza <= sza_upper + 1e-6 {
             coarse_szas.push(sza);
             sza += input.sza_step;
         }
-        eprint!("Coarse scan: {} points ... ", coarse_szas.len());
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        let r = scan_list_fn(atm, &config, &coarse_szas);
-        eprintln!("{:.1?}", coarse_t0.elapsed());
-        r
-    } else {
-        eprint!("Coarse scan ... ");
-        let _ = std::io::Write::flush(&mut std::io::stderr());
-        let r = scan(atm, &config, 90.0, sza_upper, input.sza_step);
-        eprintln!("{:.1?}", coarse_t0.elapsed());
-        r
-    };
+    }
+    eprint!(
+        "Coarse scan: {} points x {} seeds ... ",
+        coarse_szas.len(),
+        if matches!(config.scattering_mode, ScatteringMode::Single) { 1 } else { K_SEEDS }
+    );
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+    let coarse_stats = scan_szas_with_stats(atm, &config, &coarse_szas, K_SEEDS, scan, scan_list);
+    eprintln!("{:.1?}", coarse_t0.elapsed());
+    let mut se_by_sza: Vec<(f64, f64)> = coarse_szas
+        .iter()
+        .zip(coarse_stats.rel_se.iter())
+        .map(|(&s, &e)| (s, e))
+        .collect();
+    let coarse_results = coarse_stats.results;
 
     let coarse_analyses: Vec<TwilightAnalysis> = coarse_results
         .iter()
@@ -652,24 +769,15 @@ fn compute_prayer_times_inner(
         }
 
         let fine_t0 = std::time::Instant::now();
-
-        // ONE batch for ALL fine SZAs -- no chunking.
-        fine_results = if let Some(scan_list_fn) = scan_list {
-            eprint!("Fine scan: {} points ... ", fine_szas.len());
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-            let r = scan_list_fn(atm, &config, &fine_szas);
-            eprintln!("{:.1?}", fine_t0.elapsed());
-            r
-        } else {
-            eprint!("Fine scan: {} points ... ", fine_szas.len());
-            let _ = std::io::Write::flush(&mut std::io::stderr());
-            for (lo, hi) in &refine_regions {
-                let region = scan(atm, &config, *lo, *hi, fine_step);
-                fine_results.extend(region);
-            }
-            eprintln!("{:.1?}", fine_t0.elapsed());
-            fine_results
-        };
+        eprint!("Fine scan: {} points x {} seeds ... ", fine_szas.len(),
+            if matches!(config.scattering_mode, ScatteringMode::Single) { 1 } else { K_SEEDS });
+        let _ = std::io::Write::flush(&mut std::io::stderr());
+        let fine_stats = scan_szas_with_stats(atm, &config, &fine_szas, K_SEEDS, scan, scan_list);
+        eprintln!("{:.1?}", fine_t0.elapsed());
+        for (i, r) in fine_stats.results.into_iter().enumerate() {
+            se_by_sza.push((r.sza_deg, fine_stats.rel_se[i]));
+            fine_results.push(r);
+        }
     }
 
     // Combine coarse + fine results, sort by SZA, deduplicate
@@ -712,7 +820,64 @@ fn compute_prayer_times_inner(
         })
         .collect();
 
-    let prayer_result = threshold::determine_prayer_times(all_analyses, &input.threshold_config);
+    let mut prayer_result =
+        threshold::determine_prayer_times(all_analyses, &input.threshold_config);
+
+    // Step 9b: Crossing-on-fit + confidence interval.
+    //
+    // Refine each pairwise crossing with a local log-linear least-squares
+    // fit (robust to single noisy MC samples), and propagate the per-SZA
+    // standard error into a sigma on the crossing SZA:
+    //   sigma_sza = rel_SE(luminance) / |d(lnL)/dSZA|.
+    let lookup_rel_se = |sza: f64| -> f64 {
+        se_by_sza
+            .iter()
+            .filter(|(s, _)| (s - sza).abs() <= 0.35)
+            .map(|(_, e)| *e)
+            .fold(0.0f64, f64::max)
+    };
+    let fit_window = |pick: &dyn Fn(&TwilightAnalysis) -> f64, around: f64| -> Vec<(f64, f64)> {
+        prayer_result
+            .analyses
+            .iter()
+            .filter(|a| (a.sza_deg - around).abs() <= 0.6)
+            .map(|a| (a.sza_deg, pick(a)))
+            .collect()
+    };
+    let mut refine = |sza_opt: Option<f64>,
+                      pick: &dyn Fn(&TwilightAnalysis) -> f64,
+                      thresh: f64|
+     -> (Option<f64>, Option<f64>) {
+        let Some(sza0) = sza_opt else {
+            return (None, None);
+        };
+        let window = fit_window(pick, sza0);
+        match threshold::fit_crossing_loglinear(&window, thresh) {
+            Some((fitted, slope)) => {
+                let sigma_sza = lookup_rel_se(fitted) / slope.abs().max(1e-6);
+                (Some(fitted), Some(sigma_sza))
+            }
+            None => (Some(sza0), None),
+        }
+    };
+    let (fajr_sza_fit, fajr_sigma) = refine(
+        prayer_result.fajr_sza_deg,
+        &|a| a.luminance_mesopic,
+        input.threshold_config.fajr_luminance,
+    );
+    let (abyad_sza_fit, abyad_sigma) = refine(
+        prayer_result.isha_abyad_sza_deg,
+        &|a| a.luminance_mesopic,
+        input.threshold_config.isha_abyad_luminance,
+    );
+    let (ahmar_sza_fit, ahmar_sigma) = refine(
+        prayer_result.isha_ahmar_sza_deg,
+        &|a| a.luminance_red,
+        input.threshold_config.isha_ahmar_red_luminance,
+    );
+    prayer_result.fajr_sza_deg = fajr_sza_fit;
+    prayer_result.isha_abyad_sza_deg = abyad_sza_fit;
+    prayer_result.isha_ahmar_sza_deg = ahmar_sza_fit;
 
     // Step 10: Convert threshold SZAs to clock times
     let fajr_time = prayer_result
@@ -727,6 +892,38 @@ fn compute_prayer_times_inner(
         .isha_ahmar_sza_deg
         .and_then(|sza| engine.find_zenith_crossing(sza, 12.0, 24.0, 0.0001));
 
+    // Convert crossing-SZA sigmas to minutes using the local dt/dSZA slope
+    // (about 3-5 min/deg depending on latitude/season).
+    let mut sigma_minutes = |sza: Option<f64>,
+                             t: Option<f64>,
+                             sigma: Option<f64>,
+                             lo: f64,
+                             hi: f64|
+     -> Option<f64> {
+        let (Some(s0), Some(t0), Some(sig)) = (sza, t, sigma) else {
+            return None;
+        };
+        let t1 = engine.find_zenith_crossing(s0 + 0.25, lo, hi, 0.0001)?;
+        let dtdsza = ((t1 - t0) / 0.25).abs() * 60.0; // minutes per degree
+        Some(sig * dtdsza)
+    };
+    let fajr_uncertainty_min =
+        sigma_minutes(prayer_result.fajr_sza_deg, fajr_time, fajr_sigma, 0.0, 12.0);
+    let isha_abyad_uncertainty_min = sigma_minutes(
+        prayer_result.isha_abyad_sza_deg,
+        isha_abyad_time,
+        abyad_sigma,
+        12.0,
+        24.0,
+    );
+    let isha_ahmar_uncertainty_min = sigma_minutes(
+        prayer_result.isha_ahmar_sza_deg,
+        isha_ahmar_time,
+        ahmar_sigma,
+        12.0,
+        24.0,
+    );
+
     let elapsed = start.elapsed();
 
     PrayerTimeOutput {
@@ -738,6 +935,9 @@ fn compute_prayer_times_inner(
         fajr_sza_deg: prayer_result.fajr_sza_deg,
         isha_abyad_sza_deg: prayer_result.isha_abyad_sza_deg,
         isha_ahmar_sza_deg: prayer_result.isha_ahmar_sza_deg,
+        fajr_uncertainty_min,
+        isha_abyad_uncertainty_min,
+        isha_ahmar_uncertainty_min,
         fajr_depression_deg: prayer_result.fajr_sza_deg.map(|s| s - 90.0),
         isha_abyad_depression_deg: prayer_result.isha_abyad_sza_deg.map(|s| s - 90.0),
         isha_ahmar_depression_deg: prayer_result.isha_ahmar_sza_deg.map(|s| s - 90.0),

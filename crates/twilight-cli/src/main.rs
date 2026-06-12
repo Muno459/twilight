@@ -439,6 +439,17 @@ const TWILIGHT_ANGLES: &[TwilightAngle] = &[
     },
 ];
 
+
+/// Format a 1-sigma uncertainty in minutes as " +/-N.Nmin" (empty when
+/// not available, e.g. deterministic runs).
+fn format_uncertainty(min: Option<f64>) -> String {
+    match min {
+        Some(m) if m >= 0.05 => format!(" \u{00b1}{:.1}min", m),
+        Some(_) => " \u{00b1}<0.1min".to_string(),
+        None => String::new(),
+    }
+}
+
 fn format_fractional_hour(h: f64) -> String {
     if !(0.0..=24.0).contains(&h) {
         return "N/A".to_string();
@@ -733,6 +744,7 @@ fn cmd_mcrt(
         scattering_mode,
         photons_per_wavelength: photons,
         polarized,
+        seed_salt: 0,
     };
 
     // GPU initialization (default unless --cpu is passed).
@@ -947,6 +959,7 @@ fn cmd_compare(
                 scattering_mode: scattering.to_scattering_mode(),
                 photons_per_wavelength: photons,
                 polarized: !fast,
+                seed_salt: 0,
             };
             for &sza in szas {
                 let result = simulation::simulate_at_sza(&atm, &config, sza);
@@ -1333,8 +1346,9 @@ fn cmd_pray(
         output.fajr_depression_deg,
     ) {
         println!(
-            "  Fajr (true dawn):     {}  (SZA {:.2}°, depression {:.2}°)",
+            "  Fajr (true dawn):     {}{}  (SZA {:.2}°, depression {:.2}°)",
             format_fractional_hour(time),
+            format_uncertainty(output.fajr_uncertainty_min),
             sza,
             dep
         );
@@ -1351,8 +1365,9 @@ fn cmd_pray(
         output.isha_abyad_depression_deg,
     ) {
         println!(
-            "  Isha (al-abyad):      {}  (SZA {:.2}°, depression {:.2}°)",
+            "  Isha (al-abyad):      {}{}  (SZA {:.2}°, depression {:.2}°)",
             format_fractional_hour(time),
+            format_uncertainty(output.isha_abyad_uncertainty_min),
             sza,
             dep
         );
@@ -1368,8 +1383,9 @@ fn cmd_pray(
         output.isha_ahmar_depression_deg,
     ) {
         println!(
-            "  Isha (al-ahmar):      {}  (SZA {:.2}°, depression {:.2}°)",
+            "  Isha (al-ahmar):      {}{}  (SZA {:.2}°, depression {:.2}°)",
             format_fractional_hour(time),
+            format_uncertainty(output.isha_ahmar_uncertainty_min),
             sza,
             dep
         );

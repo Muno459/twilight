@@ -87,6 +87,11 @@ pub struct SimulationConfig {
     /// When false (`--fast` mode), uses scalar phase function (P11 only).
     /// Slightly faster, loses ~0.5-2% polarization correction.
     pub polarized: bool,
+    /// Extra entropy mixed into MC seeds. Salt 0 reproduces historical
+    /// runs; distinct salts give statistically independent estimates of
+    /// the same radiance — the basis for K-seed averaging and standard-
+    /// error estimation in the prayer pipeline.
+    pub seed_salt: u64,
 }
 
 impl Default for SimulationConfig {
@@ -102,8 +107,25 @@ impl Default for SimulationConfig {
             scattering_mode: ScatteringMode::Single,
             photons_per_wavelength: 10_000,
             polarized: true,
+            seed_salt: 0,
         }
     }
+}
+
+
+/// Mix the config's seed salt into a base seed. Salt 0 leaves the seed
+/// unchanged (bit-for-bit reproducibility of historical runs); any other
+/// salt is dispersed through a splitmix64 finalizer before XOR so
+/// consecutive salts give decorrelated streams.
+#[inline]
+fn mix_salt(base: u64, salt: u64) -> u64 {
+    if salt == 0 {
+        return base;
+    }
+    let mut z = salt;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    base ^ (z ^ (z >> 31))
 }
 
 /// Run simulation at a single solar zenith angle.
@@ -220,7 +242,7 @@ fn simulate_at_sza_mc(
             for p in 0..nphotons {
                 // Unique seed per (sza, wavelength, photon) triple.
                 // Include sza bits to decorrelate across SZA scan steps.
-                let sza_bits = sza_deg.to_bits();
+                let sza_bits = mix_salt(sza_deg.to_bits(), config.seed_salt);
                 let mut rng = (sza_bits)
                     .wrapping_add(w as u64)
                     .wrapping_mul(6364136223846793005)
@@ -269,7 +291,7 @@ fn simulate_at_sza_hybrid(
 
     if !config.polarized {
         // ALIS path: all wavelengths in a single call.
-        let sza_bits = sza_deg.to_bits();
+        let sza_bits = mix_salt(sza_deg.to_bits(), config.seed_salt);
         let mut rng = sza_bits.wrapping_mul(6364136223846793005).wrapping_add(1);
 
         let radiance_array = photon::hybrid_scatter_radiance_alis(
@@ -288,7 +310,7 @@ fn simulate_at_sza_hybrid(
     let per_wl_radiance: Vec<f64> = (0..num_wl)
         .into_par_iter()
         .map(|w| {
-            let sza_bits = sza_deg.to_bits();
+            let sza_bits = mix_salt(sza_deg.to_bits(), config.seed_salt);
             let mut rng = sza_bits
                 .wrapping_add(w as u64)
                 .wrapping_mul(6364136223846793005)
