@@ -6,5 +6,6 @@ license.workspace = true
 description = "CIE vision functions, spectral analysis, Fajr/Isha threshold logic"
 
 [dependencies]
+twilight-solar = { workspace = true }
 twilight-core = { workspace = true }
 libm = { workspace = true }

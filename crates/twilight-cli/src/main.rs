@@ -1082,7 +1082,79 @@ fn cmd_pray(
             None => twilight_weather::fetch_atmospheric_params(lat, lon)
                 .map(|p| (p, "current conditions".to_string())),
         };
-        match fetched.map(|(p, src)| { println!("Weather src: {}", src); p }) {
+        // SATELLITE CLOUD ENHANCEMENT: sample the GIBS MODIS cloud field
+        // (COT + cloud-top height) at the observer and along the sun
+        // azimuth ("2.5D" — the twilight shadow path crosses the cloud
+        // field tens to hundreds of km sunward). When the satellite saw
+        // cloud, it overrides the model forecast's cloud layer: measured
+        // optical depth at measured altitude beats a model cover fraction.
+        let sat_cloud = {
+            let cache = std::path::Path::new(&dem_dir)
+                .parent()
+                .map(|p| p.join("satellite"))
+                .unwrap_or_else(|| std::path::PathBuf::from("data/satellite"));
+            // Sun azimuth at the evening-twilight hour for the path samples.
+            let sun_az = twilight_hour_utc
+                .and_then(|h| {
+                    let mut inp = SpaInput {
+                        year,
+                        month,
+                        day,
+                        hour: 12,
+                        minute: 0,
+                        second: 0,
+                        timezone: 0.0,
+                        latitude: lat,
+                        longitude: lon,
+                        elevation,
+                        pressure: 1013.25,
+                        temperature: 15.0,
+                        delta_t,
+                        slope: 0.0,
+                        azm_rotation: 0.0,
+                        atmos_refract: 0.5667,
+                    };
+                    let total = (h * 3600.0).round() as i32;
+                    inp.hour = total / 3600;
+                    inp.minute = (total % 3600) / 60;
+                    inp.second = total % 60;
+                    spa::solar_position(&inp).ok().map(|o| o.azimuth)
+                })
+                .unwrap_or(270.0);
+            let sp = twilight_weather::satellite::sample_cloud_path(
+                &cache, &date_iso, lat, lon, sun_az,
+            );
+            if sp.observer.is_some() || sp.path_cloud_fraction > 0.0 {
+                if let Some(obs) = sp.observer {
+                    println!(
+                        "Satellite:  MODIS COT {:.1} @ top {:.1} km (age {}d), sunward cloud {:.0}% (mean COT {:.1})",
+                        obs.cot,
+                        obs.cloud_top_m.unwrap_or(0.0) / 1000.0,
+                        obs.age_days,
+                        sp.path_cloud_fraction * 100.0,
+                        sp.path_mean_cot
+                    );
+                } else {
+                    println!(
+                        "Satellite:  clear overhead; sunward cloud {:.0}% (mean COT {:.1})",
+                        sp.path_cloud_fraction * 100.0,
+                        sp.path_mean_cot
+                    );
+                }
+                twilight_weather::mapping::map_cloud_satellite(&sp)
+            } else {
+                None
+            }
+        };
+
+        match fetched.map(|(mut p, src)| {
+            println!("Weather src: {}", src);
+            if let Some(sc) = sat_cloud {
+                p.cloud = Some(sc);
+                p.description = format!("{} + satellite cloud", p.description);
+            }
+            p
+        }) {
             Ok(params) => {
                 let c = &params.conditions;
                 println!(
@@ -1208,9 +1280,28 @@ fn cmd_pray(
         } else if let Some(b) = bortle {
             twilight_skyglow::bortle::bortle_to_radiance(b)
         } else {
-            // Default: suburban (Bortle 5) -- a reasonable guess for someone
-            // who enabled --skyglow without specifying a value
-            twilight_skyglow::bortle::bortle_to_radiance(5)
+            // SATELLITE AUTO MODE: look up the VIIRS-derived Lorenz light-
+            // pollution atlas (propagated artificial zenith brightness) for
+            // this exact location — measured data instead of a guess.
+            let cache = std::path::Path::new(&dem_dir)
+                .parent()
+                .map(|p| p.join("skyglow"))
+                .unwrap_or_else(|| std::path::PathBuf::from("data/skyglow"));
+            match twilight_skyglow::atlas::artificial_zenith(&cache, lat, lon) {
+                Some(a) => {
+                    println!(
+                        "Skyglow:    satellite atlas {} -> artificial zenith {:.3} mcd/m^2",
+                        a.year, a.zenith_mcd
+                    );
+                    twilight_skyglow::bortle::zenith_luminance_to_radiance(a.zenith_mcd)
+                }
+                None => {
+                    eprintln!(
+                        "Note: light-pollution atlas unavailable here; using Bortle 5 default."
+                    );
+                    twilight_skyglow::bortle::bortle_to_radiance(5)
+                }
+            }
         };
 
         let result = twilight_skyglow::quick_estimate_at_angle(radiance, led_fraction, 10.0);

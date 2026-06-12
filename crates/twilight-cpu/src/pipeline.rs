@@ -1108,6 +1108,105 @@ fn compute_prayer_times_inner(
         .isha_ahmar_sza_deg
         .and_then(|sza| engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false));
 
+    // Step 10b: CELESTIAL-BACKGROUND REFINEMENT (hyperaccuracy pass).
+    //
+    // The TVI floor so far used the constant dark-sky background. The real
+    // background at the crossing instant varies with airglow (solar
+    // activity), zodiacal light, integrated starlight, and — dominantly,
+    // when the moon is up — scattered moonlight (Krisciunas & Schaefer
+    // 1991): a bright moon near dawn raises the detection floor and
+    // physically delays the perceptible fajr al-sadiq. One refinement
+    // pass: evaluate the physical background at each crossing time with
+    // the actual view geometry, re-float the thresholds, re-determine the
+    // crossings, and re-convert the times.
+    let night_sky_at = |engine: &mut SolarEngine, t_local: Option<f64>| -> Option<f64> {
+        let t = t_local?;
+        let az = engine.azimuth_at_hour(t).unwrap_or(270.0);
+        let inp = twilight_threshold::night_sky::NightSkyInput {
+            latitude: input.latitude,
+            longitude: input.longitude,
+            year: input.year,
+            month: input.month,
+            day: input.day,
+            hour_utc: (t - input.timezone).rem_euclid(24.0),
+            view_zenith_deg: 85.0,
+            view_azimuth_deg: az,
+            solar_f107: 130.0,
+            extinction_k: 0.16
+                + input.custom_aerosol.map(|a| 1.2 * a.aod_550).unwrap_or(0.05),
+        };
+        Some(twilight_threshold::night_sky::night_sky_luminance(&inp).total)
+    };
+    let bg_fajr = night_sky_at(&mut engine, fajr_time);
+    let bg_isha = night_sky_at(&mut engine, isha_abyad_time);
+    let scan_floor = prayer_result
+        .analyses
+        .iter()
+        .map(|a| a.luminance_mesopic)
+        .fold(f64::MAX, f64::min)
+        .max(0.0);
+    let scan_floor_red = prayer_result
+        .analyses
+        .iter()
+        .map(|a| a.luminance_red)
+        .fold(f64::MAX, f64::min)
+        .max(0.0);
+
+    let mut fajr_time = fajr_time;
+    let mut isha_abyad_time = isha_abyad_time;
+    let mut isha_ahmar_time = isha_ahmar_time;
+    if let (Some(bgf), Some(bgi)) = (bg_fajr, bg_isha) {
+        // Only re-float when the physical background differs materially
+        // from the constant the first pass assumed (>25%): moonlit nights,
+        // strong airglow, Milky Way pointing, etc.
+        let bg0 = threshold::NIGHT_SKY_LUMINANCE;
+        if (bgf - bg0).abs() / bg0 > 0.25 || (bgi - bg0).abs() / bg0 > 0.25 {
+            eprintln!(
+                "Celestial background: fajr-side {:.3e} cd/m^2, isha-side {:.3e} \
+                 (dark-sky const {:.3e}) — re-floating thresholds.",
+                bgf, bgi, bg0
+            );
+            let refined_config = threshold::ThresholdConfig {
+                fajr_luminance: threshold::detection_threshold(
+                    scan_floor + bgf,
+                    input.threshold_config.fajr_luminance,
+                ),
+                isha_abyad_luminance: threshold::detection_threshold(
+                    scan_floor + bgi,
+                    input.threshold_config.isha_abyad_luminance,
+                ),
+                isha_ahmar_red_luminance: threshold::detection_threshold(
+                    scan_floor_red + bgi,
+                    input.threshold_config.isha_ahmar_red_luminance,
+                ),
+                ..input.threshold_config.clone()
+            };
+            let refined = threshold::determine_prayer_times(
+                prayer_result.analyses.clone(),
+                &refined_config,
+            );
+            if refined.fajr_sza_deg.is_some() || refined.isha_abyad_sza_deg.is_some() {
+                prayer_result.fajr_sza_deg =
+                    refined.fajr_sza_deg.or(prayer_result.fajr_sza_deg);
+                prayer_result.isha_abyad_sza_deg = refined
+                    .isha_abyad_sza_deg
+                    .or(prayer_result.isha_abyad_sza_deg);
+                prayer_result.isha_ahmar_sza_deg = refined
+                    .isha_ahmar_sza_deg
+                    .or(prayer_result.isha_ahmar_sza_deg);
+                fajr_time = prayer_result.fajr_sza_deg.and_then(|sza| {
+                    engine.find_zenith_crossing_robust(sza, 0.0, 12.0, 0.0001, true)
+                });
+                isha_abyad_time = prayer_result.isha_abyad_sza_deg.and_then(|sza| {
+                    engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false)
+                });
+                isha_ahmar_time = prayer_result.isha_ahmar_sza_deg.and_then(|sza| {
+                    engine.find_zenith_crossing_robust(sza, 12.0, 28.0, 0.0001, false)
+                });
+            }
+        }
+    }
+
     // Convert crossing-SZA sigmas to minutes using the local dt/dSZA slope
     // (about 3-5 min/deg depending on latitude/season).
     let mut sigma_minutes = |sza: Option<f64>,

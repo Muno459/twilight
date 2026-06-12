@@ -19,6 +19,7 @@
 
 pub mod api;
 pub mod mapping;
+pub mod satellite;
 
 use twilight_data::aerosol::AerosolProperties;
 use twilight_data::cloud::CloudProperties;

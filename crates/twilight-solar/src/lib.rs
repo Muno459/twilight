@@ -21,5 +21,6 @@ pub mod spa;
 pub mod spa_tables;
 
 pub mod de440;
+pub mod moon;
 pub mod earth_rotation;
 pub mod spk;

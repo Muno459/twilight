@@ -15,3 +15,6 @@ randomseed
 mc.rad*
 mc.flx*
 *.spcrad
+data/skyglow/
+data/satellite/
+data/dem/

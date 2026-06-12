@@ -181,6 +181,62 @@ pub fn map_cloud(conditions: &WeatherConditions) -> Option<CloudProperties> {
     })
 }
 
+
+/// Build cloud properties from a SATELLITE sample (GIBS MODIS COT + CTH),
+/// blended with the sunward-path samples ("2.5D"): at twilight the shadow
+/// path crosses the cloud field 50-300 km toward the sun, so the
+/// radiatively relevant optical depth is a blend of the overhead and
+/// sunward columns.
+///
+/// Layer placement uses the measured cloud-top height; geometric thickness
+/// is estimated from COT (thicker optically -> deeper layer, clamped to
+/// 200-3000 m); droplet properties are chosen by the measured top height
+/// (ice cirrus above ~6 km, mixed alto 2.5-6 km, water stratiform below).
+///
+/// Returns None when the satellite saw clear sky everywhere (callers may
+/// still fall back to the model/forecast cloud).
+pub fn map_cloud_satellite(
+    sat: &crate::satellite::SatelliteCloudPath,
+) -> Option<CloudProperties> {
+    let obs_cot = sat.observer.map(|s| s.cot).unwrap_or(0.0);
+    // Sunward weighting: the path fraction scales how much of the sunward
+    // mean enters; with no sunward cloud the observer column stands alone.
+    let eff_cot = if sat.n_path_samples > 0 {
+        let w_path = 0.5 * sat.path_cloud_fraction;
+        obs_cot * (1.0 - w_path) + sat.path_mean_cot * w_path
+    } else {
+        obs_cot
+    };
+    if eff_cot < 0.3 {
+        return None; // optically negligible
+    }
+
+    let top_m = sat
+        .observer
+        .and_then(|s| s.cloud_top_m)
+        .unwrap_or(2500.0);
+    let thickness_m = (eff_cot * 80.0).clamp(200.0, 3000.0);
+    let top_km = (top_m / 1000.0).clamp(0.4, 14.0);
+    let base_km = (top_km - thickness_m / 1000.0).max(0.15);
+
+    // Droplet properties by measured top height (phase proxy).
+    let (ssa, g) = if top_km > 6.0 {
+        (0.9995, 0.77) // ice cirrus-like
+    } else if top_km > 2.5 {
+        (0.999, 0.82) // mixed/alto
+    } else {
+        (0.999, 0.85) // warm stratiform
+    };
+
+    Some(CloudProperties {
+        base_km,
+        top_km,
+        optical_depth: eff_cot,
+        ssa,
+        asymmetry: g,
+    })
+}
+
 // ── Gas composition mapping ─────────────────────────────────────────────
 
 /// NO2 molar mass (g/mol).
@@ -333,6 +389,59 @@ pub fn describe(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Satellite cloud mapping ──
+
+    #[test]
+    fn satellite_cloud_places_layer_at_measured_height() {
+        use crate::satellite::{SatelliteCloud, SatelliteCloudPath};
+        let sat = SatelliteCloudPath {
+            observer: Some(SatelliteCloud {
+                cot: 12.0,
+                cloud_top_m: Some(1800.0),
+                age_days: 0,
+            }),
+            path_mean_cot: 10.0,
+            path_cloud_fraction: 1.0,
+            n_path_samples: 4,
+        };
+        let c = map_cloud_satellite(&sat).unwrap();
+        assert!((c.top_km - 1.8).abs() < 1e-9, "top at satellite CTH");
+        assert!(c.base_km < c.top_km && c.base_km > 0.0);
+        // blended COT between observer and path
+        assert!(c.optical_depth > 10.0 && c.optical_depth < 12.5);
+        assert!((c.asymmetry - 0.85).abs() < 1e-9, "warm stratiform g");
+    }
+
+    #[test]
+    fn satellite_high_cloud_gets_ice_properties() {
+        use crate::satellite::{SatelliteCloud, SatelliteCloudPath};
+        let sat = SatelliteCloudPath {
+            observer: Some(SatelliteCloud {
+                cot: 2.0,
+                cloud_top_m: Some(9500.0),
+                age_days: 0,
+            }),
+            path_mean_cot: 0.0,
+            path_cloud_fraction: 0.0,
+            n_path_samples: 4,
+        };
+        let c = map_cloud_satellite(&sat).unwrap();
+        assert!((c.asymmetry - 0.77).abs() < 1e-9, "cirrus-like g for high top");
+        assert!(c.top_km > 9.0);
+    }
+
+    #[test]
+    fn satellite_clear_sky_yields_none() {
+        use crate::satellite::SatelliteCloudPath;
+        let sat = SatelliteCloudPath {
+            observer: None,
+            path_mean_cot: 0.0,
+            path_cloud_fraction: 0.0,
+            n_path_samples: 4,
+        };
+        assert!(map_cloud_satellite(&sat).is_none());
+    }
 
     #[test]
     fn maritime_types_reachable_from_marine_conditions() {

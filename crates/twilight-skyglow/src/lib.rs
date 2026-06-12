@@ -27,6 +27,7 @@
 //! - Mix ratio is configurable (pre-2015 cities mostly HPS, post-2020 mostly LED)
 
 pub mod angular;
+pub mod atlas;
 pub mod bortle;
 pub mod garstang;
 pub mod spectrum;
