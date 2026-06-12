@@ -259,8 +259,14 @@ impl GpuBackend for MetalBackend {
         // threadgroups. The GPU watchdog allows ~2s per dispatch; each 2500-ray
         // dispatch finishes in ~1-5ms, well under the limit. Raising from 256
         // to 2500 cuts command buffer submissions by ~10x.
-        const RAYS_PER_DISPATCH: u32 = 2500;
-        const DISPATCHES_PER_COMMAND_BUFFER: usize = 4;
+        // Sized so one command buffer stays safely under the macOS GPU
+        // watchdog (~2 s) even for deep-twilight chains that traverse many
+        // shells: 250 rays/buffer empirically completes in well under a
+        // second on Apple Silicon; the extra commit/wait round-trips cost
+        // only ~1 ms each. (The old 2500 x 4 = 10000-ray buffers were
+        // killed with kIOGPUCommandBufferCallbackErrorImpactingInteractivity.)
+        const RAYS_PER_DISPATCH: u32 = 250;
+        const DISPATCHES_PER_COMMAND_BUFFER: usize = 1;
         const PARAMS_STRIDE: usize = 16;
         let num_dispatches = secondary_rays.div_ceil(RAYS_PER_DISPATCH).max(1);
 

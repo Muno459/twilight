@@ -22,7 +22,9 @@ pub const BUFFER_MAGIC: u32 = 0x544C_5754;
 
 /// Current buffer layout version. Increment when the packing format changes.
 /// v2: added refractive_index[MAX_SHELLS] after surface_albedo.
-pub const BUFFER_VERSION: u32 = 2;
+/// v3: added cloud_extinction[MAX_SHELLS] + cloud_g_scaled (delta-scaled
+///     cloud scattering for the Eddington diffuse-transmission factor).
+pub const BUFFER_VERSION: u32 = 3;
 
 /// Maximum number of light pollution sources in a single dispatch.
 pub const MAX_LIGHT_SOURCES: usize = 2048;
@@ -116,8 +118,12 @@ pub mod atm_offsets {
     pub const ALBEDO_START: usize = WAVELENGTHS_START + super::MAX_WAVELENGTHS; // 16644 + 64 = 16708
     /// Start of refractive index array (1 f32 per shell, padded to vec4)
     pub const REFRACTIVE_INDEX_START: usize = ALBEDO_START + super::MAX_WAVELENGTHS; // 16708 + 64 = 16772
-    /// Total buffer size in f32 elements
-    pub const TOTAL_SIZE: usize = REFRACTIVE_INDEX_START + super::MAX_SHELLS; // 16772 + 64 = 16836
+    /// Start of cloud (delta-scaled scattering) extinction array, 1 f32/shell
+    pub const CLOUD_EXT_START: usize = REFRACTIVE_INDEX_START + super::MAX_SHELLS; // 16836
+    /// Scalar: delta-scaled cloud asymmetry g* (0 when no cloud)
+    pub const CLOUD_G_SCALED: usize = CLOUD_EXT_START + super::MAX_SHELLS; // 16900
+    /// Total buffer size in f32 elements (CLOUD_G_SCALED + vec4 padding)
+    pub const TOTAL_SIZE: usize = CLOUD_G_SCALED + 4; // 16904
 }
 
 impl PackedAtmosphere {
@@ -170,7 +176,9 @@ impl PackedAtmosphere {
         // Refractive index per shell (v2)
         for s in 0..atm.num_shells {
             data[atm_offsets::REFRACTIVE_INDEX_START + s] = atm.refractive_index[s] as f32;
+            data[atm_offsets::CLOUD_EXT_START + s] = atm.cloud_extinction[s] as f32;
         }
+        data[atm_offsets::CLOUD_G_SCALED] = atm.cloud_g_scaled as f32;
 
         PackedAtmosphere {
             data,
@@ -227,7 +235,9 @@ impl PackedAtmosphere {
         // Restore refractive indices (v2)
         for s in 0..ns {
             atm.refractive_index[s] = self.data[atm_offsets::REFRACTIVE_INDEX_START + s] as f64;
+            atm.cloud_extinction[s] = self.data[atm_offsets::CLOUD_EXT_START + s] as f64;
         }
+        atm.cloud_g_scaled = self.data[atm_offsets::CLOUD_G_SCALED] as f64;
 
         atm
     }
@@ -926,14 +936,14 @@ mod tests {
 
     #[test]
     fn atm_offset_total_size() {
-        // 16772 + 64 = 16836
-        assert_eq!(atm_offsets::TOTAL_SIZE, 16836);
+        // v3: 16772 + 64 (refr) + 64 (cloud ext) + 4 (g* + pad) = 16904
+        assert_eq!(atm_offsets::TOTAL_SIZE, 16904);
     }
 
     #[test]
     fn atm_total_size_in_bytes() {
-        // 16836 * 4 = 67344 bytes ≈ 65.8 KB
-        assert_eq!(atm_offsets::TOTAL_SIZE * 4, 67344);
+        // 16904 * 4 = 67616 bytes ~ 66 KB
+        assert_eq!(atm_offsets::TOTAL_SIZE * 4, 67616);
     }
 
     #[test]

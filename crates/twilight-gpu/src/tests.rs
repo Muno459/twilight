@@ -636,6 +636,49 @@ mod layer4_metal {
             .expect("Metal upload_atmosphere should succeed");
     }
 
+    /// Cloudy-atmosphere parity: the v3 buffers carry the cloud diffuse-
+    /// transmission fields; GPU single-scatter under an OD-10 stratus must
+    /// match the CPU within f32 tolerance (previously the GPU lacked the
+    /// Eddington factor entirely and was routed to CPU).
+    #[test]
+    fn metal_single_scatter_cloudy_matches_cpu() {
+        let Some(mut gpu) = try_metal() else { return };
+        use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+        use twilight_data::atmosphere_profiles::AtmosphereType;
+        use twilight_data::cloud::{default_properties, CloudType};
+
+        let props = default_properties(CloudType::Stratus);
+        let atm = twilight_data::builder::build_with_cloud_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &props,
+        );
+        gpu.upload_atmosphere(&atm).unwrap();
+
+        let obs = geographic_to_ecef(21.4225, 39.8262, 0.0);
+        for sza in [85.0, 92.0, 96.0] {
+            let sun = solar_direction_ecef(sza, 270.0, 21.4225, 39.8262);
+            let view = solar_direction_ecef(75.0, 270.0, 21.4225, 39.8262);
+            let gpu_r = gpu.single_scatter([obs.x, obs.y, obs.z],
+                                           [view.x, view.y, view.z],
+                                           [sun.x, sun.y, sun.z]).unwrap();
+            let cpu_r = twilight_core::single_scatter::single_scatter_spectrum(
+                &atm, obs, view, sun);
+            for w in (0..gpu_r.num_wavelengths).step_by(8) {
+                let c = cpu_r[w];
+                let g = gpu_r.radiance[w];
+                if c > 1e-25 {
+                    let rel = ((g - c) / c).abs();
+                    assert!(
+                        rel < 5e-3,
+                        "cloudy parity SZA {} wl#{}: gpu={:.4e} cpu={:.4e} rel={:.2e}",
+                        sza, w, g, c, rel
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn metal_single_scatter_vs_cpu_oracle() {
         let Some(mut gpu) = try_metal() else { return };
@@ -933,7 +976,6 @@ mod layer4_metal {
     }
 
     #[test]
-    #[ignore = "hybrid_scatter_v2 exceeds the macOS GPU watchdog at production ray counts; KNOWN-OPEN Metal-port work (README project status #6). Run with --ignored after the estimator port."]
     fn metal_single_hybrid_matches_one_item_batch() {
         use crate::{BatchKernel, BatchRequest};
         use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
@@ -994,7 +1036,6 @@ mod layer4_metal {
     }
 
     #[test]
-    #[ignore = "hybrid_scatter_v2 exceeds the macOS GPU watchdog at production ray counts; KNOWN-OPEN Metal-port work (README project status #6). Run with --ignored after the estimator port."]
     fn metal_multi_hybrid_matches_serial_chunk() {
         use crate::{BatchKernel, BatchRequest};
         use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};

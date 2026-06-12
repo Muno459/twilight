@@ -54,6 +54,8 @@ constant uint ATM_OPTICS_START          = 260;   // 4 + 4*64
 constant uint ATM_OPTICS_STRIDE         = 4;
 constant uint ATM_ALBEDO_START          = 16708;  // 16644 + 64
 constant uint ATM_REFRACTIVE_INDEX_START = 16772; // 16708 + 64 (v2)
+constant uint ATM_CLOUD_EXT_START        = 16836; // 16772 + 64 (v3)
+constant uint ATM_CLOUD_G_SCALED         = 16900; // 16836 + 64 (v3)
 
 // Garstang constants
 constant float H_RAYLEIGH = 8500.0f;
@@ -151,6 +153,21 @@ inline float read_albedo(device const float* atm, uint wl_idx) {
 
 inline float read_refractive_index(device const float* atm, uint shell_idx) {
     return atm[ATM_REFRACTIVE_INDEX_START + shell_idx];
+}
+
+inline float read_cloud_extinction(device const float* atm, uint shell_idx) {
+    return atm[ATM_CLOUD_EXT_START + shell_idx];
+}
+
+// Eddington diffuse transmittance of accumulated (delta-scaled) cloud
+// optical depth: T = 1/(1 + 0.75 tau (1 - g*)). Mirrors the CPU's
+// AtmosphereModel::cloud_diffuse_transmittance — a diffusing deck
+// transmits ~20-50%, which Beer-Lambert misrepresents by orders of
+// magnitude (single-representation cloud transport).
+inline float cloud_diffuse_transmittance(device const float* atm, float tau_cloud) {
+    if (tau_cloud <= 0.0f) return 1.0f;
+    float g = atm[ATM_CLOUD_G_SCALED];
+    return 1.0f / (1.0f + 0.75f * tau_cloud * (1.0f - g));
 }
 
 // Dispatch params: 4 x vec4
@@ -697,6 +714,7 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
     // and the early-exit at tau > 50 means we never accumulate more than
     // ~50 terms of similar magnitude. Saves 3 FP ops per shell crossing.
     float tau = 0.0f;
+    float tau_cloud = 0.0f;
 
     int sidx = shell_index_binary(atm, length(pos));
     if (sidx < 0) return 1.0f;
@@ -714,6 +732,7 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
         if (!bnd.found) break;
 
         tau += extinction * bnd.dist;
+        tau_cloud += read_cloud_extinction(atm, us) * bnd.dist;
 
         // Snap + nudge -- avoid redundant length() by reusing snap_to_radius
         float3 boundary_pos = pos + dir * bnd.dist;
@@ -746,7 +765,8 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
 
     // fast::exp is sufficient for shadow transmittance -- we only need
     // ~3 significant digits (the MC weight noise dominates).
-    return fast::exp(-tau);
+    // Clear-air Beer-Lambert x Eddington diffuse for the cloud portion.
+    return fast::exp(-tau) * cloud_diffuse_transmittance(atm, tau_cloud);
 }
 
 // ============================================================================
@@ -950,6 +970,8 @@ kernel void single_scatter_spectrum(
 
     KahanAccum radiance;
     KahanAccum tau_obs;
+    // Cloud portion of the eye path: Eddington diffuse (broadband).
+    float tau_cloud_obs = 0.0f;
 
     float cos_theta = dot(sun_dir, view_dir);
 
@@ -964,17 +986,21 @@ kernel void single_scatter_spectrum(
         if (sidx < 0) continue;
 
         ShellOptics op = read_optics(atm, uint(sidx), wl_idx);
+        float cloud_ext_step = read_cloud_extinction(atm, uint(sidx));
         float beta_scat = op.extinction * op.ssa;
 
         if (beta_scat < 1e-30f) {
             tau_obs.add(op.extinction * ds);
+            tau_cloud_obs += cloud_ext_step * ds;
             continue;
         }
 
         // Single exp(-(tau + half_step)) is both faster and more precise
         // than the product of two separate exps (which rounds the f32
         // multiply and wastes an ALU slot).
-        float t_obs = exp(-(tau_obs.result() + op.extinction * ds * 0.5f));
+        float tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5f;
+        float t_obs = exp(-(tau_obs.result() + op.extinction * ds * 0.5f))
+                    * cloud_diffuse_transmittance(atm, tau_cloud_mid);
 
         if (t_obs < 1e-30f) break;
 
@@ -982,6 +1008,7 @@ kernel void single_scatter_spectrum(
 
         if (t_sun < 1e-30f) {
             tau_obs.add(op.extinction * ds);
+            tau_cloud_obs += cloud_ext_step * ds;
             continue;
         }
 
@@ -990,6 +1017,7 @@ kernel void single_scatter_spectrum(
         radiance.add(di);
 
         tau_obs.add(op.extinction * ds);
+        tau_cloud_obs += cloud_ext_step * ds;
     }
 
     // Ground reflection (Lambertian BRDF = albedo / pi)
@@ -1002,7 +1030,8 @@ kernel void single_scatter_spectrum(
 
             if (cos_sun_incidence > 0.0f) {
                 float t_sun_ground = shadow_ray_transmittance(atm, ground_pos, sun_dir, wl_idx);
-                float t_obs_ground = exp(-tau_obs.result());
+                float t_obs_ground = exp(-tau_obs.result())
+                    * cloud_diffuse_transmittance(atm, tau_cloud_obs);
                 radiance.add(albedo / PI * cos_sun_incidence * t_sun_ground * t_obs_ground);
             }
         }
@@ -1717,15 +1746,20 @@ kernel void hybrid_scatter(
         }
     }
 
+    float my_cloud_ds = (my_sidx >= 0) ? read_cloud_extinction(atm, uint(my_sidx)) * ds : 0.0f;
     shared_ext_ds[step_idx] = my_ext_ds;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // ── Phase 2: Compute exclusive prefix tau_obs via threadgroup scan ───
     // This replaces the old O(N^2) per-thread summation with a Blelloch scan
     // over shared_ext_ds. step_idx gets tau_obs = sum(shared_ext_ds[0..step_idx-1]).
+    // The cloud (delta-scaled scattering) tau is scanned in lockstep so the
+    // eye path applies Eddington diffuse transmission for the cloud portion.
 
     threadgroup float shared_prefix[HYBRID_THREADGROUP_SIZE];
+    threadgroup float shared_cloud_prefix[HYBRID_THREADGROUP_SIZE];
     shared_prefix[step_idx] = shared_ext_ds[step_idx];
+    shared_cloud_prefix[step_idx] = my_cloud_ds;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Upsweep (reduce) phase
@@ -1733,6 +1767,7 @@ kernel void hybrid_scatter(
         uint idx = ((step_idx + 1u) * offset * 2u) - 1u;
         if (idx < HYBRID_THREADGROUP_SIZE) {
             shared_prefix[idx] += shared_prefix[idx - offset];
+            shared_cloud_prefix[idx] += shared_cloud_prefix[idx - offset];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -1740,6 +1775,7 @@ kernel void hybrid_scatter(
     // Convert inclusive reduce tree to exclusive scan
     if (step_idx == HYBRID_THREADGROUP_SIZE - 1u) {
         shared_prefix[step_idx] = 0.0f;
+        shared_cloud_prefix[step_idx] = 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1750,12 +1786,17 @@ kernel void hybrid_scatter(
             float t = shared_prefix[idx - offset];
             shared_prefix[idx - offset] = shared_prefix[idx];
             shared_prefix[idx] += t;
+            float tc = shared_cloud_prefix[idx - offset];
+            shared_cloud_prefix[idx - offset] = shared_cloud_prefix[idx];
+            shared_cloud_prefix[idx] += tc;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     float tau_obs = (step_idx < num_steps) ? shared_prefix[step_idx] : 0.0f;
-    float t_obs = exp(-(tau_obs + my_ext_ds * 0.5f));
+    float tau_cloud_obs = (step_idx < num_steps) ? shared_cloud_prefix[step_idx] : 0.0f;
+    float t_obs = exp(-(tau_obs + my_ext_ds * 0.5f))
+                * cloud_diffuse_transmittance(atm, tau_cloud_obs + my_cloud_ds * 0.5f);
 
     // ── Phase 3: Compute per-step Stokes contribution ─────────────────
     // Full [I,Q,U,V] propagation. Single-scatter NEE applies Mueller to
@@ -2005,6 +2046,7 @@ kernel void hybrid_scatter_v2(
 
         if (valid) {
             float tau_obs = 0.0f;
+            float tau_cloud_obs = 0.0f;
             for (uint j = 0; j < step_idx; j++) {
                 float sj = (float(j) + 0.5f) * ds;
                 float3 pj = observer_pos + view_dir * sj;
@@ -2014,6 +2056,7 @@ kernel void hybrid_scatter_v2(
                     if (sj_idx >= 0) {
                         ShellOptics oj = read_optics(atm, uint(sj_idx), wl_idx);
                         tau_obs += oj.extinction * ds;
+                        tau_cloud_obs += read_cloud_extinction(atm, uint(sj_idx)) * ds;
                     }
                 }
             }
@@ -2021,7 +2064,11 @@ kernel void hybrid_scatter_v2(
             // Single exp is more precise and faster than two multiplied exps.
             // exp(a)*exp(b) = exp(a+b), but the product loses precision
             // when both are small (the f32 multiply rounds twice).
-            t_obs = exp(-(tau_obs + my_op.extinction * ds * 0.5f));
+            // Cloud portion: Eddington diffuse (single-representation).
+            float my_cloud_ds =
+                read_cloud_extinction(atm, uint(my_sidx)) * ds;
+            t_obs = exp(-(tau_obs + my_op.extinction * ds * 0.5f))
+                  * cloud_diffuse_transmittance(atm, tau_cloud_obs + my_cloud_ds * 0.5f);
             if (t_obs < 1e-30f) {
                 valid = false;
             } else if (secondary_rays > 0u) {

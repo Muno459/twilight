@@ -401,6 +401,36 @@ mod tests {
         assert!(c.apply_solar_irradiance);
     }
 
+    // ── 150 km ceiling (regression for the deep-twilight zero) ──
+
+    /// With the old 100 km ceiling, single-scatter radiance was EXACTLY
+    /// zero for SZA >= ~104 deg — yet prayer-time crossings live at
+    /// 104-106 deg (verified against MYSTIC spherical, which still sees
+    /// signal there). The thermospheric shells (100-150 km) carry that
+    /// signal: it must be nonzero and decreasing in SZA.
+    #[test]
+    fn deep_twilight_single_scatter_nonzero_to_sza_107() {
+        let atm = make_clear_sky_atm();
+        let config = SimulationConfig {
+            view_zenith: 85.0,
+            scattering_mode: ScatteringMode::Single,
+            ..SimulationConfig::default()
+        };
+        let mut prev = f64::MAX;
+        for sza in [103.0, 104.0, 105.0, 106.0, 107.0] {
+            let r: f64 = simulate_at_sza(&atm, &config, sza).radiance.iter().sum();
+            assert!(
+                r > 0.0,
+                "single-scatter must be nonzero at SZA {} (was exactly 0 \
+                 under the 100 km ceiling), got {:.3e}",
+                sza,
+                r
+            );
+            assert!(r < prev, "radiance must decrease with SZA");
+            prev = r;
+        }
+    }
+
     // ── Cloud transport (regression for the OD-10 collapse) ──
 
     /// Through an OD-10 stratus deck the twilight sky must remain visible:

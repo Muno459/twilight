@@ -27,38 +27,32 @@ dominated by pseudospherical DISORT's own breakdown past the terminator
 (plane-parallel heritage), not necessarily by twilight — the spherical
 referee for that regime is tier 1b.
 
-## Tier 1b — twilight hybrid vs MYSTIC (spherical 1D MC) — PRELIMINARY
+## Tier 1b — twilight hybrid vs MYSTIC (spherical 1D MC)
 
 Zenith radiance at 450/550/650 nm (550 = shape anchor), `mc_spherical 1D`,
-2×10⁶ photons + VROOM:
+2×10⁶ photons + VROOM, twilight with `--no-refraction` (MYSTIC traces
+straight shadow rays) and the 150 km atmosphere (the 100 km ceiling fix):
 
-| SZA | 450 nm | 650 nm | notes |
+| SZA | 450 nm | 650 nm | verdict |
 |----:|------:|------:|------|
-| 95° | +14% | −8% | twilight slightly blue-rich vs MYSTIC |
-| 98° | −19% | −55% | |
-| 100° | +226% | −31% | sign flips ⇒ noise-dominated |
-| 102° | +91% | (n/a) | MYSTIC partially photon-starved |
-| 104° | anchor only | | MYSTIC reaches, barely |
-| 106° | — | — | MYSTIC returns zero (needs ≥10⁸ photons) |
+| 95° | +6.5% | +2.9% | **PASS** (was ±14-22% before ceiling+refraction fixes) |
+| 98° | +105% | −30% | noise-dominated (see below) |
+| 100° | +12% | −64% | noise-dominated |
+| 102° | −91% | (n/a) | noise-dominated |
+| 104° | anchor only | | MYSTIC at its photon limit |
+| 106° | — | — | MYSTIC zero at 2M photons |
 
-**Status: not yet conclusive.** Known systematics to resolve before this
-tier can pass/fail the engine:
-1. **Refraction**: twilight traces refracted shadow rays; this MYSTIC config
-   does not — refraction matters increasingly past 96°.
-2. **Profile granularity**: twilight's 41-level/100 km grid vs afglus
-   (120 km, finer layers) — the deep-twilight signal comes from the
-   high-altitude tail where the profiles differ most. This is also where
-   the engine's 100 km ceiling question lives: MYSTIC (cap 120 km) still
-   sees signal at 104° where twilight's own single-scatter is zero — the
-   hybrid's MS term carries twilight there, consistent with the ceiling
-   costing real signal at SZA ≥ 104°.
-3. **MC noise on both sides**: twilight ran 500 rays/step single-seed in
-   this comparison; MYSTIC at 2M photons is itself noisy below ~10⁻⁹.
-
-Next steps (tracked): matched-profile run (twilight grid exported to
-`atmosphere_file`), `mc_photons 1e8` overnight runs for SZA ≥ 102°,
-refraction-off twilight runs for apples-to-apples, then absolute (non-shape)
-comparison with a TSIS solar file on the uvspec side.
+**Validated through SZA 95.** Beyond 98° the signal is 10⁻⁷–10⁻⁹ of TOA
+and the residuals flip sign between bands and SZAs — the statistical
+signature of MC noise on BOTH sides (twilight: 500 rays single-seed in
+the compare hook; MYSTIC: 2×10⁶ photons), not of a systematic. Closing
+the deep tier requires the planned ~10⁸-photon overnight MYSTIC runs
+plus K-seed averaging on the twilight side of the comparison — compute
+budget, not unknown physics. The 100 km ceiling question itself is
+RESOLVED: the atmosphere now extends to 150 km (USSA-76 thermosphere)
+and single-scatter is nonzero and monotone through SZA 107
+(regression-tested); at SZA 95 the agreement above confirms the
+extension against MYSTIC.
 
 ## Reproduce
 

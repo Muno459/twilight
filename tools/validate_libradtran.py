@@ -167,7 +167,8 @@ def run_uvspec(lrt: Path, deck: str, tag: str) -> str:
 
 
 def run_twilight_compare(szas, view_zeniths, rel_azimuths, rayleigh_only,
-                         o3_du, scattering="single", photons=10000) -> dict:
+                         o3_du, scattering="single", photons=10000,
+                         no_refraction=False) -> dict:
     """Returns {(sza, vz, ra, wl): radiance_W_m2_sr_nm}."""
     if not TWILIGHT_CLI.exists():
         sys.exit("Build first: cargo build --release -p twilight-cli")
@@ -182,6 +183,8 @@ def run_twilight_compare(szas, view_zeniths, rel_azimuths, rayleigh_only,
     if rayleigh_only:
         cmd.append("--rayleigh-only")
     cmd.append("--fast")  # scalar radiance (I); polarization correction ~0.5-2%
+    if no_refraction:
+        cmd.append("--no-refraction")
     if o3_du is not None:
         cmd += ["--o3-du", f"{o3_du:g}"]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -304,8 +307,11 @@ def compare_tier1b_mystic(lrt, szas, tol, shape_only, solar_file):
         return True
 
     common = deck_common(lrt, solar_file, None, rayleigh_only=True)
+    # Straight shadow rays: MYSTIC mc_spherical does not refract — remove
+    # twilight's refraction for the apples-to-apples run.
     tw = run_twilight_compare(szas, [0.0], [0.0], True, None,
-                              scattering="hybrid", photons=500)
+                              scattering="hybrid", photons=500,
+                              no_refraction=True)
 
     n_pass = n_fail = 0
     rows = []

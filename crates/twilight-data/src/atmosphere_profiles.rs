@@ -6,47 +6,60 @@
 //! [`AtmosphereType`] enum has a single variant so that selecting an
 //! unimplemented profile is impossible rather than silently falling back.
 
-/// Standard altitude grid in km (41 levels from 0 to 100 km).
-pub const ALTITUDE_GRID_KM: [f64; 41] = [
+/// Standard altitude grid in km (46 levels from 0 to 150 km).
+///
+/// The 100-150 km extension matters ONLY for deep twilight: at solar
+/// depressions beyond ~12 deg the Earth's shadow rises above 100 km and
+/// the thermospheric tail is the only single-scatter-illuminated air left.
+/// A 100 km ceiling silently zeroed that signal (verified against MYSTIC
+/// spherical, which still sees radiance at SZA 104+).
+pub const ALTITUDE_GRID_KM: [f64; 46] = [
     0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
     17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0, 24.0, 25.0, 30.0, 35.0, 40.0, 45.0, 50.0, 55.0, 60.0,
-    65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0,
+    65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0, 100.0, 110.0, 120.0, 130.0, 140.0, 150.0,
 ];
 
 /// Number of altitude levels in the grid.
-pub const NUM_LEVELS: usize = 41;
+pub const NUM_LEVELS: usize = 46;
 
 /// US Standard Atmosphere 1976 — temperature profile [K]
-pub const US_STD_TEMPERATURE_K: [f64; 41] = [
+pub const US_STD_TEMPERATURE_K: [f64; 46] = [
     288.15, 281.65, 275.15, 268.65, 262.15, 255.65, 249.15, 242.65, 236.15, 229.65, 223.15, 216.65,
     216.65, 216.65, 216.65, 216.65, 216.65, 216.65, 216.65, 216.65, 216.65, 217.65, 218.65, 219.65,
     220.65, 221.65, 226.65, 237.05, 251.05, 264.15, 270.65, 260.65, 247.05, 233.05, 219.15, 208.40,
     198.64, 188.89, 186.87, 188.42, 195.08,
+    // Thermosphere (USSA 1976 Table 1): kinetic temperature climbs steeply.
+    240.00, 360.00, 469.27, 559.63, 634.39,
 ];
 
 /// US Standard Atmosphere 1976 — pressure profile [hPa]
-pub const US_STD_PRESSURE_HPA: [f64; 41] = [
+pub const US_STD_PRESSURE_HPA: [f64; 46] = [
     1013.25, 898.76, 795.01, 701.21, 616.60, 540.48, 472.17, 411.05, 356.51, 308.00, 264.99,
     226.99, 194.02, 165.79, 141.70, 121.11, 103.52, 88.497, 75.652, 64.674, 55.293, 47.289, 40.475,
     34.668, 29.717, 25.492, 11.970, 5.746, 2.871, 1.491, 0.7978, 0.4253, 0.2196, 0.1093, 0.05221,
     0.02388, 0.01052, 0.00446, 0.00184, 0.000760, 0.000320,
+    // Thermosphere (USSA 1976): 110-150 km.
+    7.1042e-5, 2.5382e-5, 1.2505e-5, 7.2028e-6, 4.5422e-6,
 ];
 
 /// US Standard Atmosphere 1976 — number density profile [molecules/cm³]
-pub const US_STD_NUMBER_DENSITY: [f64; 41] = [
+pub const US_STD_NUMBER_DENSITY: [f64; 46] = [
     2.547e19, 2.311e19, 2.093e19, 1.891e19, 1.703e19, 1.532e19, 1.373e19, 1.227e19, 1.093e19,
     9.711e18, 8.598e18, 7.585e18, 6.486e18, 5.543e18, 4.738e18, 4.049e18, 3.462e18, 2.960e18,
     2.529e18, 2.162e18, 1.849e18, 1.573e18, 1.341e18, 1.143e18, 9.759e17, 8.334e17, 3.828e17,
     1.757e17, 8.283e16, 4.084e16, 2.135e16, 1.181e16, 6.439e15, 3.393e15, 1.722e15, 8.300e14,
     3.838e14, 1.714e14, 7.116e13, 2.920e13, 1.189e13,
+    // Thermosphere (USSA 1976): n = p/(kT).
+    2.144e12, 5.107e11, 1.930e11, 9.322e10, 5.186e10,
 ];
 
 /// US Standard Atmosphere 1976 — ozone number density [molecules/cm³]
-pub const US_STD_OZONE_DENSITY: [f64; 41] = [
+pub const US_STD_OZONE_DENSITY: [f64; 46] = [
     5.40e11, 5.40e11, 5.40e11, 5.00e11, 4.60e11, 4.20e11, 3.90e11, 3.60e11, 3.20e11, 2.90e11,
     2.64e11, 2.40e11, 2.34e11, 2.67e11, 3.24e11, 4.07e11, 5.00e11, 5.95e11, 6.87e11, 7.37e11,
     7.45e11, 7.09e11, 6.35e11, 5.33e11, 4.34e11, 3.45e11, 1.38e11, 4.19e10, 1.30e10, 4.30e9,
     1.50e9, 5.00e8, 2.00e8, 5.00e7, 5.00e6, 5.00e5, 5.00e4, 0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0, 0.0,
 ];
 
 /// Atmosphere profile type.
@@ -77,10 +90,10 @@ pub fn pressure_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
         AtmosphereType::UsStandard => &US_STD_PRESSURE_HPA,
     };
     // Log-linear interpolation for pressure
-    let log_pressures: [f64; 41] = {
-        let mut lp = [0.0; 41];
+    let log_pressures: [f64; NUM_LEVELS] = {
+        let mut lp = [0.0; NUM_LEVELS];
         let mut i = 0;
-        while i < 41 {
+        while i < NUM_LEVELS {
             lp[i] = libm::log(pressures[i]);
             i += 1;
         }
@@ -95,10 +108,10 @@ pub fn number_density_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
     let densities = match profile {
         AtmosphereType::UsStandard => &US_STD_NUMBER_DENSITY,
     };
-    let log_densities: [f64; 41] = {
-        let mut ld = [0.0; 41];
+    let log_densities: [f64; NUM_LEVELS] = {
+        let mut ld = [0.0; NUM_LEVELS];
         let mut i = 0;
-        while i < 41 {
+        while i < NUM_LEVELS {
             ld[i] = if densities[i] > 0.0 {
                 libm::log(densities[i])
             } else {
@@ -119,10 +132,10 @@ pub fn ozone_density_at(altitude_km: f64, profile: AtmosphereType) -> f64 {
     let densities = match profile {
         AtmosphereType::UsStandard => &US_STD_OZONE_DENSITY,
     };
-    let log_densities: [f64; 41] = {
-        let mut ld = [0.0; 41];
+    let log_densities: [f64; NUM_LEVELS] = {
+        let mut ld = [0.0; NUM_LEVELS];
         let mut i = 0;
-        while i < 41 {
+        while i < NUM_LEVELS {
             ld[i] = if densities[i] > 0.0 {
                 libm::log(densities[i])
             } else {
@@ -404,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn altitude_grid_ends_at_100km() {
-        assert!((ALTITUDE_GRID_KM[NUM_LEVELS - 1] - 100.0).abs() < 1e-10);
+    fn altitude_grid_ends_at_150km() {
+        assert!((ALTITUDE_GRID_KM[NUM_LEVELS - 1] - 150.0).abs() < 1e-10);
     }
 }

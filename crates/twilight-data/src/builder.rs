@@ -27,15 +27,18 @@ pub const DEFAULT_WAVELENGTHS_NM: [f64; 41] = [
 /// Default altitude grid for atmospheric shells (km).
 /// Finer resolution in the lower atmosphere (0-30 km) where most scattering
 /// occurs, coarser above.
-pub const DEFAULT_ALTITUDES_KM: [f64; 51] = [
+pub const DEFAULT_ALTITUDES_KM: [f64; 56] = [
     0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
     13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 22.0, 24.0, 26.0, 28.0, 30.0, 32.0, 34.0, 36.0,
     38.0, 40.0, 42.0, 44.0, 46.0, 48.0, 50.0, 55.0, 60.0, 65.0, 70.0, 75.0, 80.0, 85.0, 90.0, 95.0,
-    100.0,
+    100.0, 110.0, 120.0, 130.0, 140.0, 150.0,
 ];
 
 /// Number of altitude levels (one fewer shells than levels).
-pub const NUM_ALTITUDE_LEVELS: usize = 51;
+///
+/// The 100-150 km thermospheric shells carry the deep-twilight (SZA >= 104)
+/// single-scatter signal that a 100 km ceiling silently zeroed.
+pub const NUM_ALTITUDE_LEVELS: usize = 56;
 
 /// Build a clear-sky atmosphere with Rayleigh scattering only (no gas absorption).
 ///
@@ -571,9 +574,9 @@ mod tests {
     // ── build_clear_sky ──
 
     #[test]
-    fn clear_sky_has_50_shells() {
+    fn clear_sky_has_55_shells() {
         let atm = build_clear_sky(AtmosphereType::UsStandard, 0.15);
-        assert_eq!(atm.num_shells, 50);
+        assert_eq!(atm.num_shells, 55);
     }
 
     #[test]
@@ -596,9 +599,9 @@ mod tests {
     }
 
     #[test]
-    fn clear_sky_toa_at_100km() {
+    fn clear_sky_toa_at_150km() {
         let atm = build_clear_sky(AtmosphereType::UsStandard, 0.15);
-        assert!((atm.toa_radius() - (EARTH_RADIUS_M + 100_000.0)).abs() < 1.0);
+        assert!((atm.toa_radius() - (EARTH_RADIUS_M + 150_000.0)).abs() < 1.0);
     }
 
     #[test]
@@ -908,8 +911,8 @@ mod tests {
     }
 
     #[test]
-    fn default_altitudes_end_at_100km() {
-        assert!((DEFAULT_ALTITUDES_KM[NUM_ALTITUDE_LEVELS - 1] - 100.0).abs() < 1e-10);
+    fn default_altitudes_end_at_150km() {
+        assert!((DEFAULT_ALTITUDES_KM[NUM_ALTITUDE_LEVELS - 1] - 150.0).abs() < 1e-10);
     }
 
     #[test]
@@ -1063,7 +1066,7 @@ mod tests {
         for atype in &ALL_AEROSOL_TYPES {
             let atm = build_with_aerosols(AtmosphereType::UsStandard, 0.15, *atype);
             // Sanity: should still have 50 shells and 41 wavelengths
-            assert_eq!(atm.num_shells, 50);
+            assert_eq!(atm.num_shells, 55);
             assert_eq!(atm.num_wavelengths, 41);
         }
     }
@@ -1237,7 +1240,7 @@ mod tests {
         use crate::cloud::ALL_CLOUD_TYPES;
         for ctype in &ALL_CLOUD_TYPES {
             let atm = build_with_cloud(AtmosphereType::UsStandard, 0.15, *ctype);
-            assert_eq!(atm.num_shells, 50);
+            assert_eq!(atm.num_shells, 55);
             assert_eq!(atm.num_wavelengths, 41);
         }
     }
@@ -1300,7 +1303,7 @@ mod tests {
             AerosolType::Urban,
             CloudType::Stratus,
         );
-        assert_eq!(atm.num_shells, 50);
+        assert_eq!(atm.num_shells, 55);
         assert_eq!(atm.num_wavelengths, 41);
     }
 

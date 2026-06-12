@@ -253,6 +253,10 @@ enum Commands {
         /// Scalar radiance mode (skip Stokes polarization)
         #[arg(long)]
         fast: bool,
+        /// Disable atmospheric refraction (for apples-to-apples comparison
+        /// against RT codes that trace straight shadow rays, e.g. MYSTIC)
+        #[arg(long)]
+        no_refraction: bool,
     },
 }
 
@@ -925,9 +929,10 @@ fn cmd_compare(
     scattering: CliScattering,
     photons: usize,
     fast: bool,
+    no_refraction: bool,
 ) {
     // Build the atmosphere once.
-    let atm = if rayleigh_only {
+    let mut atm = if rayleigh_only {
         builder::build_clear_sky(AtmosphereType::UsStandard, albedo)
     } else {
         let ap = aerosol
@@ -945,6 +950,12 @@ fn cmd_compare(
             None,
         )
     };
+    if no_refraction {
+        // Straight-ray comparison mode (e.g. vs MYSTIC without refraction).
+        for n in atm.refractive_index.iter_mut() {
+            *n = 1.0;
+        }
+    }
 
     // Header with enough metadata to reproduce the run.
     println!(
@@ -1914,6 +1925,7 @@ fn main() {
             scattering,
             photons,
             fast,
+            no_refraction,
         } => {
             cmd_compare(
                 lat,
@@ -1931,6 +1943,7 @@ fn main() {
                 scattering,
                 photons,
                 fast,
+                no_refraction,
             );
         }
     }
