@@ -132,14 +132,19 @@ def destination(lat_deg, lon_deg, azimuth_deg, dist_km):
 
 
 def normalize(stack):
-    """[11,H,W] raw (refl % / BT K) -> [-1,1] with NaN->0, per the dataset."""
+    """[11,H,W] raw (refl % / BT K) -> [-1,1] with NaN->0, per the dataset.
+
+    Channel order is wavelength-ascending (SEVIRI convention), so the
+    first three slots are always the solar/reflectance channels — true
+    for ABI, AHI and SEVIRI alike.
+    """
     out = np.empty_like(stack, dtype=np.float32)
-    for i, ch in enumerate(ABI_CHANNELS):
+    for i in range(stack.shape[0]):
         v = stack[i]
-        if ch in SOLAR:
+        if i < 3:  # solar: reflectance %
             v = np.clip(v, 0.0, 100.0)
             n = 2.0 * v / 100.0 - 1.0
-        else:
+        else:  # thermal: BT K
             v = np.clip(v, 180.0, 350.0)
             n = 2.0 * (v - 180.0) / 170.0 - 1.0
         n[~np.isfinite(n)] = 0.0
@@ -156,10 +161,12 @@ def iwc_from_output(y):
 
 
 def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
-               xs_win, ys_win, jc_w, ic_w, curtain, curtain_km):
+               xs_win, ys_win, jc_w, ic_w, curtain, curtain_km,
+               px_km=(2.0, 2.0)):
     """Figure: column-IWP map + vertical curtain along the sun azimuth +
     observer profile. Approximate orientation: rows ~ N->S, cols ~ W->E
-    (ABI fixed grid is slightly rotated away from nadir)."""
+    (geostationary grids are slightly rotated away from nadir).
+    px_km = (east-west, north-south) ground sampling at the observer."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -168,8 +175,9 @@ def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
     dz = heights[0] / (len(heights) - 1)
     iwp = iwc.sum(axis=0) * dz  # g/m^2
     h_, w_ = iwp.shape
-    extent_km = [-(ic_w) * 2.0, (w_ - ic_w) * 2.0,
-                 -(h_ - jc_w) * 2.0, (jc_w) * 2.0]  # 2 km/px, observer at 0,0
+    pxx, pxy = px_km
+    extent_km = [-(ic_w) * pxx, (w_ - ic_w) * pxx,
+                 -(h_ - jc_w) * pxy, (jc_w) * pxy]  # observer at 0,0
 
     fig = plt.figure(figsize=(14, 9))
     gs = fig.add_gridspec(2, 2, height_ratios=[1.15, 1.0], hspace=0.32, wspace=0.25)
@@ -233,7 +241,7 @@ def render_png(png_path, iwc, heights, args, scan_time, bucket, sat_lon,
         f"input     11-channel {bucket} full-disk scan\n"
         f"scan      {scan_time}\n"
         f"requested {args.date} {args.hour:.2f}h UTC\n"
-        f"window    {iwc.shape[2]}x{iwc.shape[1]} px @ 2 km\n"
+        f"window    {iwc.shape[2]}x{iwc.shape[1]} px @ {pxx:.1f}x{pxy:.1f} km\n"
         f"vertical  80 levels x {dzkm * 1000:.0f} m (0-18.9 km)\n"
         f"cloudy    {100.0 * float((iwp > 1.0).mean()):.0f}% of columns (IWP > 1 g/m$^2$)\n"
         f"max IWC   {float(iwc.max()):.3f} g/m$^3$"
