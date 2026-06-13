@@ -227,6 +227,28 @@ pub trait GpuBackend: Send {
         atm: &twilight_core::atmosphere::AtmosphereModel,
     ) -> Result<(), GpuError>;
 
+    /// Upload (or clear) the 3D cloud field.
+    ///
+    /// `Some(field)` packs and binds the voxel field so subsequent hybrid
+    /// dispatches take the gray cloud channel (Beer-Lambert, explicit
+    /// in-cloud scattering, Stage 3). `None` clears any bound field and
+    /// restores the legacy 1D shell-cloud path (Eddington diffuse
+    /// transmittance, unchanged).
+    ///
+    /// The default implementation is a no-op (`None` accepted, `Some`
+    /// rejected) for backends without field support.
+    fn upload_field(
+        &mut self,
+        field: Option<&twilight_core::cloud_field::Cloud3DField>,
+    ) -> Result<(), GpuError> {
+        match field {
+            None => Ok(()),
+            Some(_) => Err(GpuError::Dispatch(
+                "this backend does not support 3D cloud fields".into(),
+            )),
+        }
+    }
+
     /// Run the deterministic single-scatter spectrum kernel.
     ///
     /// Equivalent to `twilight_core::single_scatter::single_scatter_spectrum`.

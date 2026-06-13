@@ -698,20 +698,34 @@ pub fn compute_prayer_times_gpu(
 
     let atm = build_atmosphere(input);
 
-    // Cloud fields (cloud_extinction / cloud_g_scaled) ship in the v3
-    // packed buffers and the Metal kernels apply the Eddington diffuse
-    // transmission - GPU and CPU share the single-representation cloud
-    // transport.
+    // 1D shell cloud (cloud_extinction / cloud_g_scaled) ships in the packed
+    // atmosphere buffer and the Metal kernels apply the Eddington diffuse
+    // transmission - GPU and CPU share that single-representation transport.
 
-    // 3D cloud field: no GPU kernel reads it until Stage 3, so a field
-    // run must take the CPU scan (a GPU run would silently ignore the
-    // field and compute a clear sky).
-    if input.cloud_field.is_some() {
-        if input.verbose {
-            eprintln!("Note: 3D cloud field set; GPU support is Stage 3, using the CPU scan");
+    // 3D cloud field (Stage 3): pack and bind it to the GPU. The Metal
+    // hybrid kernel reads the voxel field via the device-side DDA and takes
+    // the gray cloud channel (Beer-Lambert, explicit in-cloud scattering).
+    // If the backend cannot accept the field, fall back to the CPU scan
+    // (a GPU run without the field would silently compute a clear sky).
+    if let Some(owned) = &input.cloud_field {
+        let view = owned.view();
+        if let Err(e) = gpu.upload_field(Some(&view)) {
+            if input.verbose {
+                eprintln!(
+                    "Note: GPU 3D cloud field upload failed ({}), using the CPU scan",
+                    e
+                );
+            }
+            return compute_prayer_times(input);
         }
-        return compute_prayer_times(input);
+    } else {
+        // Ensure any field from a previous run on this backend is cleared.
+        let _ = gpu.upload_field(None);
     }
+
+    // Field view for any CPU fallback path: the field is the source of
+    // truth, so a CPU fallback must still read it (never silently clear-sky).
+    let field_view = input.cloud_field.as_ref().map(|f| f.view());
 
     // Upload atmosphere to GPU. On failure, fall back to CPU entirely.
     if let Err(e) = gpu.upload_atmosphere(&atm) {
@@ -726,7 +740,7 @@ pub fn compute_prayer_times_gpu(
                     start: f64,
                     end: f64,
                     step: f64| {
-            simulation::simulate_twilight_scan(atm, config, start, end, step, None)
+            simulation::simulate_twilight_scan(atm, config, start, end, step, field_view.as_ref())
         };
         return compute_prayer_times_inner(input, &atm, &scan, None);
     }
@@ -746,8 +760,10 @@ pub fn compute_prayer_times_gpu(
                         e
                     );
                 }
-                // Field runs never reach this path (handled above).
-                simulation::simulate_twilight_scan(atm, config, start, end, step, None)
+                // CPU fallback for this scan must still read the field.
+                simulation::simulate_twilight_scan(
+                    atm, config, start, end, step, field_view.as_ref(),
+                )
             })
     };
     let scan_list = |atm: &twilight_core::atmosphere::AtmosphereModel,
@@ -763,7 +779,9 @@ pub fn compute_prayer_times_gpu(
                 }
                 let mut out = Vec::with_capacity(sza_values.len());
                 for &sza in sza_values {
-                    out.push(simulation::simulate_at_sza(atm, config, sza, None));
+                    out.push(simulation::simulate_at_sza(
+                        atm, config, sza, field_view.as_ref(),
+                    ));
                 }
                 out
             })

@@ -54,7 +54,7 @@ constant uint HYBRID_V2_NUM_SIMD_GROUPS = HYBRID_V2_THREADGROUP_SIZE / SIMD_WIDT
 constant uint ATM_HEADER_MAGIC          = 0;
 constant uint ATM_HEADER_VERSION        = 1;
 constant uint BUFFER_MAGIC              = 0x544C5754u; // "TWLT"
-constant uint BUFFER_VERSION            = 3u;
+constant uint BUFFER_VERSION            = 4u;
 // Written to output[0] when the header gate fails. Radiance and per-photon
 // weights are never negative, so the host detects this unambiguously.
 constant float HEADER_SENTINEL          = -1.0f;
@@ -192,13 +192,431 @@ inline float cloud_diffuse_transmittance(device const float* atm, float tau_clou
     return 1.0f / (1.0f + 0.75f * tau_cloud * (1.0f - g));
 }
 
+// ============================================================================
+// 3D cloud field (v4): device-side voxel accessor + DDA, a bit-for-bit port
+// of twilight-core/src/cloud_field.rs (sigma_at, g_at, tau_along,
+// advance_to_tau, distance_to_next_boundary). The field runs in f32, the
+// same regime as the rest of the shader; the f32 tau / crossing-root error
+// budget is derived in the GPU test module (G-F32-BUDGET).
+//
+// Header layout mirrors buffers.rs::field_offsets.
+// ============================================================================
+
+constant uint FIELD_HDR_MAGIC      = 0u;
+constant uint FIELD_HDR_VERSION    = 1u;
+constant uint FIELD_NZ             = 2u;
+constant uint FIELD_NLAT           = 3u;
+constant uint FIELD_NLON           = 4u;
+constant uint FIELD_TILE           = 5u;
+constant uint FIELD_NTLAT          = 6u;
+constant uint FIELD_NTLON          = 7u;
+constant uint FIELD_G_STAR_PRESENT = 8u;
+constant uint FIELD_BG_PRESENT     = 9u;
+constant uint FIELD_MACRO_PRESENT  = 10u;
+constant uint FIELD_Z0_M           = 12u;
+constant uint FIELD_DZ_M           = 13u;
+constant uint FIELD_LAT0_DEG       = 14u;
+constant uint FIELD_LON0_DEG       = 15u;
+constant uint FIELD_DLAT_DEG       = 16u;
+constant uint FIELD_DLON_DEG       = 17u;
+constant uint FIELD_G_DEFAULT      = 18u;
+constant uint FIELD_SIGMA_OFFSET   = 20u;
+constant uint FIELD_G_STAR_OFFSET  = 21u;
+constant uint FIELD_MACRO_OFFSET   = 22u;
+constant uint FIELD_BG_OFFSET      = 23u;
+
+constant float DEG_TO_RAD = PI / 180.0f;
+
+// core-compatible rem_euclid (matches cloud_field.rs::rem_euclid).
+inline float field_rem_euclid(float x, float y) {
+    float r = fmod(x, y);
+    return (r < 0.0f) ? r + y : r;
+}
+
+struct FieldCoords { float r; float lat; float lon; };
+
+inline FieldCoords field_sphere_coords(float3 p) {
+    float r = length(p);
+    float lat = asin(clamp(p.z / r, -1.0f, 1.0f)) / DEG_TO_RAD;
+    float lon = atan2(p.y, p.x) / DEG_TO_RAD;
+    return FieldCoords{r, lat, lon};
+}
+
+inline uint field_uint(device const float* fld, uint slot) {
+    return uint(fld[slot]);
+}
+
+inline uint field_array_offset(device const float* fld, uint slot) {
+    return as_type<uint>(fld[slot]);
+}
+
+inline float field_z_top_m(device const float* fld) {
+    return fld[FIELD_Z0_M] + fld[FIELD_DZ_M] * float(field_uint(fld, FIELD_NZ));
+}
+
+// Returns true and writes (iz, ilat, ilon) when inside the footprint.
+inline bool field_indices(device const float* fld, float r, float lat, float lon,
+                          thread uint &iz, thread uint &ilat, thread uint &ilon) {
+    float z0 = fld[FIELD_Z0_M];
+    float dz = fld[FIELD_DZ_M];
+    float z = r - EARTH_RADIUS_M;
+    if (z < z0 || z >= field_z_top_m(fld)) return false;
+    uint nz = field_uint(fld, FIELD_NZ);
+    uint nlat = field_uint(fld, FIELD_NLAT);
+    uint nlon = field_uint(fld, FIELD_NLON);
+    float fiz = (z - z0) / dz;
+    float flat = (lat - fld[FIELD_LAT0_DEG]) / fld[FIELD_DLAT_DEG];
+    float dlon = field_rem_euclid(lon - fld[FIELD_LON0_DEG], 360.0f);
+    float flon = dlon / fld[FIELD_DLON_DEG];
+    if (flat < 0.0f || flon < 0.0f) return false;
+    uint ila = uint(flat);
+    uint ilo = uint(flon);
+    if (ila >= nlat || ilo >= nlon) return false;
+    iz = min(uint(fiz), nz - 1u);
+    ilat = ila;
+    ilon = ilo;
+    return true;
+}
+
+// Cloud scattering extinction [1/m] at an ECEF position (sigma_at).
+inline float field_sigma_at(device const float* fld, float3 p) {
+    FieldCoords c = field_sphere_coords(p);
+    uint iz, ilat, ilon;
+    uint nlat = field_uint(fld, FIELD_NLAT);
+    uint nlon = field_uint(fld, FIELD_NLON);
+    if (field_indices(fld, c.r, c.lat, c.lon, iz, ilat, ilon)) {
+        uint sigma_off = field_array_offset(fld, FIELD_SIGMA_OFFSET);
+        return fld[sigma_off + (iz * nlat + ilat) * nlon + ilon];
+    }
+    // Outside the footprint: background column (or 0 outside z range).
+    float z0 = fld[FIELD_Z0_M];
+    float dz = fld[FIELD_DZ_M];
+    float z = c.r - EARTH_RADIUS_M;
+    uint nz = field_uint(fld, FIELD_NZ);
+    if (z < z0 || z >= field_z_top_m(fld) || field_uint(fld, FIELD_BG_PRESENT) == 0u) {
+        return 0.0f;
+    }
+    uint iz_bg = min(uint((z - z0) / dz), nz - 1u);
+    uint bg_off = field_array_offset(fld, FIELD_BG_OFFSET);
+    return fld[bg_off + iz_bg];
+}
+
+// Asymmetry g* at a position (g_at).
+inline float field_g_at(device const float* fld, float3 p) {
+    if (field_uint(fld, FIELD_G_STAR_PRESENT) == 0u) {
+        return fld[FIELD_G_DEFAULT];
+    }
+    FieldCoords c = field_sphere_coords(p);
+    uint iz, ilat, ilon;
+    uint nlat = field_uint(fld, FIELD_NLAT);
+    uint nlon = field_uint(fld, FIELD_NLON);
+    if (field_indices(fld, c.r, c.lat, c.lon, iz, ilat, ilon)) {
+        uint g_off = field_array_offset(fld, FIELD_G_STAR_OFFSET);
+        return fld[g_off + (iz * nlat + ilat) * nlon + ilon];
+    }
+    return fld[FIELD_G_DEFAULT];
+}
+
+inline float field_min_step(device const float* fld) {
+    float dz = fld[FIELD_DZ_M];
+    float dxy = fld[FIELD_DLAT_DEG] * DEG_TO_RAD * EARTH_RADIUS_M;
+    return min(dz, dxy) * 0.25f;
+}
+
+// Macrocell majorant (max sigma) for the tile containing p, or a negative
+// sentinel when p is outside the footprint / no majorant table is present.
+// A return of exactly 0 PROVES the whole tile is empty, so a DDA may skip it
+// in one coarse step without changing the (zero) tau contribution.
+inline float field_macro_majorant_at(device const float* fld, float3 p) {
+    if (field_uint(fld, FIELD_MACRO_PRESENT) == 0u) return -1.0f;
+    FieldCoords c = field_sphere_coords(p);
+    uint iz, ilat, ilon;
+    if (!field_indices(fld, c.r, c.lat, c.lon, iz, ilat, ilon)) return -1.0f;
+    uint tile = field_uint(fld, FIELD_TILE);
+    uint ntlat = field_uint(fld, FIELD_NTLAT);
+    uint ntlon = field_uint(fld, FIELD_NTLON);
+    uint off = field_array_offset(fld, FIELD_MACRO_OFFSET);
+    uint itlat = ilat / tile;
+    uint itlon = ilon / tile;
+    return fld[off + (iz * ntlat + itlat) * ntlon + itlon];
+}
+
+// Distance to the next RADIAL (z-level) boundary only. Outside the footprint
+// the field's sigma depends only on altitude (the background column), so the
+// midpoint quadrature is tau-exact over a whole radial-shell segment and the
+// horizontal (lat/lon) crossings can be skipped. Tau- and collision-exact
+// there (sigma constant within the segment), matching the CPU's accumulated
+// result while avoiding thousands of useless fine steps through clear air.
+inline float field_distance_to_next_radial_boundary(device const float* fld, float3 p, float3 dir) {
+    FieldCoords c = field_sphere_coords(p);
+    float r = c.r;
+    float best = FLT_MAX;
+    float z0 = fld[FIELD_Z0_M];
+    float dz = fld[FIELD_DZ_M];
+    float z = r - EARTH_RADIUS_M;
+    float iz = floor((z - z0) / dz);
+    float ks_r[4] = { iz - 1.0f, iz, iz + 1.0f, iz + 2.0f };
+    float b_r = dot(p, dir);
+    for (uint i = 0; i < 4; i++) {
+        float rk = EARTH_RADIUS_M + z0 + ks_r[i] * dz;
+        float cc = r * r - rk * rk;
+        float disc = b_r * b_r - cc;
+        if (disc >= 0.0f) {
+            float s = sqrt(disc);
+            float t0 = -b_r - s;
+            float t1 = -b_r + s;
+            if (t0 > 1e-6f && t0 < best) best = t0;
+            if (t1 > 1e-6f && t1 < best) best = t1;
+        }
+    }
+    return best;
+}
+
+// Distance to the nearest COARSE (macro-tile) boundary: the radial z-grid is
+// unchanged, but latitude/longitude crossings use the tile spacing. Used to
+// skip provably-empty tiles in one step. Conservative (a smaller distance is
+// always safe), so the floor-1..floor+2 window is kept.
+inline float field_distance_to_next_tile_boundary(device const float* fld, float3 p, float3 dir) {
+    FieldCoords c = field_sphere_coords(p);
+    float r = c.r;
+    float best = FLT_MAX;
+
+    float z0 = fld[FIELD_Z0_M];
+    float dz = fld[FIELD_DZ_M];
+    float lat0 = fld[FIELD_LAT0_DEG];
+    float lon0 = fld[FIELD_LON0_DEG];
+    float tile = float(field_uint(fld, FIELD_TILE));
+    float dlat_t = fld[FIELD_DLAT_DEG] * tile;
+    float dlon_t = fld[FIELD_DLON_DEG] * tile;
+
+    // Radial (fine z-grid: sigma varies per level, so keep z crossings fine).
+    float z = r - EARTH_RADIUS_M;
+    float iz = floor((z - z0) / dz);
+    float ks_r[4] = { iz - 1.0f, iz, iz + 1.0f, iz + 2.0f };
+    float b_r = dot(p, dir);
+    for (uint i = 0; i < 4; i++) {
+        float rk = EARTH_RADIUS_M + z0 + ks_r[i] * dz;
+        float cc = r * r - rk * rk;
+        float disc = b_r * b_r - cc;
+        if (disc >= 0.0f) {
+            float s = sqrt(disc);
+            float t0 = -b_r - s;
+            float t1 = -b_r + s;
+            if (t0 > 1e-6f && t0 < best) best = t0;
+            if (t1 > 1e-6f && t1 < best) best = t1;
+        }
+    }
+    // Latitude cones at tile spacing.
+    float flat = (c.lat - lat0) / dlat_t;
+    float kf = floor(flat);
+    float ks_lat[4] = { kf - 1.0f, kf, kf + 1.0f, kf + 2.0f };
+    for (uint i = 0; i < 4; i++) {
+        float phi = (lat0 + ks_lat[i] * dlat_t) * DEG_TO_RAD;
+        float tp = tan(phi);
+        float a = dir.z * dir.z - tp * tp * (dir.x * dir.x + dir.y * dir.y);
+        float b = p.z * dir.z - tp * tp * (p.x * dir.x + p.y * dir.y);
+        float cc = p.z * p.z - tp * tp * (p.x * p.x + p.y * p.y);
+        if (fabs(a) > 1e-30f) {
+            float disc = b * b - a * cc;
+            if (disc >= 0.0f) {
+                float s = sqrt(disc);
+                float roots[2] = { (-b - s) / a, (-b + s) / a };
+                for (uint j = 0; j < 2; j++) {
+                    float t = roots[j];
+                    if (t > 1e-6f && t < best) {
+                        float zc = p.z + t * dir.z;
+                        if (zc * phi >= -1e-9f) best = t;
+                    }
+                }
+            }
+        } else if (fabs(b) > 1e-30f) {
+            float t = -cc / (2.0f * b);
+            if (t > 1e-6f && t < best) best = t;
+        }
+    }
+    // Longitude planes at tile spacing.
+    float flon = field_rem_euclid(c.lon - lon0, 360.0f) / dlon_t;
+    float kn = floor(flon);
+    float ks_lon[4] = { kn - 1.0f, kn, kn + 1.0f, kn + 2.0f };
+    for (uint i = 0; i < 4; i++) {
+        float lam = (lon0 + ks_lon[i] * dlon_t) * DEG_TO_RAD;
+        float sl = sin(lam);
+        float cl = cos(lam);
+        float denom = dir.x * sl - dir.y * cl;
+        if (fabs(denom) > 1e-30f) {
+            float t = -(p.x * sl - p.y * cl) / denom;
+            if (t > 1e-6f && t < best) best = t;
+        }
+    }
+    return best;
+}
+
+// Distance to the nearest grid-cell boundary of the three families
+// (radial shells, latitude cones, longitude planes). Port of
+// distance_to_next_boundary, including the floor-1..=floor+2 candidate
+// window that handles fp landing parity.
+inline float field_distance_to_next_boundary(device const float* fld, float3 p, float3 dir) {
+    FieldCoords c = field_sphere_coords(p);
+    float r = c.r;
+    float best = FLT_MAX;
+
+    float z0 = fld[FIELD_Z0_M];
+    float dz = fld[FIELD_DZ_M];
+    float lat0 = fld[FIELD_LAT0_DEG];
+    float dlat = fld[FIELD_DLAT_DEG];
+    float lon0 = fld[FIELD_LON0_DEG];
+    float dlon = fld[FIELD_DLON_DEG];
+
+    // Radial (sphere) crossings.
+    float z = r - EARTH_RADIUS_M;
+    float iz = floor((z - z0) / dz);
+    float ks_r[4] = { iz - 1.0f, iz, iz + 1.0f, iz + 2.0f };
+    float b_r = dot(p, dir);
+    for (uint i = 0; i < 4; i++) {
+        float rk = EARTH_RADIUS_M + z0 + ks_r[i] * dz;
+        float cc = r * r - rk * rk;
+        float disc = b_r * b_r - cc;
+        if (disc >= 0.0f) {
+            float s = sqrt(disc);
+            float t0 = -b_r - s;
+            float t1 = -b_r + s;
+            if (t0 > 1e-6f && t0 < best) best = t0;
+            if (t1 > 1e-6f && t1 < best) best = t1;
+        }
+    }
+
+    // Latitude (cone) crossings.
+    float flat = (c.lat - lat0) / dlat;
+    float kf = floor(flat);
+    float ks_lat[4] = { kf - 1.0f, kf, kf + 1.0f, kf + 2.0f };
+    for (uint i = 0; i < 4; i++) {
+        float phi = (lat0 + ks_lat[i] * dlat) * DEG_TO_RAD;
+        float tp = tan(phi);
+        float a = dir.z * dir.z - tp * tp * (dir.x * dir.x + dir.y * dir.y);
+        float b = p.z * dir.z - tp * tp * (p.x * dir.x + p.y * dir.y);
+        float cc = p.z * p.z - tp * tp * (p.x * p.x + p.y * p.y);
+        if (fabs(a) > 1e-30f) {
+            float disc = b * b - a * cc;
+            if (disc >= 0.0f) {
+                float s = sqrt(disc);
+                float roots[2] = { (-b - s) / a, (-b + s) / a };
+                for (uint j = 0; j < 2; j++) {
+                    float t = roots[j];
+                    if (t > 1e-6f && t < best) {
+                        float zc = p.z + t * dir.z;
+                        if (zc * phi >= -1e-9f) best = t;
+                    }
+                }
+            }
+        } else if (fabs(b) > 1e-30f) {
+            float t = -cc / (2.0f * b);
+            if (t > 1e-6f && t < best) best = t;
+        }
+    }
+
+    // Longitude (meridian plane) crossings.
+    float flon = field_rem_euclid(c.lon - lon0, 360.0f) / dlon;
+    float kn = floor(flon);
+    float ks_lon[4] = { kn - 1.0f, kn, kn + 1.0f, kn + 2.0f };
+    for (uint i = 0; i < 4; i++) {
+        float lam = (lon0 + ks_lon[i] * dlon) * DEG_TO_RAD;
+        float sl = sin(lam);
+        float cl = cos(lam);
+        float denom = dir.x * sl - dir.y * cl;
+        if (fabs(denom) > 1e-30f) {
+            float t = -(p.x * sl - p.y * cl) / denom;
+            if (t > 1e-6f && t < best) best = t;
+        }
+    }
+
+    return best;
+}
+
+// Exact cloud optical depth along p0 + t*dir, t in [0, t_max] (tau_along).
+//
+// Empty-tile skip: when the macrocell majorant of the current tile is exactly
+// 0, the whole tile is provably clear, so we advance to the next COARSE tile
+// boundary in one step adding 0 tau. This is tau-exact (an empty region
+// contributes 0 regardless of step granularity) and is where the GPU speed
+// win over cell-by-cell stepping comes from. Non-empty tiles fall back to the
+// exact fine-cell DDA, matching the CPU bit-for-budget.
+inline float field_tau_along(device const float* fld, float3 p0, float3 dir, float t_max) {
+    if (t_max <= 0.0f) return 0.0f;
+    float tau = 0.0f;
+    float t = 0.0f;
+    float min_step = field_min_step(fld);
+    for (uint iter = 0; iter < 40000u; iter++) {
+        if (t >= t_max) break;
+        float3 p = p0 + dir * t;
+        float maj = field_macro_majorant_at(fld, p);
+        if (maj == 0.0f) {
+            // Provably empty tile: skip to the next coarse boundary, tau += 0.
+            float step = max(field_distance_to_next_tile_boundary(fld, p, dir), min_step);
+            t = min(t + step, t_max);
+            continue;
+        }
+        // Outside the footprint (maj < 0) sigma depends only on altitude:
+        // step radially (tau-exact) and skip the useless lat/lon crossings.
+        float step = (maj < 0.0f)
+            ? max(field_distance_to_next_radial_boundary(fld, p, dir), min_step)
+            : max(field_distance_to_next_boundary(fld, p, dir), min_step);
+        float t_next = min(t + step, t_max);
+        float3 mid = p0 + dir * ((t + t_next) * 0.5f);
+        tau += field_sigma_at(fld, mid) * (t_next - t);
+        t = t_next;
+    }
+    return tau;
+}
+
+// Inverse of field_tau_along: parameter t where accumulated cloud tau
+// reaches tau_target, or a negative sentinel if the segment ends first
+// (advance_to_tau). Shares the traversal exactly.
+inline float field_advance_to_tau(device const float* fld, float3 p0, float3 dir,
+                                  float t_max, float tau_target) {
+    if (tau_target <= 0.0f) return 0.0f;
+    float tau = 0.0f;
+    float t = 0.0f;
+    float min_step = field_min_step(fld);
+    for (uint iter = 0; iter < 40000u; iter++) {
+        if (t >= t_max) return -1.0f;
+        float3 p = p0 + dir * t;
+        float maj = field_macro_majorant_at(fld, p);
+        if (maj == 0.0f) {
+            // Empty tile: dtau = 0 throughout, so no collision can land here.
+            // Skip to the next coarse boundary (tau unchanged).
+            float step = max(field_distance_to_next_tile_boundary(fld, p, dir), min_step);
+            t = min(t + step, t_max);
+            continue;
+        }
+        // Outside the footprint (maj < 0) sigma depends only on altitude: a
+        // radial-shell segment has constant sigma, so the linear collision
+        // inversion below stays exact while skipping the lat/lon crossings.
+        float step = (maj < 0.0f)
+            ? max(field_distance_to_next_radial_boundary(fld, p, dir), min_step)
+            : max(field_distance_to_next_boundary(fld, p, dir), min_step);
+        float t_next = min(t + step, t_max);
+        float3 mid = p0 + dir * ((t + t_next) * 0.5f);
+        float sigma = field_sigma_at(fld, mid);
+        float dtau = sigma * (t_next - t);
+        if (tau + dtau >= tau_target) {
+            return t + (tau_target - tau) / max(sigma, 1e-30f);
+        }
+        tau += dtau;
+        t = t_next;
+    }
+    return -1.0f;
+}
+
 // Dispatch params: 4 x vec4
-// vec4(obs_x, obs_y, obs_z, pad)
+// vec4(obs_x, obs_y, obs_z, field_present)
 // vec4(view_x, view_y, view_z, pad)
 // vec4(sun_x, sun_y, sun_z, pad)
 // vec4(photons_bits, secondary_bits, seed_lo_bits, seed_hi_bits)
 inline float3 read_observer(device const float* params) {
     return float3(params[0], params[1], params[2]);
+}
+inline bool read_field_present(device const float* params) {
+    return params[3] != 0.0f;
 }
 inline float3 read_view_dir(device const float* params) {
     return float3(params[4], params[5], params[6]);
@@ -823,6 +1241,79 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
     return fast::exp(-tau) * cloud_diffuse_transmittance(atm, tau_cloud);
 }
 
+// Field-aware shadow ray (Stage 3): the gray cloud channel is delta-tracked
+// explicitly in the chains, so every transmittance leg uses Beer-Lambert
+// exp(-tau_cloud) with tau_cloud integrated by the field DDA over each
+// straight in-shell segment (pos/dir taken BEFORE the refraction step,
+// matching the CPU's cloud_tau_segment call site). Port of
+// shadow_ray_transmittance(field, CloudTransmittance::BeerLambert).
+float shadow_ray_transmittance_field(device const float* atm, device const float* fld,
+                                     bool field_present, float3 start_pos,
+                                     float3 sun_dir, uint wl_idx) {
+    if (!field_present) {
+        return shadow_ray_transmittance(atm, start_pos, sun_dir, wl_idx);
+    }
+    uint ns = atm_num_shells(atm);
+    float surface_radius = atm[ATM_SHELLS_START];
+
+    float p_proj = dot(start_pos, sun_dir);
+    if (p_proj < 0.0f) {
+        float3 cross_ps = cross(start_pos, sun_dir);
+        float perp_dist_sq = dot(cross_ps, cross_ps);
+        if (perp_dist_sq < surface_radius * surface_radius) {
+            return 0.0f;
+        }
+    }
+
+    float3 pos = start_pos;
+    float3 dir = sun_dir;
+    float tau = 0.0f;
+    float tau_cloud = 0.0f;
+
+    int sidx = shell_index_binary(atm, length(pos));
+    if (sidx < 0) return 1.0f;
+    uint us = uint(sidx);
+
+    for (uint iter = 0; iter < 200; iter++) {
+        uint shell_base = ATM_SHELLS_START + us * ATM_SHELL_STRIDE;
+        float r_inner = atm[shell_base];
+        float r_outer = atm[shell_base + 1];
+        float extinction = atm[ATM_OPTICS_START + (us * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
+
+        ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
+        if (!bnd.found) break;
+
+        tau += extinction * bnd.dist;
+        // Cloud tau for this straight segment: pos/dir BEFORE refraction.
+        tau_cloud += field_tau_along(fld, pos, dir, bnd.dist);
+
+        float3 boundary_pos = pos + dir * bnd.dist;
+        float target_r = bnd.is_outward ? r_outer : r_inner;
+        float bp_r = length(boundary_pos);
+        if (bp_r > 0.0f) boundary_pos *= (target_r / bp_r);
+
+        float inv_target_r = 1.0f / target_r;
+        float n_from = read_refractive_index(atm, us);
+        uint next_shell = bnd.is_outward ? us + 1 : us - 1;
+        float n_to = (next_shell < ns) ? read_refractive_index(atm, next_shell) : 1.0f;
+        dir = refract_at_boundary_r(dir, boundary_pos, inv_target_r, n_from, n_to);
+
+        float3 radial = boundary_pos * inv_target_r;
+        float nudge_sign = bnd.is_outward ? 1.0f : -1.0f;
+        pos = boundary_pos + radial * (nudge_sign * BOUNDARY_NUDGE_M);
+
+        if (!bnd.is_outward && target_r <= surface_radius + 1.0f) {
+            return 0.0f;
+        }
+        if (next_shell >= ns) break;
+        us = next_shell;
+        if (tau > 50.0f) return 0.0f;
+    }
+
+    // Clear-air Beer-Lambert x cloud Beer-Lambert (explicit scattering).
+    return fast::exp(-tau) * fast::exp(-tau_cloud);
+}
+
 // ============================================================================
 // Sampling functions
 // ============================================================================
@@ -1414,7 +1905,8 @@ AdvanceResult advance_to_optical_depth(device const float* atm, float3 start_pos
 // Returns float4: [I, Q, U, V] total Stokes contribution.
 // ============================================================================
 
-float4 trace_secondary_chain(device const float* atm, float3 start_pos,
+float4 trace_secondary_chain(device const float* atm, device const float* fld,
+                             bool field_present, float3 start_pos,
                              float3 sun_dir, uint wl_idx,
                              ShellOptics start_optics, float3 prev_dir_in,
                              SecondarySetup setup,
@@ -1480,7 +1972,10 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         bool forced_this_bounce = false;
         float tau_max = 0.0f;
 
-        if (setup.use_forced != 0u) {
+        // Forced mode is disabled when a 3D cloud field is present: the gas
+        // forced proposal cannot compose unbiasedly with the gray cloud
+        // channel (matches the CPU `use_forced && field.is_none()` gate).
+        if (setup.use_forced != 0u && !field_present) {
             ScoutResult scout = scout_tau_to_boundary(atm, pos, current_dir, wl_idx);
             tau_max = scout.tau;
             // Force scatter only when path exits to space, optical depth is
@@ -1495,6 +1990,12 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
         }
 
         uint scatter_shell = 0;
+        // Gray cloud channel: a cloud collision is a distinct vertex type
+        // (pure depolarizing HG scatter, no SSA, no weight change). When set,
+        // g_cloud_here carries the local delta-scaled asymmetry to the shared
+        // NEE / direction-sampling block below.
+        bool cloud_collision = false;
+        float g_cloud_here = 0.0f;
 
         if (forced_this_bounce) {
             // Upfront forced scattering (unbiased): no analog walk, no double-counting
@@ -1507,8 +2008,11 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
             pos = adv.pos;
             current_dir = adv.dir;
             scatter_shell = adv.shell_idx;
-        } else {
+        } else if (!field_present) {
             // Analog scatter: standard shell-by-shell free-path walk
+            // (legacy 1D shell-cloud path, unchanged: Eddington diffuse
+            // transmittance handled by shadow_ray_transmittance / the LOS
+            // prefix; no gray cloud channel).
             bool scatter_found = false;
 
             for (uint step = 0; step < 200; step++) {
@@ -1652,29 +2156,161 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
             }
 
             if (!scatter_found) break; // chain terminates: escaped atmosphere
+        } else {
+            // Analog scatter WITH the gray cloud channel (decomposition
+            // tracking; port of trace_secondary_chain's field path). The gas
+            // channel keeps the exponential transform; a separate gray cloud
+            // Poisson process races over each segment, the shorter free flight
+            // wins. A cloud collision is pure HG scatter (no SSA, no weight
+            // change). The cloud budget is drawn ONCE per free flight from the
+            // SAME rng stream, carried (undiminished by gas events) across
+            // shell crossings, redrawn only after a collision or ground bounce.
+            bool scatter_found = false;
+            uint found_shell = 0u;
+            // tau_c_remaining = -ln(1 - u + 1e-30), one draw at flight start.
+            float tau_c_remaining = -log(1.0f - xorshift_f32(rng) + 1e-30f);
+
+            for (uint step = 0; step < 200; step++) {
+                float r = length(pos);
+                int sidx = shell_index_binary(atm, r);
+                if (sidx < 0) break;
+
+                uint us = uint(sidx);
+                ShellGeom sh = read_shell(atm, us);
+                ShellOptics op = read_optics(atm, us, wl_idx);
+
+                ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
+                if (!bnd.found) break;
+
+                // Gas free path (exponential transform on the gas channel);
+                // clear air just walks to the boundary (free_path = INF, no
+                // gas tau draw, matching the CPU's sigma < 1e-20 branch).
+                float sigma = op.extinction;
+                float cos_bias = 0.0f;
+                float sigma_prime = sigma;
+                float free_path = INFINITY;
+                if (sigma >= 1e-20f) {
+                    cos_bias = dot(current_dir, setup.term_axis_dir);
+                    sigma_prime = sigma * (1.0f - setup.alpha_et * cos_bias);
+                    if (sigma_prime <= 0.0f) sigma_prime = sigma;
+                    float xi = xorshift_f32(rng);
+                    free_path = -log(1.0f - xi + 1e-30f) / sigma_prime;
+                }
+
+                // Race the gray cloud channel over the segment up to the gas
+                // event (gas scatter at free_path or boundary crossing).
+                float gas_cap = min(free_path, bnd.dist);
+                float cloud_dist = field_advance_to_tau(fld, pos, current_dir, gas_cap, tau_c_remaining);
+                if (cloud_dist >= 0.0f) {
+                    // Cloud wins. ET gas weight correction for the distance
+                    // actually travelled (gray cloud ratio = 1).
+                    if (setup.alpha_et > 0.0f && sigma >= 1e-20f) {
+                        float et_arg = -setup.alpha_et * sigma * cos_bias * cloud_dist;
+                        if (fabs(et_arg) < 80.0f) weight *= exp(et_arg);
+                        else { weight = 0.0f; }
+                    }
+                    if (!isfinite(weight)) break;
+                    pos = pos + current_dir * cloud_dist;
+                    g_cloud_here = field_g_at(fld, pos);
+                    found_shell = us;
+                    scatter_found = true;
+                    cloud_collision = true;
+                    break;
+                } else {
+                    // No cloud collision in this segment: consume its cloud tau.
+                    tau_c_remaining -= field_tau_along(fld, pos, current_dir, gas_cap);
+                }
+
+                if (free_path >= bnd.dist) {
+                    if (setup.alpha_et > 0.0f && sigma >= 1e-20f) {
+                        float et_arg = -setup.alpha_et * sigma * cos_bias * bnd.dist;
+                        if (fabs(et_arg) < 80.0f) weight *= exp(et_arg);
+                        else { weight = 0.0f; }
+                    }
+                    if (!isfinite(weight)) break;
+
+                    float3 boundary_pos = pos + current_dir * bnd.dist;
+                    boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
+
+                    // Ground reflection.
+                    if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
+                        float3 normal = normalize(boundary_pos);
+                        float cos_sun_ground = dot(sun_dir, normal);
+                        if (cos_sun_ground > 0.0f) {
+                            float t_sun_gb = shadow_ray_transmittance_field(atm, fld, field_present, boundary_pos, sun_dir, wl_idx);
+                            if (t_sun_gb > 1e-30f) {
+                                float albedo_nee = read_albedo(atm, wl_idx);
+                                float nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
+                                if (isfinite(nee_gb)) total_I.add(nee_gb);
+                            }
+                        }
+                        float albedo = read_albedo(atm, wl_idx);
+                        weight *= albedo;
+                        if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
+                        prev_dir = current_dir;
+                        current_dir = sample_hemisphere(normal, rng);
+                        pos = radial_nudge(boundary_pos, true);
+                        stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
+                        // New free flight: redraw the cloud budget.
+                        tau_c_remaining = -log(1.0f - xorshift_f32(rng) + 1e-30f);
+                        continue;
+                    }
+
+                    // Refract and cross into the next shell; the cloud budget
+                    // carries over undiminished by the crossing.
+                    float n_from = read_refractive_index(atm, us);
+                    uint next_s = bnd.is_outward ? us + 1 : us - 1;
+                    float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
+                    current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
+                    pos = radial_nudge(boundary_pos, bnd.is_outward);
+                    continue;
+                }
+
+                // Gas scatter within this shell.
+                if (setup.alpha_et > 0.0f && sigma >= 1e-20f) {
+                    float et_arg = -setup.alpha_et * sigma * cos_bias * free_path;
+                    if (fabs(et_arg) < 80.0f) weight *= (sigma / sigma_prime) * exp(et_arg);
+                    else { weight = 0.0f; }
+                }
+                if (!isfinite(weight)) break;
+                pos = pos + current_dir * free_path;
+                found_shell = us;
+                scatter_found = true;
+                break;
+            }
+
+            if (!scatter_found) break;
+            scatter_shell = found_shell;
         }
 
         ShellOptics op = read_optics(atm, scatter_shell, wl_idx);
 
-        // Apply SSA BEFORE NEE: the NEE connection is a scattering
-        // interaction at this vertex (matches the corrected CPU chains;
-        // SSA-after-NEE overestimated each NEE by 1/ssa).
-        weight *= op.ssa;
+        // SSA: a cloud collision is pure scattering (absorption folded out of
+        // the field), so no SSA factor; a gas collision carries the gas
+        // single-scattering albedo as before.
+        if (!cloud_collision) {
+            weight *= op.ssa;
+        }
 
-        // NEE: apply Mueller to photon's actual Stokes state
+        // NEE. A cloud vertex is a depolarizing HG (phase on I, output
+        // unpolarized); a gas vertex applies the Mueller matrix to the
+        // photon's actual Stokes state.
         if (isfinite(weight) && fabs(weight) > 1e-30f) {
-            float t_sun_sec = shadow_ray_transmittance(atm, pos, sun_dir, wl_idx);
+            float t_sun_sec = shadow_ray_transmittance_field(atm, fld, field_present, pos, sun_dir, wl_idx);
             if (t_sun_sec > 1e-30f) {
                 float cos_angle_nee = clamp(dot(sun_dir, current_dir), -1.0f, 1.0f);
-                float A_nee, B_nee, C_nee;
-                stokes_ABC(cos_angle_nee, op, A_nee, B_nee, C_nee);
-
-                float cos2phi_nee, sin2phi_nee;
-                scattering_plane_rotation(prev_dir, current_dir, -sun_dir, cos2phi_nee, sin2phi_nee);
-                // Guard against NaN from degenerate geometry
-                if (!isfinite(cos2phi_nee)) { cos2phi_nee = 1.0f; sin2phi_nee = 0.0f; }
-
-                float4 nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
+                float4 nee_stokes;
+                if (cloud_collision) {
+                    float p = henyey_greenstein_phase(cos_angle_nee, g_cloud_here);
+                    nee_stokes = float4(stokes.x * p, 0.0f, 0.0f, 0.0f);
+                } else {
+                    float A_nee, B_nee, C_nee;
+                    stokes_ABC(cos_angle_nee, op, A_nee, B_nee, C_nee);
+                    float cos2phi_nee, sin2phi_nee;
+                    scattering_plane_rotation(prev_dir, current_dir, -sun_dir, cos2phi_nee, sin2phi_nee);
+                    if (!isfinite(cos2phi_nee)) { cos2phi_nee = 1.0f; sin2phi_nee = 0.0f; }
+                    nee_stokes = scatter_stokes(A_nee, B_nee, C_nee, cos2phi_nee, sin2phi_nee, stokes);
+                }
 
                 float scale = weight * t_sun_sec / (4.0f * PI);
                 if (isfinite(scale)) {
@@ -1692,7 +2328,21 @@ float4 trace_secondary_chain(device const float* atm, float3 start_pos,
 
         if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
 
-        // Sample new direction
+        // Sample the new direction. A cloud vertex scatters from the gray HG
+        // lobe (2 dir draws: cos-theta, phi) and resets polarization; a gas
+        // vertex samples the Rayleigh/HG mixture and updates Stokes.
+        if (cloud_collision) {
+            float ct_cloud = sample_henyey_greenstein(xorshift_f32(rng), g_cloud_here);
+            float phi_cloud = 2.0f * PI * xorshift_f32(rng);
+            float3 d_cloud = scatter_direction(current_dir, ct_cloud, phi_cloud);
+            if (!isfinite(d_cloud.x) || (length(d_cloud) < 1e-10f)) break;
+            prev_dir = current_dir;
+            current_dir = d_cloud;
+            stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
+            continue;
+        }
+
+        // Sample new direction (gas vertex)
         float cos_theta = clamp(
             (xorshift_f32(rng) < op.rayleigh_fraction)
                 ? sample_rayleigh_analytic(xorshift_f32(rng))
@@ -1928,7 +2578,10 @@ kernel void hybrid_scatter(
 
             KahanAccum mc_I, mc_Q, mc_U, mc_V;
             for (uint ray = 0; ray < secondary_rays; ray++) {
-                float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
+                // Legacy v1 kernel (no PSO, no field): pass atm as a dummy
+                // field pointer with field_present = false (never read).
+                float4 chain = trace_secondary_chain(atm, atm, false,
+                                                      scatter_pos, sun_dir, wl_idx,
                                                       my_op, view_dir, setup,
                                                       ray, secondary_rays, rng);
                 mc_I.add(chain.x);
@@ -2059,6 +2712,7 @@ kernel void hybrid_scatter_v2(
     device const float* atm         [[buffer(0)]],
     device const float* params      [[buffer(1)]],
     device float*       output      [[buffer(2)]],
+    device const float* fld         [[buffer(3)]],
     uint3 tg_pos    [[threadgroup_position_in_grid]],
     uint3 tid_in_tg [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -2079,6 +2733,7 @@ kernel void hybrid_scatter_v2(
     float3 view_dir     = read_view_dir(params);
     float3 sun_dir      = read_sun_dir(params);
     uint secondary_rays = read_secondary_rays(params);
+    bool field_present  = read_field_present(params);
 
     threadgroup uint shared_valid;
     threadgroup float shared_ds;
@@ -2151,7 +2806,13 @@ kernel void hybrid_scatter_v2(
                     if (sj_idx >= 0) {
                         ShellOptics oj = read_optics(atm, uint(sj_idx), wl_idx);
                         tau_obs += oj.extinction * ds;
-                        tau_cloud_obs += read_cloud_extinction(atm, uint(sj_idx)) * ds;
+                        // Cloud: per-step midpoint extinction (field sigma_at
+                        // when present, else the 1D shell array), matching the
+                        // CPU cloud_ext_at point-sample quadrature.
+                        float cloud_ext_j = field_present
+                            ? field_sigma_at(fld, pj)
+                            : read_cloud_extinction(atm, uint(sj_idx));
+                        tau_cloud_obs += cloud_ext_j * ds;
                     }
                 }
             }
@@ -2159,11 +2820,18 @@ kernel void hybrid_scatter_v2(
             // Single exp is more precise and faster than two multiplied exps.
             // exp(a)*exp(b) = exp(a+b), but the product loses precision
             // when both are small (the f32 multiply rounds twice).
-            // Cloud portion: Eddington diffuse (single-representation).
-            float my_cloud_ds =
-                read_cloud_extinction(atm, uint(my_sidx)) * ds;
-            t_obs = exp(-(tau_obs + my_op.extinction * ds * 0.5f))
-                  * cloud_diffuse_transmittance(atm, tau_cloud_obs + my_cloud_ds * 0.5f);
+            float cloud_ext_step = field_present
+                ? field_sigma_at(fld, scatter_pos)
+                : read_cloud_extinction(atm, uint(my_sidx));
+            float my_cloud_ds = cloud_ext_step * ds;
+            // Cloud transmittance on the eye LOS: Beer-Lambert in chain mode
+            // (explicit in-cloud scattering supplies the diffusion T_diff used
+            // to approximate; mixing them double-counts), Eddington diffuse for
+            // the legacy 1D path.
+            float cloud_t_obs = field_present
+                ? exp(-(tau_cloud_obs + my_cloud_ds * 0.5f))
+                : cloud_diffuse_transmittance(atm, tau_cloud_obs + my_cloud_ds * 0.5f);
+            t_obs = exp(-(tau_obs + my_op.extinction * ds * 0.5f)) * cloud_t_obs;
             if (t_obs < 1e-30f) {
                 valid = false;
             } else if (secondary_rays > 0u) {
@@ -2209,7 +2877,7 @@ kernel void hybrid_scatter_v2(
     // Multiply by secondary_rays because CPU divides ALL output by secondary_rays.
     // SS is deterministic and must survive that division unchanged.
     if (valid && ray_lane == 0) {
-        float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
+        float t_sun = shadow_ray_transmittance_field(atm, fld, field_present, scatter_pos, sun_dir, wl_idx);
         if (t_sun > 1e-30f) {
             float cos_theta_1 = dot(sun_dir, view_dir);
             float A_1, B_1, C_1;
@@ -2240,7 +2908,8 @@ kernel void hybrid_scatter_v2(
         KahanAccum mc_I;
         for (uint ray = ray_lane; ray < secondary_rays; ray += HYBRID_V2_THREADGROUP_SIZE) {
             uint global_ray = ray + ray_offset;
-            float4 chain = trace_secondary_chain(atm, scatter_pos, sun_dir, wl_idx,
+            float4 chain = trace_secondary_chain(atm, fld, field_present,
+                                                  scatter_pos, sun_dir, wl_idx,
                                                   my_op, view_dir, setup,
                                                   global_ray, global_total_rays, rng);
             float val = chain.x * scale_m;
@@ -2283,6 +2952,36 @@ kernel void hybrid_scatter_v2(
         float result = final_sum.result();
         output[wl_idx * HYBRID_LOS_STEPS + step_idx] = isfinite(result) ? result : 0.0f;
     }
+}
+
+// ============================================================================
+// Kernel 3f: field_tau_probe (G-DDA-PARITY)
+//
+// One thread per ray. Integrates the cloud optical depth along the ray via
+// the device-side field DDA (field_tau_along) so the pure geometry can be
+// compared bit-for-budget against the CPU tau_along. No Monte Carlo.
+//
+// rays buffer: 8 f32 per ray = vec4(p0.x, p0.y, p0.z, t_max), vec4(dir.xyz, _)
+// output buffer: tau[ray]
+// ============================================================================
+
+kernel void field_tau_probe(
+    device const float* fld    [[buffer(0)]],
+    device const float* rays   [[buffer(1)]],
+    device float*       output [[buffer(2)]],
+    uint                tid    [[thread_position_in_grid]]
+) {
+    // Header gate on the field buffer (mirrors the atmosphere gate).
+    if (as_type<uint>(fld[FIELD_HDR_MAGIC]) != BUFFER_MAGIC
+        || as_type<uint>(fld[FIELD_HDR_VERSION]) != BUFFER_VERSION) {
+        if (tid == 0u) output[0] = HEADER_SENTINEL;
+        return;
+    }
+    uint base = tid * 8u;
+    float3 p0  = float3(rays[base + 0], rays[base + 1], rays[base + 2]);
+    float  tmx = rays[base + 3];
+    float3 dir = float3(rays[base + 4], rays[base + 5], rays[base + 6]);
+    output[tid] = field_tau_along(fld, p0, dir, tmx);
 }
 
 // ============================================================================

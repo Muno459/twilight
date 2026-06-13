@@ -1623,6 +1623,7 @@ dependencies = [
  "twilight-data",
  "twilight-skyglow",
  "twilight-threshold",
+ "twilight-weather",
 ]
 
 [[package]]
