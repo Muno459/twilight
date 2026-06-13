@@ -25,6 +25,35 @@ use crate::geometry::{
 };
 use crate::scattering::{henyey_greenstein_phase, rayleigh_phase};
 
+/// How a deterministic leg attenuates the cloud channel.
+///
+/// The same shadow-ray / connection geometry serves two integrators with
+/// DIFFERENT cloud physics, so the choice is an explicit argument, never a
+/// global:
+/// - `Diffuse`: the Eddington two-stream `T_diff(tau_cloud)`. This is the
+///   diffusion CLOSURE for `ScatteringMode::Single`, which cannot scatter
+///   in cloud explicitly; the Stage-1 gates pin it.
+/// - `BeerLambert`: pure `exp(-tau_cloud)`. The chain estimators
+///   (MC / Hybrid) scatter in cloud EXPLICITLY, so every transmittance the
+///   same estimator uses must be direct extinction, or diffused light is
+///   counted twice (the no-double-counting invariant).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CloudTransmittance {
+    Diffuse,
+    BeerLambert,
+}
+
+impl CloudTransmittance {
+    /// Apply the cloud attenuation factor for an accumulated cloud tau.
+    #[inline]
+    pub fn apply(self, atm: &AtmosphereModel, tau_cloud: f64) -> f64 {
+        match self {
+            CloudTransmittance::Diffuse => atm.cloud_diffuse_transmittance(tau_cloud),
+            CloudTransmittance::BeerLambert => libm::exp(-tau_cloud),
+        }
+    }
+}
+
 /// Maximum number of integration steps along the line of sight.
 const MAX_LOS_STEPS: usize = 200;
 
@@ -221,7 +250,9 @@ pub fn single_scatter_radiance(
         }
 
         // Transmittance from sun to scatter point (shadow ray)
-        let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx, field);
+        let t_sun = shadow_ray_transmittance(
+            atm, scatter_pos, sun_dir, wavelength_idx, field, CloudTransmittance::Diffuse,
+        );
 
         if t_sun < 1e-30 {
             // This point is in shadow (sun below local horizon)
@@ -272,7 +303,10 @@ pub fn single_scatter_radiance(
             // Sun must be above the local horizon at the ground point
             if cos_sun_incidence > 0.0 {
                 let t_sun_ground =
-                    shadow_ray_transmittance(atm, ground_pos, sun_dir, wavelength_idx, field);
+                    shadow_ray_transmittance(
+                        atm, ground_pos, sun_dir, wavelength_idx, field,
+                        CloudTransmittance::Diffuse,
+                    );
                 // Full LOS optical depth to the ground; cloud portion diffuse.
                 let t_obs_ground = libm::exp(-tau_obs)
                     * atm.cloud_diffuse_transmittance(tau_cloud_obs);
@@ -303,6 +337,7 @@ pub fn shadow_ray_transmittance(
     sun_dir: Vec3,
     wavelength_idx: usize,
     field: Option<&Cloud3DField>,
+    cloud_mode: CloudTransmittance,
 ) -> f64 {
     let surface_radius = atm.surface_radius();
     let num_shells = atm.num_shells;
@@ -373,8 +408,8 @@ pub fn shadow_ray_transmittance(
         }
     }
 
-    // Clear-air part: Beer-Lambert. Cloud part: Eddington diffuse.
-    libm::exp(-tau) * atm.cloud_diffuse_transmittance(tau_cloud)
+    // Clear-air part: Beer-Lambert. Cloud part: mode-dependent.
+    libm::exp(-tau) * cloud_mode.apply(atm, tau_cloud)
 }
 
 /// Compute single-scattering radiance for all wavelengths simultaneously.
@@ -435,7 +470,9 @@ pub fn single_scatter_spectrum(
 
         // Shadow ray transmittance per wavelength
         // (compute once per step, reuse geometry)
-        let t_sun = shadow_ray_transmittance_spectrum(atm, scatter_pos, sun_dir, num_wl, field);
+        let t_sun = shadow_ray_transmittance_spectrum(
+            atm, scatter_pos, sun_dir, num_wl, field, CloudTransmittance::Diffuse,
+        );
 
         let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
         let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
@@ -478,7 +515,9 @@ pub fn single_scatter_spectrum(
 
         if cos_sun_incidence > 0.0 {
             let t_sun_ground =
-                shadow_ray_transmittance_spectrum(atm, ground_pos, sun_dir, num_wl, field);
+                shadow_ray_transmittance_spectrum(
+                    atm, ground_pos, sun_dir, num_wl, field, CloudTransmittance::Diffuse,
+                );
 
             for w in 0..num_wl {
                 let albedo = atm.surface_albedo[w];
@@ -509,6 +548,7 @@ pub fn shadow_ray_transmittance_spectrum(
     sun_dir: Vec3,
     num_wl: usize,
     field: Option<&Cloud3DField>,
+    cloud_mode: CloudTransmittance,
 ) -> [f64; 64] {
     let surface_radius = atm.surface_radius();
     let num_shells = atm.num_shells;
@@ -579,7 +619,7 @@ pub fn shadow_ray_transmittance_spectrum(
         }
     }
 
-    let t_cloud = atm.cloud_diffuse_transmittance(tau_cloud);
+    let t_cloud = cloud_mode.apply(atm, tau_cloud);
     let mut result = [0.0f64; 64];
     for (w, res_w) in result.iter_mut().enumerate().take(num_wl) {
         let tau_clear = tau[w];
@@ -609,6 +649,7 @@ pub fn transmittance_between_points_spectrum(
     to: Vec3,
     num_wl: usize,
     field: Option<&Cloud3DField>,
+    cloud_mode: CloudTransmittance,
 ) -> [f64; 64] {
     let diff = Vec3::new(to.x - from.x, to.y - from.y, to.z - from.z);
     let dist_total = diff.length();
@@ -653,7 +694,7 @@ pub fn transmittance_between_points_spectrum(
         }
     }
 
-    let t_cloud = atm.cloud_diffuse_transmittance(tau_cloud);
+    let t_cloud = cloud_mode.apply(atm, tau_cloud);
     let mut result = [0.0f64; 64];
     for (w, res_w) in result.iter_mut().enumerate().take(num_wl) {
         *res_w = if tau[w] > 50.0 {
@@ -1271,7 +1312,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         // All n are 1.0 by default, so refraction is identity
-        let t = shadow_ray_transmittance(&atm, pos, sun, 1, None);
+        let t = shadow_ray_transmittance(&atm, pos, sun, 1, None, CloudTransmittance::Diffuse);
         assert!(
             (0.0..=1.0).contains(&t),
             "Transmittance should be in [0,1], got {}",
@@ -1287,7 +1328,7 @@ mod tests {
         let pos = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let t = shadow_ray_transmittance(&atm, pos, sun, 0, None);
+        let t = shadow_ray_transmittance(&atm, pos, sun, 0, None, CloudTransmittance::Diffuse);
         assert!(
             (0.0..=1.0).contains(&t),
             "Transmittance with refraction should be in [0,1], got {}",
@@ -1309,8 +1350,8 @@ mod tests {
         // Use a near-horizon sun angle where refraction matters most
         let sun = crate::geometry::solar_direction_ecef(90.5, 180.0, 0.0, 0.0);
 
-        let t_refract = shadow_ray_transmittance(&atm_refract, pos, sun, 0, None);
-        let t_straight = shadow_ray_transmittance(&atm_straight, pos, sun, 0, None);
+        let t_refract = shadow_ray_transmittance(&atm_refract, pos, sun, 0, None, CloudTransmittance::Diffuse);
+        let t_straight = shadow_ray_transmittance(&atm_straight, pos, sun, 0, None, CloudTransmittance::Diffuse);
 
         // Both should be valid transmittances
         assert!((0.0..=1.0).contains(&t_refract));
@@ -1427,7 +1468,7 @@ mod tests {
         let pos = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
         let sun = Vec3::new(1.0, 0.0, 0.0); // directly overhead
 
-        let t = shadow_ray_transmittance(&atm, pos, sun, 0, None);
+        let t = shadow_ray_transmittance(&atm, pos, sun, 0, None, CloudTransmittance::Diffuse);
         assert!(
             (t - 1.0).abs() < 1e-10,
             "Zero-extinction transmittance should be 1.0, got {}",
@@ -1445,7 +1486,7 @@ mod tests {
         // Direction straight down
         let sun_down = Vec3::new(-1.0, 0.0, 0.0);
 
-        let t = shadow_ray_transmittance(&atm, pos, sun_down, 0, None);
+        let t = shadow_ray_transmittance(&atm, pos, sun_down, 0, None, CloudTransmittance::Diffuse);
         assert!(
             t < 1e-20,
             "Shadow ray hitting ground should have zero transmittance, got {}",

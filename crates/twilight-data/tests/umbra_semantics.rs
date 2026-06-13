@@ -5,7 +5,7 @@
 //! straight chord's (by <= R*(n0-1) ~ 1.9 km), so any chord already
 //! geometrically below the surface is blocked on the CPU too.
 use twilight_core::geometry::Vec3;
-use twilight_core::single_scatter::shadow_ray_transmittance;
+use twilight_core::single_scatter::{shadow_ray_transmittance, CloudTransmittance};
 
 #[test]
 fn straight_chord_below_surface_is_blocked_on_cpu() {
@@ -21,7 +21,7 @@ fn straight_chord_below_surface_is_blocked_on_cpu() {
         let sina = (b / p.length()).min(1.0);
         let cosa = -(1.0 - sina * sina).sqrt();
         let d = Vec3::new(cosa, sina, 0.0);
-        let t = shadow_ray_transmittance(&atm, p, d, 0, None);
+        let t = shadow_ray_transmittance(&atm, p, d, 0, None, CloudTransmittance::Diffuse);
         eprintln!("straight perigee {dip_km:+6.1} km -> CPU T = {t:.3e}");
         if dip_km < -0.5 {
             assert!(

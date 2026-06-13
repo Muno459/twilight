@@ -376,6 +376,74 @@ pub fn cloud_ext_at(
     }
 }
 
+/// Outcome of racing the gray cloud channel over a straight segment
+/// `pos + t*dir`, `t` in `[0, seg_len]`, against a remaining cloud
+/// optical-depth budget `tau_c_remaining`.
+///
+/// Decomposition tracking: a chain samples gas and cloud free flights as
+/// two independent Poisson processes; the shorter wins. The cloud channel
+/// is GRAY (wavelength flat) and (unlike the gas channel) carries no
+/// exponential transform. Its collision distance is found by EXACT
+/// inversion of the piecewise-constant cloud optical depth, so no majorant
+/// rejection loop is needed.
+#[derive(Clone, Copy, Debug)]
+pub enum CloudFlight {
+    /// The cloud collision fires inside the segment, at distance `dist`.
+    Collide { dist: f64 },
+    /// No cloud collision in the segment; `tau_consumed` cloud optical
+    /// depth was crossed (subtract from the running budget and continue
+    /// into the next shell segment with the SAME budget, no re-draw).
+    Pass { tau_consumed: f64 },
+}
+
+/// Race the gray cloud channel over one straight in-shell segment.
+///
+/// `tau_c_remaining` is the cloud optical depth still to be consumed
+/// before the next cloud collision (drawn once per free flight as
+/// `-ln(1-u)` and carried, undiminished by gas events, across shell
+/// crossings within that flight). Returns whether the cloud collision
+/// lands in this segment and where, or how much cloud tau the segment
+/// consumed without colliding.
+///
+/// Shares `tau_along` / `advance_to_tau` (field) or the analytic per-shell
+/// extinction (1D fallback) so the in-field and out-of-field cloud models
+/// are one model: in chain mode there is no `T_diff` anywhere on this
+/// path, the cloud is delta-tracked by exact inversion exactly like the
+/// field case.
+#[inline]
+pub fn cloud_flight_segment(
+    atm: &crate::atmosphere::AtmosphereModel,
+    field: Option<&Cloud3DField>,
+    shell_idx: usize,
+    pos: Vec3,
+    dir: Vec3,
+    seg_len: f64,
+    tau_c_remaining: f64,
+) -> CloudFlight {
+    match field {
+        Some(f) => match f.advance_to_tau(pos, dir, seg_len, tau_c_remaining) {
+            Some(dist) => CloudFlight::Collide { dist },
+            None => CloudFlight::Pass {
+                tau_consumed: f.tau_along(pos, dir, seg_len),
+            },
+        },
+        None => {
+            let sigma_c = atm.cloud_extinction[shell_idx];
+            if sigma_c <= 0.0 {
+                return CloudFlight::Pass { tau_consumed: 0.0 };
+            }
+            let dist = tau_c_remaining / sigma_c;
+            if dist <= seg_len {
+                CloudFlight::Collide { dist }
+            } else {
+                CloudFlight::Pass {
+                    tau_consumed: sigma_c * seg_len,
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

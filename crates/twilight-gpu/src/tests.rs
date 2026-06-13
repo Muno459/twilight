@@ -2216,7 +2216,7 @@ fn test_parity_refractive_shadow_ray() {
             let pos_f32 = [scatter_pos.x as f32, 0.0f32, 0.0f32];
 
             for w in 0..3 {
-                let cpu_t = shadow_ray_transmittance(&atm, scatter_pos, sun, w, None);
+                let cpu_t = shadow_ray_transmittance(&atm, scatter_pos, sun, w, None, twilight_core::single_scatter::CloudTransmittance::Diffuse);
                 let gpu_t =
                     crate::parity::shadow_ray_transmittance_f32(&packed, pos_f32, sun_f32, w)
                         as f64;
@@ -2708,7 +2708,7 @@ fn test_parity_ground_reflection() {
     let sun_f32 = [sun.x as f32, sun.y as f32, sun.z as f32];
 
     for w in 0..3 {
-        let cpu_t = shadow_ray_transmittance(&atm, scatter_pos_f64, sun, w, None);
+        let cpu_t = shadow_ray_transmittance(&atm, scatter_pos_f64, sun, w, None, twilight_core::single_scatter::CloudTransmittance::Diffuse);
         let gpu_t =
             crate::parity::shadow_ray_transmittance_f32(&packed, scatter_pos_f32, sun_f32, w);
 
@@ -2738,7 +2738,7 @@ fn test_parity_ground_reflection() {
 
     // Only check red (wl=2) where the path is optically thin enough
     let w = 2; // 700nm, extinction factor 0.3x
-    let cpu_t = shadow_ray_transmittance(&atm, high_pos_f64, sun96, w, None);
+    let cpu_t = shadow_ray_transmittance(&atm, high_pos_f64, sun96, w, None, twilight_core::single_scatter::CloudTransmittance::Diffuse);
     let gpu_t = crate::parity::shadow_ray_transmittance_f32(&packed, high_pos_f32, sun96_f32, w);
 
     assert!(
@@ -2754,7 +2754,7 @@ fn test_parity_ground_reflection() {
 
     // Verify CPU and GPU agree on sign (both positive or both near-zero)
     for w in 0..3 {
-        let cpu_t = shadow_ray_transmittance(&atm, high_pos_f64, sun96, w, None);
+        let cpu_t = shadow_ray_transmittance(&atm, high_pos_f64, sun96, w, None, twilight_core::single_scatter::CloudTransmittance::Diffuse);
         let gpu_t =
             crate::parity::shadow_ray_transmittance_f32(&packed, high_pos_f32, sun96_f32, w);
 
