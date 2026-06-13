@@ -539,6 +539,17 @@ fn trace_transmittance(
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
                 total_optical_depth += optics.extinction * dist;
+                // Already opaque from clear air plus the cloud crossed so far:
+                // the remaining transmittance is below exp(-35) ~ 6e-16, lost in
+                // f32 rounding against any twilight radiance (~1e-5 and down).
+                // Return BEFORE the per-shell field DDA so an opaque shadow ray
+                // (every deep-twilight grazing leg, where the airmass alone is
+                // huge) skips the dominant cost for all remaining shells. The
+                // GPU shadow walk uses the identical combined threshold so the
+                // two backends stay bit-comparable.
+                if total_optical_depth + tau_cloud > 35.0 {
+                    return 0.0;
+                }
                 // Segment start pos/dir, BEFORE the refraction step.
                 tau_cloud += cloud_tau_segment(atm, field, shell_idx, pos, dir, dist);
 

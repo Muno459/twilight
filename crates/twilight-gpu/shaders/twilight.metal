@@ -1284,6 +1284,13 @@ float shadow_ray_transmittance_field(device const float* atm, device const float
         if (!bnd.found) break;
 
         tau += extinction * bnd.dist;
+        // Already opaque from clear air plus the cloud crossed so far: the
+        // remaining transmittance is below exp(-35) ~ 6e-16, lost in f32
+        // rounding against any twilight radiance. Return BEFORE the per-shell
+        // field DDA so an opaque shadow ray (every deep-twilight grazing leg)
+        // skips the dominant cost for the rest of the path. Identical combined
+        // threshold to the CPU trace_transmittance so the backends match.
+        if (tau + tau_cloud > 35.0f) return 0.0f;
         // Cloud tau for this straight segment: pos/dir BEFORE refraction.
         tau_cloud += field_tau_along(fld, pos, dir, bnd.dist);
 
