@@ -24,7 +24,14 @@ pub const BUFFER_MAGIC: u32 = 0x544C_5754;
 /// v2: added refractive_index[MAX_SHELLS] after surface_albedo.
 /// v3: added cloud_extinction[MAX_SHELLS] + cloud_g_scaled (delta-scaled
 ///     cloud scattering for the Eddington diffuse-transmission factor).
-pub const BUFFER_VERSION: u32 = 3;
+/// v4: Stage 3 3D cloud transport. No change to the atmosphere buffer
+///     layout itself, but a SEPARATE packed cloud field buffer
+///     ([`PackedCloudField`], bound at index 3) now carries the voxel
+///     sigma grid, g*, macrocell majorants, background column, and grid
+///     geometry. The version bump forces a re-pack so a stale v3 host
+///     paired with a v4 shader (or vice versa) trips the header gate
+///     loudly instead of silently running the wrong transport.
+pub const BUFFER_VERSION: u32 = 4;
 
 /// Maximum number of light pollution sources in a single dispatch.
 pub const MAX_LIGHT_SOURCES: usize = 2048;
@@ -258,6 +265,117 @@ impl PackedAtmosphere {
     }
 }
 
+// ── Packed 3D cloud field buffer (v4) ───────────────────────────────────
+
+/// Offsets into the packed cloud-field header (f32 slots).
+///
+/// The header is a fixed-size prefix; the four variable-length arrays
+/// (sigma, g_star, macrocell_max, background_column) follow it, and their
+/// start offsets are stored in the header so the shader can locate them.
+pub mod field_offsets {
+    pub const HEADER_MAGIC: usize = 0;
+    pub const HEADER_VERSION: usize = 1;
+    pub const NZ: usize = 2;
+    pub const NLAT: usize = 3;
+    pub const NLON: usize = 4;
+    pub const TILE: usize = 5;
+    pub const NTLAT: usize = 6;
+    pub const NTLON: usize = 7;
+    pub const G_STAR_PRESENT: usize = 8;
+    pub const BG_PRESENT: usize = 9;
+    pub const MACRO_PRESENT: usize = 10;
+    // slot 11 reserved
+    // Geometry (f32): grid spacings and origins.
+    pub const Z0_M: usize = 12;
+    pub const DZ_M: usize = 13;
+    pub const LAT0_DEG: usize = 14;
+    pub const LON0_DEG: usize = 15;
+    pub const DLAT_DEG: usize = 16;
+    pub const DLON_DEG: usize = 17;
+    pub const G_DEFAULT: usize = 18;
+    // slot 19 reserved
+    // Array start offsets (f32 index into the data buffer).
+    pub const SIGMA_OFFSET: usize = 20;
+    pub const G_STAR_OFFSET: usize = 21;
+    pub const MACRO_OFFSET: usize = 22;
+    pub const BG_OFFSET: usize = 23;
+    /// Header length (vec4-aligned: 24 f32 = 6 vec4).
+    pub const HEADER_LEN: usize = 24;
+}
+
+/// Packed 3D cloud field for GPU upload (v4).
+///
+/// All voxel data is f32 (the field's owning slices already are f32). The
+/// grid geometry is packed as f32; the device-side DDA runs in the same
+/// f32 regime as the rest of the shader (the f32 error budget for the tau
+/// prefix and crossing roots is derived in the GPU test module).
+#[derive(Debug, Clone)]
+pub struct PackedCloudField {
+    pub data: Vec<f32>,
+}
+
+impl PackedCloudField {
+    /// Pack a [`twilight_core::cloud_field::Cloud3DField`] view.
+    pub fn pack(field: &twilight_core::cloud_field::Cloud3DField) -> Self {
+        use field_offsets as fo;
+
+        let nz = field.nz;
+        let nlat = field.nlat;
+        let nlon = field.nlon;
+        let tile = field.tile.max(1);
+        let ntlat = nlat.div_ceil(tile);
+        let ntlon = nlon.div_ceil(tile);
+
+        let sigma_len = field.sigma.len();
+        let g_star_len = field.g_star.len();
+        let macro_len = field.macrocell_max.len();
+        let bg_len = field.background_column.len();
+
+        let sigma_off = fo::HEADER_LEN;
+        let g_star_off = sigma_off + sigma_len;
+        let macro_off = g_star_off + g_star_len;
+        let bg_off = macro_off + macro_len;
+        let total = bg_off + bg_len;
+
+        let mut data = vec![0.0f32; total.max(fo::HEADER_LEN)];
+
+        data[fo::HEADER_MAGIC] = f32::from_bits(BUFFER_MAGIC);
+        data[fo::HEADER_VERSION] = f32::from_bits(BUFFER_VERSION);
+        data[fo::NZ] = nz as f32;
+        data[fo::NLAT] = nlat as f32;
+        data[fo::NLON] = nlon as f32;
+        data[fo::TILE] = tile as f32;
+        data[fo::NTLAT] = ntlat as f32;
+        data[fo::NTLON] = ntlon as f32;
+        data[fo::G_STAR_PRESENT] = if g_star_len > 0 { 1.0 } else { 0.0 };
+        data[fo::BG_PRESENT] = if bg_len > 0 { 1.0 } else { 0.0 };
+        data[fo::MACRO_PRESENT] = if macro_len > 0 { 1.0 } else { 0.0 };
+        data[fo::Z0_M] = field.z0_m as f32;
+        data[fo::DZ_M] = field.dz_m as f32;
+        data[fo::LAT0_DEG] = field.lat0_deg as f32;
+        data[fo::LON0_DEG] = field.lon0_deg as f32;
+        data[fo::DLAT_DEG] = field.dlat_deg as f32;
+        data[fo::DLON_DEG] = field.dlon_deg as f32;
+        data[fo::G_DEFAULT] = field.g_default as f32;
+        data[fo::SIGMA_OFFSET] = f32::from_bits(sigma_off as u32);
+        data[fo::G_STAR_OFFSET] = f32::from_bits(g_star_off as u32);
+        data[fo::MACRO_OFFSET] = f32::from_bits(macro_off as u32);
+        data[fo::BG_OFFSET] = f32::from_bits(bg_off as u32);
+
+        data[sigma_off..sigma_off + sigma_len].copy_from_slice(field.sigma);
+        data[g_star_off..g_star_off + g_star_len].copy_from_slice(field.g_star);
+        data[macro_off..macro_off + macro_len].copy_from_slice(field.macrocell_max);
+        data[bg_off..bg_off + bg_len].copy_from_slice(field.background_column);
+
+        PackedCloudField { data }
+    }
+
+    /// Total size in bytes of the GPU buffer.
+    pub fn size_bytes(&self) -> usize {
+        self.data.len() * std::mem::size_of::<f32>()
+    }
+}
+
 // ── Packed solar irradiance ─────────────────────────────────────────────
 
 /// Solar irradiance LUT packed for GPU.
@@ -391,17 +509,21 @@ impl Default for PackedLightSource {
 /// Per-dispatch parameters packed as a uniform/constant buffer.
 ///
 /// Layout (16 f32 = 64 bytes, 4 x vec4):
-/// vec4(observer_x, observer_y, observer_z, _pad)
+/// vec4(observer_x, observer_y, observer_z, field_present)
 /// vec4(view_dir_x, view_dir_y, view_dir_z, _pad)
 /// vec4(sun_dir_x, sun_dir_y, sun_dir_z, _pad)
 /// vec4(photons_per_wl, secondary_rays, rng_seed_lo, rng_seed_hi)
+///
+/// `field_present` is 1.0 when a 3D cloud field buffer is bound and the
+/// chains must take the gray cloud channel (Beer-Lambert), 0.0 for the
+/// legacy 1D shell-cloud path (Eddington diffuse transmittance, unchanged).
 #[derive(Debug, Clone)]
 pub struct PackedDispatchParams {
     pub data: [f32; 16],
 }
 
 impl PackedDispatchParams {
-    /// Pack dispatch parameters from f64 vectors.
+    /// Pack dispatch parameters from f64 vectors (no cloud field).
     pub fn new(
         observer_pos: [f64; 3],
         view_dir: [f64; 3],
@@ -409,6 +531,27 @@ impl PackedDispatchParams {
         photons_per_wl: u32,
         secondary_rays: u32,
         rng_seed: u64,
+    ) -> Self {
+        Self::new_with_field(
+            observer_pos,
+            view_dir,
+            sun_dir,
+            photons_per_wl,
+            secondary_rays,
+            rng_seed,
+            false,
+        )
+    }
+
+    /// Pack dispatch parameters, flagging whether a 3D cloud field is bound.
+    pub fn new_with_field(
+        observer_pos: [f64; 3],
+        view_dir: [f64; 3],
+        sun_dir: [f64; 3],
+        photons_per_wl: u32,
+        secondary_rays: u32,
+        rng_seed: u64,
+        field_present: bool,
     ) -> Self {
         let seed_lo = (rng_seed & 0xFFFF_FFFF) as u32;
         let seed_hi = (rng_seed >> 32) as u32;
@@ -418,7 +561,7 @@ impl PackedDispatchParams {
                 observer_pos[0] as f32,
                 observer_pos[1] as f32,
                 observer_pos[2] as f32,
-                0.0,
+                if field_present { 1.0 } else { 0.0 },
                 view_dir[0] as f32,
                 view_dir[1] as f32,
                 view_dir[2] as f32,

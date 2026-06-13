@@ -97,11 +97,33 @@ agreement, consistent with the forward tier). Twilight side: hybrid,
 | 95 | ~5% | ~3% | 2.2% | PASS (anchor, matches forward tier) |
 | 96 | 10.4% | 11.0% | 1.7% | PASS |
 | 98 | 7.2% | 3.9% | 18.4% | PASS at 450/550 |
-| 100 | 28.1% | 29.9% | 14.8% | consistent twilight deficit - under investigation at 1e8 |
+| 100 | 28.1% | 29.9% | 14.8% | consistent twilight deficit - refined at 1e8 below |
 | 102 | 20.1% | 44.2% | 6.8% | sign-mixed (noise on both sides) |
 | 104 | x7 | x80 | 87% | MYSTIC variance (its own values jump 3 orders between bands) |
 | 106 | - | - | - | MYSTIC zero even backward at 1e7 |
 
-External validation now reaches SZA ~98-100 (was 95). The 1e8-photon
-overnight campaign (MC_BACKWARD_PHOTONS=1e8, TW_DEEP_PHOTONS=16000) is
-the next refinement for 100-104.
+### 1e8-photon refinement (2026-06-13, MC_BACKWARD_PHOTONS=1e8)
+
+The overnight 1e8-photon MYSTIC backward campaign was run to settle
+whether the SZA-100 disagreement was a twilight deficit or referee
+noise. It was largely the latter: with 10x the photons the SZA-100
+disagreement roughly halved in the two bands MYSTIC can still resolve.
+
+| SZA | 450 nm | 550 nm | 650 nm | note |
+|----:|------:|------:|------:|------|
+| 95 | 1.3% | 5.0% | 1.6% | PASS |
+| 96 | 4.2% | 4.7% | 2.4% | PASS |
+| 98 | 1.6% | 1.4% | 3.9% | PASS (tightened from 1e7) |
+| 100 | 13.7% | 13.6% | 28.8% | blue/green halved vs 1e7; red still noisy |
+| 102 | 24.6% | 16.4% | 47.2% | referee-limited |
+| 104 | 59.7% | 33.7% | 56.3% | referee-limited |
+| 106 | 67.0% | 1974% | 74.4% | referee incoherent |
+
+The SZA-106 550 nm point sits 100x below its own 450 and 650 nm
+neighbors (1.9e-11 against ~1e-9), which is impossible for a smooth
+twilight spectrum: at this depression public MYSTIC backward does not
+converge even at 1e8 photons, so the disagreement past SZA 102 measures
+the referee, not twilight. **External validation against MYSTIC is solid
+to SZA ~98 and usable to SZA 100; beyond SZA 102 no public 3D MC referee
+converges, and the field SQM campaign (docs/SQM_CAMPAIGN.md) is the only
+end-to-end check in the deep tail.**

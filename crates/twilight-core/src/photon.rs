@@ -5,6 +5,8 @@
 //! making it compilable to any target (CPU, GPU via WGSL, WASM, CUDA PTX).
 
 use crate::atmosphere::AtmosphereModel;
+use crate::cloud_field::{cloud_ext_at, cloud_flight_segment, cloud_tau_segment, CloudFlight, Cloud3DField};
+use crate::single_scatter::CloudTransmittance;
 use crate::geometry::{next_shell_boundary, refract_at_boundary, RefractResult, Vec3};
 use crate::scattering::{
     henyey_greenstein_phase, rayleigh_phase, sample_henyey_greenstein, sample_rayleigh_analytic,
@@ -258,6 +260,9 @@ pub struct PhotonResult {
 /// * `sun_dir` - Direction toward the sun (unit vector)
 /// * `wavelength_idx` - Index into the atmosphere model's wavelength grid
 /// * `rng_state` - Mutable RNG state (simple xorshift for no_std compatibility)
+/// * `field` - 3D cloud field; when present it owns ALL cloud (the caller
+///   guarantees `atm.cloud_extinction` is all-zero). Stage 1: chains do
+///   not scatter in cloud; the field feeds the NEE transmittances only.
 ///
 /// # Returns
 /// The photon's contribution to sky radiance at this wavelength.
@@ -268,6 +273,7 @@ pub fn trace_photon(
     sun_dir: Vec3,
     wavelength_idx: usize,
     rng_state: &mut u64,
+    field: Option<&Cloud3DField>,
 ) -> PhotonResult {
     // Split RNG: derive independent streams from master seed.
     let mut rng = McRng::from_seed(*rng_state);
@@ -282,6 +288,12 @@ pub fn trace_photon(
         num_scatters: 0,
         terminated: false,
     };
+
+    // Gray cloud channel budget for the current free flight (one rng.tau
+    // draw per flight, carried across shell crossings, redrawn after each
+    // collision / ground bounce). Decomposition tracking: gas vs cloud are
+    // competing Poisson processes; the shorter distance wins.
+    let mut tau_c_remaining = -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
 
     for _bounce in 0..MAX_SCATTERS {
         let r = pos.length();
@@ -299,97 +311,110 @@ pub fn trace_photon(
         let shell = &atm.shells[shell_idx];
         let optics = &atm.optics[shell_idx][wavelength_idx];
 
-        // If extinction is zero, photon passes through without interaction
-        if optics.extinction < 1e-20 {
-            // Move to next shell boundary (with refraction)
+        let (boundary_dist, is_outward) =
             match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
-                Some((dist, is_outward)) => {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, dir, dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    dir = new_dir;
-                    continue;
-                }
+                Some(b) => b,
                 None => {
                     result.terminated = true;
                     break;
                 }
+            };
+
+        // Gas free path (Beer-Lambert); clear air walks to the boundary.
+        let free_path = if optics.extinction < 1e-20 {
+            f64::INFINITY
+        } else {
+            let xi = xorshift_f64(&mut rng.tau);
+            -libm::log(1.0 - xi + 1e-30) / optics.extinction
+        };
+
+        // Race the gray cloud channel over the gas segment.
+        let gas_cap = free_path.min(boundary_dist);
+        let mut cloud_collision = false;
+        let mut g_cloud_here = 0.0f64;
+        match cloud_flight_segment(
+            atm, field, shell_idx, pos, dir, gas_cap, tau_c_remaining,
+        ) {
+            CloudFlight::Collide { dist } => {
+                pos = pos + dir * dist;
+                g_cloud_here = field.map(|f| f.g_at(pos)).unwrap_or(atm.cloud_g_scaled);
+                cloud_collision = true;
+            }
+            CloudFlight::Pass { tau_consumed } => {
+                tau_c_remaining -= tau_consumed;
             }
         }
 
-        // Sample free path length (Beer-Lambert)
-        let xi = xorshift_f64(&mut rng.tau);
-        let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+        if !cloud_collision && free_path >= boundary_dist {
+            // Photon exits this shell without scattering. Refract. The cloud
+            // budget CARRIES across the crossing (one flight spans shells);
+            // it is redrawn only when a collision or ground bounce ends the
+            // flight.
+            let (new_pos, new_dir) =
+                cross_boundary(pos, dir, boundary_dist, is_outward, shell_idx, atm);
+            pos = new_pos;
+            dir = new_dir;
 
-        // Check if free path reaches a shell boundary
-        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
-            Some((boundary_dist, is_outward)) => {
-                if free_path >= boundary_dist {
-                    // Photon exits this shell without scattering.
-                    // Apply refraction at the boundary.
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, dir, boundary_dist, is_outward, shell_idx, atm);
-                    pos = new_pos;
-                    dir = new_dir;
+            // Check if we hit the ground
+            if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
+                let normal = pos.normalize();
 
-                    // Check if we hit the ground
-                    if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
-                        let normal = pos.normalize();
-
-                        // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
-                        let cos_sun_ground = sun_dir.dot(normal);
-                        if cos_sun_ground > 0.0 {
-                            let t_sun_gb = trace_transmittance(atm, pos, sun_dir, wavelength_idx);
-                            if t_sun_gb > 1e-30 {
-                                let albedo = atm.surface_albedo[wavelength_idx];
-                                result.weight += weight * albedo * t_sun_gb * cos_sun_ground
-                                    / core::f64::consts::PI;
-                            }
-                        }
-
-                        // Ground reflection (Lambertian)
+                // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
+                let cos_sun_ground = sun_dir.dot(normal);
+                if cos_sun_ground > 0.0 {
+                    let t_sun_gb = trace_transmittance(
+                        atm,
+                        pos,
+                        sun_dir,
+                        wavelength_idx,
+                        field,
+                        CloudTransmittance::BeerLambert,
+                    );
+                    if t_sun_gb > 1e-30 {
                         let albedo = atm.surface_albedo[wavelength_idx];
-                        weight *= albedo;
-                        dir = sample_hemisphere(normal, &mut rng.dir);
-                        continue;
+                        result.weight += weight * albedo * t_sun_gb * cos_sun_ground
+                            / core::f64::consts::PI;
                     }
-
-                    continue;
                 }
+
+                // Ground reflection (Lambertian) ends the flight: redraw.
+                let albedo = atm.surface_albedo[wavelength_idx];
+                weight *= albedo;
+                dir = sample_hemisphere(normal, &mut rng.dir);
+                tau_c_remaining = -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
             }
-            None => {
-                result.terminated = true;
-                break;
-            }
+            continue;
         }
 
-        // Scattering event at free_path distance
-        pos = pos + dir * free_path;
-
-        // Apply single scattering albedo BEFORE next-event estimation: an
-        // NEE connection is a scattering interaction at this vertex, so its
-        // radiometric weight must carry the scattering (not just extinction)
-        // coefficient - the reference single-scatter integrand uses
-        // beta_scat = extinction * ssa. Applying SSA only after NEE
-        // overestimated each NEE contribution by 1/ssa (the hybrid secondary
-        // chains already apply SSA first).
-        weight *= optics.ssa;
+        if !cloud_collision {
+            // Gas scattering event at free_path distance.
+            pos = pos + dir * free_path;
+            // SSA applies to gas collisions only (cloud is pure scattering).
+            weight *= optics.ssa;
+        }
 
         // --- Next-Event Estimation (NEE) ---
-        // Compute direct contribution from sun at this scatter point.
-        // Pass the current photon direction for correct phase function evaluation.
-        let nee_contribution = compute_nee(atm, pos, dir, sun_dir, optics, wavelength_idx, weight);
+        let nee_contribution = if cloud_collision {
+            compute_nee_cloud(atm, pos, dir, sun_dir, g_cloud_here, wavelength_idx, weight, field)
+        } else {
+            compute_nee(atm, pos, dir, sun_dir, optics, wavelength_idx, weight, field)
+        };
         result.weight += nee_contribution;
         result.num_scatters += 1;
 
-        // Sample new direction based on phase function
-        let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
+        // Sample new direction based on the vertex's phase function.
+        let cos_theta = if cloud_collision {
+            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), g_cloud_here)
+        } else if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
             sample_henyey_greenstein(xorshift_f64(&mut rng.dir), optics.asymmetry)
         };
         let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         dir = scatter_direction(dir, cos_theta, phi);
+
+        // New free flight after the collision.
+        tau_c_remaining = -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
     }
 
     result.terminated = true;
@@ -408,6 +433,7 @@ pub fn trace_photon(
 /// the sun?" The phase function is evaluated at the angle between the
 /// incoming solar direction and the outgoing direction toward the observer
 /// (which is -photon_dir in backward tracing).
+#[allow(clippy::too_many_arguments)]
 fn compute_nee(
     atm: &AtmosphereModel,
     scatter_pos: Vec3,
@@ -416,9 +442,18 @@ fn compute_nee(
     local_optics: &crate::atmosphere::ShellOptics,
     wavelength_idx: usize,
     weight: f64,
+    field: Option<&Cloud3DField>,
 ) -> f64 {
-    // Trace shadow ray toward sun
-    let transmittance = trace_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
+    // Chain NEE: the cloud channel is direct Beer-Lambert (cloud scattering
+    // is now explicit on the walk; T_diff would double-count diffusion).
+    let transmittance = trace_transmittance(
+        atm,
+        scatter_pos,
+        sun_dir,
+        wavelength_idx,
+        field,
+        CloudTransmittance::BeerLambert,
+    );
 
     if transmittance < 1e-30 {
         return 0.0;
@@ -430,28 +465,65 @@ fn compute_nee(
     // scattered toward the observer.
     let cos_angle = sun_dir.dot(photon_dir);
 
-    let phase = local_optics.rayleigh_fraction * rayleigh_phase(cos_angle)
-        + (1.0 - local_optics.rayleigh_fraction)
-            * henyey_greenstein_phase(cos_angle, local_optics.asymmetry);
+    let phase = scalar_phase_value(cos_angle, local_optics);
 
     // Contribution = weight × transmittance × phase / (4π)
     weight * transmittance * phase * INV_4PI
 }
 
+/// NEE at a CLOUD collision vertex (scalar `trace_photon` chain).
+///
+/// Gray-channel vertex: the gray HG phase with the local delta-scaled
+/// asymmetry, Beer-Lambert cloud transmittance on the shadow ray.
+#[allow(clippy::too_many_arguments)]
+fn compute_nee_cloud(
+    atm: &AtmosphereModel,
+    scatter_pos: Vec3,
+    photon_dir: Vec3,
+    sun_dir: Vec3,
+    g_cloud: f64,
+    wavelength_idx: usize,
+    weight: f64,
+    field: Option<&Cloud3DField>,
+) -> f64 {
+    let transmittance = trace_transmittance(
+        atm,
+        scatter_pos,
+        sun_dir,
+        wavelength_idx,
+        field,
+        CloudTransmittance::BeerLambert,
+    );
+    if transmittance < 1e-30 {
+        return 0.0;
+    }
+    let cos_angle = sun_dir.dot(photon_dir);
+    weight * transmittance * cloud_phase_value(cos_angle, g_cloud) * INV_4PI
+}
+
 /// Compute transmittance along a ray through the atmosphere.
 ///
 /// Traces the ray shell-by-shell, applying Snell's law at each boundary
-/// so the shadow ray follows the physically correct curved path.
-/// Returns exp(-total_optical_depth).
+/// so the shadow ray follows the physically correct curved path. Returns
+/// exp(-tau_clear) times the cloud factor selected by `cloud_mode`:
+/// `BeerLambert` (exp(-tau_cloud)) in chain mode, where cloud scattering
+/// is sampled explicitly on the walk so a diffuse factor here would
+/// double-count it; `Diffuse` (Eddington T_diff) for single-scatter mode,
+/// which cannot scatter explicitly. Backs the chain NEE via
+/// compute_nee/compute_nee_cloud (the cloud term was previously absent
+/// here, a documented gap that this closes for both modes).
 fn trace_transmittance(
     atm: &AtmosphereModel,
     start_pos: Vec3,
     direction: Vec3,
     wavelength_idx: usize,
+    field: Option<&Cloud3DField>,
+    cloud_mode: CloudTransmittance,
 ) -> f64 {
     let mut pos = start_pos;
     let mut dir = direction;
     let mut total_optical_depth = 0.0;
+    let mut tau_cloud = 0.0;
 
     for _ in 0..200 {
         let r = pos.length();
@@ -467,6 +539,19 @@ fn trace_transmittance(
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
                 total_optical_depth += optics.extinction * dist;
+                // Already opaque from clear air plus the cloud crossed so far:
+                // the remaining transmittance is below exp(-35) ~ 6e-16, lost in
+                // f32 rounding against any twilight radiance (~1e-5 and down).
+                // Return BEFORE the per-shell field DDA so an opaque shadow ray
+                // (every deep-twilight grazing leg, where the airmass alone is
+                // huge) skips the dominant cost for all remaining shells. The
+                // GPU shadow walk uses the identical combined threshold so the
+                // two backends stay bit-comparable.
+                if total_optical_depth + tau_cloud > 35.0 {
+                    return 0.0;
+                }
+                // Segment start pos/dir, BEFORE the refraction step.
+                tau_cloud += cloud_tau_segment(atm, field, shell_idx, pos, dir, dist);
 
                 // Refract at the boundary
                 let (new_pos, new_dir) = cross_boundary(pos, dir, dist, is_outward, shell_idx, atm);
@@ -487,7 +572,7 @@ fn trace_transmittance(
         }
     }
 
-    libm::exp(-total_optical_depth)
+    libm::exp(-total_optical_depth) * cloud_mode.apply(atm, tau_cloud)
 }
 
 /// Trace multiple photons across all wavelengths and return a spectral radiance
@@ -516,6 +601,7 @@ pub fn mc_scatter_spectrum(
     sun_dir: Vec3,
     photons_per_wavelength: usize,
     base_seed: u64,
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     let mut radiance = [0.0f64; 64];
     let num_wl = atm.num_wavelengths;
@@ -535,7 +621,7 @@ pub fn mc_scatter_spectrum(
                 .wrapping_mul(2862933555777941757)
                 .wrapping_add(1);
 
-            let result = trace_photon(atm, observer_pos, view_dir, sun_dir, w, &mut rng);
+            let result = trace_photon(atm, observer_pos, view_dir, sun_dir, w, &mut rng, field);
             total_weight += result.weight;
         }
         *rad_w = total_weight / photons_per_wavelength as f64;
@@ -579,6 +665,7 @@ pub fn trace_photon_polarized(
     sun_dir: Vec3,
     wavelength_idx: usize,
     rng_state: &mut u64,
+    field: Option<&Cloud3DField>,
 ) -> PolarizedPhotonResult {
     // Split RNG: derive independent streams from master seed.
     let mut rng = McRng::from_seed(*rng_state);
@@ -594,6 +681,8 @@ pub fn trace_photon_polarized(
         terminated: false,
     };
 
+    let mut tau_c_remaining = -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
+
     for _bounce in 0..MAX_SCATTERS {
         let r = pos.length();
 
@@ -608,96 +697,126 @@ pub fn trace_photon_polarized(
         let shell = &atm.shells[shell_idx];
         let optics = &atm.optics[shell_idx][wavelength_idx];
 
-        // Zero extinction: pass through with refraction
-        if optics.extinction < 1e-20 {
+        let (boundary_dist, is_outward) =
             match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
-                Some((dist, is_outward)) => {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, dir, dist, is_outward, shell_idx, atm);
-                    prev_dir = dir;
-                    pos = new_pos;
-                    dir = new_dir;
-                    continue;
-                }
+                Some(b) => b,
                 None => {
                     result.terminated = true;
                     break;
                 }
+            };
+
+        let free_path = if optics.extinction < 1e-20 {
+            f64::INFINITY
+        } else {
+            let xi = xorshift_f64(&mut rng.tau);
+            -libm::log(1.0 - xi + 1e-30) / optics.extinction
+        };
+
+        // Race the gray cloud channel over the gas segment.
+        let gas_cap = free_path.min(boundary_dist);
+        let mut cloud_collision = false;
+        let mut g_cloud_here = 0.0f64;
+        match cloud_flight_segment(atm, field, shell_idx, pos, dir, gas_cap, tau_c_remaining) {
+            CloudFlight::Collide { dist } => {
+                prev_dir = dir;
+                pos = pos + dir * dist;
+                g_cloud_here = field.map(|f| f.g_at(pos)).unwrap_or(atm.cloud_g_scaled);
+                cloud_collision = true;
+            }
+            CloudFlight::Pass { tau_consumed } => {
+                tau_c_remaining -= tau_consumed;
             }
         }
 
-        // Sample free path
-        let xi = xorshift_f64(&mut rng.tau);
-        let free_path = -libm::log(1.0 - xi + 1e-30) / optics.extinction;
+        if !cloud_collision && free_path >= boundary_dist {
+            let (new_pos, new_dir) =
+                cross_boundary(pos, dir, boundary_dist, is_outward, shell_idx, atm);
+            prev_dir = dir;
+            pos = new_pos;
+            dir = new_dir;
 
-        // Check shell boundary
-        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
-            Some((boundary_dist, is_outward)) => {
-                if free_path >= boundary_dist {
-                    let (new_pos, new_dir) =
-                        cross_boundary(pos, dir, boundary_dist, is_outward, shell_idx, atm);
-                    prev_dir = dir;
-                    pos = new_pos;
-                    dir = new_dir;
+            if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
+                let normal = pos.normalize();
 
-                    if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
-                        let normal = pos.normalize();
-
-                        // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
-                        let cos_sun_ground = sun_dir.dot(normal);
-                        if cos_sun_ground > 0.0 {
-                            let t_sun_gb = trace_transmittance(atm, pos, sun_dir, wavelength_idx);
-                            if t_sun_gb > 1e-30 {
-                                let albedo = atm.surface_albedo[wavelength_idx];
-                                let nee_gb = weight * albedo * t_sun_gb * cos_sun_ground
-                                    / core::f64::consts::PI;
-                                // Lambertian depolarizes: only I component.
-                                result.stokes =
-                                    result.stokes.add(&StokesVector::unpolarized(nee_gb));
-                            }
-                        }
-
+                // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
+                let cos_sun_ground = sun_dir.dot(normal);
+                if cos_sun_ground > 0.0 {
+                    let t_sun_gb = trace_transmittance(
+                        atm,
+                        pos,
+                        sun_dir,
+                        wavelength_idx,
+                        field,
+                        CloudTransmittance::BeerLambert,
+                    );
+                    if t_sun_gb > 1e-30 {
                         let albedo = atm.surface_albedo[wavelength_idx];
-                        weight *= albedo;
-                        prev_dir = dir;
-                        dir = sample_hemisphere(normal, &mut rng.dir);
-                        continue;
+                        let nee_gb = weight * albedo * t_sun_gb * cos_sun_ground
+                            / core::f64::consts::PI;
+                        // Lambertian depolarizes: only I component.
+                        result.stokes = result.stokes.add(&StokesVector::unpolarized(nee_gb));
                     }
-                    continue;
                 }
+
+                // Ground reflection ends the flight: redraw the budget.
+                let albedo = atm.surface_albedo[wavelength_idx];
+                weight *= albedo;
+                prev_dir = dir;
+                dir = sample_hemisphere(normal, &mut rng.dir);
+                tau_c_remaining = -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
             }
-            None => {
-                result.terminated = true;
-                break;
-            }
+            // Plain crossing: the cloud budget carries across shells.
+            continue;
         }
 
-        // Scattering event
-        pos = pos + dir * free_path;
+        if !cloud_collision {
+            // Gas scattering event.
+            pos = pos + dir * free_path;
+            weight *= optics.ssa;
+        }
 
-        // --- Polarized NEE ---
-        // Compute the Mueller matrix for scattering sunlight (coming from
-        // sun_dir) toward the observer (along -dir).
-        // Apply SSA BEFORE NEE (see scalar trace_photon note: an NEE
-        // connection is a scattering interaction; its weight must carry the
-        // scattering albedo).
-        weight *= optics.ssa;
-
-        let nee_stokes = compute_nee_polarized(
-            atm,
-            pos,
-            dir,
-            prev_dir,
-            sun_dir,
-            optics,
-            wavelength_idx,
-            weight,
-        );
+        // --- NEE ---
+        let nee_stokes = if cloud_collision {
+            // Depolarizing HG: phase weight on I, output unpolarized.
+            let transmittance = trace_transmittance(
+                atm,
+                pos,
+                sun_dir,
+                wavelength_idx,
+                field,
+                CloudTransmittance::BeerLambert,
+            );
+            if transmittance > 1e-30 {
+                let cos_angle = sun_dir.dot(dir);
+                let nee_i = weight
+                    * transmittance
+                    * cloud_phase_value(cos_angle, g_cloud_here)
+                    * INV_4PI;
+                StokesVector::unpolarized(nee_i)
+            } else {
+                StokesVector::unpolarized(0.0)
+            }
+        } else {
+            compute_nee_polarized(
+                atm,
+                pos,
+                dir,
+                prev_dir,
+                sun_dir,
+                optics,
+                wavelength_idx,
+                weight,
+                field,
+            )
+        };
         result.stokes = result.stokes.add(&nee_stokes);
         result.num_scatters += 1;
 
-        // Sample new direction
-        let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
+        // Sample new direction.
+        let cos_theta = if cloud_collision {
+            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), g_cloud_here)
+        } else if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
             sample_henyey_greenstein(xorshift_f64(&mut rng.dir), optics.asymmetry)
@@ -705,6 +824,8 @@ pub fn trace_photon_polarized(
         let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         prev_dir = dir;
         dir = scatter_direction(dir, cos_theta, phi);
+
+        tau_c_remaining = -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
     }
 
     result.terminated = true;
@@ -723,8 +844,16 @@ fn compute_nee_polarized(
     local_optics: &crate::atmosphere::ShellOptics,
     wavelength_idx: usize,
     weight: f64,
+    field: Option<&Cloud3DField>,
 ) -> StokesVector {
-    let transmittance = trace_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
+    let transmittance = trace_transmittance(
+        atm,
+        scatter_pos,
+        sun_dir,
+        wavelength_idx,
+        field,
+        CloudTransmittance::BeerLambert,
+    );
 
     if transmittance < 1e-30 {
         return StokesVector::unpolarized(0.0);
@@ -767,6 +896,7 @@ pub fn mc_scatter_spectrum_polarized(
     sun_dir: Vec3,
     photons_per_wavelength: usize,
     base_seed: u64,
+    field: Option<&Cloud3DField>,
 ) -> [StokesVector; 64] {
     let mut radiance = [StokesVector::unpolarized(0.0); 64];
     let num_wl = atm.num_wavelengths;
@@ -785,7 +915,8 @@ pub fn mc_scatter_spectrum_polarized(
                 .wrapping_mul(2862933555777941757)
                 .wrapping_add(1);
 
-            let result = trace_photon_polarized(atm, observer_pos, view_dir, sun_dir, w, &mut rng);
+            let result =
+                trace_photon_polarized(atm, observer_pos, view_dir, sun_dir, w, &mut rng, field);
             total_stokes = total_stokes.add(&result.stokes);
         }
         let inv_n = 1.0 / photons_per_wavelength as f64;
@@ -1525,6 +1656,10 @@ fn trace_light_subpath(
     vertices: &mut [LightVertex; BDPT_MAX_LIGHT_VERTICES],
     subpath_idx: usize,
     num_subpaths: usize,
+    // Stage 2 consumes the field here (the subpath delta-tracks through
+    // it); Stage 1 has no cloud term on the light walk, only on the
+    // connection legs (transmittance_between_points_spectrum).
+    _field: Option<&Cloud3DField>,
 ) -> usize {
     let toa_radius = atm.toa_radius();
     let mut n_vertices = 0usize;
@@ -2403,6 +2538,7 @@ pub fn hybrid_scatter_radiance(
     secondary_rays: usize,
     rng_state: &mut u64,
     polarized: bool,
+    field: Option<&Cloud3DField>,
 ) -> f64 {
     use crate::geometry::ray_sphere_intersect;
     use crate::scattering::{hg_mueller, rayleigh_mueller, MuellerMatrix, StokesVector};
@@ -2454,23 +2590,35 @@ pub fn hybrid_scatter_radiance(
         let optics = &atm.optics[shell_idx][wavelength_idx];
         let beta_scat = optics.extinction * optics.ssa;
 
+        // Per-step midpoint cloud extinction (field or 1D shell array).
+        let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
+
         if beta_scat < 1e-30 {
             tau_obs += optics.extinction * ds;
-            tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds;
+            tau_cloud_obs += cloud_ext_step * ds;
             continue;
         }
 
         let tau_obs_mid = tau_obs + optics.extinction * ds * 0.5;
-        let tau_cloud_mid = tau_cloud_obs + atm.cloud_extinction[shell_idx] * ds * 0.5;
-        let t_obs = libm::exp(-tau_obs_mid)
-            * atm.cloud_diffuse_transmittance(tau_cloud_mid);
+        let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
+        // Chain-mode estimator: the cloud channel is direct Beer-Lambert on
+        // the eye LOS (explicit cloud scattering supplies the diffusion that
+        // T_diff used to approximate; mixing them double-counts).
+        let t_obs = libm::exp(-tau_obs_mid) * libm::exp(-tau_cloud_mid);
 
         if t_obs < 1e-30 {
             break;
         }
 
         // --- Order 1: deterministic single-scatter NEE ---
-        let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
+        let t_sun = shadow_ray_transmittance(
+            atm,
+            scatter_pos,
+            sun_dir,
+            wavelength_idx,
+            field,
+            CloudTransmittance::BeerLambert,
+        );
         if t_sun > 1e-30 {
             let cos_theta_1 = sun_dir.dot(view_dir);
             let scale_1 = beta_scat * INV_4PI * t_sun * t_obs * ds;
@@ -2520,6 +2668,7 @@ pub fn hybrid_scatter_radiance(
                         &mut mc_rng,
                         ray,
                         secondary_rays,
+                        field,
                     );
                     mc_stokes = mc_stokes.add(&chain_stokes);
                 }
@@ -2543,6 +2692,7 @@ pub fn hybrid_scatter_radiance(
                         ray,
                         secondary_rays,
                         1.0,
+                        field,
                     );
                 }
                 let inv_rays = 1.0 / secondary_rays as f64;
@@ -2552,7 +2702,7 @@ pub fn hybrid_scatter_radiance(
         }
 
         tau_obs += optics.extinction * ds;
-        tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds;
+        tau_cloud_obs += cloud_ext_step * ds;
     }
 
     if polarized {
@@ -2591,6 +2741,10 @@ fn trace_secondary_chain(
     rng: &mut McRng,
     ray_idx: usize,
     total_rays: usize,
+    // Stage 1: the chain walk itself stays cloud-free (the field carries
+    // scattering only; chain crossings carry cloud absorption via
+    // `optics`); the field feeds the NEE shadow rays below.
+    field: Option<&Cloud3DField>,
 ) -> crate::scattering::StokesVector {
     use crate::scattering::{scatter_stokes_fast, scattering_plane_cos_sin, StokesVector};
     use crate::single_scatter::shadow_ray_transmittance;
@@ -2694,7 +2848,11 @@ fn trace_secondary_chain(
     let local_up = start_pos.normalize();
     let cos_sza_local = sun_dir.dot(local_up);
     let sza_deg_local = libm::acos(cos_sza_local.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    let use_forced = sza_deg_local >= ZENITH_SZA_START;
+    // Forced mode disabled under a field (see the scalar chain note: the
+    // gas forced proposal cannot compose unbiasedly with the gray cloud
+    // channel; analog scattering is unbiased and the cloud channel keeps it
+    // efficient under a deck).
+    let use_forced = sza_deg_local >= ZENITH_SZA_START && field.is_none();
 
     // Exponential transform bias parameter.
     // Ramps from 0 (SZA < 96) to EXP_TRANSFORM_ALPHA_MAX (SZA >= 106).
@@ -2722,6 +2880,11 @@ fn trace_secondary_chain(
         }
 
         let scatter_shell;
+        // Cloud collision: a gray-channel vertex. Declared convention: the
+        // cloud scatters as a DEPOLARIZING HG (HG weight on the I term, the
+        // outgoing ray fully depolarized, Q=U=V=0).
+        let mut cloud_collision = false;
+        let mut g_cloud_here = 0.0f64;
 
         if forced_this_bounce {
             // Upfront forced scattering: weight = exact scatter probability.
@@ -2736,13 +2899,12 @@ fn trace_secondary_chain(
             current_dir = sd;
             scatter_shell = ss;
         } else {
-            // Analog scatter with exponential transform.
-            // Modified extinction: sigma' = sigma * (1 - alpha * cos_z)
-            // where cos_z = dot(dir, local_up). Upward photons get longer
-            // mean free path, downward get shorter. Weight corrections keep
-            // the estimator exactly unbiased.
+            // Analog scatter with exponential transform plus the gray cloud
+            // channel (decomposition tracking; see the scalar chain).
             let mut scatter_found = false;
             let mut found_shell = 0usize;
+            let mut tau_c_remaining =
+                -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
 
             for _ in 0..200 {
                 let r = pos.length();
@@ -2754,93 +2916,95 @@ fn trace_secondary_chain(
                 let shell = &atm.shells[shell_idx];
                 let optics = &atm.optics[shell_idx][wavelength_idx];
 
-                if optics.extinction < 1e-20 {
+                let (boundary_dist, is_outward) =
                     match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                        Some((dist, is_outward)) => {
-                            let (np, nd) =
-                                cross_boundary(pos, current_dir, dist, is_outward, shell_idx, atm);
-                            pos = np;
-                            current_dir = nd;
-                            continue;
-                        }
+                        Some(b) => b,
                         None => break,
+                    };
+
+                let sigma = optics.extinction;
+                let (free_path, sigma_prime, cos_bias) = if sigma < 1e-20 {
+                    (f64::INFINITY, sigma, 0.0)
+                } else {
+                    let cb = current_dir.dot(term_axis);
+                    let sp = sigma * (1.0 - alpha_et * cb);
+                    let xi = xorshift_f64(&mut rng.tau);
+                    (-libm::log(1.0 - xi + 1e-30) / sp, sp, cb)
+                };
+
+                let gas_cap = free_path.min(boundary_dist);
+                match cloud_flight_segment(
+                    atm, field, shell_idx, pos, current_dir, gas_cap, tau_c_remaining,
+                ) {
+                    CloudFlight::Collide { dist } => {
+                        if alpha_et > 0.0 && sigma >= 1e-20 {
+                            weight *= libm::exp(-alpha_et * sigma * cos_bias * dist);
+                        }
+                        pos = pos + current_dir * dist;
+                        g_cloud_here =
+                            field.map(|f| f.g_at(pos)).unwrap_or(atm.cloud_g_scaled);
+                        found_shell = shell_idx;
+                        scatter_found = true;
+                        cloud_collision = true;
+                        break;
+                    }
+                    CloudFlight::Pass { tau_consumed } => {
+                        tau_c_remaining -= tau_consumed;
                     }
                 }
 
-                // Exponential transform: modified extinction.
-                // Bias axis is tilted toward the terminator at deep twilight,
-                // drifting the random walk toward sunlit atmosphere.
-                let cos_bias = current_dir.dot(term_axis);
-                let sigma = optics.extinction;
-                let sigma_prime = sigma * (1.0 - alpha_et * cos_bias);
-                // sigma_prime > 0 guaranteed: alpha_et <= 0.5, |cos_bias| <= 1
-
-                let xi = xorshift_f64(&mut rng.tau);
-                let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
-
-                match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                    Some((boundary_dist, is_outward)) => {
-                        if free_path >= boundary_dist {
-                            // Boundary crossing weight correction:
-                            // exp(-(sigma - sigma') * D) = exp(-alpha * sigma * cos_bias * D)
-                            if alpha_et > 0.0 {
-                                weight *= libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
-                            }
-                            // Deck crossings carry cloud ABSORPTION only
-                            // (already in `optics`); the deck's diffuse
-                            // transmittance is applied exactly once per
-                            // path on the deterministic eye/sun legs.
-                            // A per-crossing T_diff here both double-
-                            // counted diffusion against those legs and
-                            // disagreed with the forced-scatter branch
-                            // and the GPU (audit 2026-06-12).
-
-                            let (np, nd) = cross_boundary(
-                                pos,
-                                current_dir,
-                                boundary_dist,
-                                is_outward,
-                                shell_idx,
-                                atm,
-                            );
-                            pos = np;
-                            current_dir = nd;
-
-                            // Ground reflection: depolarizes
-                            if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
-                                let normal = pos.normalize();
-
-                                // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
-                                let cos_sun_ground = sun_dir.dot(normal);
-                                if cos_sun_ground > 0.0 {
-                                    let t_sun_gb =
-                                        shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
-                                    if t_sun_gb > 1e-30 {
-                                        let albedo = atm.surface_albedo[wavelength_idx];
-                                        let nee_gb = weight * albedo * t_sun_gb * cos_sun_ground
-                                            / core::f64::consts::PI;
-                                        // Lambertian depolarizes: only I component.
-                                        total_stokes =
-                                            total_stokes.add(&StokesVector::unpolarized(nee_gb));
-                                    }
-                                }
-
-                                let albedo = atm.surface_albedo[wavelength_idx];
-                                weight *= albedo;
-                                prev_dir = current_dir;
-                                current_dir = sample_hemisphere(normal, &mut rng.dir);
-                                stokes = StokesVector::unpolarized(1.0);
-                                continue;
-                            }
-                            continue;
-                        }
+                if free_path >= boundary_dist {
+                    if alpha_et > 0.0 && sigma >= 1e-20 {
+                        weight *= libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
                     }
-                    None => break,
+                    // Chain deck crossings: no transmittance factor (cloud
+                    // scattering is explicit via the race; absorption was
+                    // folded out at field build time).
+
+                    let (np, nd) =
+                        cross_boundary(pos, current_dir, boundary_dist, is_outward, shell_idx, atm);
+                    pos = np;
+                    current_dir = nd;
+
+                    // Ground reflection: depolarizes
+                    if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
+                        let normal = pos.normalize();
+
+                        // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
+                        let cos_sun_ground = sun_dir.dot(normal);
+                        if cos_sun_ground > 0.0 {
+                            let t_sun_gb = shadow_ray_transmittance(
+                                atm,
+                                pos,
+                                sun_dir,
+                                wavelength_idx,
+                                field,
+                                CloudTransmittance::BeerLambert,
+                            );
+                            if t_sun_gb > 1e-30 {
+                                let albedo = atm.surface_albedo[wavelength_idx];
+                                let nee_gb = weight * albedo * t_sun_gb * cos_sun_ground
+                                    / core::f64::consts::PI;
+                                // Lambertian depolarizes: only I component.
+                                total_stokes =
+                                    total_stokes.add(&StokesVector::unpolarized(nee_gb));
+                            }
+                        }
+
+                        let albedo = atm.surface_albedo[wavelength_idx];
+                        weight *= albedo;
+                        prev_dir = current_dir;
+                        current_dir = sample_hemisphere(normal, &mut rng.dir);
+                        stokes = StokesVector::unpolarized(1.0);
+                        tau_c_remaining =
+                            -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
+                        continue;
+                    }
+                    continue;
                 }
 
                 // Scatter within this shell.
-                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
-                if alpha_et > 0.0 {
+                if alpha_et > 0.0 && sigma >= 1e-20 {
                     weight *=
                         (sigma / sigma_prime) * libm::exp(-alpha_et * sigma * cos_bias * free_path);
                 }
@@ -2858,31 +3022,57 @@ fn trace_secondary_chain(
 
         let optics = &atm.optics[scatter_shell][wavelength_idx];
 
-        // Apply SSA BEFORE NEE: the NEE connection is a scattering
-        // interaction at this vertex, so its weight must carry the
-        // scattering albedo (matches the scalar and ALIS chains).
-        weight *= optics.ssa;
+        // SSA: gas collisions carry the gas albedo; a cloud collision is
+        // pure scattering (absorption folded out of the field).
+        if !cloud_collision {
+            weight *= optics.ssa;
+        }
 
-        // NEE: apply Mueller to photon's actual Stokes state
-        let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
+        // NEE
+        let t_sun_secondary = shadow_ray_transmittance(
+            atm,
+            pos,
+            sun_dir,
+            wavelength_idx,
+            field,
+            CloudTransmittance::BeerLambert,
+        );
 
         if t_sun_secondary > 1e-30 {
             let cos_angle_nee = sun_dir.dot(current_dir);
-            let (cn, sn) = scattering_plane_cos_sin(prev_dir, current_dir, -sun_dir);
-            let nee_stokes = scatter_stokes_fast(
-                &stokes,
-                cos_angle_nee,
-                optics.rayleigh_fraction,
-                optics.asymmetry,
-                cn,
-                sn,
-            );
+            let nee_stokes = if cloud_collision {
+                // Depolarizing HG: phase on I, output unpolarized.
+                let p = cloud_phase_value(cos_angle_nee, g_cloud_here);
+                StokesVector::unpolarized(stokes.intensity() * p)
+            } else {
+                let (cn, sn) = scattering_plane_cos_sin(prev_dir, current_dir, -sun_dir);
+                scatter_stokes_fast(
+                    &stokes,
+                    cos_angle_nee,
+                    optics.rayleigh_fraction,
+                    optics.asymmetry,
+                    cn,
+                    sn,
+                )
+            };
 
             let scale = weight * t_sun_secondary * INV_4PI;
             total_stokes = total_stokes.add(&nee_stokes.scale(scale));
         }
 
-        // Sample new direction and update Stokes state
+        // Sample new direction and update Stokes state. A cloud collision
+        // is a depolarizing HG: sample the lobe, reset polarization, and
+        // continue (no Mueller update).
+        if cloud_collision {
+            let cos_theta = sample_henyey_greenstein(xorshift_f64(&mut rng.dir), g_cloud_here);
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
+            let d = scatter_direction(current_dir, cos_theta, phi);
+            prev_dir = current_dir;
+            current_dir = d;
+            stokes = StokesVector::unpolarized(1.0);
+            continue;
+        }
+
         let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
             sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
         } else {
@@ -2891,7 +3081,7 @@ fn trace_secondary_chain(
         let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         let new_dir = scatter_direction(current_dir, cos_theta, phi);
 
-        // Update Stokes through this scatter (fused, no matrices, no trig)
+        // Update Stokes through this gas scatter (fused, no matrices, no trig)
         let (cs, ss) = scattering_plane_cos_sin(prev_dir, current_dir, new_dir);
         stokes = scatter_stokes_fast(
             &stokes,
@@ -2952,6 +3142,8 @@ fn trace_secondary_chain_scalar(
     ray_idx: usize,
     total_rays: usize,
     nee_r2_weight: f64,
+    // Stage 1: NEE shadow rays only (see trace_secondary_chain note).
+    field: Option<&Cloud3DField>,
 ) -> f64 {
     use crate::single_scatter::shadow_ray_transmittance;
 
@@ -3008,8 +3200,15 @@ fn trace_secondary_chain_scalar(
     let mut total = 0.0_f64;
 
     // Upfront forced scattering gate (same logic as Stokes version).
+    // Forced mode is DISABLED when a cloud field is present: the gas
+    // forced-collision proposal (truncated to atmosphere exit) cannot be
+    // composed unbiasedly with the unforced gray cloud channel without
+    // re-deriving the joint truncation, which couples the two channels and
+    // breaks the ALIS factorization. Analog scattering is always unbiased
+    // (the cloud channel makes the analog walk efficient under a deck), so
+    // we take the conservative path the plan authorizes.
     let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    let use_forced = sza_deg_local >= ZENITH_SZA_START;
+    let use_forced = sza_deg_local >= ZENITH_SZA_START && field.is_none();
 
     // Exponential transform bias parameter (same ramp as Stokes version).
     let sza_t_et =
@@ -3084,6 +3283,12 @@ fn trace_secondary_chain_scalar(
             }
 
             let scatter_shell;
+            // A cloud collision is a distinct vertex type (gray channel):
+            // pure HG scatter with the local delta-scaled asymmetry, no
+            // weight change. `g_cloud_here` carries that asymmetry to the
+            // shared NEE / direction-sampling block below.
+            let mut cloud_collision = false;
+            let mut g_cloud_here = 0.0f64;
 
             if forced_this_bounce {
                 let exp_neg_tau = libm::exp(-tau_max);
@@ -3101,6 +3306,14 @@ fn trace_secondary_chain_scalar(
                 let mut scatter_found = false;
                 let mut found_shell = 0usize;
 
+                // Gray cloud channel: one free-flight budget drawn per
+                // bounce from the SAME `rng.tau` stream as gas, carried
+                // (undiminished by gas events) across shell crossings until
+                // either channel collides. Decomposition tracking: shortest
+                // distance wins.
+                let mut tau_c_remaining =
+                    -libm::log(1.0 - xorshift_f64(&mut local_rng.tau) + 1e-30);
+
                 for _ in 0..200 {
                     let r = pos.length();
                     let shell_idx = match atm.shell_index(r) {
@@ -3111,99 +3324,99 @@ fn trace_secondary_chain_scalar(
                     let shell = &atm.shells[shell_idx];
                     let optics = &atm.optics[shell_idx][wavelength_idx];
 
-                    if optics.extinction < 1e-20 {
+                    let (boundary_dist, is_outward) =
                         match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                            Some((dist, is_outward)) => {
-                                let (np, nd) = cross_boundary(
-                                    pos,
-                                    current_dir,
-                                    dist,
-                                    is_outward,
-                                    shell_idx,
-                                    atm,
-                                );
-                                pos = np;
-                                current_dir = nd;
-                                continue;
-                            }
+                            Some(b) => b,
                             None => break,
-                        }
-                    }
+                        };
 
-                    let cos_bias = current_dir.dot(term_axis);
+                    // Gas free path (exponential transform on the gas
+                    // channel only); clear air just crosses to the boundary.
                     let sigma = optics.extinction;
-                    let sigma_prime = sigma * (1.0 - alpha_et * cos_bias);
+                    let (free_path, sigma_prime, cos_bias) = if sigma < 1e-20 {
+                        (f64::INFINITY, sigma, 0.0)
+                    } else {
+                        let cb = current_dir.dot(term_axis);
+                        let sp = sigma * (1.0 - alpha_et * cb);
+                        let xi = xorshift_f64(&mut local_rng.tau);
+                        (-libm::log(1.0 - xi + 1e-30) / sp, sp, cb)
+                    };
 
-                    let xi = xorshift_f64(&mut local_rng.tau);
-                    let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime;
-
-                    match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                        Some((boundary_dist, is_outward)) => {
-                            if free_path >= boundary_dist {
-                                if alpha_et > 0.0 {
-                                    weight *=
-                                        libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
-                                }
-                                // Chain deck crossings: cloud absorption
-                                // only - single-representation convention
-                                // (see polarized-chain note; the former
-                                // per-crossing T_diff over-attenuated
-                                // 13-74% and diverged from forced mode
-                                // and the GPU).
-
-                                let (np, nd) = cross_boundary(
-                                    pos,
-                                    current_dir,
-                                    boundary_dist,
-                                    is_outward,
-                                    shell_idx,
-                                    atm,
-                                );
-                                pos = np;
-                                current_dir = nd;
-
-                                if !is_outward && pos.length() <= surface_radius + 1.0 {
-                                    let normal = pos.normalize();
-
-                                    // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
-                                    let cos_sun_ground = sun_dir.dot(normal);
-                                    if cos_sun_ground > 0.0 {
-                                        let t_sun_gb = shadow_ray_transmittance(
-                                            atm,
-                                            pos,
-                                            sun_dir,
-                                            wavelength_idx,
-                                        );
-                                        if t_sun_gb > 1e-30 {
-                                            let albedo = atm.surface_albedo[wavelength_idx];
-                                            total += weight * albedo * t_sun_gb * cos_sun_ground
-                                                / core::f64::consts::PI;
-                                        }
-                                    }
-
-                                    let albedo = atm.surface_albedo[wavelength_idx];
-                                    weight *= albedo;
-                                    current_dir = sample_hemisphere(normal, &mut local_rng.dir);
-                                    // Continue the walk with the reflected
-                                    // direction (the Stokes chain does the
-                                    // same): a ground bounce is not chain
-                                    // death.
-                                    continue;
-                                }
-                                // Crossed into the next shell: resample the
-                                // free path there (memoryless exponential).
-                                // Previously `break` killed the ENTIRE chain
-                                // at the first shell crossing, so scalar/ALIS
-                                // photons could never traverse the atmosphere
-                                // (massive MS underestimate; broken cloudy
-                                // skies). The Stokes chain always continued.
-                                continue;
+                    // Cloud race over the segment up to the gas event (gas
+                    // scatter at free_path or boundary crossing).
+                    let gas_cap = free_path.min(boundary_dist);
+                    match cloud_flight_segment(
+                        atm, field, shell_idx, pos, current_dir, gas_cap, tau_c_remaining,
+                    ) {
+                        CloudFlight::Collide { dist } => {
+                            // Cloud wins. ET gas weight correction applies
+                            // for the gas distance actually travelled.
+                            if alpha_et > 0.0 && sigma >= 1e-20 {
+                                weight *= libm::exp(-alpha_et * sigma * cos_bias * dist);
                             }
+                            pos = pos + current_dir * dist;
+                            g_cloud_here = field
+                                .map(|f| f.g_at(pos))
+                                .unwrap_or(atm.cloud_g_scaled);
+                            found_shell = shell_idx;
+                            scatter_found = true;
+                            cloud_collision = true;
+                            break;
                         }
-                        None => break,
+                        CloudFlight::Pass { tau_consumed } => {
+                            tau_c_remaining -= tau_consumed;
+                        }
                     }
 
-                    if alpha_et > 0.0 {
+                    if free_path >= boundary_dist {
+                        if alpha_et > 0.0 && sigma >= 1e-20 {
+                            weight *= libm::exp(-alpha_et * sigma * cos_bias * boundary_dist);
+                        }
+                        // Chain deck crossings: NO transmittance factor here.
+                        // Cloud scattering is now explicit (the race above);
+                        // cloud absorption was folded out at field build time.
+
+                        let (np, nd) =
+                            cross_boundary(pos, current_dir, boundary_dist, is_outward, shell_idx, atm);
+                        pos = np;
+                        current_dir = nd;
+
+                        if !is_outward && pos.length() <= surface_radius + 1.0 {
+                            let normal = pos.normalize();
+
+                            // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
+                            let cos_sun_ground = sun_dir.dot(normal);
+                            if cos_sun_ground > 0.0 {
+                                let t_sun_gb = shadow_ray_transmittance(
+                                    atm,
+                                    pos,
+                                    sun_dir,
+                                    wavelength_idx,
+                                    field,
+                                    CloudTransmittance::BeerLambert,
+                                );
+                                if t_sun_gb > 1e-30 {
+                                    let albedo = atm.surface_albedo[wavelength_idx];
+                                    total += weight * albedo * t_sun_gb * cos_sun_ground
+                                        / core::f64::consts::PI;
+                                }
+                            }
+
+                            let albedo = atm.surface_albedo[wavelength_idx];
+                            weight *= albedo;
+                            current_dir = sample_hemisphere(normal, &mut local_rng.dir);
+                            // Reset the cloud budget: a new free flight
+                            // begins from the reflected direction.
+                            tau_c_remaining =
+                                -libm::log(1.0 - xorshift_f64(&mut local_rng.tau) + 1e-30);
+                            continue;
+                        }
+                        // Crossed into the next shell: resample the gas free
+                        // path there; the cloud budget carries over.
+                        continue;
+                    }
+
+                    if alpha_et > 0.0 && sigma >= 1e-20 {
                         weight *= (sigma / sigma_prime)
                             * libm::exp(-alpha_et * sigma * cos_bias * free_path);
                     }
@@ -3221,19 +3434,32 @@ fn trace_secondary_chain_scalar(
 
             let optics = &atm.optics[scatter_shell][wavelength_idx];
 
-            // NEE: scalar phase function (no Mueller matrix)
-            weight *= optics.ssa;
+            // SSA: a cloud collision is pure scattering (absorption folded
+            // out of the field), so no SSA factor; a gas collision carries
+            // the gas single-scattering albedo as before.
+            if !cloud_collision {
+                weight *= optics.ssa;
+            }
 
             let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
             let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
-                let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
+                let t_sun_secondary = shadow_ray_transmittance(
+                    atm,
+                    pos,
+                    sun_dir,
+                    wavelength_idx,
+                    field,
+                    CloudTransmittance::BeerLambert,
+                );
 
                 if t_sun_secondary > 1e-30 {
                     let cos_angle_nee = sun_dir.dot(current_dir);
-                    let phase = optics.rayleigh_fraction * rayleigh_phase(cos_angle_nee)
-                        + (1.0 - optics.rayleigh_fraction)
-                            * henyey_greenstein_phase(cos_angle_nee, optics.asymmetry);
+                    let phase = if cloud_collision {
+                        cloud_phase_value(cos_angle_nee, g_cloud_here)
+                    } else {
+                        scalar_phase_value(cos_angle_nee, optics)
+                    };
 
                     // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
                     // particle, apply the MIS weight (w_back) since BDPT provides
@@ -3246,16 +3472,18 @@ fn trace_secondary_chain_scalar(
             }
             bounce_idx += 1;
 
-            // Sample new direction: 2-way one-sample MIS between phase
-            // function and Dwivedi horizontal biasing.
-            //
-            // When Dwivedi is inactive (alpha_d < 0.01), fall through to
-            // pure phase function sampling with no MIS overhead and no extra
-            // RNG consumption.
+            // Sample new direction. A cloud vertex scatters from the gray
+            // HG lobe (sampling == evaluation, no weight correction); the
+            // Dwivedi horizontal bias is a gas-channel variance device only.
             let alpha_d = d_frac;
-            let mis_active = alpha_d >= 0.02;
+            let mis_active = alpha_d >= 0.02 && !cloud_collision;
 
-            let new_dir = if mis_active {
+            let new_dir = if cloud_collision {
+                let cos_theta =
+                    sample_henyey_greenstein(xorshift_f64(&mut local_rng.dir), g_cloud_here);
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
+                scatter_direction(current_dir, cos_theta, phi)
+            } else if mis_active {
                 let local_up_here = pos.normalize();
                 let alpha_p_mis = 1.0 - alpha_d;
                 let xi_branch = xorshift_f64(&mut local_rng.dir);
@@ -3389,6 +3617,20 @@ fn scalar_phase_value(cos_theta: f64, optics: &crate::atmosphere::ShellOptics) -
     optics.rayleigh_fraction * rayleigh_phase(cos_theta)
         + (1.0 - optics.rayleigh_fraction)
             * henyey_greenstein_phase(cos_theta, optics.asymmetry)
+}
+
+/// Phase-function value at a CLOUD collision vertex.
+///
+/// Decomposition tracking splits the medium into a gas channel (Rayleigh +
+/// aerosol, evaluated by `scalar_phase_value`) and a gray cloud channel.
+/// A cloud collision is a pure single-HG scatter with the field's
+/// delta-scaled asymmetry `g_at` (or `g_default`); this is the ONE
+/// representation used everywhere a cloud vertex evaluates its phase
+/// (NEE and MIS denominators) so sampled directions match evaluated pdfs.
+/// The matching sampler is `sample_henyey_greenstein` with the same `g`.
+#[inline]
+fn cloud_phase_value(cos_theta: f64, g_cloud: f64) -> f64 {
+    henyey_greenstein_phase(cos_theta, g_cloud)
 }
 
 /// Spectral one-sample MIS weight (balance heuristic over hero choices).
@@ -3621,6 +3863,8 @@ fn trace_secondary_chain_alis(
     num_wl: usize,
     nee_r2_weight: f64,
     guide: Option<&crate::path_guide::PathGuide>,
+    // Stage 1: NEE shadow rays only (see trace_secondary_chain note).
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
 
@@ -3733,8 +3977,10 @@ fn trace_secondary_chain_alis(
     let mut total = [0.0f64; 64];
 
     // Forced scattering + exponential transform setup (same as scalar tracer).
+    // Forced mode disabled under a field (the gas forced proposal cannot
+    // compose unbiasedly with the gray cloud channel; analog is unbiased).
     let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    let use_forced = sza_deg_local >= ZENITH_SZA_START;
+    let use_forced = sza_deg_local >= ZENITH_SZA_START && field.is_none();
     let sza_t_et =
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
@@ -3815,6 +4061,11 @@ fn trace_secondary_chain_alis(
             }
 
             let scatter_shell;
+            // Gray cloud collision: a distinct vertex type. The cloud
+            // channel is wavelength flat, so a cloud collision contributes
+            // per-wavelength ratio EXACTLY 1: wr/pr are not touched by it.
+            let mut cloud_collision = false;
+            let mut g_cloud_here = 0.0f64;
 
             if forced_this_bounce {
                 let tau_max_h = tau_maxes[hero_wl];
@@ -3861,6 +4112,8 @@ fn trace_secondary_chain_alis(
             } else {
                 let mut scatter_found = false;
                 let mut found_shell = 0usize;
+                let mut tau_c_remaining =
+                    -libm::log(1.0 - xorshift_f64(&mut local_rng.tau) + 1e-30);
 
                 for _ in 0..200 {
                     let r = pos.length();
@@ -3872,121 +4125,123 @@ fn trace_secondary_chain_alis(
                     let shell = &atm.shells[shell_idx];
                     let hero_ext = atm.optics[shell_idx][hero_wl].extinction;
 
-                    if hero_ext < 1e-20 {
+                    let (boundary_dist, is_outward) =
                         match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                            Some((dist, is_outward)) => {
-                                for w in 0..num_wl {
-                                    let sigma_w = atm.optics[shell_idx][w].extinction;
-                                    if sigma_w > 1e-30 {
-                                        let ratio = libm::exp(-sigma_w * dist);
-                                        wr[w] *= ratio;
-                                        pr[w] *= ratio;
-                                    }
-                                }
-                                let (np, nd) = cross_boundary(
-                                    pos,
-                                    current_dir,
-                                    dist,
-                                    is_outward,
-                                    shell_idx,
-                                    atm,
-                                );
-                                pos = np;
-                                current_dir = nd;
-                                continue;
-                            }
+                            Some(b) => b,
                             None => break,
-                        }
-                    }
+                        };
 
-                    let cos_bias = current_dir.dot(term_axis);
+                    // Hero gas free path (ET on the gas channel). Clear-air
+                    // shells just walk to the boundary (free_path infinite).
+                    let (free_path, sigma_prime_h, cos_bias) = if hero_ext < 1e-20 {
+                        (f64::INFINITY, hero_ext, 0.0)
+                    } else {
+                        let cb = current_dir.dot(term_axis);
+                        let sp = hero_ext * (1.0 - alpha_et * cb);
+                        let xi = xorshift_f64(&mut local_rng.tau);
+                        (-libm::log(1.0 - xi + 1e-30) / sp, sp, cb)
+                    };
                     let sigma_h = hero_ext;
-                    let sigma_prime_h = sigma_h * (1.0 - alpha_et * cos_bias);
 
-                    let xi = xorshift_f64(&mut local_rng.tau);
-                    let free_path = -libm::log(1.0 - xi + 1e-30) / sigma_prime_h;
-
-                    match next_shell_boundary(pos, current_dir, shell.r_inner, shell.r_outer) {
-                        Some((boundary_dist, is_outward)) => {
-                            if free_path >= boundary_dist {
-                                if alpha_et > 0.0 {
-                                    hero_weight *=
-                                        libm::exp(-alpha_et * sigma_h * cos_bias * boundary_dist);
-                                }
-                                // Chain deck crossings: cloud absorption
-                                // only (single-representation convention,
-                                // see polarized-chain note).
-                                for w in 0..num_wl {
-                                    let sigma_w = atm.optics[shell_idx][w].extinction;
-                                    let ratio =
-                                        libm::exp(-(sigma_w - sigma_h) * boundary_dist);
-                                    wr[w] *= ratio;
-                                    pr[w] *= ratio;
-                                }
-
-                                let (np, nd) = cross_boundary(
-                                    pos,
-                                    current_dir,
-                                    boundary_dist,
-                                    is_outward,
-                                    shell_idx,
-                                    atm,
-                                );
-                                pos = np;
-                                current_dir = nd;
-
-                                if !is_outward && pos.length() <= surface_radius + 1.0 {
-                                    let normal = pos.normalize();
-
-                                    // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
-                                    // Fire shadow ray before albedo is applied to
-                                    // the continuing chain weight.
-                                    let cos_sun_ground = sun_dir.dot(normal);
-                                    if cos_sun_ground > 0.0 {
-                                        let t_suns_gb = shadow_ray_transmittance_spectrum(
-                                            atm, pos, sun_dir, num_wl,
-                                        );
-                                        let mis_w = spectral_mis_weight(&pr, num_wl);
-                                        let inv_pi = 1.0 / core::f64::consts::PI;
-                                        for w in 0..num_wl {
-                                            if t_suns_gb[w] > 1e-30 {
-                                                total[w] += mis_w
-                                                    * hero_weight
-                                                    * wr[w]
-                                                    * atm.surface_albedo[w]
-                                                    * t_suns_gb[w]
-                                                    * cos_sun_ground
-                                                    * inv_pi;
-                                            }
-                                        }
-                                    }
-
-                                    let hero_albedo = atm.surface_albedo[hero_wl];
-                                    hero_weight *= hero_albedo;
-                                    for w in 0..num_wl {
-                                        let albedo_ratio = if hero_albedo > 1e-30 {
-                                            atm.surface_albedo[w] / hero_albedo
-                                        } else {
-                                            0.0
-                                        };
-                                        wr[w] *= albedo_ratio;
-                                    }
-                                    current_dir = sample_hemisphere(normal, &mut local_rng.dir);
-                                    // Ground bounce: continue the walk with
-                                    // the reflected direction (see scalar
-                                    // chain note).
-                                    continue;
-                                }
-                                // Shell crossing: continue and resample the
-                                // free path in the new shell. `break` here
-                                // killed the chain at the first boundary.
-                                continue;
+                    // Race the gray cloud channel over the gas segment.
+                    let gas_cap = free_path.min(boundary_dist);
+                    match cloud_flight_segment(
+                        atm, field, shell_idx, pos, current_dir, gas_cap, tau_c_remaining,
+                    ) {
+                        CloudFlight::Collide { dist } => {
+                            // Gas survived [0, dist] without colliding: apply
+                            // the gas survival ratio (gray cloud ratio = 1).
+                            if alpha_et > 0.0 && sigma_h >= 1e-20 {
+                                hero_weight *=
+                                    libm::exp(-alpha_et * sigma_h * cos_bias * dist);
                             }
+                            for w in 0..num_wl {
+                                let sigma_w = atm.optics[shell_idx][w].extinction;
+                                let ratio = libm::exp(-(sigma_w - sigma_h) * dist);
+                                wr[w] *= ratio;
+                                pr[w] *= ratio;
+                            }
+                            pos = pos + current_dir * dist;
+                            g_cloud_here =
+                                field.map(|f| f.g_at(pos)).unwrap_or(atm.cloud_g_scaled);
+                            found_shell = shell_idx;
+                            scatter_found = true;
+                            cloud_collision = true;
+                            break;
                         }
-                        None => break,
+                        CloudFlight::Pass { tau_consumed } => {
+                            tau_c_remaining -= tau_consumed;
+                        }
                     }
 
-                    if alpha_et > 0.0 {
+                    if free_path >= boundary_dist {
+                        if alpha_et > 0.0 && sigma_h >= 1e-20 {
+                            hero_weight *=
+                                libm::exp(-alpha_et * sigma_h * cos_bias * boundary_dist);
+                        }
+                        // Chain deck crossings: cloud scattering is now
+                        // explicit (the race above); no transmittance factor.
+                        for w in 0..num_wl {
+                            let sigma_w = atm.optics[shell_idx][w].extinction;
+                            let ratio = libm::exp(-(sigma_w - sigma_h) * boundary_dist);
+                            wr[w] *= ratio;
+                            pr[w] *= ratio;
+                        }
+
+                        let (np, nd) =
+                            cross_boundary(pos, current_dir, boundary_dist, is_outward, shell_idx, atm);
+                        pos = np;
+                        current_dir = nd;
+
+                        if !is_outward && pos.length() <= surface_radius + 1.0 {
+                            let normal = pos.normalize();
+
+                            // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
+                            let cos_sun_ground = sun_dir.dot(normal);
+                            if cos_sun_ground > 0.0 {
+                                let t_suns_gb = shadow_ray_transmittance_spectrum(
+                                    atm,
+                                    pos,
+                                    sun_dir,
+                                    num_wl,
+                                    field,
+                                    CloudTransmittance::BeerLambert,
+                                );
+                                let mis_w = spectral_mis_weight(&pr, num_wl);
+                                let inv_pi = 1.0 / core::f64::consts::PI;
+                                for w in 0..num_wl {
+                                    if t_suns_gb[w] > 1e-30 {
+                                        total[w] += mis_w
+                                            * hero_weight
+                                            * wr[w]
+                                            * atm.surface_albedo[w]
+                                            * t_suns_gb[w]
+                                            * cos_sun_ground
+                                            * inv_pi;
+                                    }
+                                }
+                            }
+
+                            let hero_albedo = atm.surface_albedo[hero_wl];
+                            hero_weight *= hero_albedo;
+                            for w in 0..num_wl {
+                                let albedo_ratio = if hero_albedo > 1e-30 {
+                                    atm.surface_albedo[w] / hero_albedo
+                                } else {
+                                    0.0
+                                };
+                                wr[w] *= albedo_ratio;
+                            }
+                            current_dir = sample_hemisphere(normal, &mut local_rng.dir);
+                            tau_c_remaining =
+                                -libm::log(1.0 - xorshift_f64(&mut local_rng.tau) + 1e-30);
+                            continue;
+                        }
+                        continue;
+                    }
+
+                    // Hero gas scatter within this shell.
+                    if alpha_et > 0.0 && sigma_h >= 1e-20 {
                         hero_weight *= (sigma_h / sigma_prime_h)
                             * libm::exp(-alpha_et * sigma_h * cos_bias * free_path);
                     }
@@ -4012,24 +4267,35 @@ fn trace_secondary_chain_alis(
             }
 
             // Apply hero SSA for this scatter event BEFORE calculating NEE.
+            // A cloud collision is pure scattering (absorption folded out of
+            // the field) and gray (no per-wavelength SSA ratio).
             let hero_scatter_optics = &atm.optics[scatter_shell][hero_wl];
-            hero_weight *= hero_scatter_optics.ssa;
+            if !cloud_collision {
+                hero_weight *= hero_scatter_optics.ssa;
 
-            // ALIS SSA ratio correction.
-            for w in 0..num_wl {
-                let ssa_w = atm.optics[scatter_shell][w].ssa;
-                let ssa_ratio = if hero_scatter_optics.ssa > 1e-30 {
-                    ssa_w / hero_scatter_optics.ssa
-                } else {
-                    0.0
-                };
-                wr[w] *= ssa_ratio;
+                // ALIS SSA ratio correction.
+                for w in 0..num_wl {
+                    let ssa_w = atm.optics[scatter_shell][w].ssa;
+                    let ssa_ratio = if hero_scatter_optics.ssa > 1e-30 {
+                        ssa_w / hero_scatter_optics.ssa
+                    } else {
+                        0.0
+                    };
+                    wr[w] *= ssa_ratio;
+                }
             }
 
             let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
             let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
-                let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
+                let t_suns = shadow_ray_transmittance_spectrum(
+                    atm,
+                    pos,
+                    sun_dir,
+                    num_wl,
+                    field,
+                    CloudTransmittance::BeerLambert,
+                );
                 let cos_angle_nee = sun_dir.dot(current_dir);
 
                 // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
@@ -4038,11 +4304,20 @@ fn trace_secondary_chain_alis(
                 // get full weight since BDPT does not cover them.
                 let nee_weight = if bdpt_covered { nee_r2_weight } else { 1.0 };
                 let mis_w = spectral_mis_weight(&pr, num_wl);
+                // Gray cloud phase is wavelength flat: one value for all w.
+                let cloud_phase = if cloud_collision {
+                    cloud_phase_value(cos_angle_nee, g_cloud_here)
+                } else {
+                    0.0
+                };
 
                 for w in 0..num_wl {
                     if t_suns[w] > 1e-30 {
-                        let optics_w = &atm.optics[scatter_shell][w];
-                        let phase_w = scalar_phase_value(cos_angle_nee, optics_w);
+                        let phase_w = if cloud_collision {
+                            cloud_phase
+                        } else {
+                            scalar_phase_value(cos_angle_nee, &atm.optics[scatter_shell][w])
+                        };
                         total[w] += mis_w
                             * nee_weight
                             * hero_weight
@@ -4065,9 +4340,19 @@ fn trace_secondary_chain_alis(
                 Some(g) if g.is_trained() => guide_frac(sza_deg_local),
                 _ => 0.0,
             };
-            let mis_active = (alpha_d + alpha_g) >= 0.02;
+            // A cloud vertex scatters from the gray HG lobe: sampling equals
+            // evaluation (no weight correction), gray (no per-wavelength
+            // phase ratio), and the gas-only Dwivedi/guide bias does not
+            // apply.
+            let mis_active = (alpha_d + alpha_g) >= 0.02 && !cloud_collision;
 
-            let (new_dir, cos_theta_for_alis) = if mis_active {
+            let (new_dir, cos_theta_for_alis) = if cloud_collision {
+                let cos_theta =
+                    sample_henyey_greenstein(xorshift_f64(&mut local_rng.dir), g_cloud_here);
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
+                let d = scatter_direction(current_dir, cos_theta, phi);
+                (d, cos_theta)
+            } else if mis_active {
                 let local_up_here = pos.normalize();
                 let alpha_p_mis = (1.0 - alpha_d - alpha_g).max(0.10);
                 // Renormalize if we clamped alpha_p
@@ -4192,14 +4477,18 @@ fn trace_secondary_chain_alis(
             //   hero_weight * wr[w] ~ (p_hero_sr / mix_hero) * (phase_w / phase_hero)
             //                       = p_phase_w_sr / mix_hero       (correct IS weight)
             // No per-wavelength MIS denominator correction is needed.
-            let phase_hero = scalar_phase_value(cos_theta_for_alis, hero_scatter_optics);
-            if phase_hero > 1e-30 {
-                for w in 0..num_wl {
-                    let optics_w = &atm.optics[scatter_shell][w];
-                    let phase_w = scalar_phase_value(cos_theta_for_alis, optics_w);
-                    let ratio = phase_w / phase_hero;
-                    wr[w] *= ratio;
-                    pr[w] *= ratio;
+            // Cloud scattering is gray: the per-wavelength phase ratio is
+            // identically 1, so wr/pr are untouched at a cloud vertex.
+            if !cloud_collision {
+                let phase_hero = scalar_phase_value(cos_theta_for_alis, hero_scatter_optics);
+                if phase_hero > 1e-30 {
+                    for w in 0..num_wl {
+                        let optics_w = &atm.optics[scatter_shell][w];
+                        let phase_w = scalar_phase_value(cos_theta_for_alis, optics_w);
+                        let ratio = phase_w / phase_hero;
+                        wr[w] *= ratio;
+                        pr[w] *= ratio;
+                    }
                 }
             }
 
@@ -4282,6 +4571,7 @@ pub fn hybrid_scatter_radiance_alis(
     sun_dir: Vec3,
     secondary_rays: usize,
     rng_state: &mut u64,
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     use crate::geometry::ray_sphere_intersect;
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
@@ -4366,7 +4656,13 @@ pub fn hybrid_scatter_radiance_alis(
     // to each LOS step to provide an alternative path to the sun.
     use crate::single_scatter::transmittance_between_points_spectrum;
 
-    let bdpt_active = sza_deg_obs >= BDPT_SZA_START && secondary_rays > 0;
+    // BDPT is DISABLED when a cloud field is present: the light subpath is
+    // forced-scattering only, and forced scattering cannot compose with the
+    // gray cloud channel unbiasedly (same reason the chains drop forced
+    // mode). NEE-only (backward chains, w_back = 1) is unbiased, just
+    // noisier; never blend two models of the same integral. The plan
+    // authorizes this fallback until the light subpath is converted.
+    let bdpt_active = sza_deg_obs >= BDPT_SZA_START && secondary_rays > 0 && field.is_none();
 
     // MIS Blend: backward chains and BDPT compute exactly the same
     // multi-scattering integral. To prevent a 2x additive bias, we blend them.
@@ -4435,6 +4731,7 @@ pub fn hybrid_scatter_radiance_alis(
                 &mut subpath_verts,
                 subpath_idx,
                 num_light_subpaths,
+                field,
             );
             for v in 0..n_verts {
                 let lv = &subpath_verts[v];
@@ -4475,9 +4772,12 @@ pub fn hybrid_scatter_radiance_alis(
             None => continue,
         };
 
-        let cloud_ext_step = atm.cloud_extinction[shell_idx];
+        // Per-step midpoint cloud extinction (field or 1D shell array).
+        // Chain-mode estimator: Beer-Lambert cloud transmittance on the eye
+        // LOS (explicit cloud scattering supplies the diffusion).
+        let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
         let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
-        let t_cloud_mid = atm.cloud_diffuse_transmittance(tau_cloud_mid);
+        let t_cloud_mid = libm::exp(-tau_cloud_mid);
 
         // Check if any wavelength still has observable transmittance.
         let mut any_visible = false;
@@ -4493,7 +4793,14 @@ pub fn hybrid_scatter_radiance_alis(
         }
 
         // --- Order 1: deterministic single-scatter NEE (all wavelengths) ---
-        let t_suns = shadow_ray_transmittance_spectrum(atm, scatter_pos, sun_dir, num_wl);
+        let t_suns = shadow_ray_transmittance_spectrum(
+            atm,
+            scatter_pos,
+            sun_dir,
+            num_wl,
+            field,
+            CloudTransmittance::BeerLambert,
+        );
         let cos_theta_1 = sun_dir.dot(view_dir);
 
         for w in 0..num_wl {
@@ -4572,6 +4879,7 @@ pub fn hybrid_scatter_radiance_alis(
                     num_wl,
                     w_back,
                     guide_ref,
+                    field,
                 );
 
                 for w in 0..num_wl {
@@ -4668,6 +4976,7 @@ pub fn hybrid_scatter_radiance_alis(
                     &mut subpath_verts,
                     subpath_idx,
                     num_light_subpaths,
+                    field,
                 );
                 for v in 0..n_verts {
                     if n_batch_verts < BATCH_VERT_CAP {
@@ -4700,9 +5009,12 @@ pub fn hybrid_scatter_radiance_alis(
                     None => continue,
                 };
 
-                let cloud_ext_step = atm.cloud_extinction[shell_idx];
+                // BDPT LOS re-walk: same midpoint cloud quadrature as the
+                // main walk. BDPT runs only when no field is present, but the
+                // estimator is chain mode either way: Beer-Lambert cloud.
+                let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
                 let tau_cloud_mid = tau_cloud_bdpt + cloud_ext_step * ds * 0.5;
-                let t_cloud_mid = atm.cloud_diffuse_transmittance(tau_cloud_mid);
+                let t_cloud_mid = libm::exp(-tau_cloud_mid);
 
                 // Check if any wavelength still has observable transmittance.
                 let mut any_visible = false;
@@ -4747,8 +5059,14 @@ pub fn hybrid_scatter_radiance_alis(
                     let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
                     let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
 
-                    let t_conn =
-                        transmittance_between_points_spectrum(atm, scatter_pos, lv.pos, num_wl);
+                    let t_conn = transmittance_between_points_spectrum(
+                        atm,
+                        scatter_pos,
+                        lv.pos,
+                        num_wl,
+                        field,
+                        CloudTransmittance::BeerLambert,
+                    );
 
                     for w in 0..num_wl {
                         let optics_eye = &atm.optics[shell_idx][w];
@@ -4813,6 +5131,7 @@ pub fn hybrid_scatter_radiance_alis(
 ///
 /// # Returns
 /// Spectral radiance array `[f64; 64]`, one value per wavelength channel.
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_scatter_spectrum(
     atm: &AtmosphereModel,
     observer_pos: Vec3,
@@ -4821,6 +5140,7 @@ pub fn hybrid_scatter_spectrum(
     secondary_rays: usize,
     base_seed: u64,
     polarized: bool,
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     // ALIS path: trace ONE hero path per chain, evaluate ALL wavelengths.
     // ~N_wl fewer chains than per-wavelength tracing, same expected value.
@@ -4835,6 +5155,7 @@ pub fn hybrid_scatter_spectrum(
             sun_dir,
             secondary_rays,
             &mut rng,
+            field,
         );
     }
 
@@ -4857,6 +5178,7 @@ pub fn hybrid_scatter_spectrum(
             secondary_rays,
             &mut rng,
             polarized,
+            field,
         );
     }
 
@@ -5140,6 +5462,58 @@ impl McRng {
 #[allow(clippy::assertions_on_constants)] // constant-coupling pin tests
 mod tests {
     use super::*;
+
+    /// G-CHI (sampled-vs-evaluated, cloud lobe): the gray cloud HG sampler
+    /// `sample_henyey_greenstein(g)` and the shared evaluator
+    /// `cloud_phase_value(cos, g)` must agree. Histogram sampled cos(theta)
+    /// into bins and chi-square against the integral of the evaluated pdf
+    /// p(cos) = 2*pi * HG(cos) over each bin (the phase normalizes so
+    /// 2*pi * INT_{-1}^{1} HG dcos = 1). The gas lobe (Rayleigh + aerosol
+    /// mix) is already pinned by seed_mixture_pdf_* and the scalar/ALIS
+    /// statistical gates; this covers the new third lobe in every estimator
+    /// (the same two functions back the scalar, Stokes and ALIS cloud
+    /// vertices, so one chi-square per representative g suffices).
+    #[test]
+    #[ignore = "g_s2_chi_cloud_phase: heavy histogram"]
+    fn g_s2_chi_cloud_phase_sampled_matches_evaluated() {
+        const N_BINS: usize = 20;
+        let n_samples = 4_000_000usize;
+        for &g in &[0.0f64, 0.46, 0.85] {
+            let mut counts = [0usize; N_BINS];
+            let mut rng: u64 = 0x1234_5678_9abc_def0 ^ g.to_bits();
+            for _ in 0..n_samples {
+                let c = sample_henyey_greenstein(xorshift_f64(&mut rng), g).clamp(-1.0, 1.0);
+                let bin = (((c + 1.0) * 0.5 * N_BINS as f64) as usize).min(N_BINS - 1);
+                counts[bin] += 1;
+            }
+            // The phase is normalized so (1/2) INT_{-1}^1 P dcos = 1, so the
+            // cos-marginal pdf (azimuth integrated out) is P(cos)/2. Expected
+            // fraction per bin: INT_bin P(cos)/2 dcos, by fine sub-quadrature
+            // (the forward peak at g=0.85 varies too fast for midpoint).
+            let dcos = 2.0 / N_BINS as f64;
+            const SUB: usize = 200;
+            let mut chi2 = 0.0f64;
+            for (b, &cnt) in counts.iter().enumerate() {
+                let c0 = -1.0 + b as f64 * dcos;
+                let sub_dc = dcos / SUB as f64;
+                let mut frac = 0.0f64;
+                for s in 0..SUB {
+                    let c = c0 + (s as f64 + 0.5) * sub_dc;
+                    frac += 0.5 * cloud_phase_value(c, g) * sub_dc;
+                }
+                let expected = frac * n_samples as f64;
+                assert!(expected > 0.0, "bin {b} g {g} expected {expected}");
+                let d = cnt as f64 - expected;
+                chi2 += d * d / expected;
+            }
+            // 19 dof: the 0.1% critical value is ~43.8. Use a generous 80
+            // (midpoint quadrature on the forward peak at g=0.85 adds some).
+            assert!(
+                chi2 < 80.0,
+                "G-CHI cloud HG g={g}: chi2 {chi2:.2} (sampler vs evaluator mismatch)"
+            );
+        }
+    }
 
     // ── Seed-mixture pdf helpers ──
 
@@ -5462,7 +5836,7 @@ mod tests {
         let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0); // radially outward
 
         let (tau, _hit_ground) = scout_tau_to_boundary(&atm, pos, dir, 1); // wavelength 1 (550nm)
-        let t_shadow = shadow_ray_transmittance(&atm, pos, dir, 1);
+        let t_shadow = shadow_ray_transmittance(&atm, pos, dir, 1, None, crate::single_scatter::CloudTransmittance::BeerLambert);
 
         let t_from_scout = libm::exp(-tau);
         let rel_err = if t_shadow > 1e-30 {
@@ -5600,7 +5974,7 @@ mod tests {
         let sun_dir = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
         let mut rng_state: u64 = 42;
 
-        let result = trace_photon(&atm, observer_pos, view_dir, sun_dir, 0, &mut rng_state);
+        let result = trace_photon(&atm, observer_pos, view_dir, sun_dir, 0, &mut rng_state, None);
         assert!(result.terminated, "Photon should terminate");
         assert_eq!(result.num_scatters, 0, "No scattering in empty atmosphere");
         assert!(
@@ -5626,7 +6000,7 @@ mod tests {
         let sun_dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0); // overhead
 
         let mut rng_state: u64 = 42;
-        let result = trace_photon(&atm, observer_pos, view_dir, sun_dir, 0, &mut rng_state);
+        let result = trace_photon(&atm, observer_pos, view_dir, sun_dir, 0, &mut rng_state, None);
         assert!(result.terminated, "Photon should always terminate");
     }
 
@@ -5709,7 +6083,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         assert_eq!(spectrum.len(), 64);
     }
 
@@ -5720,7 +6094,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 200, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 200, 42, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 spectrum[w] >= 0.0,
@@ -5738,7 +6112,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         for w in atm.num_wavelengths..64 {
             assert!(
                 spectrum[w].abs() < 1e-30,
@@ -5756,7 +6130,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 0, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 0, 42, None);
         for w in 0..64 {
             assert!(
                 spectrum[w].abs() < 1e-30,
@@ -5772,8 +6146,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
-        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
+        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 (s1[w] - s2[w]).abs() < 1e-15,
@@ -5795,7 +6169,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         assert!(
             spectrum[0].abs() < 1e-20,
             "Empty atmosphere should give ~0 MC contribution, got {}",
@@ -5812,7 +6186,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         // Use enough photons for a reliable signal
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 1000, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 1000, 42, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -5830,7 +6204,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 10, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 10, 42, true, None);
         assert_eq!(spectrum.len(), 64);
     }
 
@@ -5841,7 +6215,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(96.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 spectrum[w] >= 0.0,
@@ -5859,7 +6233,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -5878,7 +6252,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         assert!(
             spectrum[0].abs() < 1e-20,
             "Empty atmosphere should give zero hybrid contribution, got {}",
@@ -5893,8 +6267,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
-        let s2 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let s1 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
+        let s2 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 (s1[w] - s2[w]).abs() < 1e-15,
@@ -5947,7 +6321,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
         let mut rng: u64 = 42;
 
-        let result = trace_photon(&atm, obs, view, sun, 1, &mut rng);
+        let result = trace_photon(&atm, obs, view, sun, 1, &mut rng, None);
         assert!(result.terminated, "Photon should always terminate");
     }
 
@@ -5962,7 +6336,7 @@ mod tests {
 
         for seed in 0..50u64 {
             let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let result = trace_photon(&atm, obs, view, sun, 1, &mut rng);
+            let result = trace_photon(&atm, obs, view, sun, 1, &mut rng, None);
             assert!(
                 result.weight >= 0.0,
                 "Photon weight should be non-negative: seed={}, weight={}",
@@ -5981,7 +6355,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 500, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 500, 42, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -5999,8 +6373,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
-        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
+        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 (s1[w] - s2[w]).abs() < 1e-15,
@@ -6022,7 +6396,7 @@ mod tests {
 
         for sza in &[92.0, 96.0, 102.0] {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
-            let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true);
+            let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true, None);
             for w in 0..atm.num_wavelengths {
                 assert!(
                     spectrum[w] >= 0.0,
@@ -6044,7 +6418,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -6090,7 +6464,7 @@ mod tests {
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
         let mut rng: u64 = 42;
 
-        let result = trace_photon(&atm, obs, view, sun, 0, &mut rng);
+        let result = trace_photon(&atm, obs, view, sun, 0, &mut rng, None);
         assert!(result.terminated);
         assert_eq!(result.num_scatters, 0);
         assert!(result.weight.abs() < 1e-20);
@@ -6106,7 +6480,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
         let mut rng: u64 = 42;
 
-        let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng);
+        let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng, None);
         assert!(result.terminated);
     }
 
@@ -6119,7 +6493,7 @@ mod tests {
 
         for seed in 0..50u64 {
             let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng);
+            let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng, None);
             assert!(
                 result.stokes.intensity() >= 0.0,
                 "Stokes I should be non-negative: seed={}, I={}",
@@ -6139,7 +6513,7 @@ mod tests {
 
         for seed in 0..50u64 {
             let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng);
+            let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng, None);
             if result.stokes.intensity() > 1e-20 {
                 let dop = result.stokes.degree_of_polarization();
                 assert!(
@@ -6159,7 +6533,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 500, 42);
+        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 500, 42, None);
         let total_i: f64 = spectrum[..atm.num_wavelengths]
             .iter()
             .map(|s| s.intensity())
@@ -6178,8 +6552,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42);
-        let s2 = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42);
+        let s1 = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42, None);
+        let s2 = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42, None);
         for w in 0..atm.num_wavelengths {
             for c in 0..4 {
                 assert!(
@@ -6207,8 +6581,8 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let n_photons = 2000;
-        let scalar = mc_scatter_spectrum(&atm, obs, view, sun, n_photons, 42);
-        let polarized = mc_scatter_spectrum_polarized(&atm, obs, view, sun, n_photons, 42);
+        let scalar = mc_scatter_spectrum(&atm, obs, view, sun, n_photons, 42, None);
+        let polarized = mc_scatter_spectrum_polarized(&atm, obs, view, sun, n_photons, 42, None);
 
         for w in 0..atm.num_wavelengths {
             let i_scalar = scalar[w];
@@ -6238,7 +6612,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
 
-        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42);
+        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42, None);
         for c in 0..4 {
             assert!(
                 spectrum[0].s[c].abs() < 1e-20,
@@ -6255,7 +6629,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 0, 42);
+        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 0, 42, None);
         for w in 0..64 {
             for c in 0..4 {
                 assert!(spectrum[w].s[c].abs() < 1e-30);
@@ -6276,7 +6650,7 @@ mod tests {
         // Sun on horizon → scattering angle ~ 90 degrees
         let sun = crate::geometry::solar_direction_ecef(90.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 2000, 42);
+        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 2000, 42, None);
 
         // The 550nm channel should show noticeable polarization
         let s = spectrum[1]; // 550nm
@@ -6325,7 +6699,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let mut rng = 12345u64;
-        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng, None);
         assert_eq!(result.len(), 64);
         // Active wavelengths should be non-negative
         for w in 0..3 {
@@ -6377,7 +6751,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let mut rng = 42u64;
-        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 200, &mut rng);
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 200, &mut rng, None);
         for w in 0..3 {
             assert!(
                 result[w] > 0.0,
@@ -6427,7 +6801,8 @@ mod tests {
         for seed in 0..num_seeds {
             let base = seed * 1000 + 7777;
             let mut rng_alis = base;
-            let alis = hybrid_scatter_radiance_alis(&atm, obs, view, sun, rays, &mut rng_alis);
+            let alis =
+                hybrid_scatter_radiance_alis(&atm, obs, view, sun, rays, &mut rng_alis, None);
             for w in 0..3 {
                 alis_sum[w] += alis[w];
             }
@@ -6437,8 +6812,9 @@ mod tests {
                     .wrapping_add(w as u64)
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1);
-                let val =
-                    hybrid_scatter_radiance(&atm, obs, view, sun, w, rays, &mut rng_perwl, false);
+                let val = hybrid_scatter_radiance(
+                    &atm, obs, view, sun, w, rays, &mut rng_perwl, false, None,
+                );
                 perwl_sum[w] += val;
             }
         }
@@ -6473,7 +6849,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let mut rng = 42u64;
-        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng, None);
         assert!(
             result[0].abs() < 1e-30,
             "Empty atmosphere ALIS should give zero, got {:.4e}",
@@ -6512,7 +6888,7 @@ mod tests {
         for sza in &[96.0, 100.0, 104.0, 106.0] {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
             let mut rng = 12345u64;
-            let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+            let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng, None);
             for w in 0..3 {
                 assert!(
                     result[w] >= 0.0,
@@ -6690,6 +7066,7 @@ mod tests {
                     &mut verts,
                     sp,
                     num_subpaths,
+                    None,
                 );
                 total_verts += nv;
                 for v in 0..nv {
@@ -7176,6 +7553,7 @@ mod tests {
                 ray,
                 n,
                 1.0,
+                None,
             );
         }
         let mean = total / n as f64;
@@ -7224,6 +7602,7 @@ mod tests {
                 ray,
                 n,
                 1.0,
+                None,
             );
             assert!(
                 val >= 0.0,
@@ -7276,6 +7655,7 @@ mod tests {
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
+                None,
             );
             for w in 0..num_wl {
                 assert!(
@@ -7704,6 +8084,7 @@ mod tests {
                 ray,
                 n,
                 1.0,
+                None,
             );
             assert!(
                 result >= 0.0 && result.is_finite(),
@@ -7750,6 +8131,7 @@ mod tests {
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
+                None,
             );
             for w in 0..num_wl {
                 assert!(

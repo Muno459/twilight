@@ -61,6 +61,7 @@ from cloud3d_common import (
     sample_curtain,
     sample_path,
     window_mean,
+    write_field,
     write_result,
 )
 
@@ -410,6 +411,9 @@ def main():
     ap.add_argument("--window", type=int, default=128)
     ap.add_argument("--png", default=None,
                     help="also render a figure (IWP map + sunward curtain + profiles)")
+    ap.add_argument("--field-out", default=None,
+                    help="write the full 3D IWC grid (raw f32 + .json header) "
+                         "for the Rust 3D transport")
     ap.add_argument("--png3d", default=None,
                     help="true 3D render: IWC isosurfaces over the satellite image")
     ap.add_argument("--place", default=None, help="location label for the figure title")
@@ -564,6 +568,17 @@ def main():
         window_mean=wmean,
         path=path,
     )
+
+    if args.field_out:
+        # Approximate equal-angle frame of the window (ABI pixels ~2 km),
+        # anchored so lat0 is the SOUTH edge (Rust grid convention).
+        ny = iwc.shape[1]
+        dlat = 2.0 / 111.32
+        dlon = 2.0 / (111.32 * max(math.cos(math.radians(args.lat)), 0.05))
+        lat_nw = args.lat + jc_w * dlat
+        lon_w = args.lon - ic_w * dlon
+        write_field(args.field_out, iwc, heights, lat_nw - ny * dlat, lon_w,
+                    dlat, dlon, scan_time, bucket)
 
     place = args.place or f"{args.lat:.2f}N {args.lon:.2f}E"
     if args.png and cols:

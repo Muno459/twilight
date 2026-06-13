@@ -25,6 +25,7 @@ pub fn trace_photons_parallel(
                 .wrapping_add(i as u64)
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1);
+            // 1D-only entry point: no 3D cloud field consumer routes here.
             trace_photon(
                 atm,
                 observer_pos,
@@ -32,6 +33,7 @@ pub fn trace_photons_parallel(
                 sun_dir,
                 wavelength_idx,
                 &mut rng,
+                None,
             )
         })
         .collect();

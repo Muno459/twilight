@@ -360,6 +360,13 @@ struct PrayArgs {
     /// sidecar-produced JSON. Overrides single-layer cloud sources.
     #[arg(long)]
     cloud3d: Option<String>,
+    /// Full 3D cloud field from a sidecar --field-out export (raw f32
+    /// grid + .json header). The transport engine then traces every
+    /// light path through the actual voxel structure: sun rays through
+    /// real cloud gaps instead of a horizontally uniform deck.
+    /// Overrides --cloud3d and all other cloud sources.
+    #[arg(long, value_name = "PATH")]
+    cloud_field: Option<std::path::PathBuf>,
 }
 
 /// CLI aerosol type selector.
@@ -970,19 +977,24 @@ fn cmd_mcrt(
             )
             .unwrap_or_else(|e| {
                 eprintln!("Warning: GPU dispatch failed ({}), falling back to CPU", e);
-                simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step)
+                simulation::simulate_twilight_scan(
+                    &atm, &config, sza_start, sza_end, sza_step, None,
+                )
             }),
             Err(e) => {
                 eprintln!("Warning: GPU upload failed ({}), falling back to CPU", e);
-                simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step)
+                simulation::simulate_twilight_scan(
+                    &atm, &config, sza_start, sza_end, sza_step, None,
+                )
             }
         }
     } else {
-        simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step)
+        simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step, None)
     };
 
     #[cfg(not(feature = "gpu"))]
-    let results = simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step);
+    let results =
+        simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step, None);
 
     let elapsed = start.elapsed();
 
@@ -1144,7 +1156,7 @@ fn cmd_compare(
                 seed_salt: 0,
             };
             for &sza in szas {
-                let result = simulation::simulate_at_sza(&atm, &config, sza);
+                let result = simulation::simulate_at_sza(&atm, &config, sza, None);
                 for (wl, rad) in result.wavelengths_nm.iter().zip(result.radiance.iter()) {
                     println!("{},{},{},{},{:e}", sza, vz, ra, wl, rad);
                 }
@@ -1633,6 +1645,7 @@ fn build_input(
     tz_offset: f64,
     weather: Option<WeatherBlock>,
     cloud_layers: Option<Vec<CloudProperties>>,
+    cloud_field: Option<twilight_data::cloud_field_builder::OwnedCloudField>,
     horizon_profile: Option<HorizonProfile>,
     skyglow: Option<SkyglowResult>,
     solar_f107: Option<f64>,
@@ -1678,6 +1691,7 @@ fn build_input(
         polarized: !args.fast,
         solar_f107,
         cloud_layers,
+        cloud_field,
         verbose: args.verbose,
         ..Default::default()
     }
@@ -1826,17 +1840,45 @@ fn cmd_pray(args: PrayArgs) {
         None
     };
 
-    let cloud_layers = args.cloud3d.as_deref().and_then(|spec| {
-        resolve_cloud3d(
-            spec,
-            args.lat,
-            args.lon,
-            &date_iso,
-            sampling_hour_utc,
-            sun_azimuth,
-            &satellite_cache,
-        )
+    let cloud_field = args.cloud_field.as_deref().map(|p| {
+        match twilight_weather::cloud3d::load_field(p) {
+            Ok(f) => {
+                println!(
+                    "3D cloud field: {} voxels ({}x{}x{}), source {} @ {}",
+                    f.sigma.iter().filter(|v| **v > 0.0).count(),
+                    f.nz,
+                    f.nlat,
+                    f.nlon,
+                    f.source,
+                    f.timestamp
+                );
+                f
+            }
+            Err(e) => {
+                eprintln!("Error: --cloud-field {}: {e}", p.display());
+                std::process::exit(1);
+            }
+        }
     });
+
+    let cloud_layers = if cloud_field.is_some() {
+        if args.cloud3d.is_some() {
+            println!("Note: --cloud-field overrides --cloud3d.");
+        }
+        None
+    } else {
+        args.cloud3d.as_deref().and_then(|spec| {
+            resolve_cloud3d(
+                spec,
+                args.lat,
+                args.lon,
+                &date_iso,
+                sampling_hour_utc,
+                sun_azimuth,
+                &satellite_cache,
+            )
+        })
+    };
 
     let atm_desc = match weather.as_ref() {
         Some(w) => w.description.clone(),
@@ -1911,6 +1953,7 @@ fn cmd_pray(args: PrayArgs) {
         tz.offset_hours,
         weather,
         cloud_layers,
+        cloud_field,
         horizon_profile,
         skyglow_result,
         solar_f107,
@@ -2664,7 +2707,7 @@ fn sqm_predict_curve(args: &SqmArgs) -> SqmCurve {
         let sza = pos.zenith;
 
         let sun_cd = if sza <= 110.0 {
-            let result = simulation::simulate_at_sza(&atm, &config, sza);
+            let result = simulation::simulate_at_sza(&atm, &config, sza, None);
             let analysis = twilight_threshold::threshold::analyze_twilight(
                 sza,
                 &result.wavelengths_nm,
@@ -3022,6 +3065,7 @@ fn cmd_render(sza: f64, width: u32, height: u32, rays: usize, out: &str) {
                 sun_dir,
                 rays,
                 &mut rng,
+                None,
             );
 
             let mut sum_x = 0.0;

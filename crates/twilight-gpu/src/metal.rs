@@ -66,9 +66,18 @@ pub struct MetalBackend {
     pso_mcrt_trace: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_hybrid_v2: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_garstang: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    // Test-only: device-side field DDA probe (G-DDA-PARITY). Only read by
+    // the #[cfg(test)] field_tau_probe helper, so it is dead in lib builds.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pso_field_tau_probe: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 
     // Uploaded atmosphere + constant buffers (persisted between dispatches).
     buf_atm: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    // Uploaded 3D cloud field (v4). None => 1D shell-cloud path.
+    buf_field: Option<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    // Always-bound stub so the kernel's buffer(3) argument is never null
+    // when no field is present (the shader gates on field_present anyway).
+    buf_field_stub: Retained<ProtocolObject<dyn MTLBuffer>>,
     // Solar and vision LUTs uploaded at init. Reserved for spectral weighting
     // kernels in Phase 11f pipeline integration.
     #[allow(dead_code)]
@@ -124,6 +133,7 @@ pub(crate) fn init_backend(config: &GpuConfig) -> Result<MetalBackend, GpuError>
     let pso_mcrt_trace = make_pipeline(&device, &library, "mcrt_trace_photon")?;
     let pso_hybrid_v2 = make_pipeline(&device, &library, "hybrid_scatter_v2")?;
     let pso_garstang = make_pipeline(&device, &library, "garstang_zenith")?;
+    let pso_field_tau_probe = make_pipeline(&device, &library, "field_tau_probe")?;
 
     // 5. Pack and upload constant buffers (solar spectrum, vision LUTs)
     let solar = PackedSolarSpectrum::pack();
@@ -131,6 +141,9 @@ pub(crate) fn init_backend(config: &GpuConfig) -> Result<MetalBackend, GpuError>
 
     let buf_solar = create_buffer_from_f32(&device, &solar.data)?;
     let buf_vision = create_buffer_from_f32(&device, &vision.data)?;
+    // Stub field buffer (16 f32): bound at index 3 whenever no real field
+    // is present. The shader never reads it (field_present == 0).
+    let buf_field_stub = create_empty_buffer(&device, 16)?;
 
     // 6. Build device info
     let name = device.name().to_string();
@@ -148,7 +161,10 @@ pub(crate) fn init_backend(config: &GpuConfig) -> Result<MetalBackend, GpuError>
         pso_mcrt_trace,
         pso_hybrid_v2,
         pso_garstang,
+        pso_field_tau_probe,
         buf_atm: None,
+        buf_field: None,
+        buf_field_stub,
         buf_solar,
         buf_vision,
         info,
@@ -172,6 +188,23 @@ impl GpuBackend for MetalBackend {
         self.num_wavelengths = packed.num_wavelengths;
         self.buf_atm = Some(create_buffer_from_f32(&self.device, &packed.data)?);
         Ok(())
+    }
+
+    fn upload_field(
+        &mut self,
+        field: Option<&twilight_core::cloud_field::Cloud3DField>,
+    ) -> Result<(), GpuError> {
+        match field {
+            None => {
+                self.buf_field = None;
+                Ok(())
+            }
+            Some(f) => {
+                let packed = crate::buffers::PackedCloudField::pack(f);
+                self.buf_field = Some(create_buffer_from_f32(&self.device, &packed.data)?);
+                Ok(())
+            }
+        }
     }
 
     fn single_scatter(
@@ -287,10 +320,21 @@ impl GpuBackend for MetalBackend {
         // second on Apple Silicon; the extra commit/wait round-trips cost
         // only ~1 ms each. (The old 2500 x 4 = 10000-ray buffers were
         // killed with kIOGPUCommandBufferCallbackErrorImpactingInteractivity.)
-        const RAYS_PER_DISPATCH: u32 = 250;
+        // With a 3D field bound, each ray's chain walks the device-side DDA
+        // (NEE shadow legs + the cloud-channel race), so a 250-ray buffer can
+        // exceed the macOS GPU watchdog (~2 s) at deep twilight. Measured cost
+        // on a DENSE uniform deck (worst case: no empty-tile DDA skips, every
+        // NEE shadow ray crosses thousands of occupied cells) is ~0.15-0.2 s
+        // per ray at SZA 96 on an M2 Pro, so 8 rays/buffer = ~1.4 s already
+        // brushes the watchdog and 16 trips it. Drop to 4 rays/buffer when a
+        // field is present (~0.9 s worst case, comfortable margin); broken
+        // real fields are far cheaper per ray (empty-tile skips), so this is
+        // a floor, not the typical cost. More commit/wait round-trips (~1 ms
+        // each) but every command buffer stays safely under the watchdog.
+        let rays_per_dispatch: u32 = if self.buf_field.is_some() { 4 } else { 250 };
         const DISPATCHES_PER_COMMAND_BUFFER: usize = 1;
         const PARAMS_STRIDE: usize = 16;
-        let num_dispatches = secondary_rays.div_ceil(RAYS_PER_DISPATCH).max(1);
+        let num_dispatches = secondary_rays.div_ceil(rays_per_dispatch).max(1);
 
         // Pre-allocate a single reusable output buffer for the largest chunk.
         // This eliminates per-chunk Metal buffer allocation + zeroing (~77 MB
@@ -306,8 +350,8 @@ impl GpuBackend for MetalBackend {
 
             for chunk_idx in 0..chunk_len {
                 let d = (chunk_start + chunk_idx) as u32;
-                let ray_start = d * RAYS_PER_DISPATCH;
-                let rays_this = (secondary_rays - ray_start).min(RAYS_PER_DISPATCH);
+                let ray_start = d * rays_per_dispatch;
+                let rays_this = (secondary_rays - ray_start).min(rays_per_dispatch);
 
                 // Fold the FULL 64-bit seed into the low 32 bits before
                 // packing (splitmix64 finalizer). The previous
@@ -322,13 +366,14 @@ impl GpuBackend for MetalBackend {
                     z ^ (z >> 31)
                 };
                 let ray_seed = (folded & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
-                let params = PackedDispatchParams::new(
+                let params = PackedDispatchParams::new_with_field(
                     observer_pos,
                     view_dir,
                     sun_dir,
                     secondary_rays,
                     rays_this,
                     ray_seed,
+                    self.buf_field.is_some(),
                 );
                 all_params.extend_from_slice(&params.data);
             }
@@ -341,11 +386,16 @@ impl GpuBackend for MetalBackend {
                 std::ptr::write_bytes(buf_output.contents().as_ptr() as *mut u8, 0, zero_bytes);
             }
 
+            let field_buf: &ProtocolObject<dyn MTLBuffer> = self
+                .buf_field
+                .as_deref()
+                .unwrap_or(&self.buf_field_stub);
             self.dispatch_hybrid_v2_chunk(
                 &self.pso_hybrid_v2,
                 buf_atm,
                 &buf_params,
                 &buf_output,
+                field_buf,
                 nw as u32,
                 MAX_LOS_STEPS as u32,
                 chunk_len,
@@ -497,6 +547,75 @@ impl MetalBackend {
         unsafe {
             *ptr.add(atm_offsets::HEADER_VERSION) = f32::from_bits(BUFFER_VERSION + 1);
         }
+    }
+
+    /// Overwrite the packed version word of the uploaded field buffer to a
+    /// specific value (e.g. the old v3) for the field header-gate test.
+    #[cfg(test)]
+    pub(crate) fn set_field_version_word(&self, version: u32) {
+        use crate::buffers::field_offsets;
+        let buf = self.buf_field.as_ref().expect("field not uploaded");
+        let ptr = buf.contents().as_ptr() as *mut f32;
+        unsafe {
+            *ptr.add(field_offsets::HEADER_VERSION) = f32::from_bits(version);
+        }
+    }
+
+    /// Dispatch the device-side field DDA probe (G-DDA-PARITY). Each ray is
+    /// (p0, t_max, dir): 8 f32. Returns one cloud optical depth per ray.
+    /// Requires a field uploaded via `upload_field`.
+    #[cfg(test)]
+    pub(crate) fn field_tau_probe(&self, rays: &[[f64; 7]]) -> Result<Vec<f64>, GpuError> {
+        let fld = self
+            .buf_field
+            .as_ref()
+            .ok_or_else(|| GpuError::Dispatch("field not uploaded".into()))?;
+
+        let n = rays.len();
+        let mut packed = vec![0.0f32; n * 8];
+        for (i, ray) in rays.iter().enumerate() {
+            let b = i * 8;
+            packed[b] = ray[0] as f32; // p0.x
+            packed[b + 1] = ray[1] as f32; // p0.y
+            packed[b + 2] = ray[2] as f32; // p0.z
+            packed[b + 3] = ray[3] as f32; // t_max
+            packed[b + 4] = ray[4] as f32; // dir.x
+            packed[b + 5] = ray[5] as f32; // dir.y
+            packed[b + 6] = ray[6] as f32; // dir.z
+        }
+        let buf_rays = create_buffer_from_f32(&self.device, &packed)?;
+        let buf_out = create_empty_buffer(&self.device, n)?;
+
+        let cmd_buf = self
+            .queue
+            .commandBuffer()
+            .ok_or_else(|| GpuError::Dispatch("failed to create command buffer".into()))?;
+        let encoder = cmd_buf
+            .computeCommandEncoder()
+            .ok_or_else(|| GpuError::Dispatch("failed to create compute encoder".into()))?;
+        encoder.setComputePipelineState(&self.pso_field_tau_probe);
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(fld), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(&buf_rays), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(&buf_out), 0, 2);
+        }
+        let tg = MTLSize {
+            width: 64,
+            height: 1,
+            depth: 1,
+        };
+        let grid = MTLSize {
+            width: n.div_ceil(64),
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid, tg);
+        encoder.endEncoding();
+        cmd_buf.commit();
+        cmd_buf.waitUntilCompleted();
+
+        let raw = f32_buffer_slice(&buf_out, n);
+        Ok(raw.iter().map(|&v| v as f64).collect())
     }
 
     fn scan_batch_non_hybrid(
@@ -763,6 +882,7 @@ impl MetalBackend {
         atm_buffer: &ProtocolObject<dyn MTLBuffer>,
         params_buffer: &ProtocolObject<dyn MTLBuffer>,
         output_buffer: &ProtocolObject<dyn MTLBuffer>,
+        field_buffer: &ProtocolObject<dyn MTLBuffer>,
         num_wavelengths: u32,
         num_steps: u32,
         dispatch_count: usize,
@@ -803,6 +923,7 @@ impl MetalBackend {
                 encoder.setBuffer_offset_atIndex(Some(atm_buffer), 0, 0);
                 encoder.setBuffer_offset_atIndex(Some(params_buffer), params_byte_offset, 1);
                 encoder.setBuffer_offset_atIndex(Some(output_buffer), output_byte_offset, 2);
+                encoder.setBuffer_offset_atIndex(Some(field_buffer), 0, 3);
             }
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
         }

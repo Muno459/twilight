@@ -46,6 +46,7 @@ from cloud3d_common import (
     sample_curtain,
     sample_path,
     window_mean,
+    write_field,
     write_result,
 )
 from cloud3d_profile import (
@@ -166,6 +167,8 @@ def main():
                     help="UTC ISO time; default = newest available scan")
     ap.add_argument("--out", required=True)
     ap.add_argument("--png", default=None)
+    ap.add_argument("--field-out", default=None,
+                    help="write the full 3D IWC grid (raw f32 + .json header)")
     ap.add_argument("--png3d", default=None,
                     help="true 3D render: IWC isosurfaces over the satellite image")
     ap.add_argument("--place", default=None)
@@ -284,6 +287,15 @@ def main():
         window_mean=wmean,
         path=path,
     )
+
+    if args.field_out:
+        ny = iwc.shape[1]
+        dlat = km_s / 111.32
+        dlon = km_e / (111.32 * max(math.cos(math.radians(args.lat)), 0.05))
+        lat_nw = args.lat + jc_w * dlat
+        lon_w = args.lon - ic_w * dlon
+        write_field(args.field_out, iwc, heights, lat_nw - ny * dlat, lon_w,
+                    dlat, dlon, scan_time, "meteosat-9-iodc")
 
     place = args.place or f"{args.lat:.2f}N {args.lon:.2f}E"
     if args.png and cols:

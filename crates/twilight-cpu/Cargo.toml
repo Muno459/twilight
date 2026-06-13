@@ -19,3 +19,6 @@ twilight-terrain = { workspace = true }
 twilight-skyglow = { workspace = true }
 twilight-gpu = { workspace = true, optional = true }
 rayon = "1"
+
+[dev-dependencies]
+twilight-weather = { workspace = true }

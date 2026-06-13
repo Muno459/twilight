@@ -292,7 +292,7 @@ pub fn shadow_ray_cases() -> Vec<ShadowRayCase> {
         let scatter_pos = Vec3::new(obs_r, 0.0, 0.0);
 
         for w in 0..3 {
-            let t = shadow_ray_transmittance(&atm, scatter_pos, sun_dir, w);
+            let t = shadow_ray_transmittance(&atm, scatter_pos, sun_dir, w, None, twilight_core::single_scatter::CloudTransmittance::Diffuse);
             cases.push(ShadowRayCase {
                 scatter_pos: [scatter_pos.x, scatter_pos.y, scatter_pos.z],
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z],
@@ -308,7 +308,7 @@ pub fn shadow_ray_cases() -> Vec<ShadowRayCase> {
     for &sza in &[96.0, 108.0] {
         let sun_dir = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
         for w in 0..3 {
-            let t = shadow_ray_transmittance(&atm, high_pos, sun_dir, w);
+            let t = shadow_ray_transmittance(&atm, high_pos, sun_dir, w, None, twilight_core::single_scatter::CloudTransmittance::Diffuse);
             cases.push(ShadowRayCase {
                 scatter_pos: [high_pos.x, high_pos.y, high_pos.z],
                 sun_dir: [sun_dir.x, sun_dir.y, sun_dir.z],
@@ -349,7 +349,7 @@ pub fn single_scatter_cases() -> Vec<SingleScatterCase> {
     for (i, &sza) in szas.iter().enumerate() {
         let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
         for w in 0..3 {
-            let rad = single_scatter_radiance(&atm, obs, view, sun, w);
+            let rad = single_scatter_radiance(&atm, obs, view, sun, w, None);
             cases.push(SingleScatterCase {
                 sza_deg: sza,
                 wavelength_idx: w,
@@ -381,7 +381,7 @@ pub fn spectral_cases() -> Vec<SpectralCase> {
 
     for (i, &sza) in szas.iter().enumerate() {
         let sun = solar_direction_ecef(sza, 180.0, 0.0, 0.0);
-        let spec = single_scatter_spectrum(&atm, obs, view, sun);
+        let spec = single_scatter_spectrum(&atm, obs, view, sun, None);
         cases.push(SpectralCase {
             sza_deg: sza,
             radiance: [spec[0], spec[1], spec[2]],

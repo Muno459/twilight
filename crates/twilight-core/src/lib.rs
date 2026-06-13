@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod atmosphere;
+pub mod cloud_field;
 pub mod gas_absorption;
 // Generated from tools/gen_gas_xsec.py -- data values that happen to match
 // mathematical constants (e.g. 0.3180 ~ 1/pi) are genuine cross-section

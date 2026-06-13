@@ -204,9 +204,120 @@ impl Cloud3dProfile {
     }
 }
 
+
+/// Header of a sidecar `--field-out` grid (JSON next to the raw f32).
+#[derive(Debug, serde::Deserialize)]
+pub struct FieldHeader {
+    pub nz: usize,
+    pub ny: usize,
+    pub nx: usize,
+    pub top_m: f64,
+    pub lat0_deg: f64,
+    pub lon0_deg: f64,
+    pub dlat_deg: f64,
+    pub dlon_deg: f64,
+    pub time_utc: String,
+    pub source: String,
+}
+
+/// Load a sidecar full-grid IWC file (raw little-endian f32 + .json
+/// header) into an owned 3D cloud field for the transport engine.
+///
+/// The file is top-down, rows north-to-south (the sidecar contract);
+/// `field_from_iwc_grid` consumes top-down directly, and the
+/// north-to-south rows are flipped here so latitude ascends.
+pub fn load_field(path: &std::path::Path) -> Result<
+    twilight_data::cloud_field_builder::OwnedCloudField,
+    crate::error::WeatherError,
+> {
+    use crate::error::WeatherError;
+    let header_path = path.with_extension(
+        path.extension()
+            .map(|e| format!("{}.json", e.to_string_lossy()))
+            .unwrap_or_else(|| "json".into()),
+    );
+    let hdr: FieldHeader = serde_json::from_str(
+        &std::fs::read_to_string(&header_path)
+            .map_err(|e| WeatherError::io(format!("field header: {e}")))?,
+    )
+    .map_err(|e| WeatherError::parse(format!("field header: {e}")))?;
+    let bytes = std::fs::read(path).map_err(|e| WeatherError::io(format!("field: {e}")))?;
+    let n = hdr.nz * hdr.ny * hdr.nx;
+    if bytes.len() != n * 4 {
+        return Err(WeatherError::parse(format!(
+            "field size mismatch: {} bytes for {} voxels",
+            bytes.len(),
+            n
+        )));
+    }
+    let mut iwc = vec![0.0f32; n];
+    for (i, c) in bytes.chunks_exact(4).enumerate() {
+        iwc[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+    }
+    // Flip rows: file is north-to-south, the field grid ascends in lat.
+    let (nz, ny, nx) = (hdr.nz, hdr.ny, hdr.nx);
+    let mut flipped = vec![0.0f32; n];
+    for iz in 0..nz {
+        for iy in 0..ny {
+            let src = (iz * ny + iy) * nx;
+            let dst = (iz * ny + (ny - 1 - iy)) * nx;
+            flipped[dst..dst + nx].copy_from_slice(&iwc[src..src + nx]);
+        }
+    }
+    let mut f = twilight_data::cloud_field_builder::field_from_iwc_grid(
+        &flipped,
+        nz,
+        ny,
+        nx,
+        hdr.top_m,
+        hdr.lat0_deg,
+        hdr.lon0_deg,
+        hdr.dlat_deg,
+        hdr.dlon_deg,
+        &hdr.time_utc,
+    );
+    f.source = hdr.source;
+    Ok(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_field_round_trips_sidecar_format() {
+        // Mirror of tools/cloud3d_common.py write_field: raw LE f32,
+        // top-down levels, north-to-south rows, JSON header alongside.
+        let dir = std::env::temp_dir().join("tw_field_contract");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("f.bin");
+        let (nz, ny, nx) = (2usize, 3usize, 2usize);
+        let mut iwc = vec![0.0f32; nz * ny * nx];
+        iwc[(0 * ny) * nx + 1] = 0.5; // top level, NORTH row, east col
+        iwc[(1 * ny + 2) * nx] = 0.25; // bottom level, SOUTH row, west col
+        let bytes: Vec<u8> = iwc.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&bin, bytes).unwrap();
+        std::fs::write(
+            dir.join("f.bin.json"),
+            r#"{"nz":2,"ny":3,"nx":2,"top_m":10000.0,"lat0_deg":54.0,
+                "lon0_deg":9.0,"dlat_deg":0.018,"dlon_deg":0.03,
+                "time_utc":"2026-06-13T02:00:00Z","source":"contract-test"}"#,
+        )
+        .unwrap();
+
+        let f = load_field(&bin).unwrap();
+        assert_eq!((f.nlat, f.nlon), (3, 2));
+        assert_eq!(f.source, "contract-test");
+        let idx = |iz: usize, iy: usize, ix: usize| (iz * 3 + iy) * 2 + ix;
+        // North row must land at the HIGHEST lat index after the flip;
+        // top source slab (5-10 km) regrids into dest levels 20..40.
+        assert!(f.sigma[idx(30, 2, 1)] > 0.0, "north/top voxel missing");
+        assert!(f.sigma[idx(10, 0, 0)] > 0.0, "south/bottom voxel missing");
+        assert_eq!(f.sigma[idx(30, 0, 1)], 0.0, "row flip not applied");
+        assert_eq!(f.sigma[idx(10, 2, 0)], 0.0, "row flip not applied");
+        let r = f.sigma[idx(30, 2, 1)] / f.sigma[idx(10, 0, 0)];
+        assert!((r - 2.0).abs() < 1e-4, "sigma not linear in IWC: {r}");
+    }
 
     fn synthetic(iwc_fill: &[(usize, usize, f64)]) -> Cloud3dProfile {
         let n = 80usize;
