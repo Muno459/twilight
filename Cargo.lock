@@ -1591,6 +1591,7 @@ dependencies = [
  "twilight-solar",
  "twilight-terrain",
  "twilight-threshold",
+ "twilight-weather",
 ]
 
 [[package]]

@@ -360,6 +360,13 @@ struct PrayArgs {
     /// sidecar-produced JSON. Overrides single-layer cloud sources.
     #[arg(long)]
     cloud3d: Option<String>,
+    /// Full 3D cloud field from a sidecar --field-out export (raw f32
+    /// grid + .json header). The transport engine then traces every
+    /// light path through the actual voxel structure: sun rays through
+    /// real cloud gaps instead of a horizontally uniform deck.
+    /// Overrides --cloud3d and all other cloud sources.
+    #[arg(long, value_name = "PATH")]
+    cloud_field: Option<std::path::PathBuf>,
 }
 
 /// CLI aerosol type selector.
@@ -1638,6 +1645,7 @@ fn build_input(
     tz_offset: f64,
     weather: Option<WeatherBlock>,
     cloud_layers: Option<Vec<CloudProperties>>,
+    cloud_field: Option<twilight_data::cloud_field_builder::OwnedCloudField>,
     horizon_profile: Option<HorizonProfile>,
     skyglow: Option<SkyglowResult>,
     solar_f107: Option<f64>,
@@ -1683,6 +1691,7 @@ fn build_input(
         polarized: !args.fast,
         solar_f107,
         cloud_layers,
+        cloud_field,
         verbose: args.verbose,
         ..Default::default()
     }
@@ -1831,17 +1840,45 @@ fn cmd_pray(args: PrayArgs) {
         None
     };
 
-    let cloud_layers = args.cloud3d.as_deref().and_then(|spec| {
-        resolve_cloud3d(
-            spec,
-            args.lat,
-            args.lon,
-            &date_iso,
-            sampling_hour_utc,
-            sun_azimuth,
-            &satellite_cache,
-        )
+    let cloud_field = args.cloud_field.as_deref().map(|p| {
+        match twilight_weather::cloud3d::load_field(p) {
+            Ok(f) => {
+                println!(
+                    "3D cloud field: {} voxels ({}x{}x{}), source {} @ {}",
+                    f.sigma.iter().filter(|v| **v > 0.0).count(),
+                    f.nz,
+                    f.nlat,
+                    f.nlon,
+                    f.source,
+                    f.timestamp
+                );
+                f
+            }
+            Err(e) => {
+                eprintln!("Error: --cloud-field {}: {e}", p.display());
+                std::process::exit(1);
+            }
+        }
     });
+
+    let cloud_layers = if cloud_field.is_some() {
+        if args.cloud3d.is_some() {
+            println!("Note: --cloud-field overrides --cloud3d.");
+        }
+        None
+    } else {
+        args.cloud3d.as_deref().and_then(|spec| {
+            resolve_cloud3d(
+                spec,
+                args.lat,
+                args.lon,
+                &date_iso,
+                sampling_hour_utc,
+                sun_azimuth,
+                &satellite_cache,
+            )
+        })
+    };
 
     let atm_desc = match weather.as_ref() {
         Some(w) => w.description.clone(),
@@ -1916,6 +1953,7 @@ fn cmd_pray(args: PrayArgs) {
         tz.offset_hours,
         weather,
         cloud_layers,
+        cloud_field,
         horizon_profile,
         skyglow_result,
         solar_f107,
