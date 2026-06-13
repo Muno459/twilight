@@ -195,14 +195,33 @@ impl<'a> Cloud3DField<'a> {
         }
         let mut tau = 0.0f64;
         let mut t = 0.0f64;
+        let min_step = self.min_step();
+        let has_macro = !self.macrocell_max.is_empty();
         // Bounded iteration: a 2,000 km path through 250 m cells crosses
-        // < 20k boundaries in pathological diagonals.
+        // < 20k boundaries in pathological diagonals. Empty macro-tiles are
+        // skipped in one coarse step (sigma 0 there, so tau is unchanged):
+        // a deep-twilight ray spends ~95% of its length in clear air.
         for _ in 0..40_000 {
             if t >= t_max {
                 break;
             }
             let p = p0 + dir * t;
-            let step = self.distance_to_next_boundary(p, dir).max(self.min_step());
+            let step = if has_macro {
+                let maj = self.macro_majorant_at(p);
+                if maj == 0.0 {
+                    // Provably empty tile: skip to the coarse boundary, tau += 0.
+                    let s = self.distance_to_next_tile_boundary(p, dir).max(min_step);
+                    t = (t + s).min(t_max);
+                    continue;
+                } else if maj < 0.0 {
+                    // Outside the footprint: sigma is altitude-only, step radially.
+                    self.distance_to_next_radial_boundary(p, dir).max(min_step)
+                } else {
+                    self.distance_to_next_boundary(p, dir).max(min_step)
+                }
+            } else {
+                self.distance_to_next_boundary(p, dir).max(min_step)
+            };
             let t_next = (t + step).min(t_max);
             let mid = p0 + dir * ((t + t_next) * 0.5);
             tau += self.sigma_at(mid) * (t_next - t);
@@ -223,12 +242,30 @@ impl<'a> Cloud3DField<'a> {
         }
         let mut tau = 0.0f64;
         let mut t = 0.0f64;
+        let min_step = self.min_step();
+        let has_macro = !self.macrocell_max.is_empty();
         for _ in 0..40_000 {
             if t >= t_max {
                 return None;
             }
             let p = p0 + dir * t;
-            let step = self.distance_to_next_boundary(p, dir).max(self.min_step());
+            let step = if has_macro {
+                let maj = self.macro_majorant_at(p);
+                if maj == 0.0 {
+                    // Empty tile: dtau = 0 throughout, no collision can land here.
+                    let s = self.distance_to_next_tile_boundary(p, dir).max(min_step);
+                    t = (t + s).min(t_max);
+                    continue;
+                } else if maj < 0.0 {
+                    // Outside the footprint: constant sigma over a radial segment,
+                    // so the linear collision inversion below stays exact.
+                    self.distance_to_next_radial_boundary(p, dir).max(min_step)
+                } else {
+                    self.distance_to_next_boundary(p, dir).max(min_step)
+                }
+            } else {
+                self.distance_to_next_boundary(p, dir).max(min_step)
+            };
             let t_next = (t + step).min(t_max);
             let mid = p0 + dir * ((t + t_next) * 0.5);
             let sigma = self.sigma_at(mid);
@@ -335,6 +372,132 @@ impl<'a> Cloud3DField<'a> {
             }
         }
 
+        best
+    }
+
+    /// Max sigma over the macro-tile containing `p`. Returns 0.0 for a
+    /// provably EMPTY tile (the whole tile contributes no cloud tau, so it
+    /// is crossed in one coarse step), a positive value for an OCCUPIED
+    /// tile (step finely), and -1.0 when there is no tile data or `p` is
+    /// outside the footprint (sigma is then altitude-only, so step
+    /// radially). Mirrors the GPU `field_macro_majorant_at` so the two
+    /// backends skip empty space identically, leaving the accumulated tau
+    /// unchanged (empty cells contribute zero either way).
+    #[inline]
+    fn macro_majorant_at(&self, p: Vec3) -> f64 {
+        if self.macrocell_max.is_empty() {
+            return -1.0;
+        }
+        let (r, lat, lon) = sphere_coords(p);
+        match self.indices(r, lat, lon) {
+            Some((iz, ilat, ilon)) => {
+                let ntlat = self.nlat.div_ceil(self.tile);
+                let ntlon = self.nlon.div_ceil(self.tile);
+                self.macrocell_max[(iz * ntlat + ilat / self.tile) * ntlon + ilon / self.tile]
+                    as f64
+            }
+            None => -1.0,
+        }
+    }
+
+    /// Distance to the next z-level (radial) boundary only. Outside the
+    /// footprint sigma is altitude-only, so a whole radial segment has
+    /// constant sigma and both the midpoint quadrature and the linear
+    /// collision inversion stay exact while skipping lat/lon crossings.
+    fn distance_to_next_radial_boundary(&self, p: Vec3, dir: Vec3) -> f64 {
+        let r = p.length();
+        let mut best = f64::MAX;
+        let z = r - EARTH_RADIUS_M;
+        let iz = libm::floor((z - self.z0_m) / self.dz_m);
+        let b = p.dot(dir);
+        for k in [iz - 1.0, iz, iz + 1.0, iz + 2.0] {
+            let rk = EARTH_RADIUS_M + self.z0_m + k * self.dz_m;
+            let c = r * r - rk * rk;
+            let disc = b * b - c;
+            if disc >= 0.0 {
+                let s = libm::sqrt(disc);
+                for t in [-b - s, -b + s] {
+                    if t > 1e-6 && t < best {
+                        best = t;
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    /// Distance to the nearest COARSE (macro-tile) boundary: the z-grid
+    /// stays fine (sigma varies per level), lat/lon crossings use the tile
+    /// spacing. Lets a provably empty tile be crossed in one step.
+    /// Conservative (a smaller distance is always safe), so the
+    /// floor-1..=floor+2 candidate window is kept. Mirrors the GPU
+    /// `field_distance_to_next_tile_boundary`.
+    fn distance_to_next_tile_boundary(&self, p: Vec3, dir: Vec3) -> f64 {
+        let (r, lat, lon) = sphere_coords(p);
+        let mut best = f64::MAX;
+        let dlat_t = self.dlat_deg * self.tile as f64;
+        let dlon_t = self.dlon_deg * self.tile as f64;
+
+        // Radial: fine z-grid (sigma varies per level).
+        let z = r - EARTH_RADIUS_M;
+        let iz = libm::floor((z - self.z0_m) / self.dz_m);
+        let b_r = p.dot(dir);
+        for k in [iz - 1.0, iz, iz + 1.0, iz + 2.0] {
+            let rk = EARTH_RADIUS_M + self.z0_m + k * self.dz_m;
+            let c = r * r - rk * rk;
+            let disc = b_r * b_r - c;
+            if disc >= 0.0 {
+                let s = libm::sqrt(disc);
+                for t in [-b_r - s, -b_r + s] {
+                    if t > 1e-6 && t < best {
+                        best = t;
+                    }
+                }
+            }
+        }
+        // Latitude cones at tile spacing.
+        let flat = (lat - self.lat0_deg) / dlat_t;
+        let kf = libm::floor(flat);
+        for k in [kf - 1.0, kf, kf + 1.0, kf + 2.0] {
+            let phi = (self.lat0_deg + k * dlat_t) * DEG;
+            let tp = libm::tan(phi);
+            let a = dir.z * dir.z - tp * tp * (dir.x * dir.x + dir.y * dir.y);
+            let b = p.z * dir.z - tp * tp * (p.x * dir.x + p.y * dir.y);
+            let c = p.z * p.z - tp * tp * (p.x * p.x + p.y * p.y);
+            if a.abs() > 1e-30 {
+                let disc = b * b - a * c;
+                if disc >= 0.0 {
+                    let s = libm::sqrt(disc);
+                    for t in [(-b - s) / a, (-b + s) / a] {
+                        if t > 1e-6 && t < best {
+                            let zc = p.z + t * dir.z;
+                            if zc * phi >= -1e-9 {
+                                best = t;
+                            }
+                        }
+                    }
+                }
+            } else if b.abs() > 1e-30 {
+                let t = -c / (2.0 * b);
+                if t > 1e-6 && t < best {
+                    best = t;
+                }
+            }
+        }
+        // Longitude planes at tile spacing.
+        let flon = rem_euclid(lon - self.lon0_deg, 360.0) / dlon_t;
+        let kn = libm::floor(flon);
+        for k in [kn - 1.0, kn, kn + 1.0, kn + 2.0] {
+            let lam = (self.lon0_deg + k * dlon_t) * DEG;
+            let (sl, cl) = (libm::sin(lam), libm::cos(lam));
+            let denom = dir.x * sl - dir.y * cl;
+            if denom.abs() > 1e-30 {
+                let t = -(p.x * sl - p.y * cl) / denom;
+                if t > 1e-6 && t < best {
+                    best = t;
+                }
+            }
+        }
         best
     }
 }
