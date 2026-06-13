@@ -70,6 +70,12 @@ pub struct PrayerTimeInput {
     /// satellite reconstruction (80-level IWC profile collapsed into
     /// contiguous layers) - real measured 3D cloud structure.
     pub cloud_layers: Option<Vec<CloudProperties>>,
+    /// 3D cloud field (overrides every other cloud input when set: the
+    /// field owns ALL cloud, and the atmosphere is built without cloud
+    /// layers so `cloud_extinction` stays all-zero). Deterministic legs
+    /// read it in Stage 1; chains scatter in it from Stage 2; GPU support
+    /// lands in Stage 3 (until then the pipeline runs the CPU scan).
+    pub cloud_field: Option<twilight_data::cloud_field_builder::OwnedCloudField>,
     /// Threshold configuration
     pub threshold_config: ThresholdConfig,
     /// Path to DE440 BSP file. When provided, the pipeline uses JPL DE440
@@ -125,6 +131,7 @@ impl Default for PrayerTimeInput {
             custom_aerosol: None,
             custom_cloud: None,
             cloud_layers: None,
+            cloud_field: None,
             threshold_config: ThresholdConfig::default(),
             de440_path: None,
             scattering_mode: ScatteringMode::Single,
@@ -581,6 +588,36 @@ fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::Atmos
         .custom_aerosol
         .or_else(|| input.aerosol_type.map(aerosol::default_properties));
 
+    // 3D cloud field: the field owns ALL cloud, so the shells must carry
+    // none (cloud_extinction all-zero is the transport contract). The
+    // field stores delta-scaled SCATTERING extinction; cloud absorption
+    // (ssa-residual, tau ~0.01 for stratus) is dropped with it, an
+    // accepted Stage-1 approximation (plan, open decision 2). The
+    // Eddington T_diff still needs the cloud asymmetry: carry the
+    // field's g* on the otherwise cloud-free atmosphere.
+    if let Some(field) = &input.cloud_field {
+        if input.verbose
+            && (input.cloud_layers.is_some()
+                || input.custom_cloud.is_some()
+                || input.cloud_type.is_some())
+        {
+            eprintln!(
+                "Note: 3D cloud field set; ignoring cloud_layers/custom_cloud/cloud_type \
+                 (the field owns all cloud)"
+            );
+        }
+        let mut atm = builder::build_full_with_gas(
+            AtmosphereType::UsStandard,
+            input.surface_albedo,
+            aerosol_props.as_ref(),
+            None,
+            input.o3_column_du,
+            input.no2_surface_density,
+        );
+        atm.cloud_g_scaled = field.g_default;
+        return atm;
+    }
+
     // Full vertical profile (cloud3d satellite reconstruction) wins over
     // any single-layer description.
     if let Some(layers) = &input.cloud_layers {
@@ -631,12 +668,16 @@ fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::Atmos
 /// for all solar position computations. Otherwise falls back to SPA.
 pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
     let atm = build_atmosphere(input);
-    let scan =
-        |atm: &twilight_core::atmosphere::AtmosphereModel,
-         config: &SimulationConfig,
-         start: f64,
-         end: f64,
-         step: f64| { simulation::simulate_twilight_scan(atm, config, start, end, step) };
+    // The field is captured by the scan closure (ScanFn stays
+    // reference-free); Cloud3DField is a Copy view over the owned data.
+    let field_view = input.cloud_field.as_ref().map(|f| f.view());
+    let scan = |atm: &twilight_core::atmosphere::AtmosphereModel,
+                config: &SimulationConfig,
+                start: f64,
+                end: f64,
+                step: f64| {
+        simulation::simulate_twilight_scan(atm, config, start, end, step, field_view.as_ref())
+    };
     compute_prayer_times_inner(input, &atm, &scan, None)
 }
 
@@ -662,6 +703,16 @@ pub fn compute_prayer_times_gpu(
     // transmission - GPU and CPU share the single-representation cloud
     // transport.
 
+    // 3D cloud field: no GPU kernel reads it until Stage 3, so a field
+    // run must take the CPU scan (a GPU run would silently ignore the
+    // field and compute a clear sky).
+    if input.cloud_field.is_some() {
+        if input.verbose {
+            eprintln!("Note: 3D cloud field set; GPU support is Stage 3, using the CPU scan");
+        }
+        return compute_prayer_times(input);
+    }
+
     // Upload atmosphere to GPU. On failure, fall back to CPU entirely.
     if let Err(e) = gpu.upload_atmosphere(&atm) {
         if input.verbose {
@@ -675,7 +726,7 @@ pub fn compute_prayer_times_gpu(
                     start: f64,
                     end: f64,
                     step: f64| {
-            simulation::simulate_twilight_scan(atm, config, start, end, step)
+            simulation::simulate_twilight_scan(atm, config, start, end, step, None)
         };
         return compute_prayer_times_inner(input, &atm, &scan, None);
     }
@@ -695,7 +746,8 @@ pub fn compute_prayer_times_gpu(
                         e
                     );
                 }
-                simulation::simulate_twilight_scan(atm, config, start, end, step)
+                // Field runs never reach this path (handled above).
+                simulation::simulate_twilight_scan(atm, config, start, end, step, None)
             })
     };
     let scan_list = |atm: &twilight_core::atmosphere::AtmosphereModel,
@@ -711,7 +763,7 @@ pub fn compute_prayer_times_gpu(
                 }
                 let mut out = Vec::with_capacity(sza_values.len());
                 for &sza in sza_values {
-                    out.push(simulation::simulate_at_sza(atm, config, sza));
+                    out.push(simulation::simulate_at_sza(atm, config, sza, None));
                 }
                 out
             })
@@ -2098,6 +2150,69 @@ mod tests {
             "polar day should be flagged: persistent_twilight={} max_sza={:?}",
             out.persistent_twilight,
             out.max_sza_deg
+        );
+    }
+
+    // ── 3D cloud field pipeline wiring ──
+
+    /// A field run must (a) build the atmosphere with all-zero
+    /// cloud_extinction (the field owns all cloud), (b) carry the
+    /// field's g* for the T_diff convention, and (c) complete the scan
+    /// with the field attenuating the sky (dimmer than clear).
+    #[test]
+    fn cloud_field_run_dims_sky_and_keeps_shells_cloud_free() {
+        use twilight_data::cloud::{default_properties, CloudType};
+        use twilight_data::cloud_field_builder::{field_from_layers, FieldGeometry};
+
+        let base = PrayerTimeInput {
+            latitude: 21.4225,
+            longitude: 39.8262,
+            year: 2024,
+            month: 3,
+            day: 15,
+            timezone: 3.0,
+            sza_step: 2.0,
+            scattering_mode: ScatteringMode::Single,
+            ..PrayerTimeInput::default()
+        };
+        let field = field_from_layers(
+            &[default_properties(CloudType::Stratus)],
+            FieldGeometry {
+                center_lat_deg: base.latitude,
+                center_lon_deg: base.longitude,
+                half_extent_km: 64.0,
+                res_km: 2.0,
+            },
+            "test",
+        );
+        let cloudy_in = PrayerTimeInput {
+            cloud_field: Some(field.clone()),
+            ..base.clone()
+        };
+
+        let atm = build_atmosphere(&cloudy_in);
+        assert!(
+            atm.cloud_extinction.iter().all(|&e| e == 0.0),
+            "field run must leave the shells cloud-free"
+        );
+        assert!(
+            (atm.cloud_g_scaled - field.g_default).abs() < 1e-12,
+            "field run must carry the field's g* for T_diff"
+        );
+
+        let out_clear = compute_prayer_times(&base);
+        let out_cloudy = compute_prayer_times(&cloudy_in);
+        let total = |o: &PrayerTimeOutput| -> f64 {
+            o.spectral_results
+                .iter()
+                .map(|r| r.radiance.iter().sum::<f64>())
+                .sum()
+        };
+        let (tc, tf) = (total(&out_clear), total(&out_cloudy));
+        assert!(tf > 0.0, "field run produced no radiance");
+        assert!(
+            tf < tc,
+            "OD-10 field deck must dim the scan: field {tf:.4e} vs clear {tc:.4e}"
         );
     }
 

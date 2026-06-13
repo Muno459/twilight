@@ -15,6 +15,7 @@
 
 use rayon::prelude::*;
 use twilight_core::atmosphere::AtmosphereModel;
+use twilight_core::cloud_field::Cloud3DField;
 use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef, Vec3};
 use twilight_core::photon;
 use twilight_core::single_scatter;
@@ -139,15 +140,19 @@ fn mix_salt(base: u64, salt: u64) -> u64 {
 /// units [W/m²/sr/nm]. The integral gives:
 ///   I(λ) = F_sun(λ) × ∫ β_scat × P(θ)/(4π) × T_sun × T_obs ds
 /// where F_sun(λ) is the TOA solar spectral irradiance [W/m²/nm].
+/// `field`: the 3D cloud field; when present it owns ALL cloud (the
+/// caller guarantees `atm.cloud_extinction` is all-zero, see the
+/// pipeline's `build_atmosphere`). The config stays reference-free.
 pub fn simulate_at_sza(
     atm: &AtmosphereModel,
     config: &SimulationConfig,
     sza_deg: f64,
+    field: Option<&Cloud3DField>,
 ) -> SpectralResult {
     match config.scattering_mode {
-        ScatteringMode::Single => simulate_at_sza_single(atm, config, sza_deg),
-        ScatteringMode::Multiple => simulate_at_sza_mc(atm, config, sza_deg),
-        ScatteringMode::Hybrid => simulate_at_sza_hybrid(atm, config, sza_deg),
+        ScatteringMode::Single => simulate_at_sza_single(atm, config, sza_deg, field),
+        ScatteringMode::Multiple => simulate_at_sza_mc(atm, config, sza_deg, field),
+        ScatteringMode::Hybrid => simulate_at_sza_hybrid(atm, config, sza_deg, field),
     }
 }
 
@@ -202,10 +207,11 @@ fn simulate_at_sza_single(
     atm: &AtmosphereModel,
     config: &SimulationConfig,
     sza_deg: f64,
+    field: Option<&Cloud3DField>,
 ) -> SpectralResult {
     let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
     let radiance_array =
-        single_scatter::single_scatter_spectrum(atm, observer_pos, view_dir, sun_dir);
+        single_scatter::single_scatter_spectrum(atm, observer_pos, view_dir, sun_dir, field);
     build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance)
 }
 
@@ -223,6 +229,7 @@ fn simulate_at_sza_mc(
     atm: &AtmosphereModel,
     config: &SimulationConfig,
     sza_deg: f64,
+    field: Option<&Cloud3DField>,
 ) -> SpectralResult {
     let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
     let num_wl = atm.num_wavelengths;
@@ -251,7 +258,7 @@ fn simulate_at_sza_mc(
                     .wrapping_add(1);
 
                 let result =
-                    photon::trace_photon(atm, observer_pos, view_dir, sun_dir, w, &mut rng);
+                    photon::trace_photon(atm, observer_pos, view_dir, sun_dir, w, &mut rng, field);
                 total_weight += result.weight;
             }
             total_weight / nphotons as f64
@@ -285,6 +292,7 @@ fn simulate_at_sza_hybrid(
     atm: &AtmosphereModel,
     config: &SimulationConfig,
     sza_deg: f64,
+    field: Option<&Cloud3DField>,
 ) -> SpectralResult {
     let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
     let secondary_rays = config.photons_per_wavelength;
@@ -301,6 +309,7 @@ fn simulate_at_sza_hybrid(
             sun_dir,
             secondary_rays,
             &mut rng,
+            field,
         );
         return build_spectral_result(atm, &radiance_array, sza_deg, config.apply_solar_irradiance);
     }
@@ -325,6 +334,7 @@ fn simulate_at_sza_hybrid(
                 secondary_rays,
                 &mut rng,
                 config.polarized,
+                field,
             )
         })
         .collect();
@@ -346,12 +356,13 @@ pub fn simulate_twilight_scan(
     sza_start: f64,
     sza_end: f64,
     sza_step: f64,
+    field: Option<&Cloud3DField>,
 ) -> Vec<SpectralResult> {
     let mut results = Vec::new();
     let mut sza = sza_start;
 
     while sza <= sza_end + 1e-6 {
-        let result = simulate_at_sza(atm, config, sza);
+        let result = simulate_at_sza(atm, config, sza, field);
         results.push(result);
         sza += sza_step;
     }
@@ -418,7 +429,7 @@ mod tests {
         };
         let mut prev = f64::MAX;
         for sza in [103.0, 104.0, 105.0, 106.0, 107.0] {
-            let r: f64 = simulate_at_sza(&atm, &config, sza).radiance.iter().sum();
+            let r: f64 = simulate_at_sza(&atm, &config, sza, None).radiance.iter().sum();
             assert!(
                 r > 0.0,
                 "single-scatter must be nonzero at SZA {} (was exactly 0 \
@@ -455,8 +466,8 @@ mod tests {
             ..SimulationConfig::default()
         };
         let sza = 100.0;
-        let r_clear: f64 = simulate_at_sza(&clear, &config, sza).radiance.iter().sum();
-        let r_cloudy: f64 = simulate_at_sza(&cloudy, &config, sza).radiance.iter().sum();
+        let r_clear: f64 = simulate_at_sza(&clear, &config, sza, None).radiance.iter().sum();
+        let r_cloudy: f64 = simulate_at_sza(&cloudy, &config, sza, None).radiance.iter().sum();
         assert!(
             r_cloudy > 1e-9,
             "cloudy twilight collapsed again: {:.3e} (was 1e-15 before the fix)",
@@ -474,6 +485,124 @@ mod tests {
             "dimming too extreme: cloudy={:.3e} clear={:.3e}",
             r_cloudy,
             r_clear
+        );
+    }
+
+    // ── 3D cloud field: Stage-1 gates ──
+
+    /// Stratus layer description shared by the field gates (matches
+    /// `twilight_data::cloud::default_properties(CloudType::Stratus)`).
+    fn stratus_props() -> twilight_data::cloud::CloudProperties {
+        twilight_data::cloud::default_properties(twilight_data::cloud::CloudType::Stratus)
+    }
+
+    /// A horizontally uniform stratus field centered on the default
+    /// (Mecca) observer; `background_column` extends it to infinity.
+    fn uniform_stratus_field() -> twilight_data::cloud_field_builder::OwnedCloudField {
+        use twilight_data::cloud_field_builder::{field_from_layers, FieldGeometry};
+        let c = SimulationConfig::default();
+        field_from_layers(
+            &[stratus_props()],
+            FieldGeometry {
+                center_lat_deg: c.latitude,
+                center_lon_deg: c.longitude,
+                half_extent_km: 128.0,
+                res_km: 2.0,
+            },
+            "gate",
+        )
+    }
+
+    /// G-S1a (equivalence): the 1D layered stratus transport vs the SAME
+    /// atmosphere with `cloud_extinction` zeroed (the field-run caller
+    /// contract: the field owns ALL cloud) plus the uniform 3D field.
+    /// The only remaining difference is the cloud tau quadrature
+    /// (per-shell segments vs per-voxel DDA) on the same T_diff
+    /// convention, so per-wavelength radiance must agree to < 1%.
+    /// (A fully clear-built atmosphere would also differ by the cloud
+    /// ABSORPTION the 1D builder folds into shell optics, ~4% on a
+    /// 75 deg slant, which is not the quadrature under test.)
+    #[test]
+    fn g_s1a_uniform_field_matches_1d_layered_transport() {
+        let atm_1d = builder::build_with_cloud_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &stratus_props(),
+        );
+        let mut atm_field = atm_1d.clone();
+        atm_field.cloud_extinction = [0.0; twilight_core::atmosphere::MAX_SHELLS];
+        let owned = uniform_stratus_field();
+        let view = owned.view();
+
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Single,
+            ..SimulationConfig::default()
+        };
+        for sza in [95.0, 100.0] {
+            let r_1d = simulate_at_sza(&atm_1d, &config, sza, None);
+            let r_3d = simulate_at_sza(&atm_field, &config, sza, Some(&view));
+            let mut max_rel = 0.0f64;
+            for w in 0..r_1d.radiance.len() {
+                let (a, b) = (r_1d.radiance[w], r_3d.radiance[w]);
+                if a < 1e-30 && b < 1e-30 {
+                    continue;
+                }
+                let rel = (a - b).abs() / a.max(b);
+                max_rel = max_rel.max(rel);
+                assert!(
+                    rel < 0.01,
+                    "G-S1a SZA {sza} wl[{w}]: 1D {a:.6e} vs field {b:.6e} (rel {rel:.4})"
+                );
+            }
+            eprintln!("G-S1a SZA {sza}: max per-wavelength rel diff {max_rel:.3e}");
+        }
+    }
+
+    /// G-S1b (gap physics): a field cloudy ONLY on the anti-sun side of
+    /// the footprint (sun-azimuth side clear) must be strictly brighter
+    /// than the uniform deck (sun rays pass through the gap) and no
+    /// brighter than clear sky, at SZA 96 in Single mode.
+    #[test]
+    fn g_s1b_sunside_gap_brightens_sky() {
+        let mut atm = builder::build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let uniform = uniform_stratus_field();
+        // Field runs keep the cloud asymmetry on the T_diff convention.
+        atm.cloud_g_scaled = uniform.g_default;
+
+        // Sun azimuth is 270 (west) at the default config: clear the
+        // WEST half of the footprint (lower longitudes), keep the deck
+        // on the anti-sun (east) half, then re-derive the acceleration
+        // data (the background column becomes the half-deck mean).
+        let mut gap = uniform.clone();
+        for iz in 0..gap.nz {
+            for ilat in 0..gap.nlat {
+                for ilon in 0..gap.nlon / 2 {
+                    gap.sigma[(iz * gap.nlat + ilat) * gap.nlon + ilon] = 0.0;
+                }
+            }
+        }
+        gap.derive();
+
+        let config = SimulationConfig {
+            scattering_mode: ScatteringMode::Single,
+            ..SimulationConfig::default()
+        };
+        let sza = 96.0;
+        let sum = |r: &SpectralResult| -> f64 { r.radiance.iter().sum() };
+        let r_clear = sum(&simulate_at_sza(&atm, &config, sza, None));
+        let r_uniform = sum(&simulate_at_sza(&atm, &config, sza, Some(&uniform.view())));
+        let r_gap = sum(&simulate_at_sza(&atm, &config, sza, Some(&gap.view())));
+        eprintln!(
+            "G-S1b SZA {sza}: clear {r_clear:.4e}, gap {r_gap:.4e}, uniform {r_uniform:.4e}"
+        );
+
+        assert!(
+            r_gap > r_uniform,
+            "G-S1b: gap {r_gap:.4e} must exceed uniform deck {r_uniform:.4e}"
+        );
+        assert!(
+            r_gap <= r_clear * (1.0 + 1e-12),
+            "G-S1b: gap {r_gap:.4e} must not exceed clear {r_clear:.4e}"
         );
     }
 
@@ -505,8 +634,8 @@ mod tests {
         away.view_azimuth = Some(toward.solar_azimuth + 180.0);
 
         let sza = 60.0;
-        let r_toward = simulate_at_sza(&atm, &toward, sza);
-        let r_away = simulate_at_sza(&atm, &away, sza);
+        let r_toward = simulate_at_sza(&atm, &toward, sza, None);
+        let r_away = simulate_at_sza(&atm, &away, sza, None);
         // 550 nm bin (index 17 on the 380..780/10nm grid)
         let i550 = r_toward
             .wavelengths_nm
@@ -531,7 +660,7 @@ mod tests {
     fn simulate_at_sza_returns_correct_wavelength_count() {
         let atm = make_clear_sky_atm();
         let config = default_config();
-        let result = simulate_at_sza(&atm, &config, 96.0);
+        let result = simulate_at_sza(&atm, &config, 96.0, None);
         assert_eq!(result.wavelengths_nm.len(), 41);
         assert_eq!(result.radiance.len(), 41);
     }
@@ -540,7 +669,7 @@ mod tests {
     fn simulate_at_sza_stores_sza() {
         let atm = make_clear_sky_atm();
         let config = default_config();
-        let result = simulate_at_sza(&atm, &config, 96.5);
+        let result = simulate_at_sza(&atm, &config, 96.5, None);
         assert!((result.sza_deg - 96.5).abs() < 1e-10);
     }
 
@@ -548,7 +677,7 @@ mod tests {
     fn simulate_at_sza_positive_radiance_at_civil_twilight() {
         let atm = make_clear_sky_atm();
         let config = default_config();
-        let result = simulate_at_sza(&atm, &config, 93.0); // civil twilight
+        let result = simulate_at_sza(&atm, &config, 93.0, None); // civil twilight
         let total = total_radiance(&result);
         assert!(
             total > 0.0,
@@ -562,7 +691,7 @@ mod tests {
         let atm = make_clear_sky_atm();
         let config = default_config();
         for sza in &[90.0, 96.0, 102.0, 108.0] {
-            let result = simulate_at_sza(&atm, &config, *sza);
+            let result = simulate_at_sza(&atm, &config, *sza, None);
             for (i, &r) in result.radiance.iter().enumerate() {
                 assert!(
                     r >= 0.0,
@@ -579,8 +708,8 @@ mod tests {
     fn simulate_at_sza_decreases_with_depth() {
         let atm = make_clear_sky_atm();
         let config = default_config();
-        let r_93 = total_radiance(&simulate_at_sza(&atm, &config, 93.0));
-        let r_100 = total_radiance(&simulate_at_sza(&atm, &config, 100.0));
+        let r_93 = total_radiance(&simulate_at_sza(&atm, &config, 93.0, None));
+        let r_100 = total_radiance(&simulate_at_sza(&atm, &config, 100.0, None));
         assert!(
             r_93 > r_100,
             "Radiance should decrease: SZA93={:.4e} > SZA100={:.4e}",
@@ -597,8 +726,8 @@ mod tests {
         let mut config_off = default_config();
         config_off.apply_solar_irradiance = false;
 
-        let r_on = simulate_at_sza(&atm, &config_on, 93.0);
-        let r_off = simulate_at_sza(&atm, &config_off, 93.0);
+        let r_on = simulate_at_sza(&atm, &config_on, 93.0, None);
+        let r_off = simulate_at_sza(&atm, &config_off, 93.0, None);
 
         // With solar irradiance weighting, radiance should be different
         // (unless raw radiance happens to equal 1 everywhere, which it won't)
@@ -618,7 +747,7 @@ mod tests {
     fn simulate_at_sza_wavelengths_correct() {
         let atm = make_clear_sky_atm();
         let config = default_config();
-        let result = simulate_at_sza(&atm, &config, 96.0);
+        let result = simulate_at_sza(&atm, &config, 96.0, None);
         assert!((result.wavelengths_nm[0] - 380.0).abs() < 0.01);
         assert!((result.wavelengths_nm[20] - 580.0).abs() < 0.01);
         assert!((result.wavelengths_nm[40] - 780.0).abs() < 0.01);
@@ -630,7 +759,7 @@ mod tests {
     fn twilight_scan_correct_count() {
         let atm = make_clear_sky_atm();
         let config = default_config();
-        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 2.0);
+        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 2.0, None);
         // 90, 92, 94, 96, 98, 100 = 6 steps
         assert_eq!(results.len(), 6, "Expected 6 steps, got {}", results.len());
     }
@@ -639,7 +768,7 @@ mod tests {
     fn twilight_scan_sza_values_correct() {
         let atm = make_clear_sky_atm();
         let config = default_config();
-        let results = simulate_twilight_scan(&atm, &config, 90.0, 94.0, 2.0);
+        let results = simulate_twilight_scan(&atm, &config, 90.0, 94.0, 2.0, None);
         assert!((results[0].sza_deg - 90.0).abs() < 0.01);
         assert!((results[1].sza_deg - 92.0).abs() < 0.01);
         assert!((results[2].sza_deg - 94.0).abs() < 0.01);
@@ -649,7 +778,7 @@ mod tests {
     fn twilight_scan_radiance_decreases() {
         let atm = make_clear_sky_atm();
         let config = default_config();
-        let results = simulate_twilight_scan(&atm, &config, 91.0, 105.0, 2.0);
+        let results = simulate_twilight_scan(&atm, &config, 91.0, 105.0, 2.0, None);
         let totals: Vec<f64> = results.iter().map(total_radiance).collect();
 
         // Radiance should generally decrease (may have small bumps from geometry)
@@ -757,7 +886,7 @@ mod tests {
     fn mc_returns_correct_wavelength_count() {
         let atm = make_clear_sky_atm();
         let config = mc_config();
-        let result = simulate_at_sza(&atm, &config, 96.0);
+        let result = simulate_at_sza(&atm, &config, 96.0, None);
         assert_eq!(result.wavelengths_nm.len(), 41);
         assert_eq!(result.radiance.len(), 41);
     }
@@ -766,7 +895,7 @@ mod tests {
     fn mc_stores_sza() {
         let atm = make_clear_sky_atm();
         let config = mc_config();
-        let result = simulate_at_sza(&atm, &config, 96.5);
+        let result = simulate_at_sza(&atm, &config, 96.5, None);
         assert!((result.sza_deg - 96.5).abs() < 1e-10);
     }
 
@@ -775,7 +904,7 @@ mod tests {
         let atm = make_clear_sky_atm();
         let config = mc_config();
         for sza in &[90.0, 96.0, 102.0] {
-            let result = simulate_at_sza(&atm, &config, *sza);
+            let result = simulate_at_sza(&atm, &config, *sza, None);
             for (i, &r) in result.radiance.iter().enumerate() {
                 assert!(
                     r >= 0.0,
@@ -797,7 +926,7 @@ mod tests {
             photons_per_wavelength: 2000,
             ..SimulationConfig::default()
         };
-        let result = simulate_at_sza(&atm, &config, 93.0);
+        let result = simulate_at_sza(&atm, &config, 93.0, None);
         let total = total_radiance(&result);
         assert!(
             total > 0.0,
@@ -815,8 +944,8 @@ mod tests {
             photons_per_wavelength: 2000,
             ..SimulationConfig::default()
         };
-        let r_93 = total_radiance(&simulate_at_sza(&atm, &config, 93.0));
-        let r_100 = total_radiance(&simulate_at_sza(&atm, &config, 100.0));
+        let r_93 = total_radiance(&simulate_at_sza(&atm, &config, 93.0, None));
+        let r_100 = total_radiance(&simulate_at_sza(&atm, &config, 100.0, None));
         assert!(
             r_93 > r_100 * 0.1, // generous for MC noise
             "MC SZA93 ({:.4e}) should be > SZA100 ({:.4e})",
@@ -829,7 +958,7 @@ mod tests {
     fn mc_wavelengths_correct() {
         let atm = make_clear_sky_atm();
         let config = mc_config();
-        let result = simulate_at_sza(&atm, &config, 96.0);
+        let result = simulate_at_sza(&atm, &config, 96.0, None);
         assert!((result.wavelengths_nm[0] - 380.0).abs() < 0.01);
         assert!((result.wavelengths_nm[20] - 580.0).abs() < 0.01);
         assert!((result.wavelengths_nm[40] - 780.0).abs() < 0.01);
@@ -843,7 +972,7 @@ mod tests {
             photons_per_wavelength: 0,
             ..SimulationConfig::default()
         };
-        let result = simulate_at_sza(&atm, &config, 93.0);
+        let result = simulate_at_sza(&atm, &config, 93.0, None);
         let total = total_radiance(&result);
         assert!(
             total.abs() < 1e-20,
@@ -870,8 +999,8 @@ mod tests {
             ..SimulationConfig::default()
         };
 
-        let ss_total = total_radiance(&simulate_at_sza(&atm, &ss_config, 93.0));
-        let mc_total = total_radiance(&simulate_at_sza(&atm, &mc_config, 93.0));
+        let ss_total = total_radiance(&simulate_at_sza(&atm, &ss_config, 93.0, None));
+        let mc_total = total_radiance(&simulate_at_sza(&atm, &mc_config, 93.0, None));
 
         // Both should be positive
         assert!(ss_total > 0.0, "Single-scatter should be positive");
@@ -902,7 +1031,7 @@ mod tests {
             photons_per_wavelength: 200, // few photons for speed
             ..SimulationConfig::default()
         };
-        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0);
+        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0, None);
         // 90, 95, 100 = 3 steps
         assert_eq!(results.len(), 3, "Expected 3 steps, got {}", results.len());
     }
@@ -915,7 +1044,7 @@ mod tests {
             photons_per_wavelength: 200,
             ..SimulationConfig::default()
         };
-        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0);
+        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0, None);
         assert!((results[0].sza_deg - 90.0).abs() < 0.01);
         assert!((results[1].sza_deg - 95.0).abs() < 0.01);
         assert!((results[2].sza_deg - 100.0).abs() < 0.01);
@@ -935,7 +1064,7 @@ mod tests {
     fn hybrid_returns_correct_wavelength_count() {
         let atm = make_clear_sky_atm();
         let config = hybrid_config();
-        let result = simulate_at_sza(&atm, &config, 96.0);
+        let result = simulate_at_sza(&atm, &config, 96.0, None);
         assert_eq!(result.wavelengths_nm.len(), 41);
         assert_eq!(result.radiance.len(), 41);
     }
@@ -944,7 +1073,7 @@ mod tests {
     fn hybrid_stores_sza() {
         let atm = make_clear_sky_atm();
         let config = hybrid_config();
-        let result = simulate_at_sza(&atm, &config, 96.5);
+        let result = simulate_at_sza(&atm, &config, 96.5, None);
         assert!((result.sza_deg - 96.5).abs() < 1e-10);
     }
 
@@ -953,7 +1082,7 @@ mod tests {
         let atm = make_clear_sky_atm();
         let config = hybrid_config();
         for sza in &[90.0, 96.0, 102.0] {
-            let result = simulate_at_sza(&atm, &config, *sza);
+            let result = simulate_at_sza(&atm, &config, *sza, None);
             for (i, &r) in result.radiance.iter().enumerate() {
                 assert!(
                     r >= 0.0,
@@ -974,7 +1103,7 @@ mod tests {
             photons_per_wavelength: 100,
             ..SimulationConfig::default()
         };
-        let result = simulate_at_sza(&atm, &config, 93.0);
+        let result = simulate_at_sza(&atm, &config, 93.0, None);
         let total = total_radiance(&result);
         assert!(
             total > 0.0,
@@ -999,8 +1128,8 @@ mod tests {
             ..SimulationConfig::default()
         };
 
-        let ss_total = total_radiance(&simulate_at_sza(&atm, &ss_config, 96.0));
-        let hybrid_total = total_radiance(&simulate_at_sza(&atm, &hybrid_config, 96.0));
+        let ss_total = total_radiance(&simulate_at_sza(&atm, &ss_config, 96.0, None));
+        let hybrid_total = total_radiance(&simulate_at_sza(&atm, &hybrid_config, 96.0, None));
 
         // Hybrid should be >= single-scatter (within MC noise margin)
         // Allow 20% tolerance for MC noise
@@ -1016,7 +1145,7 @@ mod tests {
     fn hybrid_wavelengths_correct() {
         let atm = make_clear_sky_atm();
         let config = hybrid_config();
-        let result = simulate_at_sza(&atm, &config, 96.0);
+        let result = simulate_at_sza(&atm, &config, 96.0, None);
         assert!((result.wavelengths_nm[0] - 380.0).abs() < 0.01);
         assert!((result.wavelengths_nm[20] - 580.0).abs() < 0.01);
         assert!((result.wavelengths_nm[40] - 780.0).abs() < 0.01);
@@ -1038,8 +1167,8 @@ mod tests {
             ..SimulationConfig::default()
         };
 
-        let ss_result = simulate_at_sza(&atm, &ss_config, 96.0);
-        let hybrid_result = simulate_at_sza(&atm, &hybrid_config, 96.0);
+        let ss_result = simulate_at_sza(&atm, &ss_config, 96.0, None);
+        let hybrid_result = simulate_at_sza(&atm, &hybrid_config, 96.0, None);
 
         for i in 0..ss_result.radiance.len() {
             let diff = (ss_result.radiance[i] - hybrid_result.radiance[i]).abs();
@@ -1067,8 +1196,8 @@ mod tests {
             photons_per_wavelength: 100,
             ..SimulationConfig::default()
         };
-        let r_93 = total_radiance(&simulate_at_sza(&atm, &config, 93.0));
-        let r_100 = total_radiance(&simulate_at_sza(&atm, &config, 100.0));
+        let r_93 = total_radiance(&simulate_at_sza(&atm, &config, 93.0, None));
+        let r_100 = total_radiance(&simulate_at_sza(&atm, &config, 100.0, None));
         assert!(
             r_93 > r_100 * 0.5,
             "Hybrid SZA93 ({:.4e}) should be > SZA100 ({:.4e})",
@@ -1085,7 +1214,7 @@ mod tests {
             photons_per_wavelength: 10,
             ..SimulationConfig::default()
         };
-        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0);
+        let results = simulate_twilight_scan(&atm, &config, 90.0, 100.0, 5.0, None);
         assert_eq!(results.len(), 3, "Expected 3 steps, got {}", results.len());
     }
 
@@ -1147,8 +1276,9 @@ mod tests {
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1);
 
-                let result =
-                    photon::hybrid_scatter_radiance_alis(&atm, obs_pos, view, sun, rays, &mut rng);
+                let result = photon::hybrid_scatter_radiance_alis(
+                    &atm, obs_pos, view, sun, rays, &mut rng, None,
+                );
                 let total: f64 = result.iter().take(atm.num_wavelengths).sum();
                 totals.push(total);
             }
@@ -1212,8 +1342,9 @@ mod tests {
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1);
 
-                let result =
-                    photon::hybrid_scatter_radiance_alis(&atm, obs_pos, view, sun, rays, &mut rng);
+                let result = photon::hybrid_scatter_radiance_alis(
+                    &atm, obs_pos, view, sun, rays, &mut rng, None,
+                );
                 let total: f64 = result.iter().take(atm.num_wavelengths).sum();
                 totals.push(total);
             }

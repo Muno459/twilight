@@ -339,6 +339,43 @@ impl<'a> Cloud3DField<'a> {
     }
 }
 
+
+/// Cloud optical depth along a straight sub-segment, from the 3D field
+/// when one is present (the field owns ALL cloud) or from the per-shell
+/// 1D array otherwise. EVERY deterministic-leg consumer goes through
+/// this function so the two representations cannot be double-counted.
+#[inline]
+pub fn cloud_tau_segment(
+    atm: &crate::atmosphere::AtmosphereModel,
+    field: Option<&Cloud3DField>,
+    shell_idx: usize,
+    pos: Vec3,
+    dir: Vec3,
+    dist: f64,
+) -> f64 {
+    match field {
+        Some(f) => f.tau_along(pos, dir, dist),
+        None => atm.cloud_extinction[shell_idx] * dist,
+    }
+}
+
+/// Cloud extinction [1/m] at a point, from the 3D field when one is
+/// present (the field owns ALL cloud) or from the per-shell 1D array
+/// otherwise. Sibling of [`cloud_tau_segment`] for fixed-step LOS loops
+/// where per-step midpoint sampling is the established quadrature.
+#[inline]
+pub fn cloud_ext_at(
+    atm: &crate::atmosphere::AtmosphereModel,
+    field: Option<&Cloud3DField>,
+    shell_idx: usize,
+    pos: Vec3,
+) -> f64 {
+    match field {
+        Some(f) => f.sigma_at(pos),
+        None => atm.cloud_extinction[shell_idx],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

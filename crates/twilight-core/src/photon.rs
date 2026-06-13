@@ -5,6 +5,7 @@
 //! making it compilable to any target (CPU, GPU via WGSL, WASM, CUDA PTX).
 
 use crate::atmosphere::AtmosphereModel;
+use crate::cloud_field::{cloud_ext_at, cloud_tau_segment, Cloud3DField};
 use crate::geometry::{next_shell_boundary, refract_at_boundary, RefractResult, Vec3};
 use crate::scattering::{
     henyey_greenstein_phase, rayleigh_phase, sample_henyey_greenstein, sample_rayleigh_analytic,
@@ -258,6 +259,9 @@ pub struct PhotonResult {
 /// * `sun_dir` - Direction toward the sun (unit vector)
 /// * `wavelength_idx` - Index into the atmosphere model's wavelength grid
 /// * `rng_state` - Mutable RNG state (simple xorshift for no_std compatibility)
+/// * `field` - 3D cloud field; when present it owns ALL cloud (the caller
+///   guarantees `atm.cloud_extinction` is all-zero). Stage 1: chains do
+///   not scatter in cloud; the field feeds the NEE transmittances only.
 ///
 /// # Returns
 /// The photon's contribution to sky radiance at this wavelength.
@@ -268,6 +272,7 @@ pub fn trace_photon(
     sun_dir: Vec3,
     wavelength_idx: usize,
     rng_state: &mut u64,
+    field: Option<&Cloud3DField>,
 ) -> PhotonResult {
     // Split RNG: derive independent streams from master seed.
     let mut rng = McRng::from_seed(*rng_state);
@@ -339,7 +344,8 @@ pub fn trace_photon(
                         // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
                         let cos_sun_ground = sun_dir.dot(normal);
                         if cos_sun_ground > 0.0 {
-                            let t_sun_gb = trace_transmittance(atm, pos, sun_dir, wavelength_idx);
+                            let t_sun_gb =
+                                trace_transmittance(atm, pos, sun_dir, wavelength_idx, field);
                             if t_sun_gb > 1e-30 {
                                 let albedo = atm.surface_albedo[wavelength_idx];
                                 result.weight += weight * albedo * t_sun_gb * cos_sun_ground
@@ -378,7 +384,8 @@ pub fn trace_photon(
         // --- Next-Event Estimation (NEE) ---
         // Compute direct contribution from sun at this scatter point.
         // Pass the current photon direction for correct phase function evaluation.
-        let nee_contribution = compute_nee(atm, pos, dir, sun_dir, optics, wavelength_idx, weight);
+        let nee_contribution =
+            compute_nee(atm, pos, dir, sun_dir, optics, wavelength_idx, weight, field);
         result.weight += nee_contribution;
         result.num_scatters += 1;
 
@@ -408,6 +415,7 @@ pub fn trace_photon(
 /// the sun?" The phase function is evaluated at the angle between the
 /// incoming solar direction and the outgoing direction toward the observer
 /// (which is -photon_dir in backward tracing).
+#[allow(clippy::too_many_arguments)]
 fn compute_nee(
     atm: &AtmosphereModel,
     scatter_pos: Vec3,
@@ -416,9 +424,10 @@ fn compute_nee(
     local_optics: &crate::atmosphere::ShellOptics,
     wavelength_idx: usize,
     weight: f64,
+    field: Option<&Cloud3DField>,
 ) -> f64 {
     // Trace shadow ray toward sun
-    let transmittance = trace_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
+    let transmittance = trace_transmittance(atm, scatter_pos, sun_dir, wavelength_idx, field);
 
     if transmittance < 1e-30 {
         return 0.0;
@@ -442,16 +451,22 @@ fn compute_nee(
 ///
 /// Traces the ray shell-by-shell, applying Snell's law at each boundary
 /// so the shadow ray follows the physically correct curved path.
-/// Returns exp(-total_optical_depth).
+/// Returns exp(-tau_clear) * T_diff(tau_cloud): the clear-air part is
+/// Beer-Lambert, the cloud part Eddington diffuse, matching
+/// `shadow_ray_transmittance` exactly (this function backs the chain NEE
+/// via compute_nee/compute_nee_polarized; it previously had NO cloud
+/// term at all, a documented gap).
 fn trace_transmittance(
     atm: &AtmosphereModel,
     start_pos: Vec3,
     direction: Vec3,
     wavelength_idx: usize,
+    field: Option<&Cloud3DField>,
 ) -> f64 {
     let mut pos = start_pos;
     let mut dir = direction;
     let mut total_optical_depth = 0.0;
+    let mut tau_cloud = 0.0;
 
     for _ in 0..200 {
         let r = pos.length();
@@ -467,6 +482,8 @@ fn trace_transmittance(
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
                 total_optical_depth += optics.extinction * dist;
+                // Segment start pos/dir, BEFORE the refraction step.
+                tau_cloud += cloud_tau_segment(atm, field, shell_idx, pos, dir, dist);
 
                 // Refract at the boundary
                 let (new_pos, new_dir) = cross_boundary(pos, dir, dist, is_outward, shell_idx, atm);
@@ -487,7 +504,7 @@ fn trace_transmittance(
         }
     }
 
-    libm::exp(-total_optical_depth)
+    libm::exp(-total_optical_depth) * atm.cloud_diffuse_transmittance(tau_cloud)
 }
 
 /// Trace multiple photons across all wavelengths and return a spectral radiance
@@ -516,6 +533,7 @@ pub fn mc_scatter_spectrum(
     sun_dir: Vec3,
     photons_per_wavelength: usize,
     base_seed: u64,
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     let mut radiance = [0.0f64; 64];
     let num_wl = atm.num_wavelengths;
@@ -535,7 +553,7 @@ pub fn mc_scatter_spectrum(
                 .wrapping_mul(2862933555777941757)
                 .wrapping_add(1);
 
-            let result = trace_photon(atm, observer_pos, view_dir, sun_dir, w, &mut rng);
+            let result = trace_photon(atm, observer_pos, view_dir, sun_dir, w, &mut rng, field);
             total_weight += result.weight;
         }
         *rad_w = total_weight / photons_per_wavelength as f64;
@@ -579,6 +597,7 @@ pub fn trace_photon_polarized(
     sun_dir: Vec3,
     wavelength_idx: usize,
     rng_state: &mut u64,
+    field: Option<&Cloud3DField>,
 ) -> PolarizedPhotonResult {
     // Split RNG: derive independent streams from master seed.
     let mut rng = McRng::from_seed(*rng_state);
@@ -646,7 +665,8 @@ pub fn trace_photon_polarized(
                         // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
                         let cos_sun_ground = sun_dir.dot(normal);
                         if cos_sun_ground > 0.0 {
-                            let t_sun_gb = trace_transmittance(atm, pos, sun_dir, wavelength_idx);
+                            let t_sun_gb =
+                                trace_transmittance(atm, pos, sun_dir, wavelength_idx, field);
                             if t_sun_gb > 1e-30 {
                                 let albedo = atm.surface_albedo[wavelength_idx];
                                 let nee_gb = weight * albedo * t_sun_gb * cos_sun_ground
@@ -692,6 +712,7 @@ pub fn trace_photon_polarized(
             optics,
             wavelength_idx,
             weight,
+            field,
         );
         result.stokes = result.stokes.add(&nee_stokes);
         result.num_scatters += 1;
@@ -723,8 +744,9 @@ fn compute_nee_polarized(
     local_optics: &crate::atmosphere::ShellOptics,
     wavelength_idx: usize,
     weight: f64,
+    field: Option<&Cloud3DField>,
 ) -> StokesVector {
-    let transmittance = trace_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
+    let transmittance = trace_transmittance(atm, scatter_pos, sun_dir, wavelength_idx, field);
 
     if transmittance < 1e-30 {
         return StokesVector::unpolarized(0.0);
@@ -767,6 +789,7 @@ pub fn mc_scatter_spectrum_polarized(
     sun_dir: Vec3,
     photons_per_wavelength: usize,
     base_seed: u64,
+    field: Option<&Cloud3DField>,
 ) -> [StokesVector; 64] {
     let mut radiance = [StokesVector::unpolarized(0.0); 64];
     let num_wl = atm.num_wavelengths;
@@ -785,7 +808,8 @@ pub fn mc_scatter_spectrum_polarized(
                 .wrapping_mul(2862933555777941757)
                 .wrapping_add(1);
 
-            let result = trace_photon_polarized(atm, observer_pos, view_dir, sun_dir, w, &mut rng);
+            let result =
+                trace_photon_polarized(atm, observer_pos, view_dir, sun_dir, w, &mut rng, field);
             total_stokes = total_stokes.add(&result.stokes);
         }
         let inv_n = 1.0 / photons_per_wavelength as f64;
@@ -1525,6 +1549,10 @@ fn trace_light_subpath(
     vertices: &mut [LightVertex; BDPT_MAX_LIGHT_VERTICES],
     subpath_idx: usize,
     num_subpaths: usize,
+    // Stage 2 consumes the field here (the subpath delta-tracks through
+    // it); Stage 1 has no cloud term on the light walk, only on the
+    // connection legs (transmittance_between_points_spectrum).
+    _field: Option<&Cloud3DField>,
 ) -> usize {
     let toa_radius = atm.toa_radius();
     let mut n_vertices = 0usize;
@@ -2394,6 +2422,7 @@ fn scout_with_vspg_segments_alis(
 /// Total spectral radiance (single-scatter + multi-scatter contribution)
 /// in the same units as `single_scatter_radiance`.
 #[allow(clippy::too_many_arguments)] // Physics function: observer, view, sun, wavelength, rays, rng, polarized are all independent
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_scatter_radiance(
     atm: &AtmosphereModel,
     observer_pos: Vec3,
@@ -2403,6 +2432,7 @@ pub fn hybrid_scatter_radiance(
     secondary_rays: usize,
     rng_state: &mut u64,
     polarized: bool,
+    field: Option<&Cloud3DField>,
 ) -> f64 {
     use crate::geometry::ray_sphere_intersect;
     use crate::scattering::{hg_mueller, rayleigh_mueller, MuellerMatrix, StokesVector};
@@ -2454,14 +2484,17 @@ pub fn hybrid_scatter_radiance(
         let optics = &atm.optics[shell_idx][wavelength_idx];
         let beta_scat = optics.extinction * optics.ssa;
 
+        // Per-step midpoint cloud extinction (field or 1D shell array).
+        let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
+
         if beta_scat < 1e-30 {
             tau_obs += optics.extinction * ds;
-            tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds;
+            tau_cloud_obs += cloud_ext_step * ds;
             continue;
         }
 
         let tau_obs_mid = tau_obs + optics.extinction * ds * 0.5;
-        let tau_cloud_mid = tau_cloud_obs + atm.cloud_extinction[shell_idx] * ds * 0.5;
+        let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
         let t_obs = libm::exp(-tau_obs_mid)
             * atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
@@ -2470,7 +2503,7 @@ pub fn hybrid_scatter_radiance(
         }
 
         // --- Order 1: deterministic single-scatter NEE ---
-        let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
+        let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx, field);
         if t_sun > 1e-30 {
             let cos_theta_1 = sun_dir.dot(view_dir);
             let scale_1 = beta_scat * INV_4PI * t_sun * t_obs * ds;
@@ -2520,6 +2553,7 @@ pub fn hybrid_scatter_radiance(
                         &mut mc_rng,
                         ray,
                         secondary_rays,
+                        field,
                     );
                     mc_stokes = mc_stokes.add(&chain_stokes);
                 }
@@ -2543,6 +2577,7 @@ pub fn hybrid_scatter_radiance(
                         ray,
                         secondary_rays,
                         1.0,
+                        field,
                     );
                 }
                 let inv_rays = 1.0 / secondary_rays as f64;
@@ -2552,7 +2587,7 @@ pub fn hybrid_scatter_radiance(
         }
 
         tau_obs += optics.extinction * ds;
-        tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds;
+        tau_cloud_obs += cloud_ext_step * ds;
     }
 
     if polarized {
@@ -2591,6 +2626,10 @@ fn trace_secondary_chain(
     rng: &mut McRng,
     ray_idx: usize,
     total_rays: usize,
+    // Stage 1: the chain walk itself stays cloud-free (the field carries
+    // scattering only; chain crossings carry cloud absorption via
+    // `optics`); the field feeds the NEE shadow rays below.
+    field: Option<&Cloud3DField>,
 ) -> crate::scattering::StokesVector {
     use crate::scattering::{scatter_stokes_fast, scattering_plane_cos_sin, StokesVector};
     use crate::single_scatter::shadow_ray_transmittance;
@@ -2813,8 +2852,13 @@ fn trace_secondary_chain(
                                 // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
                                 let cos_sun_ground = sun_dir.dot(normal);
                                 if cos_sun_ground > 0.0 {
-                                    let t_sun_gb =
-                                        shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
+                                    let t_sun_gb = shadow_ray_transmittance(
+                                        atm,
+                                        pos,
+                                        sun_dir,
+                                        wavelength_idx,
+                                        field,
+                                    );
                                     if t_sun_gb > 1e-30 {
                                         let albedo = atm.surface_albedo[wavelength_idx];
                                         let nee_gb = weight * albedo * t_sun_gb * cos_sun_ground
@@ -2864,7 +2908,7 @@ fn trace_secondary_chain(
         weight *= optics.ssa;
 
         // NEE: apply Mueller to photon's actual Stokes state
-        let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
+        let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx, field);
 
         if t_sun_secondary > 1e-30 {
             let cos_angle_nee = sun_dir.dot(current_dir);
@@ -2952,6 +2996,8 @@ fn trace_secondary_chain_scalar(
     ray_idx: usize,
     total_rays: usize,
     nee_r2_weight: f64,
+    // Stage 1: NEE shadow rays only (see trace_secondary_chain note).
+    field: Option<&Cloud3DField>,
 ) -> f64 {
     use crate::single_scatter::shadow_ray_transmittance;
 
@@ -3173,6 +3219,7 @@ fn trace_secondary_chain_scalar(
                                             pos,
                                             sun_dir,
                                             wavelength_idx,
+                                            field,
                                         );
                                         if t_sun_gb > 1e-30 {
                                             let albedo = atm.surface_albedo[wavelength_idx];
@@ -3227,7 +3274,8 @@ fn trace_secondary_chain_scalar(
             let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
             let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
-                let t_sun_secondary = shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx);
+                let t_sun_secondary =
+                    shadow_ray_transmittance(atm, pos, sun_dir, wavelength_idx, field);
 
                 if t_sun_secondary > 1e-30 {
                     let cos_angle_nee = sun_dir.dot(current_dir);
@@ -3621,6 +3669,8 @@ fn trace_secondary_chain_alis(
     num_wl: usize,
     nee_r2_weight: f64,
     guide: Option<&crate::path_guide::PathGuide>,
+    // Stage 1: NEE shadow rays only (see trace_secondary_chain note).
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
 
@@ -3944,7 +3994,7 @@ fn trace_secondary_chain_alis(
                                     let cos_sun_ground = sun_dir.dot(normal);
                                     if cos_sun_ground > 0.0 {
                                         let t_suns_gb = shadow_ray_transmittance_spectrum(
-                                            atm, pos, sun_dir, num_wl,
+                                            atm, pos, sun_dir, num_wl, field,
                                         );
                                         let mis_w = spectral_mis_weight(&pr, num_wl);
                                         let inv_pi = 1.0 / core::f64::consts::PI;
@@ -4029,7 +4079,7 @@ fn trace_secondary_chain_alis(
             let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
             let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
-                let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl);
+                let t_suns = shadow_ray_transmittance_spectrum(atm, pos, sun_dir, num_wl, field);
                 let cos_angle_nee = sun_dir.dot(current_dir);
 
                 // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
@@ -4282,6 +4332,7 @@ pub fn hybrid_scatter_radiance_alis(
     sun_dir: Vec3,
     secondary_rays: usize,
     rng_state: &mut u64,
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     use crate::geometry::ray_sphere_intersect;
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
@@ -4435,6 +4486,7 @@ pub fn hybrid_scatter_radiance_alis(
                 &mut subpath_verts,
                 subpath_idx,
                 num_light_subpaths,
+                field,
             );
             for v in 0..n_verts {
                 let lv = &subpath_verts[v];
@@ -4475,7 +4527,8 @@ pub fn hybrid_scatter_radiance_alis(
             None => continue,
         };
 
-        let cloud_ext_step = atm.cloud_extinction[shell_idx];
+        // Per-step midpoint cloud extinction (field or 1D shell array).
+        let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
         let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
         let t_cloud_mid = atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
@@ -4493,7 +4546,7 @@ pub fn hybrid_scatter_radiance_alis(
         }
 
         // --- Order 1: deterministic single-scatter NEE (all wavelengths) ---
-        let t_suns = shadow_ray_transmittance_spectrum(atm, scatter_pos, sun_dir, num_wl);
+        let t_suns = shadow_ray_transmittance_spectrum(atm, scatter_pos, sun_dir, num_wl, field);
         let cos_theta_1 = sun_dir.dot(view_dir);
 
         for w in 0..num_wl {
@@ -4572,6 +4625,7 @@ pub fn hybrid_scatter_radiance_alis(
                     num_wl,
                     w_back,
                     guide_ref,
+                    field,
                 );
 
                 for w in 0..num_wl {
@@ -4668,6 +4722,7 @@ pub fn hybrid_scatter_radiance_alis(
                     &mut subpath_verts,
                     subpath_idx,
                     num_light_subpaths,
+                    field,
                 );
                 for v in 0..n_verts {
                     if n_batch_verts < BATCH_VERT_CAP {
@@ -4700,7 +4755,9 @@ pub fn hybrid_scatter_radiance_alis(
                     None => continue,
                 };
 
-                let cloud_ext_step = atm.cloud_extinction[shell_idx];
+                // BDPT LOS re-walk: same midpoint cloud quadrature as the
+                // main walk (field or 1D shell array).
+                let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
                 let tau_cloud_mid = tau_cloud_bdpt + cloud_ext_step * ds * 0.5;
                 let t_cloud_mid = atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
@@ -4747,8 +4804,13 @@ pub fn hybrid_scatter_radiance_alis(
                     let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
                     let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
 
-                    let t_conn =
-                        transmittance_between_points_spectrum(atm, scatter_pos, lv.pos, num_wl);
+                    let t_conn = transmittance_between_points_spectrum(
+                        atm,
+                        scatter_pos,
+                        lv.pos,
+                        num_wl,
+                        field,
+                    );
 
                     for w in 0..num_wl {
                         let optics_eye = &atm.optics[shell_idx][w];
@@ -4813,6 +4875,7 @@ pub fn hybrid_scatter_radiance_alis(
 ///
 /// # Returns
 /// Spectral radiance array `[f64; 64]`, one value per wavelength channel.
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_scatter_spectrum(
     atm: &AtmosphereModel,
     observer_pos: Vec3,
@@ -4821,6 +4884,7 @@ pub fn hybrid_scatter_spectrum(
     secondary_rays: usize,
     base_seed: u64,
     polarized: bool,
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     // ALIS path: trace ONE hero path per chain, evaluate ALL wavelengths.
     // ~N_wl fewer chains than per-wavelength tracing, same expected value.
@@ -4835,6 +4899,7 @@ pub fn hybrid_scatter_spectrum(
             sun_dir,
             secondary_rays,
             &mut rng,
+            field,
         );
     }
 
@@ -4857,6 +4922,7 @@ pub fn hybrid_scatter_spectrum(
             secondary_rays,
             &mut rng,
             polarized,
+            field,
         );
     }
 
@@ -5462,7 +5528,7 @@ mod tests {
         let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0); // radially outward
 
         let (tau, _hit_ground) = scout_tau_to_boundary(&atm, pos, dir, 1); // wavelength 1 (550nm)
-        let t_shadow = shadow_ray_transmittance(&atm, pos, dir, 1);
+        let t_shadow = shadow_ray_transmittance(&atm, pos, dir, 1, None);
 
         let t_from_scout = libm::exp(-tau);
         let rel_err = if t_shadow > 1e-30 {
@@ -5600,7 +5666,7 @@ mod tests {
         let sun_dir = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
         let mut rng_state: u64 = 42;
 
-        let result = trace_photon(&atm, observer_pos, view_dir, sun_dir, 0, &mut rng_state);
+        let result = trace_photon(&atm, observer_pos, view_dir, sun_dir, 0, &mut rng_state, None);
         assert!(result.terminated, "Photon should terminate");
         assert_eq!(result.num_scatters, 0, "No scattering in empty atmosphere");
         assert!(
@@ -5626,7 +5692,7 @@ mod tests {
         let sun_dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0); // overhead
 
         let mut rng_state: u64 = 42;
-        let result = trace_photon(&atm, observer_pos, view_dir, sun_dir, 0, &mut rng_state);
+        let result = trace_photon(&atm, observer_pos, view_dir, sun_dir, 0, &mut rng_state, None);
         assert!(result.terminated, "Photon should always terminate");
     }
 
@@ -5709,7 +5775,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         assert_eq!(spectrum.len(), 64);
     }
 
@@ -5720,7 +5786,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 200, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 200, 42, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 spectrum[w] >= 0.0,
@@ -5738,7 +5804,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         for w in atm.num_wavelengths..64 {
             assert!(
                 spectrum[w].abs() < 1e-30,
@@ -5756,7 +5822,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 0, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 0, 42, None);
         for w in 0..64 {
             assert!(
                 spectrum[w].abs() < 1e-30,
@@ -5772,8 +5838,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
-        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
+        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 (s1[w] - s2[w]).abs() < 1e-15,
@@ -5795,7 +5861,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         assert!(
             spectrum[0].abs() < 1e-20,
             "Empty atmosphere should give ~0 MC contribution, got {}",
@@ -5812,7 +5878,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         // Use enough photons for a reliable signal
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 1000, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 1000, 42, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -5830,7 +5896,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 10, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 10, 42, true, None);
         assert_eq!(spectrum.len(), 64);
     }
 
@@ -5841,7 +5907,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(96.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 spectrum[w] >= 0.0,
@@ -5859,7 +5925,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -5878,7 +5944,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         assert!(
             spectrum[0].abs() < 1e-20,
             "Empty atmosphere should give zero hybrid contribution, got {}",
@@ -5893,8 +5959,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
-        let s2 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true);
+        let s1 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
+        let s2 = hybrid_scatter_spectrum(&atm, obs, view, sun, 50, 42, true, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 (s1[w] - s2[w]).abs() < 1e-15,
@@ -5947,7 +6013,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
         let mut rng: u64 = 42;
 
-        let result = trace_photon(&atm, obs, view, sun, 1, &mut rng);
+        let result = trace_photon(&atm, obs, view, sun, 1, &mut rng, None);
         assert!(result.terminated, "Photon should always terminate");
     }
 
@@ -5962,7 +6028,7 @@ mod tests {
 
         for seed in 0..50u64 {
             let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let result = trace_photon(&atm, obs, view, sun, 1, &mut rng);
+            let result = trace_photon(&atm, obs, view, sun, 1, &mut rng, None);
             assert!(
                 result.weight >= 0.0,
                 "Photon weight should be non-negative: seed={}, weight={}",
@@ -5981,7 +6047,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 500, 42);
+        let spectrum = mc_scatter_spectrum(&atm, obs, view, sun, 500, 42, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -5999,8 +6065,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
-        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42);
+        let s1 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
+        let s2 = mc_scatter_spectrum(&atm, obs, view, sun, 100, 42, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 (s1[w] - s2[w]).abs() < 1e-15,
@@ -6022,7 +6088,7 @@ mod tests {
 
         for sza in &[92.0, 96.0, 102.0] {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
-            let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true);
+            let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true, None);
             for w in 0..atm.num_wavelengths {
                 assert!(
                     spectrum[w] >= 0.0,
@@ -6044,7 +6110,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true);
+        let spectrum = hybrid_scatter_spectrum(&atm, obs, view, sun, 20, 42, true, None);
         let total: f64 = spectrum[..atm.num_wavelengths].iter().sum();
         assert!(
             total > 0.0,
@@ -6090,7 +6156,7 @@ mod tests {
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
         let mut rng: u64 = 42;
 
-        let result = trace_photon(&atm, obs, view, sun, 0, &mut rng);
+        let result = trace_photon(&atm, obs, view, sun, 0, &mut rng, None);
         assert!(result.terminated);
         assert_eq!(result.num_scatters, 0);
         assert!(result.weight.abs() < 1e-20);
@@ -6106,7 +6172,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
         let mut rng: u64 = 42;
 
-        let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng);
+        let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng, None);
         assert!(result.terminated);
     }
 
@@ -6119,7 +6185,7 @@ mod tests {
 
         for seed in 0..50u64 {
             let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng);
+            let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng, None);
             assert!(
                 result.stokes.intensity() >= 0.0,
                 "Stokes I should be non-negative: seed={}, I={}",
@@ -6139,7 +6205,7 @@ mod tests {
 
         for seed in 0..50u64 {
             let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng);
+            let result = trace_photon_polarized(&atm, obs, view, sun, 1, &mut rng, None);
             if result.stokes.intensity() > 1e-20 {
                 let dop = result.stokes.degree_of_polarization();
                 assert!(
@@ -6159,7 +6225,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 500, 42);
+        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 500, 42, None);
         let total_i: f64 = spectrum[..atm.num_wavelengths]
             .iter()
             .map(|s| s.intensity())
@@ -6178,8 +6244,8 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let s1 = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42);
-        let s2 = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42);
+        let s1 = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42, None);
+        let s2 = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42, None);
         for w in 0..atm.num_wavelengths {
             for c in 0..4 {
                 assert!(
@@ -6207,8 +6273,8 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let n_photons = 2000;
-        let scalar = mc_scatter_spectrum(&atm, obs, view, sun, n_photons, 42);
-        let polarized = mc_scatter_spectrum_polarized(&atm, obs, view, sun, n_photons, 42);
+        let scalar = mc_scatter_spectrum(&atm, obs, view, sun, n_photons, 42, None);
+        let polarized = mc_scatter_spectrum_polarized(&atm, obs, view, sun, n_photons, 42, None);
 
         for w in 0..atm.num_wavelengths {
             let i_scalar = scalar[w];
@@ -6238,7 +6304,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
         let sun = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
 
-        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42);
+        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 100, 42, None);
         for c in 0..4 {
             assert!(
                 spectrum[0].s[c].abs() < 1e-20,
@@ -6255,7 +6321,7 @@ mod tests {
         let view = crate::geometry::Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 0, 42);
+        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 0, 42, None);
         for w in 0..64 {
             for c in 0..4 {
                 assert!(spectrum[w].s[c].abs() < 1e-30);
@@ -6276,7 +6342,7 @@ mod tests {
         // Sun on horizon → scattering angle ~ 90 degrees
         let sun = crate::geometry::solar_direction_ecef(90.0, 180.0, 0.0, 0.0);
 
-        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 2000, 42);
+        let spectrum = mc_scatter_spectrum_polarized(&atm, obs, view, sun, 2000, 42, None);
 
         // The 550nm channel should show noticeable polarization
         let s = spectrum[1]; // 550nm
@@ -6325,7 +6391,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let mut rng = 12345u64;
-        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng, None);
         assert_eq!(result.len(), 64);
         // Active wavelengths should be non-negative
         for w in 0..3 {
@@ -6377,7 +6443,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let mut rng = 42u64;
-        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 200, &mut rng);
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 200, &mut rng, None);
         for w in 0..3 {
             assert!(
                 result[w] > 0.0,
@@ -6427,7 +6493,8 @@ mod tests {
         for seed in 0..num_seeds {
             let base = seed * 1000 + 7777;
             let mut rng_alis = base;
-            let alis = hybrid_scatter_radiance_alis(&atm, obs, view, sun, rays, &mut rng_alis);
+            let alis =
+                hybrid_scatter_radiance_alis(&atm, obs, view, sun, rays, &mut rng_alis, None);
             for w in 0..3 {
                 alis_sum[w] += alis[w];
             }
@@ -6437,8 +6504,9 @@ mod tests {
                     .wrapping_add(w as u64)
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1);
-                let val =
-                    hybrid_scatter_radiance(&atm, obs, view, sun, w, rays, &mut rng_perwl, false);
+                let val = hybrid_scatter_radiance(
+                    &atm, obs, view, sun, w, rays, &mut rng_perwl, false, None,
+                );
                 perwl_sum[w] += val;
             }
         }
@@ -6473,7 +6541,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         let mut rng = 42u64;
-        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+        let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng, None);
         assert!(
             result[0].abs() < 1e-30,
             "Empty atmosphere ALIS should give zero, got {:.4e}",
@@ -6512,7 +6580,7 @@ mod tests {
         for sza in &[96.0, 100.0, 104.0, 106.0] {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
             let mut rng = 12345u64;
-            let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng);
+            let result = hybrid_scatter_radiance_alis(&atm, obs, view, sun, 50, &mut rng, None);
             for w in 0..3 {
                 assert!(
                     result[w] >= 0.0,
@@ -6690,6 +6758,7 @@ mod tests {
                     &mut verts,
                     sp,
                     num_subpaths,
+                    None,
                 );
                 total_verts += nv;
                 for v in 0..nv {
@@ -7176,6 +7245,7 @@ mod tests {
                 ray,
                 n,
                 1.0,
+                None,
             );
         }
         let mean = total / n as f64;
@@ -7224,6 +7294,7 @@ mod tests {
                 ray,
                 n,
                 1.0,
+                None,
             );
             assert!(
                 val >= 0.0,
@@ -7276,6 +7347,7 @@ mod tests {
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
+                None,
             );
             for w in 0..num_wl {
                 assert!(
@@ -7704,6 +7776,7 @@ mod tests {
                 ray,
                 n,
                 1.0,
+                None,
             );
             assert!(
                 result >= 0.0 && result.is_finite(),
@@ -7750,6 +7823,7 @@ mod tests {
             let mut mc = McRng::from_seed(rng);
             let result = trace_secondary_chain_alis(
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
+                None,
             );
             for w in 0..num_wl {
                 assert!(

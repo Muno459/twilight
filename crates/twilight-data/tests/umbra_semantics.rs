@@ -21,7 +21,7 @@ fn straight_chord_below_surface_is_blocked_on_cpu() {
         let sina = (b / p.length()).min(1.0);
         let cosa = -(1.0 - sina * sina).sqrt();
         let d = Vec3::new(cosa, sina, 0.0);
-        let t = shadow_ray_transmittance(&atm, p, d, 0);
+        let t = shadow_ray_transmittance(&atm, p, d, 0, None);
         eprintln!("straight perigee {dip_km:+6.1} km -> CPU T = {t:.3e}");
         if dip_km < -0.5 {
             assert!(

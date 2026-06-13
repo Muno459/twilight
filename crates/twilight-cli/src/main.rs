@@ -970,19 +970,24 @@ fn cmd_mcrt(
             )
             .unwrap_or_else(|e| {
                 eprintln!("Warning: GPU dispatch failed ({}), falling back to CPU", e);
-                simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step)
+                simulation::simulate_twilight_scan(
+                    &atm, &config, sza_start, sza_end, sza_step, None,
+                )
             }),
             Err(e) => {
                 eprintln!("Warning: GPU upload failed ({}), falling back to CPU", e);
-                simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step)
+                simulation::simulate_twilight_scan(
+                    &atm, &config, sza_start, sza_end, sza_step, None,
+                )
             }
         }
     } else {
-        simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step)
+        simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step, None)
     };
 
     #[cfg(not(feature = "gpu"))]
-    let results = simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step);
+    let results =
+        simulation::simulate_twilight_scan(&atm, &config, sza_start, sza_end, sza_step, None);
 
     let elapsed = start.elapsed();
 
@@ -1144,7 +1149,7 @@ fn cmd_compare(
                 seed_salt: 0,
             };
             for &sza in szas {
-                let result = simulation::simulate_at_sza(&atm, &config, sza);
+                let result = simulation::simulate_at_sza(&atm, &config, sza, None);
                 for (wl, rad) in result.wavelengths_nm.iter().zip(result.radiance.iter()) {
                     println!("{},{},{},{},{:e}", sza, vz, ra, wl, rad);
                 }
@@ -2664,7 +2669,7 @@ fn sqm_predict_curve(args: &SqmArgs) -> SqmCurve {
         let sza = pos.zenith;
 
         let sun_cd = if sza <= 110.0 {
-            let result = simulation::simulate_at_sza(&atm, &config, sza);
+            let result = simulation::simulate_at_sza(&atm, &config, sza, None);
             let analysis = twilight_threshold::threshold::analyze_twilight(
                 sza,
                 &result.wavelengths_nm,
@@ -3022,6 +3027,7 @@ fn cmd_render(sza: f64, width: u32, height: u32, rays: usize, out: &str) {
                 sun_dir,
                 rays,
                 &mut rng,
+                None,
             );
 
             let mut sum_x = 0.0;

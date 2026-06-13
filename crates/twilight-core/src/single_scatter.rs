@@ -19,6 +19,7 @@
 //! with shadow rays traced toward the sun at each quadrature point.
 
 use crate::atmosphere::AtmosphereModel;
+use crate::cloud_field::{cloud_ext_at, cloud_tau_segment, Cloud3DField};
 use crate::geometry::{
     next_shell_boundary, ray_sphere_intersect, refract_at_boundary, RefractResult, Vec3,
 };
@@ -123,6 +124,8 @@ pub fn ray_path_through_shell(
 /// * `view_dir` - Viewing direction (unit vector)
 /// * `sun_dir` - Direction toward the sun (unit vector)
 /// * `wavelength_idx` - Index into the atmosphere wavelength grid
+/// * `field` - 3D cloud field; when present it owns ALL cloud (the caller
+///   guarantees `atm.cloud_extinction` is all-zero)
 ///
 /// # Returns
 /// Single-scattering radiance (proportional to W/m²/sr/nm when multiplied by solar irradiance)
@@ -132,6 +135,7 @@ pub fn single_scatter_radiance(
     view_dir: Vec3,
     sun_dir: Vec3,
     wavelength_idx: usize,
+    field: Option<&Cloud3DField>,
 ) -> f64 {
     let toa_radius = atm.toa_radius();
     let surface_radius = atm.surface_radius();
@@ -190,20 +194,24 @@ pub fn single_scatter_radiance(
 
         let optics = &atm.optics[shell_idx][wavelength_idx];
 
+        // Cloud extinction at the step midpoint: the field when present
+        // (per-voxel), the 1D shell array otherwise.
+        let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
+
         // Scattering coefficient at this point
         let beta_scat = optics.extinction * optics.ssa;
 
         if beta_scat < 1e-30 {
             // Update optical depth even if no scattering
             tau_obs += optics.extinction * ds_base;
-            tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds_base;
+            tau_cloud_obs += cloud_ext_step * ds_base;
             continue;
         }
 
         // Transmittance from observer to scatter point: Beer-Lambert for
         // clear air + Eddington diffuse for the accumulated cloud portion.
         let tau_obs_mid = tau_obs + optics.extinction * ds_base * 0.5;
-        let tau_cloud_mid = tau_cloud_obs + atm.cloud_extinction[shell_idx] * ds_base * 0.5;
+        let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds_base * 0.5;
         let t_obs = libm::exp(-tau_obs_mid)
             * atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
@@ -213,12 +221,12 @@ pub fn single_scatter_radiance(
         }
 
         // Transmittance from sun to scatter point (shadow ray)
-        let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx);
+        let t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wavelength_idx, field);
 
         if t_sun < 1e-30 {
             // This point is in shadow (sun below local horizon)
             tau_obs += optics.extinction * ds_base;
-            tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds_base;
+            tau_cloud_obs += cloud_ext_step * ds_base;
             continue;
         }
 
@@ -242,7 +250,7 @@ pub fn single_scatter_radiance(
 
         // Update accumulated optical depth for next step
         tau_obs += optics.extinction * ds_base;
-        tau_cloud_obs += atm.cloud_extinction[shell_idx] * ds_base;
+        tau_cloud_obs += cloud_ext_step * ds_base;
     }
 
     // Ground reflection: Lambertian BRDF = albedo / π
@@ -264,7 +272,7 @@ pub fn single_scatter_radiance(
             // Sun must be above the local horizon at the ground point
             if cos_sun_incidence > 0.0 {
                 let t_sun_ground =
-                    shadow_ray_transmittance(atm, ground_pos, sun_dir, wavelength_idx);
+                    shadow_ray_transmittance(atm, ground_pos, sun_dir, wavelength_idx, field);
                 // Full LOS optical depth to the ground; cloud portion diffuse.
                 let t_obs_ground = libm::exp(-tau_obs)
                     * atm.cloud_diffuse_transmittance(tau_cloud_obs);
@@ -294,6 +302,7 @@ pub fn shadow_ray_transmittance(
     start_pos: Vec3,
     sun_dir: Vec3,
     wavelength_idx: usize,
+    field: Option<&Cloud3DField>,
 ) -> f64 {
     let surface_radius = atm.surface_radius();
     let num_shells = atm.num_shells;
@@ -318,7 +327,9 @@ pub fn shadow_ray_transmittance(
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
                 tau += optics.extinction * dist;
-                tau_cloud += atm.cloud_extinction[shell_idx] * dist;
+                // Cloud tau for this straight in-shell segment: pos/dir
+                // are the segment start, BEFORE the refraction step.
+                tau_cloud += cloud_tau_segment(atm, field, shell_idx, pos, dir, dist);
 
                 // Refract at boundary
                 let boundary_pos = pos + dir * dist;
@@ -375,6 +386,7 @@ pub fn single_scatter_spectrum(
     observer_pos: Vec3,
     view_dir: Vec3,
     sun_dir: Vec3,
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     let mut radiance = [0.0f64; 64];
     let num_wl = atm.num_wavelengths;
@@ -423,9 +435,9 @@ pub fn single_scatter_spectrum(
 
         // Shadow ray transmittance per wavelength
         // (compute once per step, reuse geometry)
-        let t_sun = shadow_ray_transmittance_spectrum(atm, scatter_pos, sun_dir, num_wl);
+        let t_sun = shadow_ray_transmittance_spectrum(atm, scatter_pos, sun_dir, num_wl, field);
 
-        let cloud_ext_step = atm.cloud_extinction[shell_idx];
+        let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
         let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
         let t_cloud_mid = atm.cloud_diffuse_transmittance(tau_cloud_mid);
 
@@ -465,7 +477,8 @@ pub fn single_scatter_spectrum(
         let cos_sun_incidence = sun_dir.dot(ground_normal);
 
         if cos_sun_incidence > 0.0 {
-            let t_sun_ground = shadow_ray_transmittance_spectrum(atm, ground_pos, sun_dir, num_wl);
+            let t_sun_ground =
+                shadow_ray_transmittance_spectrum(atm, ground_pos, sun_dir, num_wl, field);
 
             for w in 0..num_wl {
                 let albedo = atm.surface_albedo[w];
@@ -495,6 +508,7 @@ pub fn shadow_ray_transmittance_spectrum(
     start_pos: Vec3,
     sun_dir: Vec3,
     num_wl: usize,
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     let surface_radius = atm.surface_radius();
     let num_shells = atm.num_shells;
@@ -518,7 +532,8 @@ pub fn shadow_ray_transmittance_spectrum(
                 for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
                     *tau_w += atm.optics[shell_idx][w].extinction * dist;
                 }
-                tau_cloud += atm.cloud_extinction[shell_idx] * dist;
+                // Segment start pos/dir, BEFORE the refraction step.
+                tau_cloud += cloud_tau_segment(atm, field, shell_idx, pos, dir, dist);
 
                 // Refract at boundary
                 let boundary_pos = pos + dir * dist;
@@ -593,6 +608,7 @@ pub fn transmittance_between_points_spectrum(
     from: Vec3,
     to: Vec3,
     num_wl: usize,
+    field: Option<&Cloud3DField>,
 ) -> [f64; 64] {
     let diff = Vec3::new(to.x - from.x, to.y - from.y, to.z - from.z);
     let dist_total = diff.length();
@@ -615,8 +631,14 @@ pub fn transmittance_between_points_spectrum(
     let mut tau = [0.0f64; 64];
     // Cloud scattering crossed by the connection gets Eddington diffuse
     // transmission, consistent with the shadow-ray and LOS integrators
-    // (single-representation cloud transport).
-    let mut tau_cloud = 0.0f64;
+    // (single-representation cloud transport). With a 3D field the whole
+    // straight chord is one DDA integral (per-shell path lengths are not
+    // contiguous segments, so cloud_tau_segment cannot be applied per
+    // shell here); without one, the per-shell 1D sum is exact.
+    let mut tau_cloud = match field {
+        Some(f) => f.tau_along(from, dir, dist_total),
+        None => 0.0,
+    };
 
     for s in 0..atm.num_shells {
         let shell = &atm.shells[s];
@@ -625,7 +647,9 @@ pub fn transmittance_between_points_spectrum(
             for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
                 *tau_w += atm.optics[s][w].extinction * path_len;
             }
-            tau_cloud += atm.cloud_extinction[s] * path_len;
+            if field.is_none() {
+                tau_cloud += atm.cloud_extinction[s] * path_len;
+            }
         }
     }
 
@@ -801,7 +825,7 @@ mod tests {
         let view = Vec3::new(0.0, 0.0, 1.0).normalize();
         let sun = Vec3::new(1.0, 0.0, 0.0); // overhead
 
-        let rad = single_scatter_radiance(&atm, obs, view, sun, 0);
+        let rad = single_scatter_radiance(&atm, obs, view, sun, 0, None);
         assert!(
             rad.abs() < 1e-30,
             "Zero extinction → zero radiance, got {}",
@@ -821,7 +845,7 @@ mod tests {
             Vec3::new(libm::cos(sza), libm::sin(sza), 0.0)
         };
 
-        let rad = single_scatter_radiance(&atm, obs, view, sun, 1); // 550nm
+        let rad = single_scatter_radiance(&atm, obs, view, sun, 1, None); // 550nm
         assert!(
             rad > 0.0,
             "Sunlit atmosphere should produce positive radiance, got {}",
@@ -839,8 +863,8 @@ mod tests {
         let sun_92 = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
         let sun_100 = crate::geometry::solar_direction_ecef(100.0, 180.0, 0.0, 0.0);
 
-        let rad_92 = single_scatter_radiance(&atm, obs, view, sun_92, 1);
-        let rad_100 = single_scatter_radiance(&atm, obs, view, sun_100, 1);
+        let rad_92 = single_scatter_radiance(&atm, obs, view, sun_92, 1, None);
+        let rad_100 = single_scatter_radiance(&atm, obs, view, sun_100, 1, None);
 
         assert!(
             rad_92 > rad_100,
@@ -868,10 +892,12 @@ mod tests {
         let sun_shallow = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
         let sun_deep = crate::geometry::solar_direction_ecef(100.0, 180.0, 0.0, 0.0);
 
-        let rad_blue_shallow = single_scatter_radiance(&atm, obs, view, sun_shallow, 0); // 400nm
-        let rad_red_shallow = single_scatter_radiance(&atm, obs, view, sun_shallow, 2); // 700nm
-        let rad_blue_deep = single_scatter_radiance(&atm, obs, view, sun_deep, 0);
-        let rad_red_deep = single_scatter_radiance(&atm, obs, view, sun_deep, 2);
+        let rad_blue_shallow =
+            single_scatter_radiance(&atm, obs, view, sun_shallow, 0, None); // 400nm
+        let rad_red_shallow =
+            single_scatter_radiance(&atm, obs, view, sun_shallow, 2, None); // 700nm
+        let rad_blue_deep = single_scatter_radiance(&atm, obs, view, sun_deep, 0, None);
+        let rad_red_deep = single_scatter_radiance(&atm, obs, view, sun_deep, 2, None);
 
         // At deeper twilight, the blue/red ratio should decrease (sky reddens)
         let ratio_shallow = if rad_red_shallow > 1e-30 {
@@ -902,7 +928,7 @@ mod tests {
         let view = Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(80.0, 180.0, 0.0, 0.0);
 
-        let spectrum = single_scatter_spectrum(&atm, obs, view, sun);
+        let spectrum = single_scatter_spectrum(&atm, obs, view, sun, None);
         // Should be [f64; 64], the first num_wavelengths should have values
         assert_eq!(spectrum.len(), 64);
     }
@@ -916,10 +942,10 @@ mod tests {
         let view = Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = single_scatter_spectrum(&atm, obs, view, sun);
+        let spectrum = single_scatter_spectrum(&atm, obs, view, sun, None);
 
         for w in 0..atm.num_wavelengths {
-            let individual = single_scatter_radiance(&atm, obs, view, sun, w);
+            let individual = single_scatter_radiance(&atm, obs, view, sun, w, None);
             let rel_err = if individual > 1e-30 {
                 ((spectrum[w] - individual) / individual).abs()
             } else {
@@ -943,7 +969,7 @@ mod tests {
         let view = Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(80.0, 180.0, 0.0, 0.0);
 
-        let spectrum = single_scatter_spectrum(&atm, obs, view, sun);
+        let spectrum = single_scatter_spectrum(&atm, obs, view, sun, None);
         for w in atm.num_wavelengths..64 {
             assert!(
                 spectrum[w].abs() < 1e-30,
@@ -964,7 +990,7 @@ mod tests {
         // SZA = 120° → well below horizon, deep shadow
         let sun = crate::geometry::solar_direction_ecef(120.0, 180.0, 0.0, 0.0);
 
-        let spectrum = single_scatter_spectrum(&atm, obs, view, sun);
+        let spectrum = single_scatter_spectrum(&atm, obs, view, sun, None);
         for w in 0..atm.num_wavelengths {
             assert!(
                 spectrum[w] < 1e-20,
@@ -985,7 +1011,7 @@ mod tests {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
             let view = Vec3::new(0.0, 1.0, 0.0).normalize();
             for w in 0..atm.num_wavelengths {
-                let rad = single_scatter_radiance(&atm, obs, view, sun, w);
+                let rad = single_scatter_radiance(&atm, obs, view, sun, w, None);
                 assert!(
                     rad >= 0.0,
                     "Radiance should be non-negative: SZA={}, wl={}, rad={:.4e}",
@@ -1021,8 +1047,8 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
 
         for w in 0..atm_no.num_wavelengths {
-            let r_no = single_scatter_radiance(&atm_no, obs, view, sun, w);
-            let r_yes = single_scatter_radiance(&atm_yes, obs, view, sun, w);
+            let r_no = single_scatter_radiance(&atm_no, obs, view, sun, w, None);
+            let r_yes = single_scatter_radiance(&atm_yes, obs, view, sun, w, None);
             assert!(
                 r_yes >= r_no,
                 "albedo=0.5 should give >= albedo=0: wl[{}] {:.4e} vs {:.4e}",
@@ -1047,8 +1073,8 @@ mod tests {
         // Sun well above horizon so ground is illuminated
         let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
 
-        let rad_no = single_scatter_radiance(&atm_no, obs, view, sun, 1);
-        let rad_yes = single_scatter_radiance(&atm_yes, obs, view, sun, 1);
+        let rad_no = single_scatter_radiance(&atm_no, obs, view, sun, 1, None);
+        let rad_yes = single_scatter_radiance(&atm_yes, obs, view, sun, 1, None);
 
         assert!(
             rad_yes >= rad_no,
@@ -1067,8 +1093,8 @@ mod tests {
         let view = Vec3::new(0.0, 0.0, 1.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
 
-        let rad_low = single_scatter_radiance(&atm_low, obs, view, sun, 1);
-        let rad_high = single_scatter_radiance(&atm_high, obs, view, sun, 1);
+        let rad_low = single_scatter_radiance(&atm_low, obs, view, sun, 1, None);
+        let rad_high = single_scatter_radiance(&atm_high, obs, view, sun, 1, None);
 
         assert!(
             rad_high >= rad_low,
@@ -1088,8 +1114,8 @@ mod tests {
         let view = Vec3::new(0.0, 0.0, 1.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(120.0, 180.0, 0.0, 0.0);
 
-        let rad_no = single_scatter_radiance(&atm_no, obs, view, sun, 1);
-        let rad_yes = single_scatter_radiance(&atm_yes, obs, view, sun, 1);
+        let rad_no = single_scatter_radiance(&atm_no, obs, view, sun, 1, None);
+        let rad_yes = single_scatter_radiance(&atm_yes, obs, view, sun, 1, None);
 
         assert!(
             (rad_no - rad_yes).abs() < 1e-25,
@@ -1108,7 +1134,7 @@ mod tests {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
             let view = Vec3::new(0.0, 0.0, 1.0).normalize();
             for w in 0..atm.num_wavelengths {
-                let rad = single_scatter_radiance(&atm, obs, view, sun, w);
+                let rad = single_scatter_radiance(&atm, obs, view, sun, w, None);
                 assert!(
                     rad >= 0.0,
                     "Radiance with albedo should be non-negative: SZA={}, wl={}, rad={:.4e}",
@@ -1128,10 +1154,10 @@ mod tests {
         let view = Vec3::new(0.0, 0.0, 1.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
 
-        let spectrum = single_scatter_spectrum(&atm, obs, view, sun);
+        let spectrum = single_scatter_spectrum(&atm, obs, view, sun, None);
 
         for w in 0..atm.num_wavelengths {
-            let individual = single_scatter_radiance(&atm, obs, view, sun, w);
+            let individual = single_scatter_radiance(&atm, obs, view, sun, w, None);
             let rel_err = if individual > 1e-30 {
                 ((spectrum[w] - individual) / individual).abs()
             } else {
@@ -1159,8 +1185,8 @@ mod tests {
         let view = Vec3::new(1.0, 0.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(60.0, 180.0, 0.0, 0.0);
 
-        let rad_no = single_scatter_radiance(&atm_no, obs, view, sun, 1);
-        let rad_yes = single_scatter_radiance(&atm_yes, obs, view, sun, 1);
+        let rad_no = single_scatter_radiance(&atm_no, obs, view, sun, 1, None);
+        let rad_yes = single_scatter_radiance(&atm_yes, obs, view, sun, 1, None);
 
         assert!(
             (rad_no - rad_yes).abs() < 1e-25,
@@ -1186,23 +1212,23 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(60.0, 0.0, 0.0, 0.0);
 
         // Blue and red should be unchanged
-        let rad_blue = single_scatter_radiance(&atm, obs, view, sun, 0);
-        let rad_blue_zero = single_scatter_radiance(&atm_zero, obs, view, sun, 0);
+        let rad_blue = single_scatter_radiance(&atm, obs, view, sun, 0, None);
+        let rad_blue_zero = single_scatter_radiance(&atm_zero, obs, view, sun, 0, None);
         assert!(
             (rad_blue - rad_blue_zero).abs() < 1e-25,
             "Blue (albedo=0) should be unchanged"
         );
 
-        let rad_red = single_scatter_radiance(&atm, obs, view, sun, 2);
-        let rad_red_zero = single_scatter_radiance(&atm_zero, obs, view, sun, 2);
+        let rad_red = single_scatter_radiance(&atm, obs, view, sun, 2, None);
+        let rad_red_zero = single_scatter_radiance(&atm_zero, obs, view, sun, 2, None);
         assert!(
             (rad_red - rad_red_zero).abs() < 1e-25,
             "Red (albedo=0) should be unchanged"
         );
 
         // Green should be >= the zero-albedo case
-        let rad_green = single_scatter_radiance(&atm, obs, view, sun, 1);
-        let rad_green_zero = single_scatter_radiance(&atm_zero, obs, view, sun, 1);
+        let rad_green = single_scatter_radiance(&atm, obs, view, sun, 1, None);
+        let rad_green_zero = single_scatter_radiance(&atm_zero, obs, view, sun, 1, None);
         assert!(
             rad_green >= rad_green_zero,
             "Green (albedo=0.5) should be >= zero-albedo: {:.4e} vs {:.4e}",
@@ -1245,7 +1271,7 @@ mod tests {
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
         // All n are 1.0 by default, so refraction is identity
-        let t = shadow_ray_transmittance(&atm, pos, sun, 1);
+        let t = shadow_ray_transmittance(&atm, pos, sun, 1, None);
         assert!(
             (0.0..=1.0).contains(&t),
             "Transmittance should be in [0,1], got {}",
@@ -1261,7 +1287,7 @@ mod tests {
         let pos = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let t = shadow_ray_transmittance(&atm, pos, sun, 0);
+        let t = shadow_ray_transmittance(&atm, pos, sun, 0, None);
         assert!(
             (0.0..=1.0).contains(&t),
             "Transmittance with refraction should be in [0,1], got {}",
@@ -1283,8 +1309,8 @@ mod tests {
         // Use a near-horizon sun angle where refraction matters most
         let sun = crate::geometry::solar_direction_ecef(90.5, 180.0, 0.0, 0.0);
 
-        let t_refract = shadow_ray_transmittance(&atm_refract, pos, sun, 0);
-        let t_straight = shadow_ray_transmittance(&atm_straight, pos, sun, 0);
+        let t_refract = shadow_ray_transmittance(&atm_refract, pos, sun, 0, None);
+        let t_straight = shadow_ray_transmittance(&atm_straight, pos, sun, 0, None);
 
         // Both should be valid transmittances
         assert!((0.0..=1.0).contains(&t_refract));
@@ -1313,7 +1339,7 @@ mod tests {
 
         for sza in &[80.0, 90.0, 92.0, 96.0, 102.0, 108.0] {
             let sun = crate::geometry::solar_direction_ecef(*sza, 180.0, 0.0, 0.0);
-            let rad = single_scatter_radiance(&atm, obs, view, sun, 0);
+            let rad = single_scatter_radiance(&atm, obs, view, sun, 0, None);
             assert!(
                 rad >= 0.0,
                 "Radiance with refraction should be non-negative: SZA={}, rad={:.4e}",
@@ -1332,7 +1358,7 @@ mod tests {
         let view = Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let rad = single_scatter_radiance(&atm, obs, view, sun, 0);
+        let rad = single_scatter_radiance(&atm, obs, view, sun, 0, None);
         assert!(
             rad > 0.0,
             "Refracted radiance should be positive at civil twilight, got {:.4e}",
@@ -1371,10 +1397,10 @@ mod tests {
         let view = Vec3::new(0.0, 1.0, 0.0).normalize();
         let sun = crate::geometry::solar_direction_ecef(92.0, 180.0, 0.0, 0.0);
 
-        let spectrum = single_scatter_spectrum(&atm, obs, view, sun);
+        let spectrum = single_scatter_spectrum(&atm, obs, view, sun, None);
 
         for w in 0..atm.num_wavelengths {
-            let individual = single_scatter_radiance(&atm, obs, view, sun, w);
+            let individual = single_scatter_radiance(&atm, obs, view, sun, w, None);
             let rel_err = if individual > 1e-30 {
                 ((spectrum[w] - individual) / individual).abs()
             } else {
@@ -1401,7 +1427,7 @@ mod tests {
         let pos = Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
         let sun = Vec3::new(1.0, 0.0, 0.0); // directly overhead
 
-        let t = shadow_ray_transmittance(&atm, pos, sun, 0);
+        let t = shadow_ray_transmittance(&atm, pos, sun, 0, None);
         assert!(
             (t - 1.0).abs() < 1e-10,
             "Zero-extinction transmittance should be 1.0, got {}",
@@ -1419,7 +1445,7 @@ mod tests {
         // Direction straight down
         let sun_down = Vec3::new(-1.0, 0.0, 0.0);
 
-        let t = shadow_ray_transmittance(&atm, pos, sun_down, 0);
+        let t = shadow_ray_transmittance(&atm, pos, sun_down, 0, None);
         assert!(
             t < 1e-20,
             "Shadow ray hitting ground should have zero transmittance, got {}",

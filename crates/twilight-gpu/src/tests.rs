@@ -748,7 +748,7 @@ mod layer4_metal {
                                            [view.x, view.y, view.z],
                                            [sun.x, sun.y, sun.z]).unwrap();
             let cpu_r = twilight_core::single_scatter::single_scatter_spectrum(
-                &atm, obs, view, sun);
+                &atm, obs, view, sun, None);
             for w in (0..gpu_r.num_wavelengths).step_by(8) {
                 let c = cpu_r[w];
                 let g = gpu_r.radiance[w];
@@ -1367,6 +1367,7 @@ fn metal_hybrid_split_dispatch_boundaries_match_cpu_statistics() {
                 secondary_rays,
                 &mut rng,
                 true,
+                None,
             );
         }
 
@@ -1681,7 +1682,7 @@ fn benchmark_cpu_vs_gpu_single_scatter() {
     let n = 100;
     let cpu_start = Instant::now();
     for _ in 0..n {
-        let _ = single_scatter_spectrum(&atm, obs, view, sun);
+        let _ = single_scatter_spectrum(&atm, obs, view, sun, None);
     }
     let cpu_elapsed = cpu_start.elapsed();
     let cpu_per_call = cpu_elapsed / n;
@@ -2215,7 +2216,7 @@ fn test_parity_refractive_shadow_ray() {
             let pos_f32 = [scatter_pos.x as f32, 0.0f32, 0.0f32];
 
             for w in 0..3 {
-                let cpu_t = shadow_ray_transmittance(&atm, scatter_pos, sun, w);
+                let cpu_t = shadow_ray_transmittance(&atm, scatter_pos, sun, w, None);
                 let gpu_t =
                     crate::parity::shadow_ray_transmittance_f32(&packed, pos_f32, sun_f32, w)
                         as f64;
@@ -2707,7 +2708,7 @@ fn test_parity_ground_reflection() {
     let sun_f32 = [sun.x as f32, sun.y as f32, sun.z as f32];
 
     for w in 0..3 {
-        let cpu_t = shadow_ray_transmittance(&atm, scatter_pos_f64, sun, w);
+        let cpu_t = shadow_ray_transmittance(&atm, scatter_pos_f64, sun, w, None);
         let gpu_t =
             crate::parity::shadow_ray_transmittance_f32(&packed, scatter_pos_f32, sun_f32, w);
 
@@ -2737,7 +2738,7 @@ fn test_parity_ground_reflection() {
 
     // Only check red (wl=2) where the path is optically thin enough
     let w = 2; // 700nm, extinction factor 0.3x
-    let cpu_t = shadow_ray_transmittance(&atm, high_pos_f64, sun96, w);
+    let cpu_t = shadow_ray_transmittance(&atm, high_pos_f64, sun96, w, None);
     let gpu_t = crate::parity::shadow_ray_transmittance_f32(&packed, high_pos_f32, sun96_f32, w);
 
     assert!(
@@ -2753,7 +2754,7 @@ fn test_parity_ground_reflection() {
 
     // Verify CPU and GPU agree on sign (both positive or both near-zero)
     for w in 0..3 {
-        let cpu_t = shadow_ray_transmittance(&atm, high_pos_f64, sun96, w);
+        let cpu_t = shadow_ray_transmittance(&atm, high_pos_f64, sun96, w, None);
         let gpu_t =
             crate::parity::shadow_ray_transmittance_f32(&packed, high_pos_f32, sun96_f32, w);
 
@@ -3016,7 +3017,7 @@ fn cpu_convergence_at_deep_twilight() {
                         .wrapping_mul(6364136223846793005)
                         .wrapping_add(1);
                     total += twilight_core::photon::hybrid_scatter_radiance(
-                        &atm, obs_pos, view, sun, w, rays, &mut rng, true,
+                        &atm, obs_pos, view, sun, w, rays, &mut rng, true, None,
                     );
                 }
                 seed_totals.push(total);
@@ -3174,6 +3175,7 @@ fn statistical_hybrid_gpu_vs_cpu_deep_twilight() {
                     secondary_rays,
                     &mut rng,
                     true,
+                    None,
                 );
                 cpu_total += rad;
             }
@@ -3303,6 +3305,7 @@ fn diagnostic_hybrid_gpu_vs_cpu_deep_twilight() {
                 secondary_rays,
                 &mut rng,
                 true,
+                None,
             );
         }
 
