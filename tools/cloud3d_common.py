@@ -173,3 +173,37 @@ def print_summary(tag, headline, iwc, cloud_frac, path):
     print(f"{tag}: cloud fraction {cloud_frac:.2f}, "
           f"max IWC {float(iwc.max()):.4f} g/m^3, path samples {len(path)}",
           file=sys.stderr)
+
+
+def write_field(field_path, iwc, heights, lat0_deg, lon0_deg, dlat_deg, dlon_deg,
+                scan_time, source):
+    """Full-grid output for the Rust 3D transport (Cloud3DField builder).
+
+    Two files: <path> = raw little-endian f32 of the (nz, ny, nx) IWC
+    grid in g/m^3, TOP-DOWN vertical order (the model convention), rows
+    north-to-south (the shared orientation contract of this module);
+    <path>.json = the header. The Rust loader flips to its own
+    conventions; this side stays byte-faithful to the model output.
+    """
+    import json as _json
+
+    a = np.ascontiguousarray(iwc, dtype="<f4")
+    with open(field_path, "wb") as f:
+        f.write(a.tobytes())
+    header = {
+        "nz": int(iwc.shape[0]),
+        "ny": int(iwc.shape[1]),
+        "nx": int(iwc.shape[2]),
+        "top_m": float(heights[0]),
+        "lat0_deg": lat0_deg,
+        "lon0_deg": lon0_deg,
+        "dlat_deg": dlat_deg,
+        "dlon_deg": dlon_deg,
+        "units": "g/m3",
+        "vertical_order": "top_down",
+        "row_order": "north_to_south",
+        "time_utc": scan_time,
+        "source": source,
+    }
+    with open(str(field_path) + ".json", "w") as f:
+        _json.dump(header, f)
