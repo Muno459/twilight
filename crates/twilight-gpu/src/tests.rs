@@ -1311,19 +1311,278 @@ mod layer4_metal {
     }
 
     /// Load the real Padborg field if present; skip the test otherwise.
+    ///
+    /// The skip is LOUD: the old real-field-only DDA gate skipped silently
+    /// whenever /tmp was cleared, leaving zero field-DDA coverage in the
+    /// suite. The synthetic checkerboard gate below is unconditional, so a
+    /// missing file no longer silences the geometry gate, but the skip of
+    /// the real-data half still deserves a banner.
     fn load_padborg_field() -> Option<twilight_data::cloud_field_builder::OwnedCloudField> {
         let path = std::path::Path::new("/tmp/padborg_field.bin");
         if !path.exists() {
-            eprintln!("G-*: /tmp/padborg_field.bin absent, skipping real-field gate");
+            eprintln!("==========================================================");
+            eprintln!("WARNING: /tmp/padborg_field.bin ABSENT.");
+            eprintln!("REAL-FIELD GATE SKIPPED. Regenerate with:");
+            eprintln!("  python3 tools/cloud3d_seviri.py --lat 54.83 --lon 9.36 \\");
+            eprintln!("    --out /tmp/padborg_field_test.json \\");
+            eprintln!("    --field-out /tmp/padborg_field.bin --place Padborg");
+            eprintln!("==========================================================");
             return None;
         }
         match twilight_weather::cloud3d::load_field(path) {
             Ok(f) => Some(f),
             Err(e) => {
-                eprintln!("G-*: failed to load Padborg field ({e}), skipping");
+                eprintln!("==========================================================");
+                eprintln!("WARNING: failed to load Padborg field ({e}).");
+                eprintln!("REAL-FIELD GATE SKIPPED.");
+                eprintln!("==========================================================");
                 None
             }
         }
+    }
+
+    // ── G-DDA-PARITY-2 synthetic harness: the checkerboard fan ──────────
+    //
+    // Mirrors the CPU referee geometry in cloud_field.rs tests exactly:
+    // nlat = nlon = 27 with tile 8 (27 is NOT a multiple of 8, so the
+    // footprint edge is off the tile lattice: BUG 3's precondition) and
+    // alternating empty/occupied tiles (maximizing empty-to-occupied
+    // boundary landings: BUG 1's precondition). Runs UNCONDITIONALLY (no
+    // external file), unlike the real-field gate.
+    const CB_NZ: usize = 4;
+    const CB_N: usize = 27;
+    const CB_TILE: usize = 8;
+    const CB_NT: usize = 4; // ceil(27 / 8)
+    const CB_SIGMA: f32 = 5e-4;
+    const CB_BG: f32 = 1.3e-4;
+
+    fn checkerboard_owned_field() -> twilight_data::cloud_field_builder::OwnedCloudField {
+        let mut sigma = vec![0.0f32; CB_NZ * CB_N * CB_N];
+        for iz in 0..CB_NZ {
+            for ilat in 0..CB_N {
+                for ilon in 0..CB_N {
+                    if (ilat / CB_TILE + ilon / CB_TILE).is_multiple_of(2) {
+                        sigma[(iz * CB_N + ilat) * CB_N + ilon] = CB_SIGMA;
+                    }
+                }
+            }
+        }
+        // Majorant derivation, same as the twilight-data builder.
+        let mut mm = vec![0.0f32; CB_NZ * CB_NT * CB_NT];
+        for iz in 0..CB_NZ {
+            for ilat in 0..CB_N {
+                for ilon in 0..CB_N {
+                    let v = sigma[(iz * CB_N + ilat) * CB_N + ilon];
+                    let m = &mut mm[(iz * CB_NT + ilat / CB_TILE) * CB_NT + ilon / CB_TILE];
+                    if v > *m {
+                        *m = v;
+                    }
+                }
+            }
+        }
+        // NOTE: background/majorants set literally (NOT derive(): the CPU
+        // referee geometry pins bg = 1.3e-4, not the horizontal mean).
+        twilight_data::cloud_field_builder::OwnedCloudField {
+            sigma,
+            g_star: vec![],
+            background_column: vec![CB_BG; CB_NZ],
+            macrocell_max: mm,
+            tile: CB_TILE,
+            nz: CB_NZ,
+            nlat: CB_N,
+            nlon: CB_N,
+            z0_m: 1000.0,
+            dz_m: 500.0,
+            lat0_deg: -0.27,
+            lon0_deg: -0.27,
+            dlat_deg: 0.02,
+            dlon_deg: 0.02,
+            g_default: 0.46,
+            timestamp: "synthetic".into(),
+            source: "checkerboard".into(),
+        }
+    }
+
+    fn east_of(p: [f64; 3]) -> [f64; 3] {
+        normalize3([-p[1], p[0], 0.0])
+    }
+
+    fn north_of(p: [f64; 3]) -> [f64; 3] {
+        cross3(normalize3(p), east_of(p))
+    }
+
+    fn axpy(a: f64, x: [f64; 3], b: f64, y: [f64; 3]) -> [f64; 3] {
+        [a * x[0] + b * y[0], a * x[1] + b * y[1], a * x[2] + b * y[2]]
+    }
+
+    /// The checkerboard referee fan (port of cb_ray_fan + the BUG 1 and
+    /// BUG 3 regression rays from cloud_field.rs): boundary-aligned,
+    /// grazing, lateral-entry, and through-the-top geometries.
+    fn cb_ray_fan() -> Vec<(&'static str, [f64; 3], [f64; 3], f64)> {
+        let deg = std::f64::consts::PI / 180.0;
+        let p1 = ecef_point(0.0, -0.26, 1250.0);
+        let p2 = ecef_point(-0.26, 0.005, 1250.0);
+        let p3 = ecef_point(-0.252, -0.252, 1100.0);
+        let p4 = ecef_point(0.004, -0.26, 1050.0);
+        let z4 = 89.5 * deg;
+        let d4 = normalize3(axpy(z4.cos(), normalize3(p4), z4.sin(), east_of(p4)));
+        let p5 = ecef_point(0.01, -0.60, 1250.0);
+        let p6 = ecef_point(0.0, -0.10, 5000.0);
+        let d6 = normalize3(axpy(1.0, east_of(p6), -0.08, normalize3(p6)));
+        let p7 = ecef_point(-0.02, -0.05, 0.0);
+        let d7 = normalize3(axpy(0.5, normalize3(p7), 0.75f64.sqrt(), east_of(p7)));
+        let mut fan = vec![
+            ("east along lon", p1, east_of(p1), 80_000.0),
+            ("north along lat", p2, north_of(p2), 80_000.0),
+            (
+                "diagonal",
+                p3,
+                normalize3(axpy(1.0, east_of(p3), 1.0, north_of(p3))),
+                100_000.0,
+            ),
+            ("grazing zen 89.5", p4, d4, 200_000.0),
+            ("lateral entry from outside", p5, east_of(p5), 150_000.0),
+            ("entry from above z_top", p6, d6, 80_000.0),
+            ("from below through z0", p7, d7, 10_000.0),
+        ];
+        // BUG 1 fan: coarse-skip landings exactly on the empty-to-occupied
+        // tile plane at lon -0.11 (start mid empty tile, and pinned on the
+        // plane with both fp parities; in f32 the eps offsets collapse onto
+        // the plane itself, which is exactly the landing-parity case the
+        // midpoint classification must survive).
+        for (label, lon_start) in [
+            ("bug1 start mid empty tile", -0.19),
+            ("bug1 on plane -eps", -0.11 - 1e-9),
+            ("bug1 on plane", -0.11),
+            ("bug1 on plane +eps", -0.11 + 1e-9),
+        ] {
+            let p0 = ecef_point(0.0, lon_start, 1250.0);
+            fan.push((label, p0, east_of(p0), 40_000.0));
+        }
+        // BUG 3 ray: partial EMPTY edge tile out through the footprint edge
+        // into the nonzero background (the edge is off the tile lattice).
+        let p8 = ecef_point(0.132, 0.22, 1250.0);
+        fan.push(("bug3 partial-tile edge", p8, east_of(p8), 60_000.0));
+        fan
+    }
+
+    /// G-DDA-PARITY-2 (synthetic, unconditional): device field_tau_along
+    /// vs the live CPU tau_along on the checkerboard fan, within the f32
+    /// budget, AND macro-skipping vs pure fine stepping on the device
+    /// (the skip is exact; and a majorant-less in-footprint field must
+    /// integrate FINELY, never radial-only: the MACRO_PRESENT==0 vs
+    /// outside-footprint conflation of the old traversal).
+    ///
+    /// Validated against the OLD traversal (pre next_segment port): it
+    /// fails there catastrophically (macro-skip vs fine disagreed by 52
+    /// percent on the boundary-aligned ray).
+    #[test]
+    fn metal_field_dda_checkerboard_matches_cpu() {
+        let Some(mut gpu) = try_metal_concrete() else { return };
+        let owned = checkerboard_owned_field();
+        let view = owned.view();
+
+        let fan = cb_ray_fan();
+        let rays: Vec<[f64; 7]> = fan
+            .iter()
+            .map(|&(_, p0, d, t)| [p0[0], p0[1], p0[2], t, d[0], d[1], d[2]])
+            .collect();
+        let cpu_tau: Vec<f64> = fan
+            .iter()
+            .map(|&(_, p0, d, t)| {
+                view.tau_along(
+                    twilight_core::geometry::Vec3::new(p0[0], p0[1], p0[2]),
+                    twilight_core::geometry::Vec3::new(d[0], d[1], d[2]),
+                    t,
+                )
+            })
+            .collect();
+
+        gpu.upload_field(Some(&view)).unwrap();
+        let gpu_tau = gpu.field_tau_probe(&rays).unwrap();
+
+        // Fine-only variant: majorant table removed. After the next_segment
+        // port this must agree with the macro walk to fp accuracy (empty
+        // cells contribute zero either way); pre-fix it took the
+        // radial-only outside-footprint path for the WHOLE field.
+        let fine_owned = twilight_data::cloud_field_builder::OwnedCloudField {
+            macrocell_max: vec![],
+            ..checkerboard_owned_field()
+        };
+        let fine_view = fine_owned.view();
+        gpu.upload_field(Some(&fine_view)).unwrap();
+        let gpu_tau_fine = gpu.field_tau_probe(&rays).unwrap();
+
+        // f32 budget: the same rtol/atol clause as the real-field gate
+        // (crossing-root f32 floor on the most-grazing ray). The bugs this
+        // fan pins dropped 6.7 to 59.4 percent of tau, 1-2 orders above it.
+        let rtol = 5e-3;
+        let atol = 2e-2;
+        let mut max_rel = 0.0f64;
+        for (i, &(label, ..)) in fan.iter().enumerate() {
+            let (c, g, gf) = (cpu_tau[i], gpu_tau[i], gpu_tau_fine[i]);
+            let abs = (g - c).abs();
+            let rel = if c > 1e-9 { abs / c } else { abs };
+            max_rel = max_rel.max(rel);
+            eprintln!(
+                "  G-DDA-PARITY-2 [{label}]: cpu {c:.6} gpu {g:.6} gpu_fine {gf:.6} rel {rel:.2e}"
+            );
+            assert!(
+                abs <= atol || rel <= rtol,
+                "G-DDA-PARITY-2 [{label}]: cpu_tau={c:.8} gpu_tau={g:.8} abs={abs:.3e} rel={rel:.3e}"
+            );
+            // Macro skip vs fine stepping on the DEVICE: both are exact
+            // traversals of the same sigma; agreement is fp-level, and the
+            // fine walk exercises the majorant-less in-footprint path.
+            let rel_fine = (g - gf).abs() / gf.max(1e-9);
+            assert!(
+                rel_fine <= 1e-3,
+                "G-DDA-PARITY-2 [{label}]: macro-skip {g:.8} vs fine {gf:.8} (rel {rel_fine:.3e})"
+            );
+        }
+        eprintln!("G-DDA-PARITY-2 (checkerboard): {} rays, max_rel={max_rel:.3e}", fan.len());
+
+        // Occupied chord fully counted (BUG 1's catastrophic mode dropped
+        // 59.4 percent): tile col 1 spans ~17.8 km at sigma 5e-4.
+        let idx_bug1 = fan
+            .iter()
+            .position(|&(l, ..)| l == "bug1 start mid empty tile")
+            .unwrap();
+        assert!(
+            gpu_tau[idx_bug1] > 0.9 * (CB_SIGMA as f64) * 16_000.0,
+            "occupied tile chord dropped at a boundary landing: gpu tau {:.4}",
+            gpu_tau[idx_bug1]
+        );
+    }
+
+    /// Out-of-bounds regression for the probe kernel itself: a ray count
+    /// that is NOT a multiple of the 64-thread threadgroup rounds the grid
+    /// up; unbounded excess threads previously read past the rays buffer
+    /// and wrote past the output buffer. With the count header the excess
+    /// threads return; the bounded results must stay valid.
+    #[test]
+    fn metal_field_tau_probe_bounds_non_multiple_ray_count() {
+        let Some(mut gpu) = try_metal_concrete() else { return };
+        let owned = checkerboard_owned_field();
+        let view = owned.view();
+        gpu.upload_field(Some(&view)).unwrap();
+
+        let p0 = ecef_point(0.0, -0.26, 1250.0);
+        let d = east_of(p0);
+        // 3 rays: grid rounds to 64 threads, 61 of them out of bounds.
+        let rays: Vec<[f64; 7]> = (1..=3)
+            .map(|k| [p0[0], p0[1], p0[2], 10_000.0 * k as f64, d[0], d[1], d[2]])
+            .collect();
+        let tau = gpu.field_tau_probe(&rays).unwrap();
+        assert_eq!(tau.len(), 3);
+        for (i, &t) in tau.iter().enumerate() {
+            assert!(
+                t.is_finite() && t >= 0.0,
+                "probe ray {i} returned invalid tau {t}"
+            );
+        }
+        // Longer t_max can only add tau (monotone in path length).
+        assert!(tau[0] <= tau[1] + 1e-9 && tau[1] <= tau[2] + 1e-9, "{tau:?}");
     }
 
     /// G-VERSION: a v3 field buffer must trip the field header gate on the

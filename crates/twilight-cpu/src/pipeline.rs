@@ -73,8 +73,11 @@ pub struct PrayerTimeInput {
     /// 3D cloud field (overrides every other cloud input when set: the
     /// field owns ALL cloud, and the atmosphere is built without cloud
     /// layers so `cloud_extinction` stays all-zero). Deterministic legs
-    /// read it in Stage 1; chains scatter in it from Stage 2; GPU support
-    /// lands in Stage 3 (until then the pipeline runs the CPU scan).
+    /// read it in Stage 1; chains scatter in it from Stage 2. Field runs
+    /// ALWAYS execute the CPU reference scan, including through the GPU
+    /// entry point, until the GPU field port is re-verified (the
+    /// single/mcrt kernels are field-blind and would silently compute a
+    /// clear sky).
     pub cloud_field: Option<twilight_data::cloud_field_builder::OwnedCloudField>,
     /// Threshold configuration
     pub threshold_config: ThresholdConfig,
@@ -681,11 +684,60 @@ pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
     compute_prayer_times_inner(input, &atm, &scan, None)
 }
 
+/// Why a GPU-entry run must route to the CPU reference scan instead of
+/// dispatching GPU kernels (`None` = GPU dispatch is safe).
+///
+/// Two confirmed wrong-physics hazards, both routed to the CPU:
+///
+/// 1. A 3D cloud field. Only the Metal hybrid kernel reads the voxel
+///    field; the single/mcrt kernels are field-blind, and under a field
+///    the atmosphere is deliberately built cloud-free (the field owns
+///    all cloud), so a field-blind GPU kernel silently computes a CLEAR
+///    sky - the worst failure class in this codebase's history. Until
+///    the GPU field port is re-verified against the CPU reference, ALL
+///    scattering modes with a field run on the CPU.
+///
+/// 2. A 1D shell cloud (any nonzero `cloud_extinction`, from
+///    cloud_type / custom_cloud / cloud_layers / the weather feed) with
+///    a chain-based estimator (Hybrid or Multiple). The CPU chain
+///    estimator scatters in the cloud explicitly (Stage 2) while the
+///    GPU hybrid kernel still runs the retired T_diff closure, so the
+///    two no longer agree; the CPU is the reference. Single mode keeps
+///    shell clouds on the GPU: the T_diff closure runs on BOTH sides
+///    there and the existing parity tests cover it.
+#[cfg(any(feature = "gpu", test))]
+fn gpu_route_to_cpu_reason(
+    input: &PrayerTimeInput,
+    atm: &twilight_core::atmosphere::AtmosphereModel,
+) -> Option<&'static str> {
+    if input.cloud_field.is_some() {
+        return Some("3D cloud field active (GPU field port pending re-verification)");
+    }
+    let shell_cloud = atm.cloud_extinction.iter().any(|&e| e > 0.0);
+    if shell_cloud
+        && matches!(
+            input.scattering_mode,
+            ScatteringMode::Hybrid | ScatteringMode::Multiple
+        )
+    {
+        return Some(
+            "1D shell cloud with a chain estimator (GPU 1D-cloud chain estimator \
+             pending re-port; the CPU scan is the reference)",
+        );
+    }
+    None
+}
+
 /// Run the prayer time pipeline with GPU-accelerated MCRT simulation.
 ///
 /// Uploads the atmosphere model to the GPU, then uses the GPU backend for
 /// both coarse and fine scan passes. If any GPU operation fails, falls back
 /// to the CPU pipeline automatically.
+///
+/// Cloudy work is routed by [`gpu_route_to_cpu_reason`]: any 3D cloud
+/// field run, and any 1D shell cloud run with a chain estimator
+/// (Hybrid/Multiple), executes the CPU reference scan instead of GPU
+/// kernels. Clear-sky work and Single-mode work stay on the GPU.
 ///
 /// The caller must have already initialized the GPU backend via
 /// `twilight_gpu::try_init()`. The atmosphere is uploaded here.
@@ -698,33 +750,26 @@ pub fn compute_prayer_times_gpu(
 
     let atm = build_atmosphere(input);
 
-    // 1D shell cloud (cloud_extinction / cloud_g_scaled) ships in the packed
-    // atmosphere buffer and the Metal kernels apply the Eddington diffuse
-    // transmission - GPU and CPU share that single-representation transport.
-
-    // 3D cloud field (Stage 3): pack and bind it to the GPU. The Metal
-    // hybrid kernel reads the voxel field via the device-side DDA and takes
-    // the gray cloud channel (Beer-Lambert, explicit in-cloud scattering).
-    // If the backend cannot accept the field, fall back to the CPU scan
-    // (a GPU run without the field would silently compute a clear sky).
-    if let Some(owned) = &input.cloud_field {
-        let view = owned.view();
-        if let Err(e) = gpu.upload_field(Some(&view)) {
-            if input.verbose {
-                eprintln!(
-                    "Note: GPU 3D cloud field upload failed ({}), using the CPU scan",
-                    e
-                );
-            }
-            return compute_prayer_times(input);
+    // Cloud routing BEFORE any GPU call: see gpu_route_to_cpu_reason.
+    if let Some(reason) = gpu_route_to_cpu_reason(input, &atm) {
+        if input.verbose {
+            eprintln!("Note: {reason}; running the CPU scan");
         }
-    } else {
-        // Ensure any field from a previous run on this backend is cleared.
-        let _ = gpu.upload_field(None);
+        return compute_prayer_times(input);
     }
 
+    // No field reaches the dispatch path below (routed to the CPU above),
+    // so clear any field left bound by a previous run on this backend.
+    // The upload_field plumbing itself stays: the coming GPU field
+    // re-port will route production field runs through it again once it
+    // is re-verified against the CPU reference.
+    let _ = gpu.upload_field(None);
+
     // Field view for any CPU fallback path: the field is the source of
-    // truth, so a CPU fallback must still read it (never silently clear-sky).
+    // truth, so a CPU fallback must still read it (never silently
+    // clear-sky). With the routing above this is always None here, but
+    // the plumbing stays so a future routing change cannot silently drop
+    // the field from the fallbacks.
     let field_view = input.cloud_field.as_ref().map(|f| f.view());
 
     // Upload atmosphere to GPU. On failure, fall back to CPU entirely.
@@ -2232,6 +2277,237 @@ mod tests {
             tf < tc,
             "OD-10 field deck must dim the scan: field {tf:.4e} vs clear {tc:.4e}"
         );
+    }
+
+    // ── GPU-entry cloud routing (silent clear-sky guard) ──
+    //
+    // These pin ROUTING only, never cloudy radiance values (the CPU
+    // chain estimator under cloud is under active change).
+
+    fn small_field_around(lat: f64, lon: f64) -> twilight_data::cloud_field_builder::OwnedCloudField {
+        use twilight_data::cloud::{default_properties, CloudType};
+        use twilight_data::cloud_field_builder::{field_from_layers, FieldGeometry};
+        field_from_layers(
+            &[default_properties(CloudType::Stratus)],
+            FieldGeometry {
+                center_lat_deg: lat,
+                center_lon_deg: lon,
+                half_extent_km: 64.0,
+                res_km: 2.0,
+            },
+            "test",
+        )
+    }
+
+    /// (a) A 3D cloud field routes EVERY scattering mode to the CPU
+    /// scan: the single/mcrt GPU kernels are field-blind and the
+    /// atmosphere under a field is built cloud-free, so GPU dispatch
+    /// would silently compute a clear sky.
+    #[test]
+    fn gpu_entry_routes_all_modes_to_cpu_under_a_field() {
+        for mode in [
+            ScatteringMode::Single,
+            ScatteringMode::Multiple,
+            ScatteringMode::Hybrid,
+        ] {
+            let input = PrayerTimeInput {
+                cloud_field: Some(small_field_around(21.4225, 39.8262)),
+                scattering_mode: mode,
+                ..PrayerTimeInput::default()
+            };
+            let atm = build_atmosphere(&input);
+            let reason = gpu_route_to_cpu_reason(&input, &atm);
+            assert!(
+                reason.is_some(),
+                "{mode:?} with a 3D field must route to the CPU scan"
+            );
+        }
+    }
+
+    /// (b) A 1D shell cloud (from any input source) with a chain-based
+    /// estimator routes to the CPU scan: the GPU hybrid kernel still
+    /// runs the retired T_diff estimator while the CPU runs Stage-2
+    /// explicit scattering.
+    #[test]
+    fn gpu_entry_routes_shell_cloud_chain_modes_to_cpu() {
+        use twilight_data::cloud::{default_properties, CloudType};
+
+        for mode in [ScatteringMode::Multiple, ScatteringMode::Hybrid] {
+            // cloud_type source
+            let input = PrayerTimeInput {
+                cloud_type: Some(CloudType::Stratus),
+                scattering_mode: mode,
+                ..PrayerTimeInput::default()
+            };
+            let atm = build_atmosphere(&input);
+            assert!(
+                gpu_route_to_cpu_reason(&input, &atm).is_some(),
+                "{mode:?} with cloud_type shell cloud must route to the CPU scan"
+            );
+
+            // custom_cloud (weather-derived) source
+            let input = PrayerTimeInput {
+                custom_cloud: Some(default_properties(CloudType::Altostratus)),
+                scattering_mode: mode,
+                ..PrayerTimeInput::default()
+            };
+            let atm = build_atmosphere(&input);
+            assert!(
+                gpu_route_to_cpu_reason(&input, &atm).is_some(),
+                "{mode:?} with custom_cloud shell cloud must route to the CPU scan"
+            );
+
+            // cloud_layers (cloud3d reconstruction) source
+            let input = PrayerTimeInput {
+                cloud_layers: Some(vec![default_properties(CloudType::ThinCirrus)]),
+                scattering_mode: mode,
+                ..PrayerTimeInput::default()
+            };
+            let atm = build_atmosphere(&input);
+            assert!(
+                gpu_route_to_cpu_reason(&input, &atm).is_some(),
+                "{mode:?} with cloud_layers shell cloud must route to the CPU scan"
+            );
+        }
+    }
+
+    /// Single mode with a 1D shell cloud stays on the GPU (T_diff
+    /// closure on both sides, covered by the existing parity tests),
+    /// and clear-sky work stays on the GPU in every mode.
+    #[test]
+    fn gpu_entry_keeps_single_shell_cloud_and_clear_sky_on_gpu() {
+        use twilight_data::cloud::CloudType;
+
+        let input = PrayerTimeInput {
+            cloud_type: Some(CloudType::Stratus),
+            scattering_mode: ScatteringMode::Single,
+            ..PrayerTimeInput::default()
+        };
+        let atm = build_atmosphere(&input);
+        assert!(
+            gpu_route_to_cpu_reason(&input, &atm).is_none(),
+            "Single mode with a 1D shell cloud stays on the GPU"
+        );
+
+        for mode in [
+            ScatteringMode::Single,
+            ScatteringMode::Multiple,
+            ScatteringMode::Hybrid,
+        ] {
+            let input = PrayerTimeInput {
+                scattering_mode: mode,
+                ..PrayerTimeInput::default()
+            };
+            let atm = build_atmosphere(&input);
+            assert!(
+                gpu_route_to_cpu_reason(&input, &atm).is_none(),
+                "{mode:?} clear sky stays on the GPU"
+            );
+        }
+    }
+
+    /// Full GPU entry point with a field present: must return the CPU
+    /// reference result WITHOUT touching the backend. The mock panics on
+    /// every GPU call, so reaching any of them fails the test. Runs only
+    /// with the `gpu` feature (trait available; no Metal device needed).
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_entry_with_field_matches_cpu_and_never_dispatches() {
+        use twilight_gpu::{
+            buffers::PackedLightSource, BackendKind, GpuBackend, GpuDeviceInfo, GpuError,
+            GpuSpectralResult,
+        };
+
+        struct NoDispatchGpu {
+            info: GpuDeviceInfo,
+        }
+        impl GpuBackend for NoDispatchGpu {
+            fn device_info(&self) -> &GpuDeviceInfo {
+                &self.info
+            }
+            fn upload_atmosphere(
+                &mut self,
+                _atm: &twilight_core::atmosphere::AtmosphereModel,
+            ) -> Result<(), GpuError> {
+                panic!("field run must not upload the atmosphere to the GPU");
+            }
+            fn single_scatter(
+                &self,
+                _o: [f64; 3],
+                _v: [f64; 3],
+                _s: [f64; 3],
+            ) -> Result<GpuSpectralResult, GpuError> {
+                panic!("field run dispatched a GPU single-scatter kernel");
+            }
+            fn mcrt_trace(
+                &self,
+                _o: [f64; 3],
+                _v: [f64; 3],
+                _s: [f64; 3],
+                _p: u32,
+                _seed: u64,
+            ) -> Result<GpuSpectralResult, GpuError> {
+                panic!("field run dispatched a GPU mcrt kernel");
+            }
+            fn hybrid_scatter(
+                &self,
+                _o: [f64; 3],
+                _v: [f64; 3],
+                _s: [f64; 3],
+                _r: u32,
+                _seed: u64,
+            ) -> Result<GpuSpectralResult, GpuError> {
+                panic!("field run dispatched a GPU hybrid kernel");
+            }
+            fn garstang_zenith(
+                &self,
+                _o: [f64; 3],
+                _sources: &[PackedLightSource],
+            ) -> Result<f64, GpuError> {
+                panic!("field run dispatched a GPU skyglow kernel");
+            }
+        }
+
+        let input = PrayerTimeInput {
+            latitude: 21.4225,
+            longitude: 39.8262,
+            year: 2024,
+            month: 3,
+            day: 15,
+            timezone: 3.0,
+            sza_step: 2.0,
+            scattering_mode: ScatteringMode::Single,
+            cloud_field: Some(small_field_around(21.4225, 39.8262)),
+            ..PrayerTimeInput::default()
+        };
+
+        let mut gpu = NoDispatchGpu {
+            info: GpuDeviceInfo {
+                name: "mock (no dispatch)".into(),
+                backend: BackendKind::Metal,
+                memory_bytes: 0,
+                max_workgroup_size: 1,
+            },
+        };
+
+        let via_gpu_entry = compute_prayer_times_gpu(&input, &mut gpu);
+        let via_cpu = compute_prayer_times(&input);
+
+        // Deterministic Single mode: the routed result must equal the CPU
+        // reference exactly (same code path). Compare outcomes, not any
+        // pinned cloudy radiance numbers.
+        assert_eq!(via_gpu_entry.fajr_time, via_cpu.fajr_time);
+        assert_eq!(via_gpu_entry.isha_abyad_time, via_cpu.isha_abyad_time);
+        assert_eq!(via_gpu_entry.isha_ahmar_time, via_cpu.isha_ahmar_time);
+        let total = |o: &PrayerTimeOutput| -> f64 {
+            o.spectral_results
+                .iter()
+                .map(|r| r.radiance.iter().sum::<f64>())
+                .sum()
+        };
+        let (tg, tc) = (total(&via_gpu_entry), total(&via_cpu));
+        assert!(tg > 0.0, "routed field run produced no radiance");
+        assert_eq!(tg, tc, "routed run must be the CPU reference bit-for-bit");
     }
 
     // ── format_time ──

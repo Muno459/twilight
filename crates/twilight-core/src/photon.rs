@@ -358,6 +358,15 @@ pub fn trace_photon(
             // Check if we hit the ground
             if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
                 let normal = pos.normalize();
+                // The crossing nudge (boundary_pos + dir*1e-3 with dir still
+                // DOWNWARD) left the bounce point BELOW the surface, where
+                // shell_index() is None: the ground shadow ray then saw an
+                // empty atmosphere (T_sun = 1 straight through any deck) and
+                // the next bounce iteration killed the chain as "escaped".
+                // Snap the bounce point to just above the surface: the
+                // shadow ray starts in shell 0 (real gas+cloud attenuation)
+                // and the reflected chain lives on.
+                pos = normal * (atm.surface_radius() + 1e-3);
 
                 // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
                 let cos_sun_ground = sun_dir.dot(normal);
@@ -738,6 +747,10 @@ pub fn trace_photon_polarized(
 
             if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
                 let normal = pos.normalize();
+                // Snap the bounce point back above the surface (see the
+                // scalar tracer): sub-surface positions have no shell, so
+                // the shadow ray read T = 1 and the chain died next bounce.
+                pos = normal * (atm.surface_radius() + 1e-3);
 
                 // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
                 let cos_sun_ground = sun_dir.dot(normal);
@@ -928,6 +941,63 @@ pub fn mc_scatter_spectrum_polarized(
 
 /// Number of LOS steps for the hybrid integrator.
 const HYBRID_LOS_STEPS: usize = 200;
+
+/// Maximum cloud optical depth per hybrid LOS quadrature (sub)step.
+///
+/// The hybrid eye-path quadrature approximates INT source(s) e^{-tau(s)} ds
+/// over a step by source(mid) * e^{-tau_mid} * ds. With a per-step cloud
+/// tau of x this carries a factor e^{-x/2} / [(1 - e^{-x})/x]: 0.98 at
+/// x = 0.25, but 0.18 at x = 7.5 and 0.01 at x = 14.5 (a 750-1450 m step
+/// through a tau* = 10 deck) - the converged G2 thick-deck deficit that
+/// tracked the eye-path slant cloud OD. Steps whose cloud tau exceeds this
+/// bound are subdivided so the midpoint rule stays within ~0.03 percent.
+const CLOUD_SUBSTEP_TAU: f64 = 0.25;
+
+/// Cap on quadrature substeps per coarse LOS step (bounds cost and the
+/// stack arrays; tau*/mu up to ~16 per step stays fully resolved, thicker
+/// decks degrade gracefully to tau ~0.5 substeps, still within 1 percent).
+const CLOUD_MAX_SUBSTEPS: usize = 64;
+
+/// Exact cloud optical depth of one straight eye-path (sub)step.
+///
+/// Field case: the shared exact DDA (`tau_along`). 1D per-shell fallback:
+/// analytic per-shell path lengths (`ray_path_through_shell`), which is
+/// exact for a straight segment through the spherical shells. This
+/// replaces the previous eye-path convention (midpoint-classified shell
+/// sigma times the WHOLE step, via `cloud_tau_segment`): a 750 m zenith
+/// step one third below a deck still got full-deck extinction over its
+/// entire length, inflating the deck's in-scatter source and the eye
+/// cloud OD by up to 1.5x (the G2 tau* = 1 zenith +17 percent). The chain
+/// walkers are unaffected: they always race per-shell segments.
+fn eye_step_cloud_tau(
+    atm: &AtmosphereModel,
+    field: Option<&Cloud3DField>,
+    start: Vec3,
+    dir: Vec3,
+    ds: f64,
+) -> f64 {
+    match field {
+        Some(f) => f.tau_along(start, dir, ds),
+        None => {
+            let mut tau = 0.0;
+            for s in 0..atm.num_shells {
+                let sigma_c = atm.cloud_extinction[s];
+                if sigma_c <= 0.0 {
+                    continue;
+                }
+                tau += sigma_c
+                    * crate::single_scatter::ray_path_through_shell(
+                        start,
+                        dir,
+                        atm.shells[s].r_inner,
+                        atm.shells[s].r_outer,
+                        ds,
+                    );
+            }
+            tau
+        }
+    }
+}
 
 /// Safety limit to prevent infinite loops from floating-point pathology.
 ///
@@ -1656,9 +1726,13 @@ fn trace_light_subpath(
     vertices: &mut [LightVertex; BDPT_MAX_LIGHT_VERTICES],
     subpath_idx: usize,
     num_subpaths: usize,
-    // Stage 2 consumes the field here (the subpath delta-tracks through
-    // it); Stage 1 has no cloud term on the light walk, only on the
-    // connection legs (transmittance_between_points_spectrum).
+    // UNUSED, and honestly so: this walk is forced-scattering, gas-only,
+    // and therefore cloud-BLIND, while its connection legs
+    // (transmittance_between_points_spectrum) are cloud-attenuated. BDPT
+    // is disabled whenever ANY gray cloud channel is present (3D field or
+    // 1D shell deck; see `bdpt_active` in the driver) until this subpath
+    // is converted to delta-track the channel. The parameter stays so the
+    // conversion lands without another signature change.
     _field: Option<&Cloud3DField>,
 ) -> usize {
     let toa_radius = atm.toa_radius();
@@ -2566,15 +2640,79 @@ pub fn hybrid_scatter_radiance(
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
 
+    // Any gray cloud channel this run? Computed once; disables forced-
+    // collision mode in the chains (gas-only proposal).
+    let cloud_channel = has_cloud_channel(atm, field);
+
     // Dual path: full Stokes [I,Q,U,V] when polarized, scalar when not.
     let mut stokes_total = StokesVector::unpolarized(0.0);
     let mut scalar_total = 0.0_f64;
     let mut tau_obs = 0.0; // optical depth from observer
-    // Cloud portion of the eye path -> Eddington diffuse transmission.
+    // Cloud portion of the eye path (Beer-Lambert in chain mode).
     let mut tau_cloud_obs = 0.0;
 
     for step in 0..num_steps {
-        let s = (step as f64 + 0.5) * ds;
+        let step_start_s = step as f64 * ds;
+        let step_start = observer_pos + view_dir * step_start_s;
+
+        // Exact cloud optical depth of the COARSE step (see
+        // eye_step_cloud_tau) plus cloud-adaptive substepping (see
+        // CLOUD_SUBSTEP_TAU): mirrors the ALIS driver so the two hybrid
+        // paths stay one estimator. Cloud-free steps keep k = 1 and are
+        // bit-identical to the pre-substepping code.
+        let tau_cloud_coarse = eye_step_cloud_tau(atm, field, step_start, view_dir, ds);
+        let k_sub = if tau_cloud_coarse > CLOUD_SUBSTEP_TAU {
+            (libm::ceil(tau_cloud_coarse / CLOUD_SUBSTEP_TAU) as usize)
+                .clamp(2, CLOUD_MAX_SUBSTEPS)
+        } else {
+            1
+        };
+        let sub_ds = ds / k_sub as f64;
+
+        // Distribute the coarse step's chain budget over its substeps
+        // proportionally to estimated contribution (source strength times
+        // eye transmittance into the substep); unbiased for any n_j >= 1.
+        let mut sub_tau_cloud = [0.0f64; CLOUD_MAX_SUBSTEPS];
+        let mut sub_rays = [0usize; CLOUD_MAX_SUBSTEPS];
+        if k_sub == 1 {
+            sub_tau_cloud[0] = tau_cloud_coarse;
+            sub_rays[0] = secondary_rays;
+        } else {
+            let mut sub_w = [0.0f64; CLOUD_MAX_SUBSTEPS];
+            let mut sum_w = 0.0f64;
+            let mut tau_prefix = 0.0f64;
+            for (j, (stc, sw)) in sub_tau_cloud
+                .iter_mut()
+                .zip(sub_w.iter_mut())
+                .enumerate()
+                .take(k_sub)
+            {
+                let sub_start = observer_pos + view_dir * (step_start_s + j as f64 * sub_ds);
+                let tc = eye_step_cloud_tau(atm, field, sub_start, view_dir, sub_ds);
+                *stc = tc;
+                let mid = sub_start + view_dir * (sub_ds * 0.5);
+                let tg = match atm.shell_index(mid.length()) {
+                    Some(si) => atm.optics[si][wavelength_idx].extinction * sub_ds,
+                    None => 0.0,
+                };
+                *sw = (tc + tg) * libm::exp(-(tau_prefix + 0.5 * tc));
+                sum_w += *sw;
+                tau_prefix += tc;
+            }
+            for (sr, sw) in sub_rays.iter_mut().zip(sub_w.iter()).take(k_sub) {
+                *sr = if secondary_rays == 0 {
+                    0
+                } else if sum_w > 1e-300 {
+                    (libm::round(secondary_rays as f64 * sw / sum_w) as usize).max(1)
+                } else {
+                    (secondary_rays / k_sub).max(1)
+                };
+            }
+        }
+
+        let mut los_opaque = false;
+        for sub in 0..k_sub {
+        let s = step_start_s + (sub as f64 + 0.5) * sub_ds;
         let scatter_pos = observer_pos + view_dir * s;
         let r = scatter_pos.length();
 
@@ -2590,25 +2728,36 @@ pub fn hybrid_scatter_radiance(
         let optics = &atm.optics[shell_idx][wavelength_idx];
         let beta_scat = optics.extinction * optics.ssa;
 
-        // Per-step midpoint cloud extinction (field or 1D shell array).
-        let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
+        let tau_cloud_step = sub_tau_cloud[sub];
+        let beta_cloud = tau_cloud_step / sub_ds;
 
-        if beta_scat < 1e-30 {
-            tau_obs += optics.extinction * ds;
-            tau_cloud_obs += cloud_ext_step * ds;
+        if beta_scat < 1e-30 && beta_cloud <= 0.0 {
+            tau_obs += optics.extinction * sub_ds;
+            tau_cloud_obs += tau_cloud_step;
             continue;
         }
 
-        let tau_obs_mid = tau_obs + optics.extinction * ds * 0.5;
-        let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
+        let tau_obs_mid = tau_obs + optics.extinction * sub_ds * 0.5;
+        let tau_cloud_mid = tau_cloud_obs + tau_cloud_step * 0.5;
         // Chain-mode estimator: the cloud channel is direct Beer-Lambert on
         // the eye LOS (explicit cloud scattering supplies the diffusion that
         // T_diff used to approximate; mixing them double-counts).
         let t_obs = libm::exp(-tau_obs_mid) * libm::exp(-tau_cloud_mid);
 
         if t_obs < 1e-30 {
+            los_opaque = true;
             break;
         }
+
+        // Local asymmetry for this step's cloud source terms (order-1 NEE
+        // and cloud-seeded chains).
+        let g_cloud_step = if beta_cloud > 0.0 {
+            field
+                .map(|f| f.g_at(scatter_pos))
+                .unwrap_or(atm.cloud_g_scaled)
+        } else {
+            0.0
+        };
 
         // --- Order 1: deterministic single-scatter NEE ---
         let t_sun = shadow_ray_transmittance(
@@ -2621,7 +2770,7 @@ pub fn hybrid_scatter_radiance(
         );
         if t_sun > 1e-30 {
             let cos_theta_1 = sun_dir.dot(view_dir);
-            let scale_1 = beta_scat * INV_4PI * t_sun * t_obs * ds;
+            let scale_1 = beta_scat * INV_4PI * t_sun * t_obs * sub_ds;
 
             if polarized {
                 // Full Mueller matrix for polarized order-1
@@ -2646,13 +2795,45 @@ pub fn hybrid_scatter_radiance(
                         * henyey_greenstein_phase(cos_theta_1, optics.asymmetry);
                 scalar_total += phase * scale_1;
             }
+
+            // Cloud in-scatter source, order-1 NEE (gray channel): the
+            // deterministic term for sun -> cloud -> eye at this step,
+            // beta_cloud * P_HG(g*)/4pi * T_sun * T_obs * ds. Without it
+            // every path whose eye-nearest vertex is a cloud scatter is
+            // dropped (the dominant radiance under an overcast deck). The
+            // cloud vertex is a depolarizing HG: I-term only.
+            if beta_cloud > 0.0 {
+                let scale_c = beta_cloud
+                    * cloud_phase_value(cos_theta_1, g_cloud_step)
+                    * INV_4PI
+                    * t_sun
+                    * t_obs
+                    * sub_ds;
+                if polarized {
+                    stokes_total = stokes_total.add(&StokesVector::unpolarized(scale_c));
+                } else {
+                    scalar_total += scale_c;
+                }
+            }
         }
 
         // --- Orders 2+: MC secondary chains ---
-        if secondary_rays > 0 {
+        let rays_this_sub = sub_rays[sub];
+        if rays_this_sub > 0 {
+            // Cloud-seed mixture (see the derivation block at the scalar
+            // chain seed): each chain estimates
+            // beta_gas*I_gas + beta_cloud*I_cloud with a single type draw
+            // whose selection probability cancels the per-type coefficient,
+            // so the per-step scale is beta_total = beta_scat + beta_cloud.
+            let chain_cloud = ChainCloud {
+                channel: cloud_channel,
+                beta_seed: beta_cloud,
+                g_seed: g_cloud_step,
+            };
+            let scale_m = (beta_scat + beta_cloud) * t_obs * sub_ds;
             if polarized {
                 let mut mc_stokes = StokesVector::unpolarized(0.0);
-                for ray in 0..secondary_rays {
+                for ray in 0..rays_this_sub {
                     // Per-chain McRng: master advances by 1 per chain,
                     // making inter-chain sequencing deterministic regardless
                     // of per-chain RNG consumption.
@@ -2667,18 +2848,18 @@ pub fn hybrid_scatter_radiance(
                         optics,
                         &mut mc_rng,
                         ray,
-                        secondary_rays,
+                        rays_this_sub,
                         field,
+                        chain_cloud,
                     );
                     mc_stokes = mc_stokes.add(&chain_stokes);
                 }
-                let inv_rays = 1.0 / secondary_rays as f64;
+                let inv_rays = 1.0 / rays_this_sub as f64;
                 let mc_avg = mc_stokes.scale(inv_rays);
-                let scale_m = beta_scat * t_obs * ds;
                 stokes_total = stokes_total.add(&mc_avg.scale(scale_m));
             } else {
                 let mut mc_scalar = 0.0_f64;
-                for ray in 0..secondary_rays {
+                for ray in 0..rays_this_sub {
                     let _ = xorshift_f64(rng_state);
                     let mut mc_rng = McRng::from_seed(*rng_state);
                     mc_scalar += trace_secondary_chain_scalar(
@@ -2690,19 +2871,23 @@ pub fn hybrid_scatter_radiance(
                         optics,
                         &mut mc_rng,
                         ray,
-                        secondary_rays,
+                        rays_this_sub,
                         1.0,
                         field,
+                        chain_cloud,
                     );
                 }
-                let inv_rays = 1.0 / secondary_rays as f64;
-                let scale_m = beta_scat * t_obs * ds;
+                let inv_rays = 1.0 / rays_this_sub as f64;
                 scalar_total += mc_scalar * inv_rays * scale_m;
             }
         }
 
-        tau_obs += optics.extinction * ds;
-        tau_cloud_obs += cloud_ext_step * ds;
+        tau_obs += optics.extinction * sub_ds;
+        tau_cloud_obs += tau_cloud_step;
+        }
+        if los_opaque {
+            break;
+        }
     }
 
     if polarized {
@@ -2741,10 +2926,11 @@ fn trace_secondary_chain(
     rng: &mut McRng,
     ray_idx: usize,
     total_rays: usize,
-    // Stage 1: the chain walk itself stays cloud-free (the field carries
-    // scattering only; chain crossings carry cloud absorption via
-    // `optics`); the field feeds the NEE shadow rays below.
+    // The chain delta-tracks the gray cloud channel through the field (or
+    // the 1D shells); NEE shadow rays are cloud-attenuated Beer-Lambert.
     field: Option<&Cloud3DField>,
+    // Per-run channel flag + per-step cloud seed mixture (see ChainCloud).
+    cloud: ChainCloud,
 ) -> crate::scattering::StokesVector {
     use crate::scattering::{scatter_stokes_fast, scattering_plane_cos_sin, StokesVector};
     use crate::single_scatter::shadow_ray_transmittance;
@@ -2805,8 +2991,27 @@ fn trace_secondary_chain(
     let q_seed = seed_mixture_pdf(
         dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, start_optics,
     );
+
+    // Cloud-seed mixture: see the derivation block at the scalar chain
+    // seed (trace_secondary_chain_scalar); this chain mirrors it exactly,
+    // including RNG parity (one rng.ctl draw, taken only when the seeding
+    // step carries cloud, so clear-sky streams are untouched). A cloud
+    // seed swaps the numerator phase to the gray HG lobe; the caller
+    // scales the chain average by beta_total = beta_gas + beta_cloud.
+    let seed_is_cloud = if cloud.beta_seed > 0.0 {
+        let beta_gas_seed = start_optics.extinction * start_optics.ssa;
+        let p_c = cloud.beta_seed / (cloud.beta_seed + beta_gas_seed);
+        xorshift_f64(&mut rng.ctl) < p_c
+    } else {
+        false
+    };
     let w0 = if q_seed > 1e-300 {
-        scalar_phase_value(dir.dot(prev_dir_in), start_optics) * INV_4PI / q_seed
+        let phase_seed = if seed_is_cloud {
+            cloud_phase_value(dir.dot(prev_dir_in), cloud.g_seed)
+        } else {
+            scalar_phase_value(dir.dot(prev_dir_in), start_optics)
+        };
+        phase_seed * INV_4PI / q_seed
     } else {
         0.0
     };
@@ -2816,6 +3021,8 @@ fn trace_secondary_chain(
     // scattered light is weakly polarized and the I-error of this
     // approximation is sub-percent. (The previous code applied a Mueller
     // scatter for the WRONG geometry - sun->omega - then normalized it away.)
+    // A cloud seed is depolarizing HG by the declared convention, so the
+    // unpolarized seed state is exact for it.
     let mut stokes = StokesVector::unpolarized(1.0);
 
     let mut pos = start_pos;
@@ -2848,11 +3055,14 @@ fn trace_secondary_chain(
     let local_up = start_pos.normalize();
     let cos_sza_local = sun_dir.dot(local_up);
     let sza_deg_local = libm::acos(cos_sza_local.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    // Forced mode disabled under a field (see the scalar chain note: the
-    // gas forced proposal cannot compose unbiasedly with the gray cloud
-    // channel; analog scattering is unbiased and the cloud channel keeps it
-    // efficient under a deck).
-    let use_forced = sza_deg_local >= ZENITH_SZA_START && field.is_none();
+    // Forced mode disabled under ANY gray cloud channel, 3D field or 1D
+    // shell deck (see the scalar chain note and has_cloud_channel): the
+    // forced flights sample from GAS-only scout tau and neither attenuate
+    // through nor collide in the cloud, while analog bounces of the same
+    // chain race it: a biased composition. Analog-only under cloud is
+    // unbiased, just noisier; combined-channel tracking for the
+    // shell-constant 1D deck is the known follow-up.
+    let use_forced = sza_deg_local >= ZENITH_SZA_START && !cloud.channel;
 
     // Exponential transform bias parameter.
     // Ramps from 0 (SZA < 96) to EXP_TRANSFORM_ALPHA_MAX (SZA >= 106).
@@ -2969,6 +3179,10 @@ fn trace_secondary_chain(
                     // Ground reflection: depolarizes
                     if !is_outward && pos.length() <= atm.surface_radius() + 1.0 {
                         let normal = pos.normalize();
+                        // Snap above the surface (see trace_photon): the
+                        // sub-surface bounce point had no shell, so the
+                        // shadow ray read T = 1 and the chain died.
+                        pos = normal * (atm.surface_radius() + 1e-3);
 
                         // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
                         let cos_sun_ground = sun_dir.dot(normal);
@@ -3142,8 +3356,11 @@ fn trace_secondary_chain_scalar(
     ray_idx: usize,
     total_rays: usize,
     nee_r2_weight: f64,
-    // Stage 1: NEE shadow rays only (see trace_secondary_chain note).
+    // The chain delta-tracks the gray cloud channel (field DDA or 1D
+    // shells); NEE shadow rays are cloud-attenuated Beer-Lambert.
     field: Option<&Cloud3DField>,
+    // Per-run channel flag + per-step cloud seed mixture (see ChainCloud).
+    cloud: ChainCloud,
 ) -> f64 {
     use crate::single_scatter::shadow_ray_transmittance;
 
@@ -3190,8 +3407,59 @@ fn trace_secondary_chain_scalar(
     let q_seed = seed_mixture_pdf(
         dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, start_optics,
     );
+
+    // ── Cloud-seed mixture: the estimator, derived ──────────────────────
+    //
+    // At a LOS step the orders-2+ in-scatter source toward the eye is,
+    // per unit length (omega the direction of the incoming radiance
+    // estimated by the chain, v the view direction):
+    //
+    //   S = beta_gas   * INT P_gas(omega.v)/4pi      L(omega) d omega
+    //     + beta_cloud * INT P_HG(omega.v; g*)/4pi   L(omega) d omega
+    //
+    // with beta_gas = extinction * ssa of the seed shell optics and
+    // beta_cloud the step's gray cloud scattering coefficient (exact DDA
+    // step tau / ds, handed in as cloud.beta_seed).
+    //
+    // Sampling procedure, one sample per chain:
+    //   1. omega ~ q, the existing 3-component seed mixture. Any q > 0 on
+    //      the integrand's support keeps the estimator unbiased (the gas
+    //      phase component of q is strictly positive everywhere), so the
+    //      samplers and the rng.dir stream are UNCHANGED.
+    //   2. Vertex type T: cloud with p_c = beta_cloud / beta_total, gas
+    //      with 1 - p_c = beta_gas / beta_total, where beta_total =
+    //      beta_gas + beta_cloud. One rng.ctl draw, taken ONLY when
+    //      beta_cloud > 0, so clear-sky RNG sequences are unchanged.
+    //   3. Seed weight w0 = P_T(omega.v)/4pi / q(omega); the walk after
+    //      the seed is vertex-type agnostic, so the chain returns
+    //      w0 * Lhat(omega) with the SAME unbiased Lhat either way. The
+    //      driver multiplies the chain average by beta_total * T_obs * ds.
+    //
+    // Expectation over (T, omega):
+    //   E = beta_total * INT q(omega) [ p_c * P_HG /(4pi q)
+    //                                 + (1-p_c) * P_gas/(4pi q) ] L d omega
+    //     = beta_total * p_c     * INT P_HG /4pi L
+    //     + beta_total * (1-p_c) * INT P_gas/4pi L
+    //     = beta_cloud * I_cloud + beta_gas * I_gas = S,
+    //
+    // exact: the type-selection probability cancels the per-type
+    // coefficient (beta_total * p_c = beta_cloud), so the mixture adds no
+    // weight variance beyond the phase-numerator swap.
+    // ────────────────────────────────────────────────────────────────────
+    let seed_is_cloud = if cloud.beta_seed > 0.0 {
+        let beta_gas_seed = start_optics.extinction * start_optics.ssa;
+        let p_c = cloud.beta_seed / (cloud.beta_seed + beta_gas_seed);
+        xorshift_f64(&mut rng.ctl) < p_c
+    } else {
+        false
+    };
     let initial_weight = if q_seed > 1e-300 {
-        scalar_phase_value(dir.dot(view_dir), start_optics) * INV_4PI / q_seed
+        let phase_seed = if seed_is_cloud {
+            cloud_phase_value(dir.dot(view_dir), cloud.g_seed)
+        } else {
+            scalar_phase_value(dir.dot(view_dir), start_optics)
+        };
+        phase_seed * INV_4PI / q_seed
     } else {
         0.0
     };
@@ -3200,15 +3468,18 @@ fn trace_secondary_chain_scalar(
     let mut total = 0.0_f64;
 
     // Upfront forced scattering gate (same logic as Stokes version).
-    // Forced mode is DISABLED when a cloud field is present: the gas
-    // forced-collision proposal (truncated to atmosphere exit) cannot be
-    // composed unbiasedly with the unforced gray cloud channel without
-    // re-deriving the joint truncation, which couples the two channels and
-    // breaks the ALIS factorization. Analog scattering is always unbiased
-    // (the cloud channel makes the analog walk efficient under a deck), so
-    // we take the conservative path the plan authorizes.
+    // Forced mode is DISABLED under ANY gray cloud channel (3D field or
+    // 1D shell deck; see has_cloud_channel): the gas forced-collision
+    // proposal (truncated to atmosphere exit, sampled from GAS-only scout
+    // tau) cannot be composed unbiasedly with the unforced gray cloud
+    // channel without re-deriving the joint truncation, which couples the
+    // two channels and breaks the ALIS factorization. Analog scattering is
+    // always unbiased (the cloud channel makes the analog walk efficient
+    // under a deck), so we take the conservative path the plan authorizes;
+    // combined-channel tracking for the shell-constant 1D deck is the
+    // known follow-up.
     let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    let use_forced = sza_deg_local >= ZENITH_SZA_START && field.is_none();
+    let use_forced = sza_deg_local >= ZENITH_SZA_START && !cloud.channel;
 
     // Exponential transform bias parameter (same ramp as Stokes version).
     let sza_t_et =
@@ -3383,6 +3654,10 @@ fn trace_secondary_chain_scalar(
 
                         if !is_outward && pos.length() <= surface_radius + 1.0 {
                             let normal = pos.normalize();
+                            // Snap above the surface (see trace_photon): the
+                            // sub-surface bounce point had no shell, so the
+                            // shadow ray read T = 1 and the chain died.
+                            pos = normal * (surface_radius + 1e-3);
 
                             // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
                             let cos_sun_ground = sun_dir.dot(normal);
@@ -3633,6 +3908,53 @@ fn cloud_phase_value(cos_theta: f64, g_cloud: f64) -> f64 {
     henyey_greenstein_phase(cos_theta, g_cloud)
 }
 
+/// True when ANY gray cloud channel is active for a run: a 3D field is
+/// present, or the 1D per-shell cloud extinction is nonzero somewhere.
+///
+/// Forced-collision mode and the BDPT light subpath sample GAS-only
+/// proposals (their scouts accumulate `atm.optics` extinction only), so
+/// they can no more compose with the unforced 1D gray channel than with
+/// the field: gating them on `field.is_none()` alone left `--cloud` /
+/// `--weather` runs (1D deck, no field) forcing flights straight through
+/// the deck while analog bounces of the same chain raced it. Gate on THIS
+/// instead. Analog-only under cloud is unbiased, just noisier;
+/// combined-channel tracking for the shell-constant 1D cloud (folding the
+/// gray deck into the per-shell gas total, exact for piecewise-constant
+/// shells) is the known follow-up that would restore forced mode there.
+#[inline]
+fn has_cloud_channel(atm: &AtmosphereModel, field: Option<&Cloud3DField>) -> bool {
+    field.is_some()
+        || atm.cloud_extinction[..atm.num_shells.min(crate::atmosphere::MAX_SHELLS)]
+            .iter()
+            .any(|&c| c > 0.0)
+}
+
+/// Cloud context handed from the hybrid drivers to the secondary chains.
+#[derive(Clone, Copy)]
+struct ChainCloud {
+    /// Any gray cloud channel active this run (3D field or 1D shell deck).
+    /// Computed once per driver by [`has_cloud_channel`]; disables
+    /// forced-collision mode in the chains (gas-only proposal, see there).
+    channel: bool,
+    /// Gray cloud scattering coefficient of the seeding LOS step [1/m]:
+    /// the step's exact DDA cloud tau divided by ds (the per-shell
+    /// constant in the 1D fallback). Zero on clear steps.
+    beta_seed: f64,
+    /// Delta-scaled asymmetry g* for a cloud-seeded vertex (field `g_at`
+    /// at the step midpoint, or `atm.cloud_g_scaled` in 1D).
+    g_seed: f64,
+}
+
+impl ChainCloud {
+    /// No cloud anywhere (clear-sky steps and unit tests).
+    #[cfg(test)]
+    const CLEAR: ChainCloud = ChainCloud {
+        channel: false,
+        beta_seed: 0.0,
+        g_seed: 0.0,
+    };
+}
+
 /// Spectral one-sample MIS weight (balance heuristic over hero choices).
 ///
 /// `pr[c] = q~_c(path)/q~_hero(path)` is the idealized path-pdf ratio as if
@@ -3848,7 +4170,9 @@ fn advance_to_optical_depth_alis(
 /// - Different phase function (direction sampling ratio at each bounce)
 ///
 /// Returns per-wavelength MC contributions `[f64; 64]` to be multiplied by
-/// the LOS-step weighting factor for each wavelength.
+/// the LOS-step weighting factor for each wavelength, plus whether the
+/// seed vertex was a CLOUD scatter (the driver applies the per-type beta
+/// factor on cloudy steps; see the ALIS cloud-seed mixture block below).
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 fn trace_secondary_chain_alis(
     atm: &AtmosphereModel,
@@ -3863,9 +4187,12 @@ fn trace_secondary_chain_alis(
     num_wl: usize,
     nee_r2_weight: f64,
     guide: Option<&crate::path_guide::PathGuide>,
-    // Stage 1: NEE shadow rays only (see trace_secondary_chain note).
+    // The chain delta-tracks the gray cloud channel (field DDA or 1D
+    // shells); NEE shadow rays are cloud-attenuated Beer-Lambert.
     field: Option<&Cloud3DField>,
-) -> [f64; 64] {
+    // Per-run channel flag + per-step cloud seed mixture (see ChainCloud).
+    cloud: ChainCloud,
+) -> ([f64; 64], bool) {
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
 
     let local_up = start_pos.normalize();
@@ -3918,23 +4245,79 @@ fn trace_secondary_chain_alis(
         dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, hero_optics,
     );
     let hero_phase_view = scalar_phase_value(cos_seed_view, hero_optics);
+
+    // ── ALIS cloud-seed mixture ─────────────────────────────────────────
+    //
+    // The scalar derivation (see trace_secondary_chain_scalar) holds per
+    // wavelength, but here beta_gas_w varies with w while the type draw is
+    // shared, so the per-type coefficient cannot cancel for every
+    // wavelength at once. The chain therefore reports its seed type and
+    // the DRIVER applies the per-type beta factors when accumulating the
+    // chain (cloudy steps then scale by t_obs_w * ds only, no beta).
+    // Keeping the betas OUT of the chain weights matters: the weight
+    // window targets O(1) weights (w_target = 1 at the seed altitude), and
+    // a beta-scaled seed weight (~1e-4) would Russian-roulette virtually
+    // every chain at its first window check. With one type draw at
+    //
+    //   p_c = beta_cloud / beta_total_hero,
+    //   beta_total_hero = beta_cloud + beta_gas_hero,
+    //
+    //   cloud seed: w0 = P_HG(omega.v; g*)/4pi / q,
+    //               wr[w] = 1 and pr[w] = 1 for all w (gray channel);
+    //               driver factor, all w: beta_total_hero.
+    //     E_w = p_c * beta_total_hero * P_HG/(4pi q) * L_w
+    //         = beta_cloud * P_HG/(4pi q) * L_w.                    Exact.
+    //   gas seed:   w0 = P_hero(omega.v)/4pi / q,
+    //               wr[w] = P_w/P_hero, pr[w] = q_w/q_hero (both exactly
+    //               the clear-sky values); driver factor:
+    //               beta_gas_w * beta_total_hero / beta_gas_hero.
+    //     E_w = (1 - p_c) * (P_hero/4pi q) * (P_w/P_hero)
+    //           * beta_gas_w * (beta_total_hero/beta_gas_hero) * L_w
+    //         = beta_gas_w * P_w/(4pi q) * L_w.   Exact for every w and
+    //           any hero (beta_gas_hero cancels through 1 - p_c).
+    //
+    // The spectral one-sample MIS stays unbiased: its weight family only
+    // needs to be a positive function of the path that is consistent
+    // across hero choices, and both "1 for all c at a cloud seed" (the
+    // channel is gray) and "q_c/q_h at a gas seed" satisfy that.
+    // With beta_cloud = 0 all of this reduces bit-for-bit to the
+    // pre-cloud code (no ctl draw, no driver factor; the driver keeps
+    // multiplying beta_scat_w).
+    // ────────────────────────────────────────────────────────────────────
+    let mut seed_is_cloud = false;
+    if cloud.beta_seed > 0.0 {
+        let beta_gas_hero_seed = hero_optics.extinction * hero_optics.ssa;
+        let p_c = cloud.beta_seed / (cloud.beta_seed + beta_gas_hero_seed);
+        seed_is_cloud = xorshift_f64(&mut rng.ctl) < p_c;
+    }
+
     let initial_weight = if q_seed > 1e-300 {
-        hero_phase_view * INV_4PI / q_seed
+        if seed_is_cloud {
+            cloud_phase_value(cos_seed_view, cloud.g_seed) * INV_4PI / q_seed
+        } else {
+            hero_phase_view * INV_4PI / q_seed
+        }
     } else {
         0.0
     };
 
-    // Per-wavelength weight ratios: weight_ratio[w] = w0_w / w0_hero
-    //   = P_w(omega.view) / P_hero(omega.view)   (q cancels).
-    // SSA is handled by the outer integrator (beta_scat per wavelength) and
-    // the per-bounce ssa ratio; no start-shell SSA here (double-count).
+    // Per-wavelength weight ratios: weight_ratio[w] = w0_w / w0_hero.
+    // Gas seed: = P_w(omega.view) / P_hero(omega.view) (q cancels).
+    // Cloud seed: exactly 1 (gray channel).
+    // SSA is handled by the outer integrator (beta_scat per wavelength on
+    // clear steps; the per-type beta factors on cloudy ones, see above)
+    // and the per-bounce ssa ratio; no start-shell SSA here (double-count).
     let mut weight_ratio = [0.0f64; 64];
     for w in 0..num_wl {
-        let optics_w = &atm.optics[start_shell][w];
-        weight_ratio[w] = if hero_phase_view > 1e-30 {
-            scalar_phase_value(cos_seed_view, optics_w) / hero_phase_view
-        } else {
+        weight_ratio[w] = if seed_is_cloud {
             1.0
+        } else {
+            let optics_w = &atm.optics[start_shell][w];
+            if hero_phase_view > 1e-30 {
+                scalar_phase_value(cos_seed_view, optics_w) / hero_phase_view
+            } else {
+                1.0
+            }
         };
     }
 
@@ -3963,8 +4346,11 @@ fn trace_secondary_chain_alis(
     // the denominator. This removes the heavy tail.
     let mut pdf_ratio = [0.0f64; 64];
     for w in 0..num_wl {
-        let optics_w = &atm.optics[start_shell][w];
-        pdf_ratio[w] = if q_seed > 1e-300 {
+        pdf_ratio[w] = if seed_is_cloud {
+            // Gray cloud seed: hero-independent event, ratio family 1.
+            1.0
+        } else if q_seed > 1e-300 {
+            let optics_w = &atm.optics[start_shell][w];
             seed_mixture_pdf(
                 dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, optics_w,
             ) / q_seed
@@ -3977,10 +4363,13 @@ fn trace_secondary_chain_alis(
     let mut total = [0.0f64; 64];
 
     // Forced scattering + exponential transform setup (same as scalar tracer).
-    // Forced mode disabled under a field (the gas forced proposal cannot
-    // compose unbiasedly with the gray cloud channel; analog is unbiased).
+    // Forced mode disabled under ANY gray cloud channel, 3D field or 1D
+    // shell deck (the gas forced proposal is sampled from GAS-only scout
+    // tau and cannot compose unbiasedly with the gray cloud channel;
+    // analog is unbiased, and combined-channel tracking for the
+    // shell-constant 1D deck is the known follow-up).
     let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    let use_forced = sza_deg_local >= ZENITH_SZA_START && field.is_none();
+    let use_forced = sza_deg_local >= ZENITH_SZA_START && !cloud.channel;
     let sza_t_et =
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
@@ -4195,6 +4584,10 @@ fn trace_secondary_chain_alis(
 
                         if !is_outward && pos.length() <= surface_radius + 1.0 {
                             let normal = pos.normalize();
+                            // Snap above the surface (see trace_photon): the
+                            // sub-surface bounce point had no shell, so the
+                            // shadow ray read T = 1 and the chain died.
+                            pos = normal * (surface_radius + 1e-3);
 
                             // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
                             let cos_sun_ground = sun_dir.dot(normal);
@@ -4547,7 +4940,7 @@ fn trace_secondary_chain_alis(
         }
     }
 
-    total
+    (total, seed_is_cloud)
 }
 
 /// ALIS hybrid multi-scatter spectral radiance for all wavelengths.
@@ -4599,6 +4992,11 @@ pub fn hybrid_scatter_radiance_alis(
 
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
+
+    // Any gray cloud channel this run? Computed once; disables forced-
+    // collision mode in the chains and the BDPT light subpath (both are
+    // gas-only proposals).
+    let cloud_channel = has_cloud_channel(atm, field);
 
     // --- LOS ray-budget redistribution (importance sampling by altitude) ---
     //
@@ -4656,13 +5054,14 @@ pub fn hybrid_scatter_radiance_alis(
     // to each LOS step to provide an alternative path to the sun.
     use crate::single_scatter::transmittance_between_points_spectrum;
 
-    // BDPT is DISABLED when a cloud field is present: the light subpath is
-    // forced-scattering only, and forced scattering cannot compose with the
-    // gray cloud channel unbiasedly (same reason the chains drop forced
-    // mode). NEE-only (backward chains, w_back = 1) is unbiased, just
+    // BDPT is DISABLED under ANY gray cloud channel (3D field or 1D shell
+    // deck): the light subpath is forced-scattering only and cloud-blind
+    // (gas-only proposals), while its connection legs are cloud-attenuated;
+    // composing the two is the same biased composition as forced mode in
+    // the chains. NEE-only (backward chains, w_back = 1) is unbiased, just
     // noisier; never blend two models of the same integral. The plan
     // authorizes this fallback until the light subpath is converted.
-    let bdpt_active = sza_deg_obs >= BDPT_SZA_START && secondary_rays > 0 && field.is_none();
+    let bdpt_active = sza_deg_obs >= BDPT_SZA_START && secondary_rays > 0 && !cloud_channel;
 
     // MIS Blend: backward chains and BDPT compute exactly the same
     // multi-scattering integral. To prevent a 2x additive bias, we blend them.
@@ -4759,72 +5158,31 @@ pub fn hybrid_scatter_radiance_alis(
     let mut tau_cloud_obs = 0.0f64;
 
     for step in 0..num_steps {
-        let s = (step as f64 + 0.5) * ds;
-        let scatter_pos = observer_pos + view_dir * s;
-        let r = scatter_pos.length();
+        let step_start_s = step as f64 * ds;
+        let step_start = observer_pos + view_dir * step_start_s;
 
-        if r > toa_radius || r < surface_radius {
-            continue;
-        }
+        // Exact cloud optical depth of the COARSE step: shared DDA (field)
+        // or analytic per-shell path lengths (1D fallback). See
+        // eye_step_cloud_tau for why the previous midpoint-shell convention
+        // distorted deck-edge steps.
+        let tau_cloud_coarse = eye_step_cloud_tau(atm, field, step_start, view_dir, ds);
 
-        let shell_idx = match atm.shell_index(r) {
-            Some(idx) => idx,
-            None => continue,
+        // Cloud-adaptive substepping: bound the per-substep cloud tau so
+        // the midpoint quadrature source*e^{-tau_mid}*ds stays accurate
+        // (see CLOUD_SUBSTEP_TAU). Cloud-free steps keep k = 1 and are
+        // bit-identical to the pre-substepping code.
+        let k_sub = if tau_cloud_coarse > CLOUD_SUBSTEP_TAU {
+            (libm::ceil(tau_cloud_coarse / CLOUD_SUBSTEP_TAU) as usize)
+                .clamp(2, CLOUD_MAX_SUBSTEPS)
+        } else {
+            1
         };
+        let sub_ds = ds / k_sub as f64;
 
-        // Per-step midpoint cloud extinction (field or 1D shell array).
-        // Chain-mode estimator: Beer-Lambert cloud transmittance on the eye
-        // LOS (explicit cloud scattering supplies the diffusion).
-        let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
-        let tau_cloud_mid = tau_cloud_obs + cloud_ext_step * ds * 0.5;
-        let t_cloud_mid = libm::exp(-tau_cloud_mid);
-
-        // Check if any wavelength still has observable transmittance.
-        let mut any_visible = false;
-        for w in 0..num_wl {
-            let tau_mid = tau_obs[w] + atm.optics[shell_idx][w].extinction * ds * 0.5;
-            if libm::exp(-tau_mid) * t_cloud_mid > 1e-30 {
-                any_visible = true;
-                break;
-            }
-        }
-        if !any_visible {
-            break;
-        }
-
-        // --- Order 1: deterministic single-scatter NEE (all wavelengths) ---
-        let t_suns = shadow_ray_transmittance_spectrum(
-            atm,
-            scatter_pos,
-            sun_dir,
-            num_wl,
-            field,
-            CloudTransmittance::BeerLambert,
-        );
-        let cos_theta_1 = sun_dir.dot(view_dir);
-
-        for w in 0..num_wl {
-            let optics = &atm.optics[shell_idx][w];
-            let beta_scat = optics.extinction * optics.ssa;
-            if beta_scat < 1e-30 {
-                continue;
-            }
-
-            let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
-            let t_obs = libm::exp(-tau_obs_mid) * t_cloud_mid;
-            if t_obs < 1e-30 || t_suns[w] < 1e-30 {
-                continue;
-            }
-
-            let phase = scalar_phase_value(cos_theta_1, optics);
-            radiance[w] += beta_scat * phase * INV_4PI * t_suns[w] * t_obs * ds;
-        }
-
-        // --- Orders 2+: ALIS MC secondary chains ---
+        // --- Orders 2+ ray budget for the COARSE step ---
         //
-        // Ray budget per step: when LOS importance sampling is active,
-        // high-altitude steps receive more rays (proportional to
-        // exp(altitude / h_scale)) and low-altitude steps receive fewer.
+        // When LOS importance sampling is active, high-altitude steps
+        // receive more rays (proportional to exp(altitude / h_scale)).
         // The estimator (1/n_i) * sum(chains) is unbiased for any n_i > 0,
         // so no weight correction is needed -- only per-step variance changes.
         let rays_this_step = if use_los_importance && los_importance[step] > 0.0 {
@@ -4839,10 +5197,152 @@ pub fn hybrid_scatter_radiance_alis(
             0
         };
 
-        if rays_this_step > 0 {
-            let mut mc_totals = [0.0f64; 64];
+        // Distribute the coarse step's chain budget over its substeps
+        // proportionally to each substep's estimated contribution (source
+        // strength times eye transmittance INTO the substep). Unbiased for
+        // any n_j >= 1: every substep keeps its own (1/n_j)*sum estimator.
+        let mut sub_tau_cloud = [0.0f64; CLOUD_MAX_SUBSTEPS];
+        let mut sub_rays = [0usize; CLOUD_MAX_SUBSTEPS];
+        if k_sub == 1 {
+            sub_tau_cloud[0] = tau_cloud_coarse;
+            sub_rays[0] = rays_this_step;
+        } else {
+            let mut sub_w = [0.0f64; CLOUD_MAX_SUBSTEPS];
+            let mut sum_w = 0.0f64;
+            let mut tau_prefix = 0.0f64;
+            for (j, (stc, sw)) in sub_tau_cloud
+                .iter_mut()
+                .zip(sub_w.iter_mut())
+                .enumerate()
+                .take(k_sub)
+            {
+                let sub_start = observer_pos + view_dir * (step_start_s + j as f64 * sub_ds);
+                let tc = eye_step_cloud_tau(atm, field, sub_start, view_dir, sub_ds);
+                *stc = tc;
+                // Gas share of the allocation weight uses the bluest
+                // channel (strongest Rayleigh); the weights only steer
+                // allocation, any positive choice stays unbiased.
+                let mid = sub_start + view_dir * (sub_ds * 0.5);
+                let tg = match atm.shell_index(mid.length()) {
+                    Some(si) => atm.optics[si][0].extinction * sub_ds,
+                    None => 0.0,
+                };
+                *sw = (tc + tg) * libm::exp(-(tau_prefix + 0.5 * tc));
+                sum_w += *sw;
+                tau_prefix += tc;
+            }
+            for (sr, sw) in sub_rays.iter_mut().zip(sub_w.iter()).take(k_sub) {
+                *sr = if rays_this_step == 0 {
+                    0
+                } else if sum_w > 1e-300 {
+                    (libm::round(rays_this_step as f64 * sw / sum_w) as usize).max(1)
+                } else {
+                    (rays_this_step / k_sub).max(1)
+                };
+            }
+        }
 
-            for ray in 0..rays_this_step {
+        let mut los_opaque = false;
+        for sub in 0..k_sub {
+        let s = step_start_s + (sub as f64 + 0.5) * sub_ds;
+        let scatter_pos = observer_pos + view_dir * s;
+        let r = scatter_pos.length();
+
+        if r > toa_radius || r < surface_radius {
+            continue;
+        }
+
+        let shell_idx = match atm.shell_index(r) {
+            Some(idx) => idx,
+            None => continue,
+        };
+
+        let tau_cloud_step = sub_tau_cloud[sub];
+        let beta_cloud = tau_cloud_step / sub_ds;
+        let tau_cloud_mid = tau_cloud_obs + tau_cloud_step * 0.5;
+        let t_cloud_mid = libm::exp(-tau_cloud_mid);
+
+        // Check if any wavelength still has observable transmittance.
+        let mut any_visible = false;
+        for w in 0..num_wl {
+            let tau_mid = tau_obs[w] + atm.optics[shell_idx][w].extinction * sub_ds * 0.5;
+            if libm::exp(-tau_mid) * t_cloud_mid > 1e-30 {
+                any_visible = true;
+                break;
+            }
+        }
+        if !any_visible {
+            los_opaque = true;
+            break;
+        }
+
+        // Local asymmetry for this step's cloud source terms (order-1 NEE
+        // and cloud-seeded chains).
+        let g_cloud_step = if beta_cloud > 0.0 {
+            field
+                .map(|f| f.g_at(scatter_pos))
+                .unwrap_or(atm.cloud_g_scaled)
+        } else {
+            0.0
+        };
+
+        // --- Order 1: deterministic single-scatter NEE (all wavelengths) ---
+        let t_suns = shadow_ray_transmittance_spectrum(
+            atm,
+            scatter_pos,
+            sun_dir,
+            num_wl,
+            field,
+            CloudTransmittance::BeerLambert,
+        );
+        let cos_theta_1 = sun_dir.dot(view_dir);
+        // Gray cloud phase toward the eye: one value for all wavelengths.
+        let cloud_phase_1 = if beta_cloud > 0.0 {
+            cloud_phase_value(cos_theta_1, g_cloud_step)
+        } else {
+            0.0
+        };
+
+        for w in 0..num_wl {
+            let optics = &atm.optics[shell_idx][w];
+            let beta_scat = optics.extinction * optics.ssa;
+            if beta_scat < 1e-30 && beta_cloud <= 0.0 {
+                continue;
+            }
+
+            let tau_obs_mid = tau_obs[w] + optics.extinction * sub_ds * 0.5;
+            let t_obs = libm::exp(-tau_obs_mid) * t_cloud_mid;
+            if t_obs < 1e-30 || t_suns[w] < 1e-30 {
+                continue;
+            }
+
+            if beta_scat >= 1e-30 {
+                let phase = scalar_phase_value(cos_theta_1, optics);
+                radiance[w] += beta_scat * phase * INV_4PI * t_suns[w] * t_obs * sub_ds;
+            }
+            // Cloud in-scatter source, order-1 NEE (gray channel): the
+            // deterministic sun -> cloud -> eye term at this step. The
+            // channel is gray, so the per-wavelength weights differ only
+            // through t_suns[w] and the gas part of t_obs, exactly like
+            // the gas term.
+            if beta_cloud > 0.0 {
+                radiance[w] += beta_cloud * cloud_phase_1 * INV_4PI * t_suns[w] * t_obs * sub_ds;
+            }
+        }
+
+        // --- Orders 2+: ALIS MC secondary chains ---
+        let rays_this_sub = sub_rays[sub];
+        if rays_this_sub > 0 {
+            let mut mc_totals = [0.0f64; 64];
+            // Cloud-seed mixture context for this step's chains (see the
+            // ALIS seed derivation in trace_secondary_chain_alis).
+            let chain_cloud = ChainCloud {
+                channel: cloud_channel,
+                beta_seed: beta_cloud,
+                g_seed: g_cloud_step,
+            };
+
+            for ray in 0..rays_this_sub {
                 // Per-chain McRng: master advances by 1 per chain.
                 let _ = xorshift_f64(rng_state);
                 let mut mc_rng = McRng::from_seed(*rng_state);
@@ -4866,7 +5366,7 @@ pub fn hybrid_scatter_radiance_alis(
                 // confirmed against per-wavelength tracing).
                 let hero_wl =
                     (splitmix64(*rng_state ^ 0xA115_4E80_5EED_0001) % num_wl as u64) as usize;
-                let chain_result = trace_secondary_chain_alis(
+                let (chain_result, chain_seed_is_cloud) = trace_secondary_chain_alis(
                     atm,
                     scatter_pos,
                     sun_dir,
@@ -4875,40 +5375,76 @@ pub fn hybrid_scatter_radiance_alis(
                     shell_idx,
                     &mut mc_rng,
                     ray,
-                    rays_this_step,
+                    rays_this_sub,
                     num_wl,
                     w_back,
                     guide_ref,
                     field,
+                    chain_cloud,
                 );
 
-                for w in 0..num_wl {
-                    mc_totals[w] += chain_result[w];
+                if beta_cloud > 0.0 {
+                    // Per-type beta factor (see the ALIS cloud-seed
+                    // mixture derivation): the chain kept O(1) weights;
+                    // the seed-type coefficient is applied here, per
+                    // chain, since it depends on the chain's hero.
+                    let hero_o = &atm.optics[shell_idx][hero_wl];
+                    let beta_gas_hero = hero_o.extinction * hero_o.ssa;
+                    let beta_total_hero = beta_cloud + beta_gas_hero;
+                    if chain_seed_is_cloud {
+                        for w in 0..num_wl {
+                            mc_totals[w] += chain_result[w] * beta_total_hero;
+                        }
+                    } else {
+                        // A gas seed implies beta_gas_hero > 0 (otherwise
+                        // p_c = 1 and the seed is always cloud).
+                        let boost = beta_total_hero / beta_gas_hero;
+                        for w in 0..num_wl {
+                            let ow = &atm.optics[shell_idx][w];
+                            mc_totals[w] +=
+                                chain_result[w] * ow.extinction * ow.ssa * boost;
+                        }
+                    }
+                } else {
+                    for w in 0..num_wl {
+                        mc_totals[w] += chain_result[w];
+                    }
                 }
             }
 
-            let inv_rays = 1.0 / rays_this_step as f64;
+            let inv_rays = 1.0 / rays_this_sub as f64;
             for w in 0..num_wl {
                 let optics = &atm.optics[shell_idx][w];
                 let beta_scat = optics.extinction * optics.ssa;
-                if beta_scat < 1e-30 {
+                if beta_scat < 1e-30 && beta_cloud <= 0.0 {
                     continue;
                 }
-                let tau_obs_mid = tau_obs[w] + optics.extinction * ds * 0.5;
+                let tau_obs_mid = tau_obs[w] + optics.extinction * sub_ds * 0.5;
                 let t_obs = libm::exp(-tau_obs_mid) * t_cloud_mid;
                 if t_obs < 1e-30 {
                     continue;
                 }
-                radiance[w] += mc_totals[w] * inv_rays * beta_scat * t_obs * ds;
+                if beta_cloud > 0.0 {
+                    // Cloudy step: the chain folded the per-type beta
+                    // factors into its seed weights (ALIS seed derivation);
+                    // scale by transmittance and step length only.
+                    radiance[w] += mc_totals[w] * inv_rays * t_obs * sub_ds;
+                } else {
+                    radiance[w] += mc_totals[w] * inv_rays * beta_scat * t_obs * sub_ds;
+                }
             }
         }
 
         // BDPT connections are now handled in a separate batched pass below.
 
         for w in 0..num_wl {
-            tau_obs[w] += atm.optics[shell_idx][w].extinction * ds;
+            tau_obs[w] += atm.optics[shell_idx][w].extinction * sub_ds;
         }
-        tau_cloud_obs += cloud_ext_step * ds;
+        tau_cloud_obs += tau_cloud_step;
+        }
+        if los_opaque {
+            break;
+        }
     }
 
     // --- BDPT connections: batched post-processing pass ---
@@ -5009,9 +5545,11 @@ pub fn hybrid_scatter_radiance_alis(
                     None => continue,
                 };
 
-                // BDPT LOS re-walk: same midpoint cloud quadrature as the
-                // main walk. BDPT runs only when no field is present, but the
-                // estimator is chain mode either way: Beer-Lambert cloud.
+                // BDPT LOS re-walk. BDPT runs only when NO gray cloud
+                // channel is present (field or 1D deck), so this cloud
+                // accumulation is identically zero; it is kept so the
+                // re-walk stays structurally aligned with the main walk
+                // (Beer-Lambert cloud in chain mode) for the conversion.
                 let cloud_ext_step = cloud_ext_at(atm, field, shell_idx, scatter_pos);
                 let tau_cloud_mid = tau_cloud_bdpt + cloud_ext_step * ds * 0.5;
                 let t_cloud_mid = libm::exp(-tau_cloud_mid);
@@ -5506,11 +6044,20 @@ mod tests {
                 let d = cnt as f64 - expected;
                 chi2 += d * d / expected;
             }
-            // 19 dof: the 0.1% critical value is ~43.8. Use a generous 80
-            // (midpoint quadrature on the forward peak at g=0.85 adds some).
+            // 20 bins with all expected counts fixed by the evaluator (no
+            // fitted parameters) give 19 dof. Critical values of chi2(19):
+            // 30.14 at p = 0.05, 36.19 at p = 0.01, 43.82 at p = 0.001.
+            // The 200-point sub-quadrature renders the expected fractions
+            // exact to ~1e-8 even on the g = 0.85 forward peak, so no
+            // quadrature allowance is needed. Gate at the p = 0.001
+            // critical value: a correct sampler with this fixed seed never
+            // trips it, while a wrong sampler at 4M samples lands in the
+            // hundreds. The previous threshold of 80 was ~2.7x the p = 0.05
+            // value and could have passed a meaningfully wrong sampler.
             assert!(
-                chi2 < 80.0,
-                "G-CHI cloud HG g={g}: chi2 {chi2:.2} (sampler vs evaluator mismatch)"
+                chi2 < 43.82,
+                "G-CHI cloud HG g={g}: chi2 {chi2:.2} > 43.82 (chi2(19) at \
+                 p=0.001; sampler vs evaluator mismatch)"
             );
         }
     }
@@ -7554,6 +8101,7 @@ mod tests {
                 n,
                 1.0,
                 None,
+                ChainCloud::CLEAR,
             );
         }
         let mean = total / n as f64;
@@ -7603,6 +8151,7 @@ mod tests {
                 n,
                 1.0,
                 None,
+                ChainCloud::CLEAR,
             );
             assert!(
                 val >= 0.0,
@@ -7653,9 +8202,10 @@ mod tests {
             let hero_wl = ray % num_wl;
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
-            let result = trace_secondary_chain_alis(
+            let (result, _) = trace_secondary_chain_alis(
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
                 None,
+                ChainCloud::CLEAR,
             );
             for w in 0..num_wl {
                 assert!(
@@ -8085,6 +8635,7 @@ mod tests {
                 n,
                 1.0,
                 None,
+                ChainCloud::CLEAR,
             );
             assert!(
                 result >= 0.0 && result.is_finite(),
@@ -8129,9 +8680,10 @@ mod tests {
             let hero_wl = ray % num_wl;
             let _ = xorshift_f64(&mut rng);
             let mut mc = McRng::from_seed(rng);
-            let result = trace_secondary_chain_alis(
+            let (result, _) = trace_secondary_chain_alis(
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
                 None,
+                ChainCloud::CLEAR,
             );
             for w in 0..num_wl {
                 assert!(

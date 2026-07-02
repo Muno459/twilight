@@ -220,6 +220,47 @@ pub struct FieldHeader {
     pub source: String,
 }
 
+/// Sanity cap on each grid dimension. The sidecar exports regional
+/// grids of at most a few hundred cells per axis; anything past this
+/// is a corrupt or hostile header.
+const MAX_FIELD_DIM: usize = 4096;
+
+/// Reject degenerate or corrupt headers BEFORE the payload is touched.
+/// A zero dimension previously survived to `derive()`, where the
+/// background column divided by zero and poisoned every tau with NaN -
+/// a silently wrong sky instead of an error.
+fn validate_field_header(hdr: &FieldHeader) -> Result<(), WeatherError> {
+    use crate::error::WeatherError;
+    for (name, v) in [("nz", hdr.nz), ("ny", hdr.ny), ("nx", hdr.nx)] {
+        if !(1..=MAX_FIELD_DIM).contains(&v) {
+            return Err(WeatherError::parse(format!(
+                "field header: {name} = {v} outside 1..={MAX_FIELD_DIM}"
+            )));
+        }
+    }
+    if !hdr.top_m.is_finite() || hdr.top_m <= 0.0 {
+        return Err(WeatherError::parse(format!(
+            "field header: top_m = {} must be finite and > 0",
+            hdr.top_m
+        )));
+    }
+    for (name, v) in [("dlat_deg", hdr.dlat_deg), ("dlon_deg", hdr.dlon_deg)] {
+        if !v.is_finite() || v <= 0.0 {
+            return Err(WeatherError::parse(format!(
+                "field header: {name} = {v} must be finite and > 0"
+            )));
+        }
+    }
+    for (name, v) in [("lat0_deg", hdr.lat0_deg), ("lon0_deg", hdr.lon0_deg)] {
+        if !v.is_finite() {
+            return Err(WeatherError::parse(format!(
+                "field header: {name} = {v} must be finite"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Load a sidecar full-grid IWC file (raw little-endian f32 + .json
 /// header) into an owned 3D cloud field for the transport engine.
 ///
@@ -241,6 +282,7 @@ pub fn load_field(path: &std::path::Path) -> Result<
             .map_err(|e| WeatherError::io(format!("field header: {e}")))?,
     )
     .map_err(|e| WeatherError::parse(format!("field header: {e}")))?;
+    validate_field_header(&hdr)?;
     let bytes = std::fs::read(path).map_err(|e| WeatherError::io(format!("field: {e}")))?;
     let n = hdr.nz * hdr.ny * hdr.nx;
     if bytes.len() != n * 4 {
@@ -252,7 +294,20 @@ pub fn load_field(path: &std::path::Path) -> Result<
     }
     let mut iwc = vec![0.0f32; n];
     for (i, c) in bytes.chunks_exact(4).enumerate() {
-        iwc[i] = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        // IWC is a physical density: non-finite or negative values are
+        // corrupt data and would poison the derived taus.
+        if !v.is_finite() || v < 0.0 {
+            let iz = i / (hdr.ny * hdr.nx);
+            let rem = i % (hdr.ny * hdr.nx);
+            return Err(WeatherError::parse(format!(
+                "field payload: invalid IWC {v} at index {i} (level {iz}, row {}, \
+                 col {}); values must be finite and non-negative",
+                rem / hdr.nx,
+                rem % hdr.nx
+            )));
+        }
+        iwc[i] = v;
     }
     // Flip rows: file is north-to-south, the field grid ascends in lat.
     let (nz, ny, nx) = (hdr.nz, hdr.ny, hdr.nx);
@@ -293,8 +348,9 @@ mod tests {
         let bin = dir.join("f.bin");
         let (nz, ny, nx) = (2usize, 3usize, 2usize);
         let mut iwc = vec![0.0f32; nz * ny * nx];
-        iwc[(0 * ny) * nx + 1] = 0.5; // top level, NORTH row, east col
-        iwc[(1 * ny + 2) * nx] = 0.25; // bottom level, SOUTH row, west col
+        let sidx = |iz: usize, iy: usize, ix: usize| (iz * ny + iy) * nx + ix;
+        iwc[sidx(0, 0, 1)] = 0.5; // top level, NORTH row, east col
+        iwc[sidx(1, 2, 0)] = 0.25; // bottom level, SOUTH row, west col
         let bytes: Vec<u8> = iwc.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&bin, bytes).unwrap();
         std::fs::write(
@@ -317,6 +373,113 @@ mod tests {
         assert_eq!(f.sigma[idx(10, 2, 0)], 0.0, "row flip not applied");
         let r = f.sigma[idx(30, 2, 1)] / f.sigma[idx(10, 0, 0)];
         assert!((r - 2.0).abs() < 1e-4, "sigma not linear in IWC: {r}");
+    }
+
+    /// Write a raw field + header pair under a fresh temp dir; returns
+    /// the .bin path load_field expects.
+    fn write_field_pair(dir_name: &str, header_json: &str, iwc: &[f32]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("f.bin");
+        let bytes: Vec<u8> = iwc.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(&bin, bytes).unwrap();
+        std::fs::write(dir.join("f.bin.json"), header_json).unwrap();
+        bin
+    }
+
+    fn header_1x1x1() -> &'static str {
+        r#"{"nz":1,"ny":1,"nx":1,"top_m":10000.0,"lat0_deg":54.0,
+            "lon0_deg":9.0,"dlat_deg":0.018,"dlon_deg":0.03,
+            "time_utc":"2026-06-13T02:00:00Z","source":"validation-test"}"#
+    }
+
+    /// ny = 0 previously reached derive(), where the background column
+    /// divided by zero and every tau became NaN. It must error instead.
+    #[test]
+    fn zero_dimension_header_rejected() {
+        let bin = write_field_pair(
+            "tw_field_zero_dim",
+            r#"{"nz":2,"ny":0,"nx":2,"top_m":10000.0,"lat0_deg":54.0,
+                "lon0_deg":9.0,"dlat_deg":0.018,"dlon_deg":0.03,
+                "time_utc":"2026-06-13T02:00:00Z","source":"t"}"#,
+            &[],
+        );
+        let msg = load_field(&bin).unwrap_err().to_string();
+        assert!(msg.contains("ny") && msg.contains('0'), "{msg}");
+
+        let bin = write_field_pair(
+            "tw_field_zero_nx",
+            r#"{"nz":2,"ny":3,"nx":0,"top_m":10000.0,"lat0_deg":54.0,
+                "lon0_deg":9.0,"dlat_deg":0.018,"dlon_deg":0.03,
+                "time_utc":"2026-06-13T02:00:00Z","source":"t"}"#,
+            &[],
+        );
+        let msg = load_field(&bin).unwrap_err().to_string();
+        assert!(msg.contains("nx"), "{msg}");
+    }
+
+    #[test]
+    fn degenerate_header_geometry_rejected() {
+        // Oversized dimension.
+        let bin = write_field_pair(
+            "tw_field_huge_dim",
+            r#"{"nz":2,"ny":3,"nx":100000,"top_m":10000.0,"lat0_deg":54.0,
+                "lon0_deg":9.0,"dlat_deg":0.018,"dlon_deg":0.03,
+                "time_utc":"2026-06-13T02:00:00Z","source":"t"}"#,
+            &[],
+        );
+        assert!(load_field(&bin).is_err(), "oversized nx must be rejected");
+
+        // Zero grid spacing.
+        let bin = write_field_pair(
+            "tw_field_zero_dlat",
+            r#"{"nz":1,"ny":1,"nx":1,"top_m":10000.0,"lat0_deg":54.0,
+                "lon0_deg":9.0,"dlat_deg":0.0,"dlon_deg":0.03,
+                "time_utc":"2026-06-13T02:00:00Z","source":"t"}"#,
+            &[0.1],
+        );
+        let msg = load_field(&bin).unwrap_err().to_string();
+        assert!(msg.contains("dlat_deg"), "{msg}");
+
+        // Non-positive top.
+        let bin = write_field_pair(
+            "tw_field_zero_top",
+            r#"{"nz":1,"ny":1,"nx":1,"top_m":0.0,"lat0_deg":54.0,
+                "lon0_deg":9.0,"dlat_deg":0.018,"dlon_deg":0.03,
+                "time_utc":"2026-06-13T02:00:00Z","source":"t"}"#,
+            &[0.1],
+        );
+        let msg = load_field(&bin).unwrap_err().to_string();
+        assert!(msg.contains("top_m"), "{msg}");
+    }
+
+    /// Non-finite payload values must error, naming the offending index.
+    #[test]
+    fn nan_payload_rejected() {
+        let bin = write_field_pair("tw_field_nan", header_1x1x1(), &[f32::NAN]);
+        let msg = load_field(&bin).unwrap_err().to_string();
+        assert!(msg.contains("index 0"), "{msg}");
+
+        let bin = write_field_pair("tw_field_inf", header_1x1x1(), &[f32::INFINITY]);
+        assert!(load_field(&bin).is_err(), "infinite IWC must be rejected");
+    }
+
+    /// Negative payload values must error, naming the offending index.
+    #[test]
+    fn negative_payload_rejected() {
+        let bin = write_field_pair("tw_field_neg", header_1x1x1(), &[-0.5]);
+        let msg = load_field(&bin).unwrap_err().to_string();
+        assert!(msg.contains("index 0") && msg.contains("-0.5"), "{msg}");
+    }
+
+    /// A valid single-voxel field still loads after validation.
+    #[test]
+    fn valid_minimal_field_still_loads() {
+        let bin = write_field_pair("tw_field_ok", header_1x1x1(), &[0.1]);
+        let f = load_field(&bin).unwrap();
+        assert_eq!((f.nlat, f.nlon), (1, 1));
+        assert!(f.sigma.iter().all(|v| v.is_finite()));
+        assert!(f.background_column.iter().all(|v| v.is_finite()));
     }
 
     fn synthetic(iwc_fill: &[(usize, usize, f64)]) -> Cloud3dProfile {

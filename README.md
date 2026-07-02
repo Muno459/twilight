@@ -98,8 +98,10 @@ tuning.
 | Reference | Regime | Agreement |
 |---|---|---|
 | DISORT (pseudospherical, 16 streams) | SZA 60 to 90° | **2.6 to 3.5 % median** |
+| DISORT, absolute scale (no normalization) | SZA 60 to 85° | **ratio 0.975 to 0.993** |
 | MYSTIC (spherical Monte Carlo) | SZA 95° | **+6.5 % / +2.9 %** (450/650 nm) |
-| MYSTIC | SZA ≥ 98° | noise-limited on both sides; a large-photon campaign is planned |
+| MYSTIC backward, 1e8 photons | SZA 96 to 100° | **1 to 14 %**; past 102° the public referee itself no longer converges |
+| DISORT + MYSTIC, cloud slab (same delta-scaled HG problem) | tau* 1 / 3 / 10, SZA 30 to 60° | **144 of 144 points within 3 % + 2 SE**, both MC estimators |
 
 ## Live data
 
@@ -266,10 +268,21 @@ established local calendars. Known limits, stated plainly:
   ships with the engine (`twilight-cli sqm predict|compare` and the
   campaign protocol in docs/SQM_CAMPAIGN.md); what remains is a meter on a
   roof and clear nights.
-- **Transport is 1D-spherical.** The 3D cloud field is measured in 3D but
-  transported as horizontally uniform layers sampled along the sunlight's
-  path. Cloud internal scattering is closed-form two-stream, not
-  path-traced.
+- **3D cloud transport runs on the CPU.** With `--cloud-field`, light is
+  path-traced through the measured voxel volume (explicit in-cloud
+  scattering, validated against DISORT/MYSTIC on cloud slabs); the GPU
+  currently accelerates clear-sky and single-scatter work only, so a
+  cloudy multi-scatter run takes tens of minutes, not seconds.
+- **Under a thick deck at depressions past ~7°, the production (hybrid)
+  estimator converges one-sidedly from below** at default ray budgets
+  (about 0.4x at optical depth 10; the independent analog estimator
+  matches MYSTIC there). Real broken fields are far thinner; the
+  combined-channel sampler that removes this is tracked work.
+- **No external 3D spherical twilight referee exists.** The cloud
+  transport is externally checked on plane-parallel slabs at daytime sun
+  and the clear-sky spherical transport to SZA ~100; the combined
+  regime (3D clouds at twilight geometry) is checked by internal
+  cross-estimator gates and, ultimately, the SQM field campaign.
 - **External transport validation reaches SZA ~98-100** (the absolute
   radiometric scale is proven to 1-2.5% at SZA 60-85; MYSTIC backward-mode
   agreement extends to ~100°), while the events live at 99 to 108°. The

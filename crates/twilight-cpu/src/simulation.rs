@@ -616,22 +616,30 @@ mod tests {
 
     // ── 3D cloud field: Stage-2 explicit-scattering gates ──
 
+    /// Thin uniform deck (OD 2, base 1 km, top 3 km) shared by the Stage-2
+    /// chain gates in both representations (1D shell cloud and 3D field).
+    /// Thin enough that the analog cloud channel converges at gate photon
+    /// counts (the OD-10 stratus default is the documented variance-starved
+    /// case, see `stratus_twilight_remains_visible_and_below_clear_sky`).
+    fn thin_deck_props() -> twilight_data::cloud::CloudProperties {
+        twilight_data::cloud::CloudProperties {
+            base_km: 1.0,
+            top_km: 3.0,
+            optical_depth: 2.0,
+            ssa: 0.999,
+            asymmetry: 0.85,
+        }
+    }
+
     /// A horizontally uniform thin field (OD-2) for the Stage-2 chain gates.
     /// Thin enough that the analog cloud channel converges at modest photon
     /// counts (forced mode is off under cloud), uniform so it has an exact
     /// 1D-shell equivalent.
     fn uniform_thin_field() -> twilight_data::cloud_field_builder::OwnedCloudField {
-        use twilight_data::cloud::CloudProperties;
         use twilight_data::cloud_field_builder::{field_from_layers, FieldGeometry};
         let c = SimulationConfig::default();
         field_from_layers(
-            &[CloudProperties {
-                base_km: 1.0,
-                top_km: 3.0,
-                optical_depth: 2.0,
-                ssa: 0.999,
-                asymmetry: 0.85,
-            }],
+            &[thin_deck_props()],
             FieldGeometry {
                 center_lat_deg: c.latitude,
                 center_lon_deg: c.longitude,
@@ -643,6 +651,8 @@ mod tests {
     }
 
     /// Average summed radiance over K seeds (mean and standard error).
+    /// Seeds run in parallel (rayon); the per-seed salts and therefore the
+    /// values are identical to the previous serial version.
     fn mc_mean_se(
         atm: &AtmosphereModel,
         config: &SimulationConfig,
@@ -650,13 +660,14 @@ mod tests {
         field: Option<&Cloud3DField>,
         k: u64,
     ) -> (f64, f64) {
-        let mut s = Vec::new();
-        for seed in 0..k {
-            let mut c = config.clone();
-            c.seed_salt = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
-            let r: f64 = simulate_at_sza(atm, &c, sza, field).radiance.iter().sum();
-            s.push(r);
-        }
+        let s: Vec<f64> = (0..k)
+            .into_par_iter()
+            .map(|seed| {
+                let mut c = config.clone();
+                c.seed_salt = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                simulate_at_sza(atm, &c, sza, field).radiance.iter().sum()
+            })
+            .collect();
         let mean = s.iter().sum::<f64>() / k as f64;
         let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / k as f64;
         (mean, (var / k as f64).sqrt())
@@ -671,14 +682,7 @@ mod tests {
     #[test]
     #[ignore = "g_s2_eq1d: heavy MC"]
     fn g_s2_eq1d_uniform_field_matches_1d_explicit() {
-        use twilight_data::cloud::CloudProperties;
-        let props = CloudProperties {
-            base_km: 1.0,
-            top_km: 3.0,
-            optical_depth: 2.0,
-            ssa: 0.999,
-            asymmetry: 0.85,
-        };
+        let props = thin_deck_props();
         // 1D path: shell cloud extinction, no field.
         let atm_1d = builder::build_with_cloud_properties(
             AtmosphereType::UsStandard,
@@ -715,14 +719,84 @@ mod tests {
         );
     }
 
+    /// Per-wavelength SCALAR-chain hybrid reference: one independent scalar
+    /// chain family per wavelength (`hybrid_scatter_radiance` with
+    /// `polarized = false`), summed with the same solar-irradiance weights
+    /// as `build_spectral_result`. Same estimator family and LOS quadrature
+    /// as ALIS, no hero-path machinery, no polarization: a comparison
+    /// against it isolates the ALIS spectral reweighting alone.
+    fn perwl_scalar_hybrid_total(
+        atm: &AtmosphereModel,
+        config: &SimulationConfig,
+        sza: f64,
+        field: Option<&Cloud3DField>,
+    ) -> f64 {
+        let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza);
+        (0..atm.num_wavelengths)
+            .into_par_iter()
+            .map(|w| {
+                let sza_bits = mix_salt(sza.to_bits(), config.seed_salt);
+                let mut rng = sza_bits
+                    .wrapping_add(w as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1);
+                let raw = photon::hybrid_scatter_radiance(
+                    atm,
+                    observer_pos,
+                    view_dir,
+                    sun_dir,
+                    w,
+                    config.photons_per_wavelength,
+                    &mut rng,
+                    false,
+                    field,
+                );
+                if config.apply_solar_irradiance && w < SOLAR_IRRADIANCE.len() {
+                    raw * SOLAR_IRRADIANCE[w]
+                } else {
+                    raw
+                }
+            })
+            .sum()
+    }
+
+    /// K-seed mean and standard error of the per-wavelength scalar hybrid.
+    fn perwl_scalar_mean_se(
+        atm: &AtmosphereModel,
+        config: &SimulationConfig,
+        sza: f64,
+        field: Option<&Cloud3DField>,
+        k: u64,
+    ) -> (f64, f64) {
+        let s: Vec<f64> = (0..k)
+            .into_par_iter()
+            .map(|seed| {
+                let mut c = config.clone();
+                c.seed_salt = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                perwl_scalar_hybrid_total(atm, &c, sza, field)
+            })
+            .collect();
+        let mean = s.iter().sum::<f64>() / k as f64;
+        let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / k as f64;
+        (mean, (var / k as f64).sqrt())
+    }
+
     /// G-ALIS (Stage-2): the ALIS hero-path chain vs explicit per-wavelength
-    /// scalar chains on a synthetic 3D cloud (a cube embedded in the
+    /// SCALAR chains on a synthetic 3D cloud (a cube embedded in the
     /// footprint) must agree statistically. The CPU runs ALIS in Hybrid
-    /// non-polarized mode; the per-wavelength reference uses the polarized
-    /// Stokes hybrid (per-wl rayon) as an independent estimator of the same
-    /// integral. Agreement within combined MC error validates that the gray
-    /// cloud channel leaves the ALIS spectral ratios (which it multiplies by
-    /// 1) consistent with explicit per-wavelength transport.
+    /// non-polarized mode; the reference is the per-wavelength scalar chain
+    /// (the `polarized = false` path of `hybrid_scatter_radiance`), an
+    /// independent estimator of the SAME scalar integral with the same LOS
+    /// quadrature. The previous reference was the polarized Stokes hybrid,
+    /// which confounds ALIS machinery errors with polarization-coupling
+    /// physics; its 3% physics floor let a recorded 6.4%-scale delta pass
+    /// unexamined. The scalar reference removes the physics floor entirely.
+    ///
+    /// Acceptance band, derived from the measured seed-mean standard errors:
+    /// |mean_alis - mean_ref| < 3 * sqrt(se_alis^2 + se_ref^2), the two-sided
+    /// ~99.7% band under the normal approximation of K-seed means. No
+    /// systematic floor is added because the two estimators share the
+    /// integrand and quadrature exactly; any excess is an ALIS bug.
     #[test]
     #[ignore = "g_s2_alis: heavy MC"]
     fn g_s2_alis_matches_per_wavelength_on_cube() {
@@ -751,28 +825,29 @@ mod tests {
         let mut atm = builder::build_clear_sky(AtmosphereType::UsStandard, 0.15);
         atm.cloud_g_scaled = owned.g_default;
 
-        let base = SimulationConfig {
+        let alis = SimulationConfig {
             view_zenith: 80.0,
             scattering_mode: ScatteringMode::Hybrid,
             photons_per_wavelength: 256,
+            polarized: false,
             ..SimulationConfig::default()
         };
-        let alis = SimulationConfig { polarized: false, ..base.clone() };
-        let perwl = SimulationConfig { polarized: true, ..base };
 
         let sza = 94.0;
         let (m_alis, se_alis) = mc_mean_se(&atm, &alis, sza, Some(&view), 8);
-        let (m_pw, se_pw) = mc_mean_se(&atm, &perwl, sza, Some(&view), 8);
+        let (m_pw, se_pw) = perwl_scalar_mean_se(&atm, &alis, sza, Some(&view), 8);
         let se = (se_alis * se_alis + se_pw * se_pw).sqrt();
         let diff = (m_alis - m_pw).abs();
         eprintln!(
-            "G-ALIS SZA {sza}: alis {m_alis:.5e} (se {se_alis:.2e}) perwl {m_pw:.5e} (se {se_pw:.2e}) diff {diff:.2e}"
+            "G-ALIS SZA {sza}: alis {m_alis:.5e} (se {se_alis:.2e}) perwl-scalar {m_pw:.5e} (se {se_pw:.2e}) diff {diff:.2e} band {:.2e}",
+            3.0 * se
         );
-        // Polarized vs scalar carries a small (~1-2%) systematic from the
-        // I-coupling correction on top of MC noise; allow 3 se + 3% floor.
+        // Band derived from the measured SEs alone (see the doc comment):
+        // same integrand, same quadrature, so 3 combined SE with no floor.
         assert!(
-            diff < 3.0 * se + 0.03 * m_alis.max(m_pw),
-            "G-ALIS: alis {m_alis:.5e} vs perwl {m_pw:.5e} differ by {diff:.3e}"
+            diff < 3.0 * se,
+            "G-ALIS: alis {m_alis:.5e} vs perwl-scalar {m_pw:.5e} differ by {diff:.3e} (> 3 se = {:.3e})",
+            3.0 * se
         );
     }
 
@@ -820,6 +895,179 @@ mod tests {
             r_gap <= r_clear * 1.05,
             "G-GAP-MC: gap {r_gap:.4e} must not exceed clear {r_clear:.4e}"
         );
+    }
+
+    /// G-HYB-MULT (Stage-2 cross-estimator gate): Hybrid vs
+    /// `ScatteringMode::Multiple` under cloud.
+    ///
+    /// The adversarial review's central complaint: no INDEPENDENT reference
+    /// for the chain estimator existed (G-EQ1D's two sides are trajectory-
+    /// correlated replicas of the same decomposition-tracking walker).
+    /// `trace_photon` (Multiple mode) is an independent estimator of the
+    /// same radiance integral: a fully analog backward walk that races the
+    /// gray cloud channel on EVERY flight, so it places cloud vertices on
+    /// the eye ray itself. Post the 2026-07 G2 campaign, Multiple is also
+    /// the externally anchored side: it matches disort/MYSTIC on the G2
+    /// slab at SZA 30-85 AND spherical-backward MYSTIC at SZA 95/97 under
+    /// this very deck (550 nm: 0.93 +- 0.08 and 0.98 +- 0.15).
+    ///
+    /// Two regimes, gated differently and honestly:
+    ///
+    /// 1. SZA 88 and 92 (twilight, converged): two-sided agreement,
+    ///    |mean_h - mean_m| < 3 * combined SE + 5% construction floor
+    ///    (straight midpoint LOS vs refracting analog walk).
+    /// 2. SZA 97 (deep twilight, above ZENITH_SZA_START = 96): ONE-SIDED.
+    ///    Forced-collision mode is disabled under any cloud channel (its
+    ///    gas-only proposal cannot compose with the gray cloud channel),
+    ///    so the hybrid chains run ANALOG under the deck at an SZA where
+    ///    the clear-sky estimator relies on forced scattering to reach the
+    ///    sunlit region (shadow height ~48 km). The analog chain estimator
+    ///    is unbiased but VARIANCE-STARVED here: it converges one-sidedly
+    ///    from below (measured 550 nm, 8 seeds: 7.5e-6 at 512 photons,
+    ///    9.3e-6 at 2048, 1.07e-5 at 8192, vs MYSTIC 1.66e-5 +- 0.14e-5),
+    ///    the same documented limitation as
+    ///    `stratus_twilight_remains_visible_and_below_clear_sky`; the
+    ///    combined-channel forced mode for the 1D deck remains the tracked
+    ///    Stage-2 follow-up. The PRE-fix version of this gate ran two-sided
+    ///    at SZA 95/97 and passed only by cancellation: the hybrid's
+    ///    order-1 term was inflated ~e^{+0.3} by the midpoint-shell eye-OD
+    ///    misclassification (fixed) and its seed variance was ~20x larger,
+    ///    widening the 3-SE band to cover the deficit. The one-sided upper
+    ///    bound retains the gate's original regression target: the
+    ///    cloud-blind forced composition INFLATED the hybrid well above
+    ///    Multiple, which the bound still fails loudly. A floor at
+    ///    0.25 * multiple guards against total collapse of the analog
+    ///    chain term at the gate budget.
+    #[test]
+    #[ignore = "g_s2_hybrid_matches_multiple: heavy MC"]
+    fn g_s2_hybrid_matches_multiple() {
+        let atm_1d = builder::build_with_cloud_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &thin_deck_props(),
+        );
+        let mut atm_field = builder::build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let owned = uniform_thin_field();
+        atm_field.cloud_g_scaled = owned.g_default;
+        let view = owned.view();
+
+        let hybrid = SimulationConfig {
+            view_zenith: 80.0,
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 256,
+            polarized: false,
+            ..SimulationConfig::default()
+        };
+        let multiple = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 40_000,
+            ..hybrid.clone()
+        };
+
+        let cases: [(&str, &AtmosphereModel, Option<&Cloud3DField>); 2] = [
+            ("1D deck", &atm_1d, None),
+            ("field deck", &atm_field, Some(&view)),
+        ];
+        let mut failures = Vec::new();
+        for (label, atm, field) in cases {
+            // Regime 1: converged twilight, two-sided.
+            for sza in [88.0, 92.0] {
+                let (m_h, se_h) = mc_mean_se(atm, &hybrid, sza, field, 8);
+                let (m_m, se_m) = mc_mean_se(atm, &multiple, sza, field, 8);
+                let se = (se_h * se_h + se_m * se_m).sqrt();
+                let diff = (m_h - m_m).abs();
+                let band = 3.0 * se + 0.05 * m_h.max(m_m);
+                eprintln!(
+                    "G-HYB-MULT {label} SZA {sza}: hybrid {m_h:.5e} (se {se_h:.2e}) \
+                     multiple {m_m:.5e} (se {se_m:.2e}) diff {diff:.2e} band {band:.2e} \
+                     ratio {:.3}",
+                    m_h / m_m
+                );
+                if diff.is_nan() || diff >= band {
+                    failures.push(format!(
+                        "{label} SZA {sza}: hybrid {m_h:.5e} vs multiple {m_m:.5e} \
+                         (diff {diff:.3e} > band {band:.3e})"
+                    ));
+                }
+            }
+            // Regime 2: deep twilight, one-sided (see header).
+            {
+                let sza = 97.0;
+                let (m_h, se_h) = mc_mean_se(atm, &hybrid, sza, field, 8);
+                let (m_m, se_m) = mc_mean_se(atm, &multiple, sza, field, 8);
+                let se = (se_h * se_h + se_m * se_m).sqrt();
+                let upper = m_m + 3.0 * se + 0.05 * m_m;
+                let floor = 0.25 * m_m;
+                eprintln!(
+                    "G-HYB-MULT {label} SZA {sza} (one-sided): hybrid {m_h:.5e} \
+                     (se {se_h:.2e}) multiple {m_m:.5e} (se {se_m:.2e}) \
+                     ratio {:.3} bounds [{floor:.3e}, {upper:.3e}]",
+                    m_h / m_m
+                );
+                if m_h.is_nan() || m_h >= upper || m_h <= floor {
+                    failures.push(format!(
+                        "{label} SZA {sza}: hybrid {m_h:.5e} outside \
+                         [{floor:.3e}, {upper:.3e}] around multiple {m_m:.5e}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "G-HYB-MULT: hybrid and Multiple disagree:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// G-FORCED-OFF (Fix 1 observable): pre-fix, at SZA >= ZENITH_SZA_START
+    /// (96) with a 1D deck (no field), forced-collision flights sampled from
+    /// GAS-only scout tau: nearly every space-exiting bounce crossed the
+    /// deck as if it were transparent while analog bounces of the same chain
+    /// raced it, INFLATING the multiple-scatter term. Post-fix the chains
+    /// are analog under any gray cloud channel.
+    ///
+    /// The gate keeps the smallest honest observable: 1D-deck hybrid
+    /// radiance at SZA 97 and 100 must be finite, positive (the sky stays
+    /// visible through an OD-2 deck), and BELOW clear sky (a deck can only
+    /// remove or redistribute light; its absorption lives in the shell
+    /// optics). The pre-fix inflated composition is what this pins against.
+    #[test]
+    #[ignore = "g_s2_forced_off_under_1d_cloud: heavy MC"]
+    fn g_s2_forced_off_under_1d_cloud() {
+        let clear = make_clear_sky_atm();
+        let cloudy = builder::build_with_cloud_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &thin_deck_props(),
+        );
+        let config = SimulationConfig {
+            view_zenith: 80.0,
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 256,
+            polarized: false,
+            ..SimulationConfig::default()
+        };
+        for sza in [97.0, 100.0] {
+            let (r_clear, se_c) = mc_mean_se(&clear, &config, sza, None, 8);
+            let (r_deck, se_d) = mc_mean_se(&cloudy, &config, sza, None, 8);
+            eprintln!(
+                "G-FORCED-OFF SZA {sza}: clear {r_clear:.4e} (se {se_c:.2e}) \
+                 deck {r_deck:.4e} (se {se_d:.2e}) deck/clear {:.4}",
+                r_deck / r_clear
+            );
+            assert!(
+                r_deck.is_finite() && r_deck > 0.0,
+                "G-FORCED-OFF SZA {sza}: deck radiance must be finite and positive, got {r_deck:.4e}"
+            );
+            // Below clear sky, with a 3-sigma statistical allowance.
+            let se = (se_c * se_c + se_d * se_d).sqrt();
+            assert!(
+                r_deck < r_clear + 3.0 * se,
+                "G-FORCED-OFF SZA {sza}: OD-2 deck must dim the sky: \
+                 deck {r_deck:.4e} vs clear {r_clear:.4e} (3 se = {:.2e})",
+                3.0 * se
+            );
+        }
     }
 
     // ── Phase-function orientation (regression for the supplement-angle bug) ──
@@ -1635,5 +1883,458 @@ mod tests {
             }
         }
         eprintln!("\n{:=<80}\n", "");
+    }
+
+    // ── G2 diagnostic: independent flat-slab referee ─────────────────────
+
+    /// Local RNG for the independent referee (splitmix64, distinct from the
+    /// xorshift streams in photon.rs).
+    struct DiagRng(u64);
+    impl DiagRng {
+        fn f64(&mut self) -> f64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            (z >> 11) as f64 * (1.0 / 9007199254740992.0)
+        }
+    }
+
+    /// One homogeneous layer of the flattened 1D profile.
+    #[derive(Clone, Copy)]
+    struct DiagLayer {
+        z_lo: f64,
+        z_hi: f64,
+        sig_gas: f64,
+        ssa_gas: f64,
+        sig_cloud: f64,
+    }
+
+    /// Extract the 550 nm 1D profile from an AtmosphereModel.
+    fn diag_profile(atm: &AtmosphereModel, w: usize) -> Vec<DiagLayer> {
+        let rs = atm.surface_radius();
+        (0..atm.num_shells)
+            .map(|s| DiagLayer {
+                z_lo: atm.shells[s].r_inner - rs,
+                z_hi: atm.shells[s].r_outer - rs,
+                sig_gas: atm.optics[s][w].extinction,
+                ssa_gas: atm.optics[s][w].ssa,
+                sig_cloud: atm.cloud_extinction[s],
+            })
+            .collect()
+    }
+
+    /// Vertical optical depth (gas + cloud) from height z to TOA.
+    fn diag_tau_above(layers: &[DiagLayer], z: f64) -> f64 {
+        let mut tau = 0.0;
+        for l in layers {
+            if l.z_hi <= z {
+                continue;
+            }
+            let lo = l.z_lo.max(z);
+            tau += (l.sig_gas + l.sig_cloud) * (l.z_hi - lo);
+        }
+        tau
+    }
+
+    /// Rotate `dir` by polar angle acos(ct) and azimuth phi (local impl,
+    /// independent of scattering::scatter_direction).
+    fn diag_rotate(dir: [f64; 3], ct: f64, phi: f64) -> [f64; 3] {
+        let st = (1.0 - ct * ct).max(0.0).sqrt();
+        let (sp, cp) = (phi.sin(), phi.cos());
+        // orthonormal basis around dir
+        let a = if dir[2].abs() < 0.9 {
+            [0.0, 0.0, 1.0]
+        } else {
+            [1.0, 0.0, 0.0]
+        };
+        // u = normalize(dir x a)
+        let mut u = [
+            dir[1] * a[2] - dir[2] * a[1],
+            dir[2] * a[0] - dir[0] * a[2],
+            dir[0] * a[1] - dir[1] * a[0],
+        ];
+        let un = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+        u = [u[0] / un, u[1] / un, u[2] / un];
+        // v = dir x u
+        let v = [
+            dir[1] * u[2] - dir[2] * u[1],
+            dir[2] * u[0] - dir[0] * u[2],
+            dir[0] * u[1] - dir[1] * u[0],
+        ];
+        [
+            st * cp * u[0] + st * sp * v[0] + ct * dir[0],
+            st * cp * u[1] + st * sp * v[1] + ct * dir[1],
+            st * cp * u[2] + st * sp * v[2] + ct * dir[2],
+        ]
+    }
+
+    /// Independent plane-parallel backward MC with NEE for the G2 slab.
+    /// Single combined-extinction channel (textbook algorithm, no
+    /// decomposition race), local RNG, local phase samplers. Returns
+    /// radiance in unit-solar-irradiance units (sr^-1).
+    #[allow(clippy::too_many_arguments)]
+    fn diag_flat_mc(
+        layers: &[DiagLayer],
+        g_cloud: f64,
+        albedo: f64,
+        sza_deg: f64,
+        vz_deg: f64,
+        n_photons: usize,
+        seed: u64,
+        max_bounces: usize,
+    ) -> (f64, f64) {
+        let z_top = layers.last().unwrap().z_hi;
+        let mu0 = (sza_deg.to_radians()).cos();
+        let sun = [sza_deg.to_radians().sin(), 0.0, mu0];
+        let view = [vz_deg.to_radians().sin(), 0.0, vz_deg.to_radians().cos()];
+
+        let (t1, t2) = (0..n_photons)
+            .into_par_iter()
+            .map(|p| {
+                let mut rng = DiagRng(seed ^ (p as u64).wrapping_mul(0x2545_F491_4F6C_DD1D));
+                let mut z = 1e-4;
+                let mut d = view;
+                let mut w = 1.0f64;
+                let mut acc = 0.0f64;
+                let mut acc1 = 0.0f64; // order-1: first-vertex NEE
+                let mut nv = 0usize;
+                let mut li = 0usize; // current layer index
+                'walk: for _ in 0..max_bounces {
+                    // free flight to tau_target through combined extinction
+                    let mut tau_t = -(1.0 - rng.f64()).max(1e-300).ln();
+                    loop {
+                        // locate current layer
+                        while li + 1 < layers.len() && z >= layers[li].z_hi {
+                            li += 1;
+                        }
+                        while li > 0 && z < layers[li].z_lo {
+                            li -= 1;
+                        }
+                        let l = layers[li];
+                        let sig = l.sig_gas + l.sig_cloud;
+                        if d[2].abs() < 1e-12 {
+                            break 'walk; // horizontal: leaves slab sideways (flat approx)
+                        }
+                        let z_next = if d[2] > 0.0 { l.z_hi } else { l.z_lo };
+                        let s_bound = (z_next - z) / d[2];
+                        let tau_seg = sig * s_bound;
+                        if tau_seg >= tau_t {
+                            // collision inside this layer
+                            let s = tau_t / sig;
+                            z += d[2] * s;
+                            let is_cloud = rng.f64() < l.sig_cloud / sig;
+                            if !is_cloud {
+                                w *= l.ssa_gas;
+                            }
+                            // NEE
+                            let t_sun = (-(diag_tau_above(layers, z)) / mu0).exp();
+                            let cos_nee = sun[0] * d[0] + sun[1] * d[1] + sun[2] * d[2];
+                            let phase = if is_cloud {
+                                let g2 = g_cloud * g_cloud;
+                                let den = 1.0 + g2 - 2.0 * g_cloud * cos_nee;
+                                (1.0 - g2) / (den * den.sqrt())
+                            } else {
+                                0.75 * (1.0 + cos_nee * cos_nee)
+                            };
+                            let nee = w * t_sun * phase / (4.0 * core::f64::consts::PI);
+                            if nv == 0 {
+                                acc1 += nee;
+                            } else {
+                                acc += nee;
+                            }
+                            nv += 1;
+                            // new direction
+                            let ct = if is_cloud {
+                                if g_cloud.abs() < 1e-6 {
+                                    2.0 * rng.f64() - 1.0
+                                } else {
+                                    let g2 = g_cloud * g_cloud;
+                                    let s2 = (1.0 - g2) / (1.0 - g_cloud + 2.0 * g_cloud * rng.f64());
+                                    ((1.0 + g2 - s2 * s2) / (2.0 * g_cloud)).clamp(-1.0, 1.0)
+                                }
+                            } else {
+                                // Rayleigh by rejection (local, independent)
+                                loop {
+                                    let mu = 2.0 * rng.f64() - 1.0;
+                                    if rng.f64() * 1.5 <= 0.75 * (1.0 + mu * mu) {
+                                        break mu;
+                                    }
+                                }
+                            };
+                            let phi = 2.0 * core::f64::consts::PI * rng.f64();
+                            d = diag_rotate(d, ct, phi);
+                            continue 'walk;
+                        }
+                        // crosses the layer boundary
+                        tau_t -= tau_seg;
+                        z = z_next + d[2].signum() * 1e-9;
+                        if z >= z_top {
+                            break 'walk; // escaped to space
+                        }
+                        if z <= 0.0 {
+                            // ground: NEE + Lambertian bounce
+                            z = 1e-9;
+                            let t_sun = (-(diag_tau_above(layers, 0.0)) / mu0).exp();
+                            acc += w * albedo * t_sun * mu0 / core::f64::consts::PI;
+                            nv += 1;
+                            w *= albedo;
+                            if w < 1e-12 {
+                                break 'walk;
+                            }
+                            // cosine-weighted upward hemisphere
+                            let ct = rng.f64().sqrt();
+                            let st = (1.0 - ct * ct).sqrt();
+                            let ph = 2.0 * core::f64::consts::PI * rng.f64();
+                            d = [st * ph.cos(), st * ph.sin(), ct];
+                            tau_t = -(1.0 - rng.f64()).max(1e-300).ln();
+                        }
+                    }
+                }
+                (acc1, acc)
+            })
+            .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+        (t1 / n_photons as f64, t2 / n_photons as f64)
+    }
+
+    /// Flat replica of `trace_photon`'s WALK STRUCTURE: per-segment gas
+    /// free-path redraw racing a carried gray cloud budget (decomposition
+    /// tracking), same NEE estimator. Same flat geometry and local RNG as
+    /// `diag_flat_mc`, so any deviation from it isolates the race logic
+    /// itself (vs the spherical shell machinery).
+    #[allow(clippy::too_many_arguments)]
+    fn diag_flat_mc_race(
+        layers: &[DiagLayer],
+        g_cloud: f64,
+        albedo: f64,
+        sza_deg: f64,
+        vz_deg: f64,
+        n_photons: usize,
+        seed: u64,
+        max_bounces: usize,
+    ) -> f64 {
+        let z_top = layers.last().unwrap().z_hi;
+        let mu0 = (sza_deg.to_radians()).cos();
+        let sun = [sza_deg.to_radians().sin(), 0.0, mu0];
+        let view = [vz_deg.to_radians().sin(), 0.0, vz_deg.to_radians().cos()];
+
+        let total: f64 = (0..n_photons)
+            .into_par_iter()
+            .map(|p| {
+                let mut rng = DiagRng(seed ^ (p as u64).wrapping_mul(0x2545_F491_4F6C_DD1D));
+                let mut z = 1e-4;
+                let mut d = view;
+                let mut w = 1.0f64;
+                let mut acc = 0.0f64;
+                let mut li = 0usize;
+                // Cloud budget for the current flight (carried across
+                // segment boundaries, redrawn after each collision).
+                let mut tau_c = -(1.0 - rng.f64()).max(1e-300).ln();
+                'walk: for _ in 0..max_bounces {
+                    // one SEGMENT per iteration (twilight's bounce-loop body)
+                    while li + 1 < layers.len() && z >= layers[li].z_hi {
+                        li += 1;
+                    }
+                    while li > 0 && z < layers[li].z_lo {
+                        li -= 1;
+                    }
+                    let l = layers[li];
+                    if d[2].abs() < 1e-12 {
+                        break 'walk;
+                    }
+                    let z_next = if d[2] > 0.0 { l.z_hi } else { l.z_lo };
+                    let s_bound = (z_next - z) / d[2];
+                    // gas free path, redrawn EVERY segment (twilight line 327)
+                    let free_path = if l.sig_gas < 1e-20 {
+                        f64::INFINITY
+                    } else {
+                        -(1.0 - rng.f64()).max(1e-300).ln() / l.sig_gas
+                    };
+                    let gas_cap = free_path.min(s_bound);
+                    // race the carried cloud budget over [0, gas_cap]
+                    let mut is_cloud = false;
+                    let mut s_coll = free_path;
+                    if l.sig_cloud > 0.0 {
+                        let dist_c = tau_c / l.sig_cloud;
+                        if dist_c <= gas_cap {
+                            is_cloud = true;
+                            s_coll = dist_c;
+                        } else {
+                            tau_c -= l.sig_cloud * gas_cap;
+                        }
+                    }
+                    if !is_cloud && free_path >= s_bound {
+                        // cross the boundary; budget carries
+                        z = z_next + d[2].signum() * 1e-9;
+                        if z >= z_top {
+                            break 'walk;
+                        }
+                        if z <= 0.0 {
+                            z = 1e-9;
+                            let t_sun = (-(diag_tau_above(layers, 0.0)) / mu0).exp();
+                            acc += w * albedo * t_sun * mu0 / core::f64::consts::PI;
+                            w *= albedo;
+                            if w < 1e-12 {
+                                break 'walk;
+                            }
+                            let ct = rng.f64().sqrt();
+                            let st = (1.0 - ct * ct).sqrt();
+                            let ph = 2.0 * core::f64::consts::PI * rng.f64();
+                            d = [st * ph.cos(), st * ph.sin(), ct];
+                            // ground bounce ends the flight: redraw budget
+                            tau_c = -(1.0 - rng.f64()).max(1e-300).ln();
+                        }
+                        continue 'walk;
+                    }
+                    // collision (cloud at s_coll, else gas at free_path)
+                    z += d[2] * s_coll;
+                    if !is_cloud {
+                        w *= l.ssa_gas;
+                    }
+                    let t_sun = (-(diag_tau_above(layers, z)) / mu0).exp();
+                    let cos_nee = sun[0] * d[0] + sun[1] * d[1] + sun[2] * d[2];
+                    let phase = if is_cloud {
+                        let g2 = g_cloud * g_cloud;
+                        let den = 1.0 + g2 - 2.0 * g_cloud * cos_nee;
+                        (1.0 - g2) / (den * den.sqrt())
+                    } else {
+                        0.75 * (1.0 + cos_nee * cos_nee)
+                    };
+                    acc += w * t_sun * phase / (4.0 * core::f64::consts::PI);
+                    let ct = if is_cloud {
+                        if g_cloud.abs() < 1e-6 {
+                            2.0 * rng.f64() - 1.0
+                        } else {
+                            let g2 = g_cloud * g_cloud;
+                            let s2 = (1.0 - g2) / (1.0 - g_cloud + 2.0 * g_cloud * rng.f64());
+                            ((1.0 + g2 - s2 * s2) / (2.0 * g_cloud)).clamp(-1.0, 1.0)
+                        }
+                    } else {
+                        loop {
+                            let mu = 2.0 * rng.f64() - 1.0;
+                            if rng.f64() * 1.5 <= 0.75 * (1.0 + mu * mu) {
+                                break mu;
+                            }
+                        }
+                    };
+                    let phi = 2.0 * core::f64::consts::PI * rng.f64();
+                    d = diag_rotate(d, ct, phi);
+                    // collision ends the flight: redraw budget
+                    tau_c = -(1.0 - rng.f64()).max(1e-300).ln();
+                }
+                acc
+            })
+            .sum();
+        total / n_photons as f64
+    }
+
+    /// DIAG (G2 root cause): independent plane-parallel referee vs
+    /// `trace_photon` (Multiple mode) on the identical per-shell profile.
+    /// Prints ratios; asserts nothing (diagnostic only).
+    #[test]
+    #[ignore = "diag: heavy MC diagnostic (G2 root-cause tooling)"]
+    fn diag_g2_slab_independent_reference() {
+        use twilight_data::cloud::CloudProperties;
+        let cases = [
+            ("g2_tau1", 0.85f64, 1.0f64, false, 0.15f64),
+            ("g2_g085", 0.85f64, 10.0f64, false, 0.15f64),
+        ];
+        for (label, g_unscaled, tau_star, nogas, albedo_in) in cases {
+            let f = g_unscaled * g_unscaled;
+            let de_scale = 1.0 - 0.999 * f;
+            let props = CloudProperties {
+                base_km: 1.0,
+                top_km: 2.0,
+                optical_depth: tau_star / de_scale,
+                ssa: 0.999,
+                asymmetry: g_unscaled,
+            };
+            let mut atm = builder::build_with_cloud_properties(
+                AtmosphereType::UsStandard,
+                0.15,
+                &props,
+            );
+            for n in atm.refractive_index.iter_mut() {
+                *n = 1.0;
+            }
+            let albedo = albedo_in;
+            for a in atm.surface_albedo.iter_mut() {
+                *a = albedo;
+            }
+            if nogas {
+                // Pure-cloud variant: kill the gas channel to isolate the
+                // cloud-specific machinery.
+                for s in 0..atm.num_shells {
+                    for w in 0..atm.num_wavelengths {
+                        atm.optics[s][w].extinction = 0.0;
+                    }
+                }
+            }
+            let w550 = (0..atm.num_wavelengths)
+                .find(|&w| (atm.wavelengths_nm[w] - 550.0).abs() < 0.5)
+                .expect("550 nm channel");
+            let layers = diag_profile(&atm, w550);
+            let g_scaled = atm.cloud_g_scaled;
+
+            for vz in [0.0f64, 60.0] {
+                // Independent flat referee.
+                let (flat1, flat2p) = diag_flat_mc(
+                    &layers, g_scaled, albedo, 30.0, vz, 400_000, 0xD1A6_0001, 100_000,
+                );
+                let flat = flat1 + flat2p;
+                // Flat replica of twilight's two-budget race walk.
+                let flat_race = diag_flat_mc_race(
+                    &layers, g_scaled, albedo, 30.0, vz, 400_000, 0xD1A6_0002, 100_000,
+                );
+                // trace_photon on the same atm (spherical machinery).
+                let config = SimulationConfig {
+                    view_zenith: vz,
+                    scattering_mode: ScatteringMode::Multiple,
+                    apply_solar_irradiance: false,
+                    photons_per_wavelength: 0,
+                    polarized: false,
+                    ..SimulationConfig::default()
+                };
+                let (obs, sun, view) = compute_geometry(&config, 30.0);
+                let n_ph = 60_000usize;
+                let sum: f64 = (0..n_ph)
+                    .into_par_iter()
+                    .map(|p| {
+                        let mut rng = (p as u64)
+                            .wrapping_mul(2862933555777941757)
+                            .wrapping_add(0xC0FF_EE00)
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1);
+                        photon::trace_photon(&atm, obs, view, sun, w550, &mut rng, None).weight
+                    })
+                    .sum();
+                let tw = sum / n_ph as f64;
+                eprintln!(
+                    "DIAG {label} tau*={tau_star} vz={vz}: flat_ref={flat:.5e} \
+                     (o1 {flat1:.5e} + o2p {flat2p:.5e}) \
+                     flat_race={flat_race:.5e} (race/ref {:.4}) \
+                     trace_photon={tw:.5e} ratio tw/flat={:.4}",
+                    flat_race / flat,
+                    tw / flat
+                );
+                // Gate: the two flat estimators bracket MC noise at ~0.5%,
+                // trace_photon adds spherical-vs-flat geometry (<1% for
+                // these near-vertical daytime cases). 4% catches every bug
+                // class found in the G2 campaign (the ground-bounce T=1
+                // NEE alone was +30..+90% here) while staying insensitive
+                // to seeds.
+                assert!(
+                    (flat_race / flat - 1.0).abs() < 0.04,
+                    "DIAG {label} vz={vz}: race replica {flat_race:.4e} vs \
+                     flat referee {flat:.4e}"
+                );
+                assert!(
+                    (tw / flat - 1.0).abs() < 0.04,
+                    "DIAG {label} vz={vz}: trace_photon {tw:.4e} vs flat \
+                     referee {flat:.4e} (Multiple-mode absolute-radiance bug)"
+                );
+            }
+        }
     }
 }
