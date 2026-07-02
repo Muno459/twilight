@@ -178,6 +178,28 @@ enum Commands {
         /// against RT codes that trace straight shadow rays, e.g. MYSTIC)
         #[arg(long)]
         no_refraction: bool,
+        /// Custom uniform cloud deck: UNSCALED optical depth (the builder
+        /// applies delta-Eddington similarity scaling internally). Overrides
+        /// --cloud. Combined with --rayleigh-only this yields Rayleigh +
+        /// cloud only (no gas absorption, no aerosol): the external
+        /// slab-referee configuration (gate G2).
+        #[arg(long)]
+        cloud_tau: Option<f64>,
+        /// Custom cloud base altitude in km (with --cloud-tau)
+        #[arg(long, default_value = "1.0")]
+        cloud_base_km: f64,
+        /// Custom cloud top altitude in km (with --cloud-tau)
+        #[arg(long, default_value = "2.0")]
+        cloud_top_km: f64,
+        /// Custom cloud single-scattering albedo (with --cloud-tau)
+        #[arg(long, default_value = "0.999")]
+        cloud_ssa: f64,
+        /// Custom cloud Henyey-Greenstein asymmetry g (with --cloud-tau)
+        #[arg(long, default_value = "0.85")]
+        cloud_g: f64,
+        /// RNG seed salt for the MC scattering modes (multi-seed error bars)
+        #[arg(long, default_value = "0")]
+        seed_salt: u64,
     },
     /// Sky Quality Meter field calibration: predict a night's zenith
     /// sky-brightness curve and compare it against measured SQM logs
@@ -1106,22 +1128,34 @@ fn cmd_compare(
     rayleigh_only: bool,
     aerosol: CliAerosol,
     cloud: CliCloud,
+    custom_cloud: Option<CloudProperties>,
     o3_du: Option<f64>,
     scattering: CliScattering,
     photons: usize,
     fast: bool,
     no_refraction: bool,
+    seed_salt: u64,
 ) {
     // Build the atmosphere once.
     let mut atm = if rayleigh_only {
-        builder::build_clear_sky(AtmosphereType::UsStandard, albedo)
+        match &custom_cloud {
+            // G2 slab referee: Rayleigh + delta-Eddington-scaled cloud,
+            // no gas absorption, no aerosol (matches a libRadtran deck
+            // with `no_absorption mol` + a scaled HG water cloud).
+            Some(cp) => {
+                builder::build_with_cloud_properties(AtmosphereType::UsStandard, albedo, cp)
+            }
+            None => builder::build_clear_sky(AtmosphereType::UsStandard, albedo),
+        }
     } else {
         let ap = aerosol
             .to_aerosol_type()
             .map(twilight_data::aerosol::default_properties);
-        let cp = cloud
-            .to_cloud_type()
-            .map(twilight_data::cloud::default_properties);
+        let cp = custom_cloud.or_else(|| {
+            cloud
+                .to_cloud_type()
+                .map(twilight_data::cloud::default_properties)
+        });
         builder::build_full_with_gas(
             AtmosphereType::UsStandard,
             albedo,
@@ -1140,9 +1174,25 @@ fn cmd_compare(
 
     // Header with enough metadata to reproduce the run.
     println!(
-        "# twilight compare: lat={} lon={} elev={} albedo={} rayleigh_only={} o3_du={:?} scattering={:?} photons={} polarized={}",
-        lat, lon, elevation, albedo, rayleigh_only, o3_du, scattering.to_scattering_mode(), photons, !fast
+        "# twilight compare: lat={} lon={} elev={} albedo={} rayleigh_only={} o3_du={:?} scattering={:?} photons={} polarized={} seed_salt={}",
+        lat, lon, elevation, albedo, rayleigh_only, o3_du, scattering.to_scattering_mode(), photons, !fast, seed_salt
     );
+    if let Some(cp) = &custom_cloud {
+        // Delta-Eddington scaled quantities actually carried by the medium
+        // (see twilight-data builder::add_cloud_layer): the external referee
+        // must be configured with THESE, not the unscaled inputs.
+        let f = cp.asymmetry * cp.asymmetry;
+        let de_scale = 1.0 - cp.ssa * f;
+        let ssa_s = ((1.0 - f) * cp.ssa / de_scale).clamp(0.0, 1.0);
+        let g_s = cp.asymmetry / (1.0 + cp.asymmetry);
+        println!(
+            "# custom cloud: base_km={} top_km={} tau_unscaled={} ssa={} g={} | scaled: tau*={:.6} ssa*={:.6} g*={:.6} tau_scat*={:.6} tau_abs={:.6}",
+            cp.base_km, cp.top_km, cp.optical_depth, cp.ssa, cp.asymmetry,
+            cp.optical_depth * de_scale, ssa_s, g_s,
+            cp.optical_depth * de_scale * ssa_s,
+            cp.optical_depth * de_scale * (1.0 - ssa_s),
+        );
+    }
     println!("sza_deg,view_zenith_deg,rel_azimuth_deg,wavelength_nm,radiance_w_m2_sr_nm");
 
     for &vz in view_zeniths {
@@ -1158,7 +1208,7 @@ fn cmd_compare(
                 scattering_mode: scattering.to_scattering_mode(),
                 photons_per_wavelength: photons,
                 polarized: !fast,
-                seed_salt: 0,
+                seed_salt,
             };
             for &sza in szas {
                 let result = simulation::simulate_at_sza(&atm, &config, sza, None);
@@ -3348,7 +3398,21 @@ fn main() {
             photons,
             fast,
             no_refraction,
+            cloud_tau,
+            cloud_base_km,
+            cloud_top_km,
+            cloud_ssa,
+            cloud_g,
+            seed_salt,
         } => {
+            // Custom uniform deck for the external slab referee (G2).
+            let custom_cloud = cloud_tau.map(|tau| CloudProperties {
+                base_km: cloud_base_km,
+                top_km: cloud_top_km,
+                optical_depth: tau,
+                ssa: cloud_ssa,
+                asymmetry: cloud_g,
+            });
             cmd_compare(
                 lat,
                 lon,
@@ -3361,11 +3425,13 @@ fn main() {
                 rayleigh_only,
                 aerosol,
                 cloud,
+                custom_cloud,
                 o3_du,
                 scattering,
                 photons,
                 fast,
                 no_refraction,
+                seed_salt,
             );
         }
         Commands::Sqm { action } => match action {

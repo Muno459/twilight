@@ -370,6 +370,280 @@ def compare_tier1b_mystic(lrt, szas, tol, shape_only, solar_file,
     _report(out_rows, n_pass, n_fail, tol)
     return n_fail == 0
 
+# ---------------------------------------------------------------------------
+# G2: explicit-cloud slab referee (docs/3D_TRANSPORT_PLAN.md gate G2)
+# ---------------------------------------------------------------------------
+# twilight's cloud channel is DELTA-EDDINGTON SCALED at build time
+# (twilight-data builder::add_cloud_layer): for unscaled (tau, ssa, g) the
+# medium actually carries
+#   tau_ext* = tau * (1 - ssa*g^2)          extinction OD of the deck
+#   ssa*     = (1-g^2)*ssa / (1 - ssa*g^2)  single-scattering albedo
+#   g*       = g / (1+g)                    HG asymmetry
+# with the scattering part in a gray per-shell cloud channel and the
+# absorption part folded into the shell optics. The referee therefore
+# solves the SAME transport problem by configuring the libRadtran water
+# cloud with tau_ext*, ssa*, g* and a Henyey-Greenstein phase function
+# (wc_properties hu is HG by construction; wc_modify tau/ssa/gg set).
+# This gates the CHAIN MACHINERY, not the delta-scaling approximation.
+G2_CLOUD_SSA = 0.999   # twilight water-cloud preset constants
+G2_CLOUD_G = 0.85
+G2_CLOUD_BASE_KM = 1.0  # afglus grid levels -> exact layer match
+G2_CLOUD_TOP_KM = 2.0
+G2_F = G2_CLOUD_G * G2_CLOUD_G
+G2_DE_SCALE = 1.0 - G2_CLOUD_SSA * G2_F
+G2_SSA_STAR = (1.0 - G2_F) * G2_CLOUD_SSA / G2_DE_SCALE
+G2_G_STAR = G2_CLOUD_G / (1.0 + G2_CLOUD_G)
+G2_TAU_STARS = [1.0, 3.0, 10.0]     # scaled extinction ODs under test
+G2_SZAS = [30.0, 60.0, 85.0]        # 85 = stretch (pseudospherical disort)
+G2_WLS = [450.0, 550.0, 650.0]
+G2_VZ = [0.0, 60.0]                 # zenith + one off-zenith
+G2_RA = [0.0, 180.0]
+G2_SEEDS = list(range(1, 7))
+G2_PHOTONS = {"hybrid": 2000, "multiple": 8000}
+G2_MYSTIC_PHOTONS = int(os.environ.get("G2_MYSTIC_PHOTONS", "4000000"))
+
+
+def g2_solar_file() -> Path:
+    """uvspec solar file = twilight's exact TSIS-1 10nm table (mW/m^2/nm).
+
+    Duplicated from crates/twilight-data/src/solar_spectrum.rs so the two
+    codes share the identical solar scale (absolute comparison, no
+    shape-only normalization needed).
+    """
+    irr = [1.119, 1.068, 1.527, 1.714, 1.744, 1.638, 1.810, 2.087, 2.024,
+           1.948, 2.005, 1.946, 1.940, 1.889, 1.863, 1.843, 1.824, 1.848,
+           1.833, 1.803, 1.780, 1.694, 1.704, 1.693, 1.639, 1.636, 1.594,
+           1.580, 1.544, 1.515, 1.486, 1.438, 1.413, 1.389, 1.360, 1.323,
+           1.296, 1.265, 1.194, 1.244, 1.216]
+    p = OUT_DIR / "g2_solar_tsis_tw.dat"
+    lines = ["# twilight TSIS-1 HSRS 10nm table (solar_spectrum.rs), mW/m^2/nm"]
+    for i, e in enumerate(irr):
+        lines.append(f"{380 + 10 * i:.1f} {e * 1000:.3f}")
+    p.write_text("\n".join(lines) + "\n")
+    return p
+
+
+def g2_wc_file() -> Path:
+    """1D wc file: one layer between base and top (layer interpretation).
+
+    LWC/reff are placeholders; wc_modify tau/ssa/gg override everything.
+    """
+    p = OUT_DIR / "g2_wc_slab.dat"
+    p.write_text(f"# z(km) LWC(g/m^3) reff(um)\n"
+                 f"{G2_CLOUD_TOP_KM:.1f} 0.0 0.0\n"
+                 f"{G2_CLOUD_BASE_KM:.1f} 0.1 10.0\n")
+    return p
+
+
+def g2_deck(lrt: Path, solar: Path, wc: Path, tau_star: float | None,
+            solver: str, sza: float, wl: float, umus: list[float],
+            phis: list[float]) -> str:
+    data = lrt / "data"
+    cloud = ""
+    if tau_star is not None:
+        cloud = (f"wc_file 1D {wc}\n"
+                 f"wc_properties hu\n"
+                 f"wc_modify tau set {tau_star:.6f}\n"
+                 f"wc_modify ssa set {G2_SSA_STAR:.6f}\n"
+                 f"wc_modify gg set {G2_G_STAR:.6f}\n")
+    solver_lines = {
+        "disort": "rte_solver disort\nnumber_of_streams 32\npseudospherical",
+        "mystic": f"rte_solver montecarlo\nmc_photons {G2_MYSTIC_PHOTONS}\nmc_std",
+    }[solver]
+    umu_s = " ".join(f"{u:.6f}" for u in umus)
+    phi_s = " ".join(f"{p:.1f}" for p in phis)
+    return f"""data_files_path {data}/
+atmosphere_file {data}/atmmod/afglus.dat
+source solar {solar} per_nm
+albedo {ALBEDO}
+wavelength {wl:.1f} {wl:.1f}
+mol_abs_param crs
+no_absorption mol
+{cloud}{solver_lines}
+sza {sza:.2f}
+phi0 0.0
+umu {umu_s}
+phi {phi_s}
+zout 0.0
+output_user lambda uu
+quiet
+"""
+
+
+def g2_run_twilight(tau_star: float | None, mode: str, seed: int) -> dict:
+    """One twilight compare run over the full G2 grid. Returns
+    {(sza, vz, ra, wl): W/m^2/sr/nm}."""
+    cmd = [
+        str(TWILIGHT_CLI), "compare",
+        "--sza", ",".join(f"{s:g}" for s in G2_SZAS),
+        "--view-zenith", ",".join(f"{v:g}" for v in G2_VZ),
+        "--rel-azimuth", ",".join(f"{r:g}" for r in G2_RA),
+        "--rayleigh-only", "--fast", "--no-refraction",
+        "--scattering", mode,
+        "--photons", str(G2_PHOTONS[mode]),
+        "--seed-salt", str(seed),
+    ]
+    if tau_star is not None:
+        tau_unscaled = tau_star / G2_DE_SCALE
+        cmd += ["--cloud-tau", f"{tau_unscaled:.6f}",
+                "--cloud-base-km", f"{G2_CLOUD_BASE_KM:g}",
+                "--cloud-top-km", f"{G2_CLOUD_TOP_KM:g}",
+                "--cloud-ssa", f"{G2_CLOUD_SSA:g}",
+                "--cloud-g", f"{G2_CLOUD_G:g}"]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"twilight-cli compare failed ({mode}, tau*={tau_star}):\n"
+                 f"{r.stderr[:2000]}")
+    table = {}
+    for row in csv.reader(io.StringIO(r.stdout)):
+        if not row or row[0].startswith("#") or row[0] == "sza_deg":
+            continue
+        sza, vz, ra, wl, rad = (float(x) for x in row)
+        if wl in G2_WLS:
+            table[(sza, vz, ra, wl)] = rad
+    return table
+
+
+def g2_mean_se(vals: list[float]) -> tuple[float, float]:
+    n = len(vals)
+    m = sum(vals) / n
+    if n < 2:
+        return m, 0.0
+    var = sum((v - m) ** 2 for v in vals) / (n - 1)
+    return m, math.sqrt(var / n)
+
+
+def compare_g2(lrt):
+    """G2 referee campaign: twilight chain estimators vs disort/MYSTIC on
+    the delta-Eddington-scaled homogeneous cloud slab."""
+    if lrt is None:
+        sys.exit("G2 needs libRadtran (set LIBRADTRAN_DIR)")
+    if not TWILIGHT_CLI.exists():
+        sys.exit("Build first: cargo build --release -p twilight-cli")
+
+    solar = g2_solar_file()
+    wc = g2_wc_file()
+    umus = [-math.cos(math.radians(v)) for v in G2_VZ]
+
+    print("=== G2: explicit-cloud slab referee ===")
+    print(f"  scaled deck constants: de_scale={G2_DE_SCALE:.7f} "
+          f"ssa*={G2_SSA_STAR:.7f} g*={G2_G_STAR:.7f}")
+    for ts in G2_TAU_STARS:
+        print(f"  tau*={ts:g}: twilight --cloud-tau {ts / G2_DE_SCALE:.6f} "
+              f"(unscaled); uvspec wc_modify tau set {ts:.6f}")
+
+    cases: list[float | None] = [None] + G2_TAU_STARS  # None = clear anchor
+
+    # ---- twilight side: hybrid + multiple, multi-seed --------------------
+    tw: dict = {}   # (tau_star, mode) -> {(sza,vz,ra,wl): (mean, se)}
+    from concurrent.futures import ThreadPoolExecutor
+    for tau_star in cases:
+        for mode in ("hybrid", "multiple"):
+            # hybrid compare runs are single-threaded; parallelize seeds.
+            workers = 6 if mode == "hybrid" else 2
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                tables = list(ex.map(
+                    lambda s: g2_run_twilight(tau_star, mode, s), G2_SEEDS))
+            merged = {}
+            for key in tables[0]:
+                merged[key] = g2_mean_se([t[key] for t in tables])
+            tw[(tau_star, mode)] = merged
+            label = "clear" if tau_star is None else f"tau*={tau_star:g}"
+            print(f"  twilight {mode:8s} {label}: {len(G2_SEEDS)} seeds done")
+
+    # ---- disort side -----------------------------------------------------
+    dis: dict = {}  # (tau_star, sza, vz, ra, wl) -> W/m^2/sr/nm
+    for tau_star in cases:
+        for sza in G2_SZAS:
+            for wl in G2_WLS:
+                tag = (f"g2_disort_"
+                       f"{'clear' if tau_star is None else f'tau{tau_star:g}'}"
+                       f"_sza{sza:g}_wl{wl:g}")
+                deck = g2_deck(lrt, solar, wc, tau_star, "disort", sza, wl,
+                               umus, G2_RA)
+                out = run_uvspec(lrt, deck, tag)
+                lr = parse_uvspec_radiance(out, umus, G2_RA)
+                for vz, umu in zip(G2_VZ, umus):
+                    for ra in G2_RA:
+                        for (wl_l, u_l, p_l), v in lr.items():
+                            if abs(u_l - umu) < 1e-6 and abs(p_l - ra) < 1e-6:
+                                dis[(tau_star, sza, vz, ra, wl)] = v
+    print("  disort referee done")
+
+    # ---- MYSTIC MC cross-check (one direction per run) -------------------
+    mystic: dict = {}  # (tau_star, sza, vz, ra, wl) -> (rad, std)
+    mystic_cases = [(3.0, 60.0, 0.0, 0.0, 550.0),
+                    (3.0, 30.0, 0.0, 0.0, 550.0),
+                    (10.0, 60.0, 0.0, 0.0, 550.0),
+                    (10.0, 30.0, 0.0, 0.0, 550.0),
+                    (10.0, 60.0, 60.0, 0.0, 550.0),
+                    (1.0, 60.0, 0.0, 0.0, 550.0)]
+    for (ts, sza, vz, ra, wl) in mystic_cases:
+        tag = f"g2_mystic_tau{ts:g}_sza{sza:g}_vz{vz:g}_ra{ra:g}_wl{wl:g}"
+        umu = -math.cos(math.radians(vz))
+        deck = g2_deck(lrt, solar, wc, ts, "mystic", sza, wl, [umu], [ra])
+        run_uvspec(lrt, deck, tag)
+        rad = std = None
+        spc = OUT_DIR / "mc.rad.spc"
+        stdf = OUT_DIR / "mc.rad.std.spc"
+        if spc.exists():
+            parts = spc.read_text().split()
+            if len(parts) >= 5:
+                rad = float(parts[4]) * 1e-3
+        if stdf.exists():
+            parts = stdf.read_text().split()
+            if len(parts) >= 5:
+                std = float(parts[4]) * 1e-3
+        if rad is not None:
+            mystic[(ts, sza, vz, ra, wl)] = (rad, std or 0.0)
+            print(f"  MYSTIC tau*={ts:g} sza={sza:g} vz={vz:g}: "
+                  f"{rad:.4e} +- {std or 0:.1e}")
+
+    # ---- table ------------------------------------------------------------
+    out_csv = OUT_DIR / "g2_results.csv"
+    with open(out_csv, "w") as f:
+        w = csv.writer(f)
+        w.writerow(["tau_star", "sza", "vz", "ra", "wl",
+                    "tw_hybrid", "tw_hybrid_se", "tw_multiple",
+                    "tw_multiple_se", "disort", "mystic", "mystic_std",
+                    "hyb_over_disort", "mul_over_disort"])
+        for tau_star in cases:
+            ts_key = 0.0 if tau_star is None else tau_star
+            for sza in G2_SZAS:
+                for vz in G2_VZ:
+                    for ra in G2_RA:
+                        if vz == 0.0 and ra != 0.0:
+                            continue  # zenith is azimuth-degenerate
+                        for wl in G2_WLS:
+                            h, hse = tw[(tau_star, "hybrid")][(sza, vz, ra, wl)]
+                            m, mse = tw[(tau_star, "multiple")][(sza, vz, ra, wl)]
+                            d = dis[(tau_star, sza, vz, ra, wl)]
+                            my = mystic.get((ts_key, sza, vz, ra, wl))
+                            w.writerow([ts_key, sza, vz, ra, wl,
+                                        f"{h:.6e}", f"{hse:.2e}",
+                                        f"{m:.6e}", f"{mse:.2e}",
+                                        f"{d:.6e}",
+                                        f"{my[0]:.6e}" if my else "",
+                                        f"{my[1]:.2e}" if my else "",
+                                        f"{h / d:.4f}" if d > 0 else "",
+                                        f"{m / d:.4f}" if d > 0 else ""])
+    print(f"  full table: {out_csv}")
+
+    # console summary at 550
+    print("\n  550 nm summary (ratio twilight/disort, mean of seeds):")
+    print("  tau*   sza  vz  ra   hybrid/disort  multiple/disort")
+    for tau_star in cases:
+        ts_key = 0.0 if tau_star is None else tau_star
+        for sza in G2_SZAS:
+            for vz, ra in [(0.0, 0.0), (60.0, 0.0), (60.0, 180.0)]:
+                h, hse = tw[(tau_star, "hybrid")][(sza, vz, ra, 550.0)]
+                m, mse = tw[(tau_star, "multiple")][(sza, vz, ra, 550.0)]
+                d = dis[(tau_star, sza, vz, ra, 550.0)]
+                print(f"  {ts_key:5g} {sza:5g} {vz:3g} {ra:4g}   "
+                      f"{h / d:6.3f}+-{hse / d:.3f}   {m / d:6.3f}+-{mse / d:.3f}")
+    return True
+
+
 def _report(rows, n_pass, n_fail, tol):
     worst = sorted(rows, key=lambda r: -r[6])[:10]
     print(f"  {n_pass} pass / {n_fail} fail (tol {tol:.0%})")
@@ -389,7 +663,8 @@ def _report(rows, n_pass, n_fail, tol):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tier", choices=["1a", "1b", "1b-deep", "2", "3"], default=None)
+    ap.add_argument("--tier", choices=["1a", "1b", "1b-deep", "2", "3", "g2"],
+                    default=None)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--decks-only", action="store_true",
                     help="emit uvspec decks without running (no libRadtran needed)")
@@ -427,6 +702,8 @@ def main():
                                         solar_file=args.solar_file,
                                         solver="mystic-backward",
                                         tw_photons=TW_DEEP_PHOTONS)
+        elif tier == "g2":
+            ok &= compare_g2(lrt)
         elif tier in ("2", "3"):
             print(f"Tier {tier}: deck templates not yet automated - "
                   "see module docstring for the design.")
