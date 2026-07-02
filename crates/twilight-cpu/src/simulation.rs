@@ -616,22 +616,30 @@ mod tests {
 
     // ── 3D cloud field: Stage-2 explicit-scattering gates ──
 
+    /// Thin uniform deck (OD 2, base 1 km, top 3 km) shared by the Stage-2
+    /// chain gates in both representations (1D shell cloud and 3D field).
+    /// Thin enough that the analog cloud channel converges at gate photon
+    /// counts (the OD-10 stratus default is the documented variance-starved
+    /// case, see `stratus_twilight_remains_visible_and_below_clear_sky`).
+    fn thin_deck_props() -> twilight_data::cloud::CloudProperties {
+        twilight_data::cloud::CloudProperties {
+            base_km: 1.0,
+            top_km: 3.0,
+            optical_depth: 2.0,
+            ssa: 0.999,
+            asymmetry: 0.85,
+        }
+    }
+
     /// A horizontally uniform thin field (OD-2) for the Stage-2 chain gates.
     /// Thin enough that the analog cloud channel converges at modest photon
     /// counts (forced mode is off under cloud), uniform so it has an exact
     /// 1D-shell equivalent.
     fn uniform_thin_field() -> twilight_data::cloud_field_builder::OwnedCloudField {
-        use twilight_data::cloud::CloudProperties;
         use twilight_data::cloud_field_builder::{field_from_layers, FieldGeometry};
         let c = SimulationConfig::default();
         field_from_layers(
-            &[CloudProperties {
-                base_km: 1.0,
-                top_km: 3.0,
-                optical_depth: 2.0,
-                ssa: 0.999,
-                asymmetry: 0.85,
-            }],
+            &[thin_deck_props()],
             FieldGeometry {
                 center_lat_deg: c.latitude,
                 center_lon_deg: c.longitude,
@@ -643,6 +651,8 @@ mod tests {
     }
 
     /// Average summed radiance over K seeds (mean and standard error).
+    /// Seeds run in parallel (rayon); the per-seed salts and therefore the
+    /// values are identical to the previous serial version.
     fn mc_mean_se(
         atm: &AtmosphereModel,
         config: &SimulationConfig,
@@ -650,13 +660,14 @@ mod tests {
         field: Option<&Cloud3DField>,
         k: u64,
     ) -> (f64, f64) {
-        let mut s = Vec::new();
-        for seed in 0..k {
-            let mut c = config.clone();
-            c.seed_salt = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
-            let r: f64 = simulate_at_sza(atm, &c, sza, field).radiance.iter().sum();
-            s.push(r);
-        }
+        let s: Vec<f64> = (0..k)
+            .into_par_iter()
+            .map(|seed| {
+                let mut c = config.clone();
+                c.seed_salt = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                simulate_at_sza(atm, &c, sza, field).radiance.iter().sum()
+            })
+            .collect();
         let mean = s.iter().sum::<f64>() / k as f64;
         let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / k as f64;
         (mean, (var / k as f64).sqrt())
@@ -671,14 +682,7 @@ mod tests {
     #[test]
     #[ignore = "g_s2_eq1d: heavy MC"]
     fn g_s2_eq1d_uniform_field_matches_1d_explicit() {
-        use twilight_data::cloud::CloudProperties;
-        let props = CloudProperties {
-            base_km: 1.0,
-            top_km: 3.0,
-            optical_depth: 2.0,
-            ssa: 0.999,
-            asymmetry: 0.85,
-        };
+        let props = thin_deck_props();
         // 1D path: shell cloud extinction, no field.
         let atm_1d = builder::build_with_cloud_properties(
             AtmosphereType::UsStandard,
@@ -715,14 +719,84 @@ mod tests {
         );
     }
 
+    /// Per-wavelength SCALAR-chain hybrid reference: one independent scalar
+    /// chain family per wavelength (`hybrid_scatter_radiance` with
+    /// `polarized = false`), summed with the same solar-irradiance weights
+    /// as `build_spectral_result`. Same estimator family and LOS quadrature
+    /// as ALIS, no hero-path machinery, no polarization: a comparison
+    /// against it isolates the ALIS spectral reweighting alone.
+    fn perwl_scalar_hybrid_total(
+        atm: &AtmosphereModel,
+        config: &SimulationConfig,
+        sza: f64,
+        field: Option<&Cloud3DField>,
+    ) -> f64 {
+        let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza);
+        (0..atm.num_wavelengths)
+            .into_par_iter()
+            .map(|w| {
+                let sza_bits = mix_salt(sza.to_bits(), config.seed_salt);
+                let mut rng = sza_bits
+                    .wrapping_add(w as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1);
+                let raw = photon::hybrid_scatter_radiance(
+                    atm,
+                    observer_pos,
+                    view_dir,
+                    sun_dir,
+                    w,
+                    config.photons_per_wavelength,
+                    &mut rng,
+                    false,
+                    field,
+                );
+                if config.apply_solar_irradiance && w < SOLAR_IRRADIANCE.len() {
+                    raw * SOLAR_IRRADIANCE[w]
+                } else {
+                    raw
+                }
+            })
+            .sum()
+    }
+
+    /// K-seed mean and standard error of the per-wavelength scalar hybrid.
+    fn perwl_scalar_mean_se(
+        atm: &AtmosphereModel,
+        config: &SimulationConfig,
+        sza: f64,
+        field: Option<&Cloud3DField>,
+        k: u64,
+    ) -> (f64, f64) {
+        let s: Vec<f64> = (0..k)
+            .into_par_iter()
+            .map(|seed| {
+                let mut c = config.clone();
+                c.seed_salt = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                perwl_scalar_hybrid_total(atm, &c, sza, field)
+            })
+            .collect();
+        let mean = s.iter().sum::<f64>() / k as f64;
+        let var = s.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / k as f64;
+        (mean, (var / k as f64).sqrt())
+    }
+
     /// G-ALIS (Stage-2): the ALIS hero-path chain vs explicit per-wavelength
-    /// scalar chains on a synthetic 3D cloud (a cube embedded in the
+    /// SCALAR chains on a synthetic 3D cloud (a cube embedded in the
     /// footprint) must agree statistically. The CPU runs ALIS in Hybrid
-    /// non-polarized mode; the per-wavelength reference uses the polarized
-    /// Stokes hybrid (per-wl rayon) as an independent estimator of the same
-    /// integral. Agreement within combined MC error validates that the gray
-    /// cloud channel leaves the ALIS spectral ratios (which it multiplies by
-    /// 1) consistent with explicit per-wavelength transport.
+    /// non-polarized mode; the reference is the per-wavelength scalar chain
+    /// (the `polarized = false` path of `hybrid_scatter_radiance`), an
+    /// independent estimator of the SAME scalar integral with the same LOS
+    /// quadrature. The previous reference was the polarized Stokes hybrid,
+    /// which confounds ALIS machinery errors with polarization-coupling
+    /// physics; its 3% physics floor let a recorded 6.4%-scale delta pass
+    /// unexamined. The scalar reference removes the physics floor entirely.
+    ///
+    /// Acceptance band, derived from the measured seed-mean standard errors:
+    /// |mean_alis - mean_ref| < 3 * sqrt(se_alis^2 + se_ref^2), the two-sided
+    /// ~99.7% band under the normal approximation of K-seed means. No
+    /// systematic floor is added because the two estimators share the
+    /// integrand and quadrature exactly; any excess is an ALIS bug.
     #[test]
     #[ignore = "g_s2_alis: heavy MC"]
     fn g_s2_alis_matches_per_wavelength_on_cube() {
@@ -751,28 +825,29 @@ mod tests {
         let mut atm = builder::build_clear_sky(AtmosphereType::UsStandard, 0.15);
         atm.cloud_g_scaled = owned.g_default;
 
-        let base = SimulationConfig {
+        let alis = SimulationConfig {
             view_zenith: 80.0,
             scattering_mode: ScatteringMode::Hybrid,
             photons_per_wavelength: 256,
+            polarized: false,
             ..SimulationConfig::default()
         };
-        let alis = SimulationConfig { polarized: false, ..base.clone() };
-        let perwl = SimulationConfig { polarized: true, ..base };
 
         let sza = 94.0;
         let (m_alis, se_alis) = mc_mean_se(&atm, &alis, sza, Some(&view), 8);
-        let (m_pw, se_pw) = mc_mean_se(&atm, &perwl, sza, Some(&view), 8);
+        let (m_pw, se_pw) = perwl_scalar_mean_se(&atm, &alis, sza, Some(&view), 8);
         let se = (se_alis * se_alis + se_pw * se_pw).sqrt();
         let diff = (m_alis - m_pw).abs();
         eprintln!(
-            "G-ALIS SZA {sza}: alis {m_alis:.5e} (se {se_alis:.2e}) perwl {m_pw:.5e} (se {se_pw:.2e}) diff {diff:.2e}"
+            "G-ALIS SZA {sza}: alis {m_alis:.5e} (se {se_alis:.2e}) perwl-scalar {m_pw:.5e} (se {se_pw:.2e}) diff {diff:.2e} band {:.2e}",
+            3.0 * se
         );
-        // Polarized vs scalar carries a small (~1-2%) systematic from the
-        // I-coupling correction on top of MC noise; allow 3 se + 3% floor.
+        // Band derived from the measured SEs alone (see the doc comment):
+        // same integrand, same quadrature, so 3 combined SE with no floor.
         assert!(
-            diff < 3.0 * se + 0.03 * m_alis.max(m_pw),
-            "G-ALIS: alis {m_alis:.5e} vs perwl {m_pw:.5e} differ by {diff:.3e}"
+            diff < 3.0 * se,
+            "G-ALIS: alis {m_alis:.5e} vs perwl-scalar {m_pw:.5e} differ by {diff:.3e} (> 3 se = {:.3e})",
+            3.0 * se
         );
     }
 
@@ -820,6 +895,137 @@ mod tests {
             r_gap <= r_clear * 1.05,
             "G-GAP-MC: gap {r_gap:.4e} must not exceed clear {r_clear:.4e}"
         );
+    }
+
+    /// G-HYB-MULT (Stage-2 cross-estimator gate): Hybrid vs
+    /// `ScatteringMode::Multiple` under cloud.
+    ///
+    /// The adversarial review's central complaint: no INDEPENDENT reference
+    /// for the chain estimator existed (G-EQ1D's two sides are trajectory-
+    /// correlated replicas of the same decomposition-tracking walker).
+    /// `trace_photon` (Multiple mode) is an independent estimator of the
+    /// same radiance integral: a fully analog backward walk that races the
+    /// gray cloud channel on EVERY flight, so it places cloud vertices on
+    /// the eye ray itself. The Hybrid estimator must agree with it on
+    /// (i) a thin uniform 1D deck and (ii) the same deck as a 3D field, at
+    /// SZA 95 and at SZA 97 (above ZENITH_SZA_START = 96, where the pre-fix
+    /// forced mode ran cloud-blind on the 1D deck; post-fix both modes are
+    /// analog under any cloud channel).
+    ///
+    /// Acceptance band, stated: |mean_h - mean_m| < 3 * combined SE of the
+    /// K-seed means + 5% construction floor. The floor covers the known
+    /// small systematic construction differences between the estimators
+    /// (Hybrid integrates a straight 500 m midpoint-quadrature LOS while
+    /// the analog walk refracts at shell boundaries), which do not vanish
+    /// with photons. Any disagreement beyond it is an estimator bug.
+    #[test]
+    #[ignore = "g_s2_hybrid_matches_multiple: heavy MC"]
+    fn g_s2_hybrid_matches_multiple() {
+        let atm_1d = builder::build_with_cloud_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &thin_deck_props(),
+        );
+        let mut atm_field = builder::build_clear_sky(AtmosphereType::UsStandard, 0.15);
+        let owned = uniform_thin_field();
+        atm_field.cloud_g_scaled = owned.g_default;
+        let view = owned.view();
+
+        let hybrid = SimulationConfig {
+            view_zenith: 80.0,
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 256,
+            polarized: false,
+            ..SimulationConfig::default()
+        };
+        let multiple = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 40_000,
+            ..hybrid.clone()
+        };
+
+        let cases: [(&str, &AtmosphereModel, Option<&Cloud3DField>); 2] = [
+            ("1D deck", &atm_1d, None),
+            ("field deck", &atm_field, Some(&view)),
+        ];
+        let mut failures = Vec::new();
+        for (label, atm, field) in cases {
+            for sza in [95.0, 97.0] {
+                let (m_h, se_h) = mc_mean_se(atm, &hybrid, sza, field, 8);
+                let (m_m, se_m) = mc_mean_se(atm, &multiple, sza, field, 8);
+                let se = (se_h * se_h + se_m * se_m).sqrt();
+                let diff = (m_h - m_m).abs();
+                let band = 3.0 * se + 0.05 * m_h.max(m_m);
+                eprintln!(
+                    "G-HYB-MULT {label} SZA {sza}: hybrid {m_h:.5e} (se {se_h:.2e}) \
+                     multiple {m_m:.5e} (se {se_m:.2e}) diff {diff:.2e} band {band:.2e} \
+                     ratio {:.3}",
+                    m_h / m_m
+                );
+                if diff.is_nan() || diff >= band {
+                    failures.push(format!(
+                        "{label} SZA {sza}: hybrid {m_h:.5e} vs multiple {m_m:.5e} \
+                         (diff {diff:.3e} > band {band:.3e})"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "G-HYB-MULT: hybrid and Multiple disagree:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// G-FORCED-OFF (Fix 1 observable): pre-fix, at SZA >= ZENITH_SZA_START
+    /// (96) with a 1D deck (no field), forced-collision flights sampled from
+    /// GAS-only scout tau: nearly every space-exiting bounce crossed the
+    /// deck as if it were transparent while analog bounces of the same chain
+    /// raced it, INFLATING the multiple-scatter term. Post-fix the chains
+    /// are analog under any gray cloud channel.
+    ///
+    /// The gate keeps the smallest honest observable: 1D-deck hybrid
+    /// radiance at SZA 97 and 100 must be finite, positive (the sky stays
+    /// visible through an OD-2 deck), and BELOW clear sky (a deck can only
+    /// remove or redistribute light; its absorption lives in the shell
+    /// optics). The pre-fix inflated composition is what this pins against.
+    #[test]
+    #[ignore = "g_s2_forced_off_under_1d_cloud: heavy MC"]
+    fn g_s2_forced_off_under_1d_cloud() {
+        let clear = make_clear_sky_atm();
+        let cloudy = builder::build_with_cloud_properties(
+            AtmosphereType::UsStandard,
+            0.15,
+            &thin_deck_props(),
+        );
+        let config = SimulationConfig {
+            view_zenith: 80.0,
+            scattering_mode: ScatteringMode::Hybrid,
+            photons_per_wavelength: 256,
+            polarized: false,
+            ..SimulationConfig::default()
+        };
+        for sza in [97.0, 100.0] {
+            let (r_clear, se_c) = mc_mean_se(&clear, &config, sza, None, 8);
+            let (r_deck, se_d) = mc_mean_se(&cloudy, &config, sza, None, 8);
+            eprintln!(
+                "G-FORCED-OFF SZA {sza}: clear {r_clear:.4e} (se {se_c:.2e}) \
+                 deck {r_deck:.4e} (se {se_d:.2e}) deck/clear {:.4}",
+                r_deck / r_clear
+            );
+            assert!(
+                r_deck.is_finite() && r_deck > 0.0,
+                "G-FORCED-OFF SZA {sza}: deck radiance must be finite and positive, got {r_deck:.4e}"
+            );
+            // Below clear sky, with a 3-sigma statistical allowance.
+            let se = (se_c * se_c + se_d * se_d).sqrt();
+            assert!(
+                r_deck < r_clear + 3.0 * se,
+                "G-FORCED-OFF SZA {sza}: OD-2 deck must dim the sky: \
+                 deck {r_deck:.4e} vs clear {r_clear:.4e} (3 se = {:.2e})",
+                3.0 * se
+            );
+        }
     }
 
     // ── Phase-function orientation (regression for the supplement-angle bug) ──
