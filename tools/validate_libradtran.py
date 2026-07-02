@@ -644,6 +644,479 @@ def compare_g2(lrt):
     return True
 
 
+# ---------------------------------------------------------------------------
+# G3-CLOUD-TWILIGHT: the uniform 1-2 km deck at TWILIGHT geometry vs
+# spherical BACKWARD MYSTIC (external referee for the "clouds at twilight
+# geometry" confidence row). Same delta-scaled same-problem construction
+# as G2 (wc_properties hu + wc_modify tau/ssa/gg set == twilight's
+# internally delta-Eddington-scaled gray cloud channel), but the referee
+# is MYSTIC with mc_spherical 1D + mc_backward + mc_vroom + mc_std, the
+# only public referee that is valid past SZA ~95. Zenith view, absolute
+# comparison on the shared TSIS-1 10 nm solar table, no refraction on
+# either side, twilight's 150 km atmosphere vs afglus's 120 km top (the
+# residual geometry difference is < the stat bands through SZA 101).
+#
+# Expected per docs/RESULTS.md: the hybrid estimator is one-sided LOW
+# under the deck at SZA >= 97 (analog-under-cloud starvation, 0.37-0.45x
+# class, converges from below). That is REPORTED as the documented
+# limitation, not gated. Multiple (independent analog estimator) is
+# gated everywhere its own variance allows.
+# ---------------------------------------------------------------------------
+G3_SZAS = [95.0, 97.0, 99.0, 101.0]
+G3_TAU_BOTH = [1.0, 3.0]            # both estimators, all G3_SZAS
+G3_TAU_MULT_ONLY = [10.0]           # multiple-only (hybrid limitation documented)
+G3_TAU10_SZAS = [95.0, 97.0]        # tau*=10 runtime cap: keep 95-97 coverage
+G3_WLS = [450.0, 550.0, 650.0]
+G3_SEEDS = list(range(1, 7))
+G3_HYB_PHOTONS = int(os.environ.get("G3_HYB_PHOTONS", "16000"))
+# multiple: per-SZA-group photon tiers (deep SZA needs far more analog rays)
+G3_MUL_PHOTONS = {95.0: 500_000, 97.0: 500_000,
+                  99.0: 2_000_000, 101.0: 2_000_000}
+# MYSTIC backward: 1e7 where it resolves in seconds-minutes, 1e8 deep
+G3_MYSTIC_PHOTONS = {95.0: 10_000_000, 97.0: 10_000_000,
+                     99.0: 100_000_000, 101.0: 100_000_000}
+G3_MYSTIC_WORKERS = int(os.environ.get("G3_MYSTIC_WORKERS", "5"))
+G3_SYS_FLOOR = 0.05  # systematic band floor: solar-table interpolation,
+                     # afglus 120 km top vs twilight 150 km, scalar (--fast)
+G3_SMOKE = os.environ.get("G3_SMOKE") == "1"
+if G3_SMOKE:
+    G3_SZAS = [95.0, 97.0]
+    G3_TAU_BOTH = [1.0]
+    G3_TAU_MULT_ONLY = []
+    G3_WLS = [550.0]
+    G3_SEEDS = [1, 2]
+    G3_HYB_PHOTONS = 1000
+    G3_MUL_PHOTONS = {95.0: 50_000, 97.0: 50_000}
+    G3_MYSTIC_PHOTONS = {95.0: 1_000_000, 97.0: 1_000_000}
+
+
+def g3_mystic_deck(lrt: Path, solar: Path, wc: Path, tau_star: float,
+                   sza: float, wl: float, photons: int) -> str:
+    data = lrt / "data"
+    return f"""data_files_path {data}/
+atmosphere_file {data}/atmmod/afglus.dat
+source solar {solar} per_nm
+albedo {ALBEDO}
+wavelength {wl:.1f} {wl:.1f}
+mol_abs_param crs
+no_absorption mol
+wc_file 1D {wc}
+wc_properties hu
+wc_modify tau set {tau_star:.6f}
+wc_modify ssa set {G2_SSA_STAR:.6f}
+wc_modify gg set {G2_G_STAR:.6f}
+rte_solver montecarlo
+mc_spherical 1D
+mc_photons {photons}
+mc_backward
+mc_vroom on
+mc_std
+sza {sza:.2f}
+phi0 0.0
+umu -1.000000
+phi 0.0
+zout 0.0
+output_user lambda uu
+quiet
+"""
+
+
+def g3_run_mystic_case(lrt: Path, solar: Path, wc: Path, tau_star: float,
+                       sza: float, wl: float):
+    """One spherical-backward MYSTIC run in its own work dir (uvspec drops
+    mc.rad.spc/randomseed in cwd; per-case dirs make the pool safe).
+    Returns (rad_W, se_W, photons)."""
+    photons = G3_MYSTIC_PHOTONS[sza]
+    tag = f"g3_mystic_tau{tau_star:g}_sza{sza:g}_wl{wl:g}"
+    workdir = OUT_DIR / "g3" / tag
+    workdir.mkdir(parents=True, exist_ok=True)
+    deck = g3_mystic_deck(lrt, solar, wc, tau_star, sza, wl, photons)
+    inp = workdir / "case.inp"
+    done = workdir / "case.done"  # written only after a completed run:
+    # cache validity is tied to completion, not to deck presence (a killed
+    # run leaves case.inp but no marker).
+    cached = (done.exists() and done.read_text() == deck
+              and (workdir / "mc.rad.spc").exists())
+    if not cached:
+        done.unlink(missing_ok=True)
+        inp.write_text(deck)
+        with open(inp) as fi, open(workdir / "case.out", "w") as fo:
+            r = subprocess.run([str(lrt / "bin" / "uvspec")], stdin=fi,
+                               stdout=fo, stderr=subprocess.PIPE, text=True,
+                               cwd=workdir)
+        if r.returncode != 0:
+            # Degrade gracefully (NO-REF row) so a killed/failed deep run
+            # cannot take the whole campaign down with it.
+            print(f"  MYSTIC {tag}: FAILED/KILLED (rc={r.returncode}) - "
+                  f"dropped\n{r.stderr[:500]}", flush=True)
+            return None, None, photons
+        done.write_text(deck)
+
+    def read_spc(name):
+        p = workdir / name
+        if not p.exists():
+            return None
+        parts = p.read_text().split()
+        return float(parts[4]) * 1e-3 if len(parts) >= 5 else None  # mW -> W
+
+    rad = read_spc("mc.rad.spc")
+    se = read_spc("mc.rad.std.spc")
+    print(f"  MYSTIC {tag}: rad={rad if rad is not None else float('nan'):.4e} "
+          f"se={se if se is not None else float('nan'):.1e} "
+          f"({photons:.0e} photons)", flush=True)
+    return rad, se, photons
+
+
+def g3_run_twilight(tau_star: float, mode: str, seed: int,
+                    szas: list[float], photons: int) -> dict:
+    """One twilight compare run, zenith only. {(sza, wl): W/m^2/sr/nm}."""
+    cmd = [
+        str(TWILIGHT_CLI), "compare",
+        "--sza", ",".join(f"{s:g}" for s in szas),
+        "--view-zenith", "0", "--rel-azimuth", "0",
+        "--rayleigh-only", "--fast", "--no-refraction",
+        "--scattering", mode,
+        "--photons", str(photons),
+        "--seed-salt", str(seed),
+        "--cloud-tau", f"{tau_star / G2_DE_SCALE:.6f}",
+        "--cloud-base-km", f"{G2_CLOUD_BASE_KM:g}",
+        "--cloud-top-km", f"{G2_CLOUD_TOP_KM:g}",
+        "--cloud-ssa", f"{G2_CLOUD_SSA:g}",
+        "--cloud-g", f"{G2_CLOUD_G:g}",
+    ]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit(f"twilight-cli compare failed ({mode}, tau*={tau_star}, "
+                 f"seed {seed}):\n{r.stderr[:2000]}")
+    table = {}
+    for row in csv.reader(io.StringIO(r.stdout)):
+        if not row or row[0].startswith("#") or row[0] == "sza_deg":
+            continue
+        sza, vz, ra, wl, rad = (float(x) for x in row)
+        if wl in G3_WLS:
+            table[(sza, wl)] = rad
+    return table
+
+
+def compare_g3_cloud_twilight(lrt):
+    """G3 campaign: twilight chain estimators vs spherical backward MYSTIC
+    on the delta-scaled uniform deck at SZA 95-101, zenith view."""
+    if lrt is None:
+        sys.exit("g3-cloud-twilight needs libRadtran (set LIBRADTRAN_DIR)")
+    if not TWILIGHT_CLI.exists():
+        sys.exit("Build first: cargo build --release -p twilight-cli")
+    from concurrent.futures import ThreadPoolExecutor
+
+    solar = g2_solar_file()
+    wc = g2_wc_file()
+    mult_taus = G3_TAU_BOTH + G3_TAU_MULT_ONLY
+
+    def szas_for(tau_star):
+        return G3_TAU10_SZAS if tau_star in G3_TAU_MULT_ONLY else G3_SZAS
+
+    print("=== G3: clouds at twilight geometry (spherical backward MYSTIC) ===")
+    print(f"  scaled constants: de_scale={G2_DE_SCALE:.7f} "
+          f"ssa*={G2_SSA_STAR:.7f} g*={G2_G_STAR:.7f}")
+    for ts in mult_taus:
+        print(f"  tau*={ts:g}: twilight --cloud-tau {ts / G2_DE_SCALE:.6f}; "
+              f"uvspec wc_modify tau set {ts:.6f}; SZAs {szas_for(ts)}")
+
+    # ---- MYSTIC referee pool (started first; runs while twilight runs) ----
+    mystic_cases = [(ts, sza, wl) for ts in mult_taus
+                    for sza in szas_for(ts) for wl in G3_WLS]
+    mystic_pool = ThreadPoolExecutor(max_workers=G3_MYSTIC_WORKERS)
+    mystic_futs = {c: mystic_pool.submit(g3_run_mystic_case, lrt, solar, wc, *c)
+                   for c in mystic_cases}
+
+    # ---- twilight hybrid: one grid run per seed, seeds in parallel --------
+    tw: dict = {}  # (tau, mode) -> {(sza, wl): (mean, se)}
+    for ts in G3_TAU_BOTH:
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            tables = list(ex.map(
+                lambda s: g3_run_twilight(ts, "hybrid", s, G3_SZAS,
+                                          G3_HYB_PHOTONS), G3_SEEDS))
+        tw[(ts, "hybrid")] = {k: g2_mean_se([t[k] for t in tables])
+                              for k in tables[0]}
+        print(f"  twilight hybrid   tau*={ts:g}: {len(G3_SEEDS)} seeds x "
+              f"{G3_HYB_PHOTONS} photons done", flush=True)
+
+    # ---- twilight multiple: photon tiers by SZA group ---------------------
+    for ts in mult_taus:
+        merged: dict = {}
+        groups: dict[int, list[float]] = {}
+        for sza in szas_for(ts):
+            groups.setdefault(G3_MUL_PHOTONS[sza], []).append(sza)
+        for photons, szas in sorted(groups.items()):
+            with ThreadPoolExecutor(max_workers=3) as ex:
+                tables = list(ex.map(
+                    lambda s: g3_run_twilight(ts, "multiple", s, szas,
+                                              photons), G3_SEEDS))
+            for k in tables[0]:
+                merged[k] = g2_mean_se([t[k] for t in tables])
+        tw[(ts, "multiple")] = merged
+        print(f"  twilight multiple tau*={ts:g}: {len(G3_SEEDS)} seeds done",
+              flush=True)
+
+    # ---- collect MYSTIC ----------------------------------------------------
+    mystic = {c: f.result() for c, f in mystic_futs.items()}
+    mystic_pool.shutdown()
+
+    # ---- gate + table -------------------------------------------------------
+    # Band per point: 3 x combined SE + a flat systematic floor. Verdicts:
+    #   multiple: PASS/FAIL, except LOW-POWER when the band exceeds half the
+    #             referee value (the comparison has no statistical power).
+    #   hybrid:   gated at SZA 95 only; SZA >= 97 under the deck is the
+    #             documented one-sided-low limitation -> KNOWN-LIM (reported,
+    #             not counted). tau* 10 not run for hybrid at all.
+    out_csv = OUT_DIR / "g3_cloud_twilight_results.csv"
+    n_pass = n_fail = n_lowpow = n_knownlim = 0
+    with open(out_csv, "w") as f:
+        w = csv.writer(f)
+        w.writerow(["tau_star", "sza", "wl",
+                    "tw_hybrid", "tw_hybrid_se", "tw_multiple",
+                    "tw_multiple_se", "mystic", "mystic_se",
+                    "mystic_photons", "hyb_over_mystic", "mul_over_mystic",
+                    "band_mul", "verdict_hybrid", "verdict_multiple"])
+        for ts in mult_taus:
+            for sza in szas_for(ts):
+                for wl in G3_WLS:
+                    my, myse, nph = mystic[(ts, sza, wl)]
+                    hyb = tw.get((ts, "hybrid"), {}).get((sza, wl))
+                    mul = tw[(ts, "multiple")][(sza, wl)]
+                    if my is None or my <= 0:
+                        w.writerow([ts, sza, wl,
+                                    f"{hyb[0]:.4e}" if hyb else "",
+                                    f"{hyb[1]:.2e}" if hyb else "",
+                                    f"{mul[0]:.4e}", f"{mul[1]:.2e}",
+                                    "0", "", f"{nph:.0e}", "", "", "",
+                                    "NO-REF", "NO-REF"])
+                        continue
+                    myse = myse or 0.0
+
+                    def verdict(mean, se, gated, known_lim):
+                        band = 3.0 * math.sqrt(se * se + myse * myse) \
+                            + G3_SYS_FLOOR * my
+                        if known_lim:
+                            return "KNOWN-LIM", band
+                        if band > 0.5 * my:
+                            return "LOW-POWER", band
+                        if not gated:
+                            return "INFO", band
+                        return ("PASS" if abs(mean - my) <= band else "FAIL",
+                                band)
+
+                    v_h = band_h = None
+                    if hyb is not None:
+                        v_h, band_h = verdict(hyb[0], hyb[1], gated=(sza < 97),
+                                              known_lim=(sza >= 97))
+                        if v_h == "KNOWN-LIM":
+                            n_knownlim += 1
+                        elif v_h == "PASS":
+                            n_pass += 1
+                        elif v_h == "FAIL":
+                            n_fail += 1
+                        elif v_h == "LOW-POWER":
+                            n_lowpow += 1
+                    v_m, band_m = verdict(mul[0], mul[1], gated=True,
+                                          known_lim=False)
+                    if v_m == "PASS":
+                        n_pass += 1
+                    elif v_m == "FAIL":
+                        n_fail += 1
+                    else:
+                        n_lowpow += 1
+                    w.writerow([ts, sza, wl,
+                                f"{hyb[0]:.4e}" if hyb else "",
+                                f"{hyb[1]:.2e}" if hyb else "",
+                                f"{mul[0]:.4e}", f"{mul[1]:.2e}",
+                                f"{my:.4e}", f"{myse:.2e}", f"{nph:.0e}",
+                                f"{hyb[0] / my:.4f}" if hyb else "",
+                                f"{mul[0] / my:.4f}",
+                                f"{band_m / my:.4f}",
+                                v_h or "", v_m])
+                    hyb_s = (f"hyb {hyb[0] / my:5.2f}x [{v_h}]"
+                             if hyb else "hyb   -  ")
+                    print(f"  tau*={ts:4g} SZA {sza:5.1f} wl {wl:3.0f}: "
+                          f"{hyb_s}  mul {mul[0] / my:5.2f}x [{v_m}]  "
+                          f"my={my:.3e}+-{myse:.1e}", flush=True)
+
+    print(f"\n  gate: {n_pass} pass / {n_fail} fail / {n_lowpow} low-power "
+          f"/ {n_knownlim} known-lim (hybrid SZA>=97, documented "
+          f"analog-under-cloud starvation)")
+    print(f"  full table: {out_csv}")
+    return n_fail == 0
+
+
+# ---------------------------------------------------------------------------
+# G3-CUBE (transport plan G2b): synthetic 3D cube at daytime SZA vs MYSTIC 3D.
+#
+# STATUS: decks-prepared. The campaign cannot execute against the public
+# libRadtran and the current twilight CLI, for two independent reasons that
+# this tier documents and reproduces:
+#
+#   1. Referee gap: the public libRadtran 2.0.6 ships MYSTIC with
+#      HAVE_MYSTIC3D compiled out. A 3D wc_file parses and loads, but the
+#      first photon touching a 3D layer aborts with "Error! you are not
+#      allowed to use mystic 3D!" (libsrc_c/mystic.c, travel_tau guard),
+#      and `mc_sample_grid` is not even tokenized in src/uvspec_lex.l.
+#      Full 3D MYSTIC is distributed by LMU on collaboration terms only.
+#   2. twilight CLI gap: `compare` (the radiance surface all referee tiers
+#      drive) does not accept --cloud-field; only `pray` does, and pray
+#      emits prayer times, not radiances. External refereeing of the voxel
+#      transport path needs compare --cloud-field (or an equivalent
+#      radiance-grid surface).
+#
+# What IS delivered, ready to run the moment a full-MYSTIC build (or SHDOM/
+# I3RC) plus the compare surface exist:
+#   - a 16x16x1 km^3-cell domain (plane-parallel periodic in MYSTIC; the
+#     4x4 km cloudy block is 6 km from its periodic images, so daytime
+#     shadows at SZA <= 60 cannot wrap) with per-cell EXPLICIT delta-scaled
+#     gray optics (wc3D flag 1: ext g ssa - the same-problem construction,
+#     no microphysics parameterization in the loop),
+#   - the byte-identical twilight Cloud3DField sidecar for the same cube
+#     (via tools/cloud3d_common.write_field), using the ice preset of
+#     crates/twilight-data cloud_field_builder.rs (ssa 0.97, g 0.77,
+#     r_eff 30 um, rho_ice 0.917e6 g/m^3) inverted so the field carries
+#     scaled extinction tau*/km identical to the referee cells,
+#   - decks for SZA {30, 60} x view {zenith, 60 deg slant} x pixel
+#     {cloud-center, clear} x 550 nm, backward MYSTIC.
+# ---------------------------------------------------------------------------
+G3C_SSA_ICE = 0.97          # crates/twilight-data cloud_field_builder.rs
+G3C_G_ICE = 0.77
+G3C_RHO_ICE = 0.917e6       # g/m^3
+G3C_R_EFF = 30e-6           # m
+G3C_F = G3C_G_ICE * G3C_G_ICE
+G3C_DE = 1.0 - G3C_SSA_ICE * G3C_F
+G3C_SSA_STAR = (1.0 - G3C_F) * G3C_SSA_ICE / G3C_DE
+G3C_G_STAR = G3C_G_ICE / (1.0 + G3C_G_ICE)
+G3C_TAU_STAR = 3.0          # scaled extinction OD across the 1 km cube depth
+G3C_N = 16                  # 16 x 16 cells, 1 km each
+G3C_BLOCK = (7, 10)         # 1-based inclusive ix/iy range of the cloudy block
+G3C_BASE_KM, G3C_TOP_KM = 1.0, 2.0
+G3C_SZAS = [30.0, 60.0]
+G3C_VIEWS = [(0.0, "vz0"), (60.0, "vz60")]
+G3C_PIXELS = [((G3C_N // 2, G3C_N // 2), "cloud"), ((2, 2), "clear")]
+G3C_WL = 550.0
+G3C_PHOTONS = 4_000_000
+
+
+def g3cube_emit(lrt):
+    """Emit the ready-to-run G2b cube artifacts and demonstrate the blockers."""
+    out = OUT_DIR / "g3cube"
+    out.mkdir(parents=True, exist_ok=True)
+    solar = g2_solar_file()
+
+    # --- referee cube: per-cell explicit scaled optics (flag 1) -----------
+    lo, hi = G3C_BLOCK
+    lines = [f"{G3C_N} {G3C_N} 1 1",
+             f"1.0 1.0 {G3C_BASE_KM:g} {G3C_TOP_KM:g}"]
+    for iy in range(lo, hi + 1):
+        for ix in range(lo, hi + 1):
+            lines.append(f"{ix} {iy} 1 {G3C_TAU_STAR:.6f} "
+                         f"{G3C_G_STAR:.7f} {G3C_SSA_STAR:.7f}")
+    wc3d = out / "wc3d_cube.dat"
+    wc3d.write_text("\n".join(lines) + "\n")
+
+    data = (lrt / "data") if lrt else Path("<LIBRADTRAN_DIR>/data")
+    n_decks = 0
+    for sza in G3C_SZAS:
+        for vz, vtag in G3C_VIEWS:
+            for (px, py), ptag in G3C_PIXELS:
+                deck = f"""# G2b cube referee deck - REQUIRES full MYSTIC (HAVE_MYSTIC3D):
+# the public libRadtran 2.0.6 rejects mc_sample_grid at parse time and
+# aborts 3D transport with "you are not allowed to use mystic 3D!".
+data_files_path {data}/
+atmosphere_file {data}/atmmod/afglus.dat
+source solar {solar} per_nm
+albedo {ALBEDO}
+wavelength {G3C_WL:.1f} {G3C_WL:.1f}
+mol_abs_param crs
+no_absorption mol
+wc_file 3D {wc3d}
+rte_solver montecarlo
+mc_photons {G3C_PHOTONS}
+mc_backward {px} {py} {px} {py}
+mc_sample_grid {G3C_N} {G3C_N} 1 1
+mc_vroom on
+mc_std
+sza {sza:.2f}
+phi0 0.0
+umu {-math.cos(math.radians(vz)):.6f}
+phi 0.0
+zout 0.0
+output_user lambda uu
+quiet
+"""
+                (out / f"g3cube_sza{sza:g}_{vtag}_{ptag}.inp").write_text(deck)
+                n_decks += 1
+
+    # --- twilight sidecar: the SAME cube as a Cloud3DField ----------------
+    # field_from_iwc_grid: beta = 3 IWC / (2 rho r_eff); the gray channel
+    # carries beta * de_scale (* ssa* split). Invert for IWC such that the
+    # cell's scaled extinction equals G3C_TAU_STAR per km.
+    beta_per_iwc_km = 3.0 / (2.0 * G3C_RHO_ICE * G3C_R_EFF) * 1e3  # km^-1 per g/m^3
+    iwc_cloud = G3C_TAU_STAR / G3C_DE / beta_per_iwc_km            # g/m^3
+    sys.path.insert(0, str(REPO / "tools"))
+    import numpy as np
+    from cloud3d_common import write_field
+    nz_src, top_m = 4, 4000.0   # slab boundaries 4/3/2/1/0 km: index 2 = 1-2 km
+    iwc = np.zeros((nz_src, G3C_N, G3C_N), dtype=np.float32)
+    iwc[2, lo - 1:hi, lo - 1:hi] = iwc_cloud   # y-symmetric block: N-S flip safe
+    heights = np.linspace(top_m, 0.0, nz_src)  # only [0] (top_m) enters the header
+    dlat = 1.0 / 111.32
+    lat0 = -(G3C_N / 2) * dlat                 # south edge; domain centered on (0,0)
+    write_field(out / "cube_field.bin", iwc, heights, lat0, lat0, dlat, dlat,
+                "2026-07-02T12:00:00Z", "g3-cube synthetic (validate_libradtran)")
+
+    print("=== G3-CUBE (G2b): synthetic 3D cube - decks prepared ===")
+    print(f"  cube: {hi - lo + 1}x{hi - lo + 1} km block, {G3C_BASE_KM:g}-"
+          f"{G3C_TOP_KM:g} km, per-cell ext*={G3C_TAU_STAR:g}/km "
+          f"g*={G3C_G_STAR:.7f} ssa*={G3C_SSA_STAR:.7f} "
+          f"(ice preset de_scale={G3C_DE:.6f})")
+    print(f"  sidecar IWC for the same scaled optics: {iwc_cloud:.6f} g/m^3")
+    print(f"  {n_decks} decks + {wc3d.name} + cube_field.bin(.json) in {out}/")
+
+    # --- demonstrate blocker 1 empirically ---------------------------------
+    # Two distinct public-build failures, both probed:
+    #   (a) the full 16x16 deck: mc_sample_grid is rejected at parse time,
+    #       and without it the 3D backward setup crashes (SIGBUS) before
+    #       transport - the 3D sampling machinery is simply not there;
+    #   (b) a minimal 2x2 single-pixel deck survives setup and hits the
+    #       explicit guard "you are not allowed to use mystic 3D!"
+    #       (HAVE_MYSTIC3D compiled out).
+    if lrt is not None:
+        wc_min = out / "_probe_wc3d_2x2.dat"
+        wc_min.write_text("2 2 1 1\n1.0 1.0 1.0 2.0\n"
+                          f"1 1 1 {G3C_TAU_STAR:.6f} "
+                          f"{G3C_G_STAR:.7f} {G3C_SSA_STAR:.7f}\n")
+        probe = out / "_probe_minimal3d.inp"
+        base = (out / "g3cube_sza30_vz0_cloud.inp").read_text().splitlines()
+        keep = []
+        for l in base:
+            if l.startswith("mc_sample_grid"):
+                continue
+            if l.startswith("wc_file 3D"):
+                l = f"wc_file 3D {wc_min}"
+            if l.startswith("mc_backward "):
+                l = "mc_backward 1 1 1 1"
+            if l.startswith("mc_photons"):
+                l = "mc_photons 1000"
+            keep.append(l)
+        probe.write_text("\n".join(keep) + "\n")
+        with open(probe) as fi:
+            r = subprocess.run([str(lrt / "bin" / "uvspec")], stdin=fi,
+                               capture_output=True, text=True, cwd=out)
+        blocked = "not allowed to use mystic 3D" in (r.stderr or "")
+        print(f"  public-referee probe (minimal 3D deck): rc={r.returncode} "
+              f"{'-> confirmed: HAVE_MYSTIC3D compiled out' if blocked else '(unexpected: inspect stderr)'}")
+        if not blocked:
+            print(r.stderr[:800])
+    print("  twilight CLI gap: `compare` has no --cloud-field (only `pray`); "
+          "voxel-path radiances are not externally refereeable until that "
+          "surface exists.")
+    return True
+
+
 def _report(rows, n_pass, n_fail, tol):
     worst = sorted(rows, key=lambda r: -r[6])[:10]
     print(f"  {n_pass} pass / {n_fail} fail (tol {tol:.0%})")
@@ -663,7 +1136,8 @@ def _report(rows, n_pass, n_fail, tol):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--tier", choices=["1a", "1b", "1b-deep", "2", "3", "g2"],
+    ap.add_argument("--tier", choices=["1a", "1b", "1b-deep", "2", "3", "g2",
+                                       "g3-cloud-twilight", "g3-cube"],
                     default=None)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--decks-only", action="store_true",
@@ -704,6 +1178,10 @@ def main():
                                         tw_photons=TW_DEEP_PHOTONS)
         elif tier == "g2":
             ok &= compare_g2(lrt)
+        elif tier == "g3-cloud-twilight":
+            ok &= compare_g3_cloud_twilight(lrt)
+        elif tier == "g3-cube":
+            ok &= g3cube_emit(lrt)
         elif tier in ("2", "3"):
             print(f"Tier {tier}: deck templates not yet automated - "
                   "see module docstring for the design.")
