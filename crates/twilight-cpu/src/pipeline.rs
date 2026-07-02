@@ -1096,7 +1096,11 @@ fn khayt_pass(
             })
             .collect()
     };
-    let fan_for = |sun_az: Option<f64>| -> (Vec<Vec<(f64, f64)>>, Vec<Vec<(f64, f64)>>, Vec<f64>, Vec<f64>) {
+    // One side's dawn-band fan: (band patch curves, reference patch
+    // curves, band patch view zeniths, reference patch view zeniths),
+    // each curve a per-SZA (mesopic, red) luminance series.
+    type FanCurves = (Vec<Vec<(f64, f64)>>, Vec<Vec<(f64, f64)>>, Vec<f64>, Vec<f64>);
+    let fan_for = |sun_az: Option<f64>| -> FanCurves {
         let band_z: Vec<f64> = params
             .band_offsets_deg
             .iter()
