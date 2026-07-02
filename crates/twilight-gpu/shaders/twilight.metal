@@ -323,10 +323,18 @@ inline float field_min_step(device const float* fld) {
     return min(dz, dxy) * 0.25f;
 }
 
-// Macrocell majorant (max sigma) for the tile containing p, or a negative
-// sentinel when p is outside the footprint / no majorant table is present.
-// A return of exactly 0 PROVES the whole tile is empty, so a DDA may skip it
-// in one coarse step without changing the (zero) tau contribution.
+// Macrocell majorant (max sigma) for the tile containing p. Returns 0.0 for
+// a provably EMPTY tile (crossable in one coarse step, tau += 0), a positive
+// value for an OCCUPIED tile (step finely), and -1.0 when p is outside the
+// footprint / z range (sigma is then altitude-only, so a footprint-capped
+// coarse segment has constant sigma). Mirrors the CPU macro_majorant_at.
+// Only ever evaluated at SEGMENT MIDPOINTS by field_next_segment: landing
+// points sit exactly on boundaries where fp parity picks an arbitrary side.
+// The no-majorant-table case is handled by the CALLER (has_macro flag read
+// once per traversal), so -1.0 here unambiguously means outside-footprint;
+// a majorant-less in-footprint field integrates FINELY, never radial-only
+// (the old traversal conflated MACRO_PRESENT == 0 with outside-footprint
+// and integrated the whole field radial-only).
 inline float field_macro_majorant_at(device const float* fld, float3 p) {
     if (field_uint(fld, FIELD_MACRO_PRESENT) == 0u) return -1.0f;
     FieldCoords c = field_sphere_coords(p);
@@ -341,24 +349,33 @@ inline float field_macro_majorant_at(device const float* fld, float3 p) {
     return fld[off + (iz * ntlat + itlat) * ntlon + itlon];
 }
 
-// Distance to the next RADIAL (z-level) boundary only. Outside the footprint
-// the field's sigma depends only on altitude (the background column), so the
-// midpoint quadrature is tau-exact over a whole radial-shell segment and the
-// horizontal (lat/lon) crossings can be skipped. Tau- and collision-exact
-// there (sigma constant within the segment), matching the CPU's accumulated
-// result while avoiding thousands of useless fine steps through clear air.
-inline float field_distance_to_next_radial_boundary(device const float* fld, float3 p, float3 dir) {
-    FieldCoords c = field_sphere_coords(p);
-    float r = c.r;
+// Distance along dir from p to the nearest crossing of one of the SIX
+// bounding surfaces of the voxel grid: the lat0 and lat0 + nlat*dlat cones,
+// the lon0 and lon0 + nlon*dlon meridian planes, and the spheres at z0 and
+// z_top. Caps every coarse step (empty-tile skip and out-of-footprint
+// segment) so no coarse segment straddles the footprint edge or the
+// z0/z_top handover. Port of the CPU distance_to_footprint_boundary: all
+// six surfaces are fixed (absolute indices), so no floor-window is needed;
+// the ~0 root of a just-landed-on surface is rejected by the same t > 1e-6
+// guard as the lattice functions. The meridian planes are full great-circle
+// planes (both halves): an antipodal-half crossing just splits a segment in
+// two, which is always safe.
+inline float field_distance_to_footprint_boundary(device const float* fld, float3 p, float3 dir) {
     float best = FLT_MAX;
     float z0 = fld[FIELD_Z0_M];
-    float dz = fld[FIELD_DZ_M];
-    float z = r - EARTH_RADIUS_M;
-    float iz = floor((z - z0) / dz);
-    float ks_r[4] = { iz - 1.0f, iz, iz + 1.0f, iz + 2.0f };
+    float lat0 = fld[FIELD_LAT0_DEG];
+    float lon0 = fld[FIELD_LON0_DEG];
+    float nlat = float(field_uint(fld, FIELD_NLAT));
+    float nlon = float(field_uint(fld, FIELD_NLON));
+    float dlat = fld[FIELD_DLAT_DEG];
+    float dlon = fld[FIELD_DLON_DEG];
+
+    // Spheres at z0 and z_top.
+    float r = length(p);
     float b_r = dot(p, dir);
-    for (uint i = 0; i < 4; i++) {
-        float rk = EARTH_RADIUS_M + z0 + ks_r[i] * dz;
+    float zs[2] = { z0, field_z_top_m(fld) };
+    for (uint i = 0; i < 2; i++) {
+        float rk = EARTH_RADIUS_M + zs[i];
         float cc = r * r - rk * rk;
         float disc = b_r * b_r - cc;
         if (disc >= 0.0f) {
@@ -367,6 +384,45 @@ inline float field_distance_to_next_radial_boundary(device const float* fld, flo
             float t1 = -b_r + s;
             if (t0 > 1e-6f && t0 < best) best = t0;
             if (t1 > 1e-6f && t1 < best) best = t1;
+        }
+    }
+    // Latitude cones at lat0 and lat0 + nlat*dlat.
+    float lats[2] = { lat0, lat0 + nlat * dlat };
+    for (uint i = 0; i < 2; i++) {
+        float phi = lats[i] * DEG_TO_RAD;
+        float tp = tan(phi);
+        float a = dir.z * dir.z - tp * tp * (dir.x * dir.x + dir.y * dir.y);
+        float bq = p.z * dir.z - tp * tp * (p.x * dir.x + p.y * dir.y);
+        float cc = p.z * p.z - tp * tp * (p.x * p.x + p.y * p.y);
+        if (fabs(a) > 1e-30f) {
+            float disc = bq * bq - a * cc;
+            if (disc >= 0.0f) {
+                float s = sqrt(disc);
+                float roots[2] = { (-bq - s) / a, (-bq + s) / a };
+                for (uint j = 0; j < 2; j++) {
+                    float t = roots[j];
+                    if (t > 1e-6f && t < best) {
+                        // Reject the mirror cone (opposite hemisphere).
+                        float zc = p.z + t * dir.z;
+                        if (zc * phi >= -1e-9f) best = t;
+                    }
+                }
+            }
+        } else if (fabs(bq) > 1e-30f) {
+            float t = -cc / (2.0f * bq);
+            if (t > 1e-6f && t < best) best = t;
+        }
+    }
+    // Meridian planes at lon0 and lon0 + nlon*dlon.
+    float lons[2] = { lon0, lon0 + nlon * dlon };
+    for (uint i = 0; i < 2; i++) {
+        float lam = lons[i] * DEG_TO_RAD;
+        float sl = sin(lam);
+        float cl = cos(lam);
+        float denom = dir.x * sl - dir.y * cl;
+        if (fabs(denom) > 1e-30f) {
+            float t = -(p.x * sl - p.y * cl) / denom;
+            if (t > 1e-6f && t < best) best = t;
         }
     }
     return best;
@@ -532,73 +588,121 @@ inline float field_distance_to_next_boundary(device const float* fld, float3 p, 
     return best;
 }
 
-// Exact cloud optical depth along p0 + t*dir, t in [0, t_max] (tau_along).
+// One traversal segment starting at parameter t: writes the constant sigma
+// over [t, t_next] to sigma_out and returns t_next. Port of the CPU
+// next_segment (the full algorithm derivation lives on that function in
+// cloud_field.rs); both field_tau_along and field_advance_to_tau walk
+// through THIS one function, so the collision inversion inverts exactly the
+// integral it was normalized with.
 //
-// Empty-tile skip: when the macrocell majorant of the current tile is exactly
-// 0, the whole tile is provably clear, so we advance to the next COARSE tile
-// boundary in one step adding 0 tau. This is tau-exact (an empty region
-// contributes 0 regardless of step granularity) and is where the GPU speed
-// win over cell-by-cell stepping comes from. Non-empty tiles fall back to the
-// exact fine-cell DDA, matching the CPU bit-for-budget.
+// 1. FINE CANDIDATE between adjacent boundaries of the full lattice (which
+//    contains every footprint surface): lies in ONE voxel, ONE macro-tile,
+//    ONE z level, on ONE side of the footprint edge; needs no extra cap.
+// 2. Without majorant data, integrate the fine segment (sigma at its
+//    midpoint).
+// 3. MIDPOINT CLASSIFICATION: the majorant is evaluated at the segment
+//    MIDPOINT, never at a landing point (endpoints sit exactly on
+//    boundaries, where fp rounding parity can index the just-left tile;
+//    classifying there made the empty-tile skip re-fire from an
+//    empty-to-occupied boundary and drop the whole occupied chord: 59.4
+//    percent of tau on a boundary-aligned checkerboard ray).
+// 4. maj_f > 0 (occupied tile): integrate the fine segment.
+// 5. maj_f <= 0: COARSE EXTENSION to the next tile boundary, CAPPED by the
+//    footprint surfaces so no coarse segment straddles the inside/outside
+//    or z-range handover (an uncapped radial step misintegrated grazing
+//    chords across the footprint edge; an uncapped tile skip overshot the
+//    edge when nlat/nlon is not a multiple of tile). Classify the coarse
+//    segment at ITS midpoint:
+//    - maj_f == 0 && maj_c == 0: provably empty tile, skip it (sigma 0).
+//    - maj_f < 0 && maj_c < 0: outside the footprint / z range, sigma is
+//      altitude-only and constant over the capped segment: sample at the
+//      coarse midpoint.
+//    - Any disagreement (min_step flooring near tangencies / fp-degenerate
+//      landings): fall back to the fine segment with ITS midpoint, always
+//      valid.
+// min_step flooring bounds the quadrature error by sigma_max * min_step per
+// tangency event and can never skip a full cell (see the CPU doc).
+inline float field_next_segment(device const float* fld, float3 p0, float3 dir,
+                                float t, float t_max, float min_step,
+                                bool has_macro, thread float &sigma_out) {
+    float3 p = p0 + dir * t;
+    float d_fine = max(field_distance_to_next_boundary(fld, p, dir), min_step);
+    float t_fine = min(t + d_fine, t_max);
+    float3 mid_fine = p0 + dir * ((t + t_fine) * 0.5f);
+    if (!has_macro) {
+        sigma_out = field_sigma_at(fld, mid_fine);
+        return t_fine;
+    }
+    float maj_f = field_macro_majorant_at(fld, mid_fine);
+    if (maj_f > 0.0f) {
+        // Occupied tile: integrate finely within it.
+        sigma_out = field_sigma_at(fld, mid_fine);
+        return t_fine;
+    }
+    // Empty tile or outside the footprint: try the coarse extension, capped
+    // by the footprint surfaces.
+    float d_fp = field_distance_to_footprint_boundary(fld, p, dir);
+    float d_coarse = max(min(field_distance_to_next_tile_boundary(fld, p, dir), d_fp), min_step);
+    float t_coarse = min(t + d_coarse, t_max);
+    float3 mid_coarse = p0 + dir * ((t + t_coarse) * 0.5f);
+    float maj_c = field_macro_majorant_at(fld, mid_coarse);
+    if (maj_f == 0.0f && maj_c == 0.0f) {
+        // Provably empty tile: cross it in one step, tau += 0.
+        sigma_out = 0.0f;
+        return t_coarse;
+    }
+    if (maj_f < 0.0f && maj_c < 0.0f) {
+        // Outside the footprint (or z range): sigma is altitude-only and
+        // constant over the capped coarse segment.
+        sigma_out = field_sigma_at(fld, mid_coarse);
+        return t_coarse;
+    }
+    // Fine/coarse classification disagreement: the fine segment with its own
+    // midpoint is always a valid constant-sigma span.
+    sigma_out = field_sigma_at(fld, mid_fine);
+    return t_fine;
+}
+
+// Exact cloud optical depth along p0 + t*dir, t in [0, t_max] (tau_along):
+// repeated field_next_segment calls, each yielding one constant-sigma span
+// (a fine voxel span, a whole empty macro-tile, or a footprint-capped
+// out-of-footprint stretch of one radial band). Port of the CPU tau_along.
 inline float field_tau_along(device const float* fld, float3 p0, float3 dir, float t_max) {
     if (t_max <= 0.0f) return 0.0f;
     float tau = 0.0f;
     float t = 0.0f;
     float min_step = field_min_step(fld);
+    bool has_macro = field_uint(fld, FIELD_MACRO_PRESENT) != 0u;
     for (uint iter = 0; iter < 40000u; iter++) {
         if (t >= t_max) break;
-        float3 p = p0 + dir * t;
-        float maj = field_macro_majorant_at(fld, p);
-        if (maj == 0.0f) {
-            // Provably empty tile: skip to the next coarse boundary, tau += 0.
-            float step = max(field_distance_to_next_tile_boundary(fld, p, dir), min_step);
-            t = min(t + step, t_max);
-            continue;
-        }
-        // Outside the footprint (maj < 0) sigma depends only on altitude:
-        // step radially (tau-exact) and skip the useless lat/lon crossings.
-        float step = (maj < 0.0f)
-            ? max(field_distance_to_next_radial_boundary(fld, p, dir), min_step)
-            : max(field_distance_to_next_boundary(fld, p, dir), min_step);
-        float t_next = min(t + step, t_max);
-        float3 mid = p0 + dir * ((t + t_next) * 0.5f);
-        tau += field_sigma_at(fld, mid) * (t_next - t);
+        float sigma;
+        float t_next = field_next_segment(fld, p0, dir, t, t_max, min_step, has_macro, sigma);
+        tau += sigma * (t_next - t);
         t = t_next;
     }
     return tau;
 }
 
-// Inverse of field_tau_along: parameter t where accumulated cloud tau
+// Inverse of field_tau_along: parameter t where the accumulated cloud tau
 // reaches tau_target, or a negative sentinel if the segment ends first
-// (advance_to_tau). Shares the traversal exactly.
+// (advance_to_tau). Walks the SAME field_next_segment spans, so the
+// inversion is exact by construction (forced/cloud-channel sampling must
+// invert exactly the integral it was normalized with).
 inline float field_advance_to_tau(device const float* fld, float3 p0, float3 dir,
                                   float t_max, float tau_target) {
     if (tau_target <= 0.0f) return 0.0f;
     float tau = 0.0f;
     float t = 0.0f;
     float min_step = field_min_step(fld);
+    bool has_macro = field_uint(fld, FIELD_MACRO_PRESENT) != 0u;
     for (uint iter = 0; iter < 40000u; iter++) {
         if (t >= t_max) return -1.0f;
-        float3 p = p0 + dir * t;
-        float maj = field_macro_majorant_at(fld, p);
-        if (maj == 0.0f) {
-            // Empty tile: dtau = 0 throughout, so no collision can land here.
-            // Skip to the next coarse boundary (tau unchanged).
-            float step = max(field_distance_to_next_tile_boundary(fld, p, dir), min_step);
-            t = min(t + step, t_max);
-            continue;
-        }
-        // Outside the footprint (maj < 0) sigma depends only on altitude: a
-        // radial-shell segment has constant sigma, so the linear collision
-        // inversion below stays exact while skipping the lat/lon crossings.
-        float step = (maj < 0.0f)
-            ? max(field_distance_to_next_radial_boundary(fld, p, dir), min_step)
-            : max(field_distance_to_next_boundary(fld, p, dir), min_step);
-        float t_next = min(t + step, t_max);
-        float3 mid = p0 + dir * ((t + t_next) * 0.5f);
-        float sigma = field_sigma_at(fld, mid);
+        float sigma;
+        float t_next = field_next_segment(fld, p0, dir, t, t_max, min_step, has_macro, sigma);
         float dtau = sigma * (t_next - t);
         if (tau + dtau >= tau_target) {
+            // Constant sigma within the segment: linear inversion (sigma > 0
+            // whenever this fires; zero-sigma segments cannot lift tau).
             return t + (tau_target - tau) / max(sigma, 1e-30f);
         }
         tau += dtau;
@@ -2968,7 +3072,11 @@ kernel void hybrid_scatter_v2(
 // the device-side field DDA (field_tau_along) so the pure geometry can be
 // compared bit-for-budget against the CPU tau_along. No Monte Carlo.
 //
-// rays buffer: 8 f32 per ray = vec4(p0.x, p0.y, p0.z, t_max), vec4(dir.xyz, _)
+// rays buffer: one 8-f32 header (slot 0 = ray count as a bit pattern, rest
+// pad), then 8 f32 per ray = vec4(p0.x, p0.y, p0.z, t_max), vec4(dir.xyz, _).
+// The count bounds the thread: the dispatch grid rounds up to the
+// threadgroup size, and unbounded excess threads read and write past the
+// buffers (out-of-bounds on both sides for any non-multiple ray count).
 // output buffer: tau[ray]
 // ============================================================================
 
@@ -2978,13 +3086,15 @@ kernel void field_tau_probe(
     device float*       output [[buffer(2)]],
     uint                tid    [[thread_position_in_grid]]
 ) {
+    uint n_rays = as_type<uint>(rays[0]);
+    if (tid >= n_rays) return;
     // Header gate on the field buffer (mirrors the atmosphere gate).
     if (as_type<uint>(fld[FIELD_HDR_MAGIC]) != BUFFER_MAGIC
         || as_type<uint>(fld[FIELD_HDR_VERSION]) != BUFFER_VERSION) {
         if (tid == 0u) output[0] = HEADER_SENTINEL;
         return;
     }
-    uint base = tid * 8u;
+    uint base = 8u + tid * 8u;
     float3 p0  = float3(rays[base + 0], rays[base + 1], rays[base + 2]);
     float  tmx = rays[base + 3];
     float3 dir = float3(rays[base + 4], rays[base + 5], rays[base + 6]);

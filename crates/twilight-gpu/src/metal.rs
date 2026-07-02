@@ -572,9 +572,14 @@ impl MetalBackend {
             .ok_or_else(|| GpuError::Dispatch("field not uploaded".into()))?;
 
         let n = rays.len();
-        let mut packed = vec![0.0f32; n * 8];
+        // One 8-f32 header carrying the ray count (slot 0, bit pattern):
+        // the dispatch grid rounds up to whole threadgroups, and the kernel
+        // bounds itself on this count so excess threads never read or write
+        // out of bounds.
+        let mut packed = vec![0.0f32; (n + 1) * 8];
+        packed[0] = f32::from_bits(n as u32);
         for (i, ray) in rays.iter().enumerate() {
-            let b = i * 8;
+            let b = (i + 1) * 8;
             packed[b] = ray[0] as f32; // p0.x
             packed[b + 1] = ray[1] as f32; // p0.y
             packed[b + 2] = ray[2] as f32; // p0.z
