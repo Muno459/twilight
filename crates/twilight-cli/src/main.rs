@@ -364,7 +364,12 @@ struct PrayArgs {
     /// grid + .json header). The transport engine then traces every
     /// light path through the actual voxel structure: sun rays through
     /// real cloud gaps instead of a horizontally uniform deck.
-    /// Overrides --cloud3d and all other cloud sources.
+    /// Overrides --cloud3d and all other cloud sources. The observer
+    /// (--lat/--lon) must lie inside the field footprint; a field
+    /// exported for another location is a hard error. Fields whose
+    /// data timestamp is older than 3 hours print a staleness warning
+    /// (clouds advect ~10 km per 10 min). Field runs execute on the
+    /// CPU reference scan (GPU field port pending re-verification).
     #[arg(long, value_name = "PATH")]
     cloud_field: Option<std::path::PathBuf>,
 }
@@ -1787,6 +1792,111 @@ fn wall_fractional_hour(
         + wall.second() as f64 / 3600.0
 }
 
+/// Warn when --cloud-field data is older than this many hours: clouds
+/// advect ~10 km per 10 minutes, so a 3 h old field no longer describes
+/// the actual sky. A warning, not an error: computing tomorrow's Fajr
+/// from tonight's export is legitimate planning.
+const CLOUD_FIELD_STALE_HOURS: f64 = 3.0;
+
+/// Footprint of a 3D cloud field as (lat_min, lat_max, lon_min, lon_max)
+/// in degrees. lon_max may exceed 180 for grids crossing the
+/// antimeridian; containment tests must therefore be wrap-safe.
+fn cloud_field_footprint(
+    f: &twilight_data::cloud_field_builder::OwnedCloudField,
+) -> (f64, f64, f64, f64) {
+    (
+        f.lat0_deg,
+        f.lat0_deg + f.nlat as f64 * f.dlat_deg,
+        f.lon0_deg,
+        f.lon0_deg + f.nlon as f64 * f.dlon_deg,
+    )
+}
+
+/// Wrap-safe test that an observer lies inside a field footprint.
+///
+/// Outside the footprint the transport engine silently substitutes the
+/// field's horizontal-mean background column, i.e. the wrong region's
+/// clouds become a global uniform deck - so the CLI must hard-error
+/// instead of accepting a field exported for another location.
+fn observer_in_footprint(
+    lat: f64,
+    lon: f64,
+    lat_min: f64,
+    lat_max: f64,
+    lon_min: f64,
+    lon_max: f64,
+) -> bool {
+    if lat < lat_min || lat > lat_max {
+        return false;
+    }
+    let lon_span = lon_max - lon_min;
+    if lon_span >= 360.0 {
+        return true;
+    }
+    (lon - lon_min).rem_euclid(360.0) <= lon_span
+}
+
+/// Parse a sidecar field timestamp: RFC 3339 ("2026-06-13T02:00:00Z")
+/// or the naive "YYYY-MM-DDTHH:MM[:SS]" form the cloud3d sidecar emits,
+/// which is UTC by contract.
+fn parse_field_timestamp(ts: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return Some(t.with_timezone(&chrono::Utc));
+    }
+    for fmt in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"] {
+        if let Ok(t) = chrono::NaiveDateTime::parse_from_str(ts, fmt) {
+            return Some(t.and_utc());
+        }
+    }
+    None
+}
+
+/// Footprint and staleness validation for a loaded --cloud-field.
+/// Exits the process when the observer is outside the footprint; prints
+/// a prominent warning when the field data is stale.
+fn validate_cloud_field_for_observer(
+    f: &twilight_data::cloud_field_builder::OwnedCloudField,
+    lat: f64,
+    lon: f64,
+) {
+    let (lat_min, lat_max, lon_min, lon_max) = cloud_field_footprint(f);
+    if !observer_in_footprint(lat, lon, lat_min, lat_max, lon_min, lon_max) {
+        eprintln!(
+            "Error: --cloud-field footprint does not contain the observer.\n  \
+             observer: lat {:.4}, lon {:.4}\n  \
+             field:    lat {:.4}..{:.4}, lon {:.4}..{:.4}\n  \
+             Outside the footprint the field's mean background column would \
+             silently stand in for the whole sky (the wrong region's clouds \
+             as a uniform deck). Re-export the field around this observer \
+             (sidecar --field-out).",
+            lat, lon, lat_min, lat_max, lon_min, lon_max
+        );
+        std::process::exit(1);
+    }
+
+    match parse_field_timestamp(&f.timestamp) {
+        Some(t) => {
+            let age_h = (chrono::Utc::now() - t).num_seconds() as f64 / 3600.0;
+            if age_h > CLOUD_FIELD_STALE_HOURS {
+                eprintln!(
+                    "WARNING: --cloud-field data is {:.1} h old ({}). Clouds advect \
+                     ~10 km per 10 min, so this field may no longer describe the \
+                     actual sky; the times below are computed on the stale field. \
+                     Re-export a fresh field when possible.",
+                    age_h, f.timestamp
+                );
+            }
+        }
+        None => {
+            eprintln!(
+                "Note: --cloud-field timestamp {:?} is unparseable; staleness \
+                 not checked.",
+                f.timestamp
+            );
+        }
+    }
+}
+
 fn cmd_pray(args: PrayArgs) {
     let (year, month, day) = resolve_date(&args.date);
     let tz = resolve_timezone(args.lat, args.lon, year, month, day, args.tz);
@@ -1852,6 +1962,8 @@ fn cmd_pray(args: PrayArgs) {
                     f.source,
                     f.timestamp
                 );
+                // Wrong-location fields hard-error; stale fields warn.
+                validate_cloud_field_for_observer(&f, args.lat, args.lon);
                 f
             }
             Err(e) => {
@@ -1966,6 +2078,16 @@ fn cmd_pray(args: PrayArgs) {
 
     #[cfg(feature = "gpu")]
     let mut gpu_backend = if args.cpu {
+        None
+    } else if input.cloud_field.is_some() {
+        // 3D cloud field: every scattering mode runs the CPU reference
+        // scan until the GPU field port is re-verified (the single/mcrt
+        // kernels are field-blind and would silently compute a clear
+        // sky), so a GPU backend would go unused; skip the init.
+        println!(
+            "Note: 3D cloud field active; using the CPU reference scan \
+             (GPU field port pending re-verification)."
+        );
         None
     } else {
         try_init_gpu(args.gpu_backend, args.photons)
@@ -3250,5 +3372,91 @@ fn main() {
             SqmCommands::Predict(args) => cmd_sqm_predict(args),
             SqmCommands::Compare(args) => cmd_sqm_compare(args),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── --cloud-field observer/footprint validation ──
+
+    #[test]
+    fn footprint_contains_interior_and_edges() {
+        // Padborg-style field: lat 54.0..55.0, lon 9.0..10.0.
+        assert!(observer_in_footprint(54.5, 9.5, 54.0, 55.0, 9.0, 10.0));
+        // Boundary points are inside.
+        assert!(observer_in_footprint(54.0, 9.0, 54.0, 55.0, 9.0, 10.0));
+        assert!(observer_in_footprint(55.0, 10.0, 54.0, 55.0, 9.0, 10.0));
+    }
+
+    #[test]
+    fn footprint_rejects_outside_observers() {
+        // North/south of the grid.
+        assert!(!observer_in_footprint(55.5, 9.5, 54.0, 55.0, 9.0, 10.0));
+        assert!(!observer_in_footprint(53.9, 9.5, 54.0, 55.0, 9.0, 10.0));
+        // East/west of the grid.
+        assert!(!observer_in_footprint(54.5, 10.5, 54.0, 55.0, 9.0, 10.0));
+        assert!(!observer_in_footprint(54.5, 8.9, 54.0, 55.0, 9.0, 10.0));
+        // A Mecca observer against a Denmark field: the exact silent
+        // uniform-deck case this validation exists to stop.
+        assert!(!observer_in_footprint(21.4225, 39.8262, 54.0, 55.0, 9.0, 10.0));
+    }
+
+    #[test]
+    fn footprint_longitude_is_wrap_safe() {
+        // Field crossing the antimeridian: lon 179..181 (= -179).
+        assert!(observer_in_footprint(0.0, 179.5, -1.0, 1.0, 179.0, 181.0));
+        assert!(observer_in_footprint(0.0, -179.5, -1.0, 1.0, 179.0, 181.0));
+        assert!(!observer_in_footprint(0.0, 178.0, -1.0, 1.0, 179.0, 181.0));
+        assert!(!observer_in_footprint(0.0, -178.0, -1.0, 1.0, 179.0, 181.0));
+        // Same footprint written with negative west edge.
+        assert!(observer_in_footprint(0.0, 179.5, -1.0, 1.0, -181.0, -179.0));
+        // Full-circumference grids contain every longitude.
+        assert!(observer_in_footprint(0.0, 123.4, -1.0, 1.0, 0.0, 360.0));
+    }
+
+    #[test]
+    fn cloud_field_footprint_spans_whole_grid() {
+        use twilight_data::cloud_field_builder::{field_from_layers, FieldGeometry};
+        let f = field_from_layers(
+            &[],
+            FieldGeometry {
+                center_lat_deg: 54.5,
+                center_lon_deg: 9.5,
+                half_extent_km: 64.0,
+                res_km: 2.0,
+            },
+            "test",
+        );
+        let (lat_min, lat_max, lon_min, lon_max) = cloud_field_footprint(&f);
+        // The center must sit inside, roughly centered.
+        assert!(observer_in_footprint(54.5, 9.5, lat_min, lat_max, lon_min, lon_max));
+        assert!((0.5 * (lat_min + lat_max) - 54.5).abs() < 0.1);
+        assert!((0.5 * (lon_min + lon_max) - 9.5).abs() < 0.1);
+        // A point far outside the ~128 km grid must be rejected.
+        assert!(!observer_in_footprint(58.0, 9.5, lat_min, lat_max, lon_min, lon_max));
+    }
+
+    // ── --cloud-field timestamp parsing / staleness ──
+
+    #[test]
+    fn field_timestamp_accepts_sidecar_formats() {
+        // RFC 3339 with Z (field header contract).
+        let t = parse_field_timestamp("2026-06-13T02:00:00Z").expect("rfc3339");
+        assert_eq!(t.to_rfc3339(), "2026-06-13T02:00:00+00:00");
+        // Naive with and without seconds (cloud3d profile style, UTC).
+        assert!(parse_field_timestamp("2026-06-12T08:30:00").is_some());
+        assert!(parse_field_timestamp("2026-06-12T08:30").is_some());
+        // Offset form normalizes to UTC.
+        let t = parse_field_timestamp("2026-06-13T04:00:00+02:00").expect("offset");
+        assert_eq!(t.to_rfc3339(), "2026-06-13T02:00:00+00:00");
+    }
+
+    #[test]
+    fn field_timestamp_rejects_garbage() {
+        assert!(parse_field_timestamp("").is_none());
+        assert!(parse_field_timestamp("not a time").is_none());
+        assert!(parse_field_timestamp("2026-13-45T99:99").is_none());
     }
 }

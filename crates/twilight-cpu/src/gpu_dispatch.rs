@@ -13,12 +13,54 @@
 //! 4. Results are converted to `SpectralResult` with solar irradiance weighting
 //!
 //! The threshold analysis and SZA-to-time conversion remain on CPU.
+//!
+//! # Cloud routing contract
+//!
+//! The GPU kernels do NOT currently cover all cloud configurations:
+//!
+//! - The single/mcrt kernels are field-blind: they never read a 3D cloud
+//!   field, and under a field the atmosphere is built cloud-free, so
+//!   dispatching them would silently compute a CLEAR sky. This module
+//!   has no field parameter at all; the pipeline routes every field run
+//!   to the CPU scan before reaching this module.
+//! - For 1D shell clouds (nonzero `cloud_extinction`) the GPU chain
+//!   kernels (hybrid/mcrt) still run the retired T_diff diffuse-
+//!   transmission estimator, while the CPU chain estimator scatters in
+//!   the cloud explicitly (Stage 2); the two no longer agree and the
+//!   CPU is the reference. [`check_cloud_chain_supported`] rejects such
+//!   dispatches so direct callers fall back to the CPU scan. Single
+//!   mode keeps shell clouds here: the T_diff closure runs on BOTH
+//!   sides and the parity tests cover it.
 
 use twilight_core::atmosphere::AtmosphereModel;
 use twilight_data::solar_spectrum::SOLAR_IRRADIANCE;
 use twilight_gpu::{BatchKernel, BatchRequest, GpuBackend, GpuError, GpuSpectralResult};
 
 use crate::simulation::{compute_geometry, ScatteringMode, SimulationConfig, SpectralResult};
+
+/// Refuse chain-mode dispatch when the atmosphere carries a 1D shell
+/// cloud (see the module-level cloud routing contract). Returning an
+/// error here makes every caller's existing `unwrap_or_else` fallback
+/// run the CPU reference scan instead of silently using the retired
+/// GPU T_diff estimator.
+fn check_cloud_chain_supported(
+    atm: &AtmosphereModel,
+    config: &SimulationConfig,
+) -> Result<(), GpuError> {
+    if matches!(
+        config.scattering_mode,
+        ScatteringMode::Hybrid | ScatteringMode::Multiple
+    ) && atm.cloud_extinction.iter().any(|&e| e > 0.0)
+    {
+        return Err(GpuError::Dispatch(
+            "1D shell cloud with a chain estimator (hybrid/multiple): the GPU \
+             chain kernels still run the retired T_diff closure and no longer \
+             match the CPU reference; use the CPU scan (GPU re-port pending)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
 
 /// Simulate at a single solar zenith angle using the GPU backend.
 ///
@@ -46,6 +88,7 @@ pub fn simulate_at_sza_gpu(
     config: &SimulationConfig,
     sza_deg: f64,
 ) -> Result<SpectralResult, GpuError> {
+    check_cloud_chain_supported(atm, config)?;
     let (observer_pos, sun_dir, view_dir) = compute_geometry(config, sza_deg);
 
     let obs = [observer_pos.x, observer_pos.y, observer_pos.z];
@@ -88,6 +131,7 @@ pub fn simulate_twilight_scan_gpu(
     sza_end: f64,
     sza_step: f64,
 ) -> Result<Vec<SpectralResult>, GpuError> {
+    check_cloud_chain_supported(atm, config)?;
     // Collect all SZA values upfront.
     let mut sza_values = Vec::new();
     let mut sza = sza_start;
@@ -157,6 +201,7 @@ pub fn simulate_twilight_szalist_gpu(
     config: &SimulationConfig,
     sza_values: &[f64],
 ) -> Result<Vec<SpectralResult>, GpuError> {
+    check_cloud_chain_supported(atm, config)?;
     if sza_values.is_empty() {
         return Ok(Vec::new());
     }
@@ -411,6 +456,71 @@ mod tests {
             "View dir magnitude {} should be 1",
             view_mag
         );
+    }
+
+    // ── check_cloud_chain_supported (cloud routing contract) ──────────
+
+    fn make_cloudy_atm() -> AtmosphereModel {
+        use twilight_data::atmosphere_profiles::AtmosphereType;
+        use twilight_data::builder;
+        use twilight_data::cloud::{default_properties, CloudType};
+        builder::build_full(
+            AtmosphereType::UsStandard,
+            0.15,
+            None,
+            Some(&default_properties(CloudType::Stratus)),
+        )
+    }
+
+    fn config_with_mode(mode: ScatteringMode) -> SimulationConfig {
+        SimulationConfig {
+            scattering_mode: mode,
+            ..SimulationConfig::default()
+        }
+    }
+
+    /// Chain modes (hybrid/multiple) must refuse a shell-cloud
+    /// atmosphere: the GPU chain kernels still run the retired T_diff
+    /// estimator and no longer match the CPU reference.
+    #[test]
+    fn cloudy_chain_dispatch_rejected() {
+        let atm = make_cloudy_atm();
+        assert!(
+            atm.cloud_extinction.iter().any(|&e| e > 0.0),
+            "test atmosphere must actually carry a shell cloud"
+        );
+        for mode in [ScatteringMode::Hybrid, ScatteringMode::Multiple] {
+            let cfg = config_with_mode(mode);
+            let err = check_cloud_chain_supported(&atm, &cfg)
+                .expect_err("shell cloud + chain mode must be rejected");
+            assert!(
+                matches!(err, GpuError::Dispatch(_)),
+                "expected Dispatch error, got {err:?}"
+            );
+        }
+    }
+
+    /// Single mode keeps shell clouds on the GPU (T_diff on both
+    /// sides), and clear skies pass in every mode.
+    #[test]
+    fn single_cloudy_and_clear_dispatch_allowed() {
+        let cloudy = make_cloudy_atm();
+        assert!(
+            check_cloud_chain_supported(&cloudy, &config_with_mode(ScatteringMode::Single))
+                .is_ok(),
+            "Single mode with a shell cloud stays on the GPU"
+        );
+        let clear = make_test_atm();
+        for mode in [
+            ScatteringMode::Single,
+            ScatteringMode::Multiple,
+            ScatteringMode::Hybrid,
+        ] {
+            assert!(
+                check_cloud_chain_supported(&clear, &config_with_mode(mode)).is_ok(),
+                "{mode:?} clear sky stays on the GPU"
+            );
+        }
     }
 
     #[test]
