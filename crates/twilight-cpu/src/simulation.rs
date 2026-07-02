@@ -446,24 +446,26 @@ mod tests {
 
     /// Through an OD-10 stratus deck the twilight sky must remain visible.
     ///
-    /// KNOWN LIMITATION (Stage 2, documented): this gate pinned the Stage-1
-    /// Eddington T_diff closure (a deterministic ~1e-12 floor). Stage 2 makes
-    /// in-cloud scattering EXPLICIT, and forced mode is disabled wherever a
-    /// gray cloud channel is present (it cannot compose with the forced gas
-    /// truncation unbiasedly, see the chain notes in photon.rs). Under a
-    /// horizontally UNIFORM thick deck the analog-only chains then need an
-    /// impractical photon count to sample the rare deck-penetrating multiple-
-    /// scattering paths, so the converged value is not reachable at gate
-    /// photon counts (measured: OD-10/SZA-95 climbs 7.3e-5 at P=400 vs 7.8e-9
-    /// at P=50, still far under-converged). The estimator is UNBIASED, just
-    /// variance-starved for this pathological geometry; the production target
-    /// (the broken/thin 3D Padborg field) is well within the G-VAR tolerance.
-    /// Restoring efficiency needs combined-channel forced mode for the 1D
-    /// fallback (cloud folded into the per-shell gas total, exact since the
-    /// shell cloud is piecewise constant), tracked as Stage-2 follow-up.
+    /// HISTORY: this gate pinned the Stage-1 Eddington T_diff closure (a
+    /// deterministic ~1e-12 floor). Stage 2 made in-cloud scattering
+    /// EXPLICIT but disabled forced mode under any cloud channel, and the
+    /// analog-only chains could not sample the rare deck-penetrating paths
+    /// of a uniform OD-10 deck at gate budgets (measured: OD-10/SZA-95
+    /// climbs 7.3e-5 at P=400 vs 7.8e-9 at P=50, far under-converged), so
+    /// the gate sat ignored as a documented starvation limitation.
+    ///
+    /// NOW: the combined-channel forced mode folds the shell-constant gray
+    /// deck into the forced-flight channel exactly (photon.rs, `use_forced`
+    /// derivation), so deck-penetrating paths are sampled by construction.
+    /// The gate runs at SZA 97, inside the forced-mode regime
+    /// (ZENITH_SZA_START = 96, where the starvation actually lived; probed
+    /// post-fix at 4000 photons: cloudy 2.9e-5..1.1e-4 across seeds vs
+    /// clear 7.0e-3, both assertions hold with 60x+ margin). Below SZA 96
+    /// forced mode is inactive by the SZA ramp and the uniform OD-10 deck
+    /// remains analog and variance-starved: a documented residual, not
+    /// covered by this gate. Still `#[ignore]`: heavy MC (minutes).
     #[test]
-    #[ignore = "g_s2_: uniform thick 1D deck is variance-starved without \
-                combined-channel forced mode (unbiased, documented follow-up)"]
+    #[ignore = "g_s2_: heavy MC (OD-10 deck, two full hybrid runs)"]
     fn stratus_twilight_remains_visible_and_below_clear_sky() {
         use twilight_data::cloud::{default_properties, CloudType};
         let clear = make_clear_sky_atm();
@@ -480,7 +482,7 @@ mod tests {
             polarized: false,
             ..SimulationConfig::default()
         };
-        let sza = 95.0;
+        let sza = 97.0;
         let r_clear: f64 = simulate_at_sza(&clear, &config, sza, None).radiance.iter().sum();
         let r_cloudy: f64 = simulate_at_sza(&cloudy, &config, sza, None).radiance.iter().sum();
         assert!(
@@ -633,7 +635,8 @@ mod tests {
 
     /// A horizontally uniform thin field (OD-2) for the Stage-2 chain gates.
     /// Thin enough that the analog cloud channel converges at modest photon
-    /// counts (forced mode is off under cloud), uniform so it has an exact
+    /// counts (forced mode is off under a 3D FIELD; the 1D deck now runs
+    /// combined-channel forced flights), uniform so it has an exact
     /// 1D-shell equivalent.
     fn uniform_thin_field() -> twilight_data::cloud_field_builder::OwnedCloudField {
         use twilight_data::cloud_field_builder::{field_from_layers, FieldGeometry};
@@ -916,28 +919,26 @@ mod tests {
     /// 1. SZA 88 and 92 (twilight, converged): two-sided agreement,
     ///    |mean_h - mean_m| < 3 * combined SE + 5% construction floor
     ///    (straight midpoint LOS vs refracting analog walk).
-    /// 2. SZA 97 (deep twilight, above ZENITH_SZA_START = 96): ONE-SIDED.
-    ///    Forced-collision mode is disabled under any cloud channel (its
-    ///    gas-only proposal cannot compose with the gray cloud channel),
-    ///    so the hybrid chains run ANALOG under the deck at an SZA where
-    ///    the clear-sky estimator relies on forced scattering to reach the
-    ///    sunlit region (shadow height ~48 km). The analog chain estimator
-    ///    is unbiased but VARIANCE-STARVED here: it converges one-sidedly
-    ///    from below (measured 550 nm, 8 seeds: 7.5e-6 at 512 photons,
-    ///    9.3e-6 at 2048, 1.07e-5 at 8192, vs MYSTIC 1.66e-5 +- 0.14e-5),
-    ///    the same documented limitation as
-    ///    `stratus_twilight_remains_visible_and_below_clear_sky`; the
-    ///    combined-channel forced mode for the 1D deck remains the tracked
-    ///    Stage-2 follow-up. The PRE-fix version of this gate ran two-sided
-    ///    at SZA 95/97 and passed only by cancellation: the hybrid's
-    ///    order-1 term was inflated ~e^{+0.3} by the midpoint-shell eye-OD
-    ///    misclassification (fixed) and its seed variance was ~20x larger,
-    ///    widening the 3-SE band to cover the deficit. The one-sided upper
-    ///    bound retains the gate's original regression target: the
-    ///    cloud-blind forced composition INFLATED the hybrid well above
-    ///    Multiple, which the bound still fails loudly. A floor at
-    ///    0.25 * multiple guards against total collapse of the analog
-    ///    chain term at the gate budget.
+    /// 2. SZA 97 (deep twilight, above ZENITH_SZA_START = 96), split by
+    ///    representation since the combined-channel forced mode landed:
+    ///    - 1D deck: TWO-SIDED, same band construction as regime 1. The
+    ///      hybrid chains now run combined-channel forced flights under
+    ///      the 1D deck (gas + gray shell cloud folded into one exactly
+    ///      piecewise-constant channel; see the derivation in photon.rs),
+    ///      which removes the analog starvation that previously forced a
+    ///      one-sided bound here (pre-fix measured 550 nm, 8 seeds:
+    ///      7.5e-6 at 512 photons, 9.3e-6 at 2048, 1.07e-5 at 8192 vs
+    ///      MYSTIC 1.66e-5 +- 0.14e-5, converging one-sidedly from below).
+    ///      The two-sided band also retains the gate's original regression
+    ///      target: the old cloud-blind forced composition INFLATED the
+    ///      hybrid well above Multiple, which the upper side fails loudly.
+    ///    - 3D field: ONE-SIDED (upper bound + 0.25x collapse floor),
+    ///      unchanged. Forced mode remains OFF under a field (sigma_c is
+    ///      not shell-constant; an exact fold needs per-segment majorants
+    ///      plus truncated delta tracking with per-wavelength null ratios,
+    ///      the documented remaining limitation), so the field chains are
+    ///      analog and variance-starved at this SZA: unbiased, converging
+    ///      one-sidedly from below at gate budgets.
     #[test]
     #[ignore = "g_s2_hybrid_matches_multiple: heavy MC"]
     fn g_s2_hybrid_matches_multiple() {
@@ -964,12 +965,14 @@ mod tests {
             ..hybrid.clone()
         };
 
-        let cases: [(&str, &AtmosphereModel, Option<&Cloud3DField>); 2] = [
-            ("1D deck", &atm_1d, None),
-            ("field deck", &atm_field, Some(&view)),
+        let cases: [(&str, &AtmosphereModel, Option<&Cloud3DField>, bool); 2] = [
+            // forced_capable: the 1D deck runs combined-channel forced
+            // flights at SZA >= 96; the field stays analog (see header).
+            ("1D deck", &atm_1d, None, true),
+            ("field deck", &atm_field, Some(&view), false),
         ];
         let mut failures = Vec::new();
-        for (label, atm, field) in cases {
+        for (label, atm, field, forced_capable) in cases {
             // Regime 1: converged twilight, two-sided.
             for sza in [88.0, 92.0] {
                 let (m_h, se_h) = mc_mean_se(atm, &hybrid, sza, field, 8);
@@ -990,25 +993,52 @@ mod tests {
                     ));
                 }
             }
-            // Regime 2: deep twilight, one-sided (see header).
+            // Regime 2: deep twilight. Two-sided where forced mode
+            // composes with the deck (1D), one-sided where the chains are
+            // still analog and starved (field); see header. The 1D forced
+            // side runs 2048 photons: at 256 the forced-under-deck chains
+            // are heavy-tailed (see g_s2_forced_under_1d_cloud_matches_
+            // multiple for the measured ladder) and a 3-SE band is not
+            // meaningful there.
             {
                 let sza = 97.0;
-                let (m_h, se_h) = mc_mean_se(atm, &hybrid, sza, field, 8);
+                let hybrid_97 = SimulationConfig {
+                    photons_per_wavelength: if forced_capable { 2048 } else { 256 },
+                    ..hybrid.clone()
+                };
+                let (m_h, se_h) = mc_mean_se(atm, &hybrid_97, sza, field, 8);
                 let (m_m, se_m) = mc_mean_se(atm, &multiple, sza, field, 8);
                 let se = (se_h * se_h + se_m * se_m).sqrt();
-                let upper = m_m + 3.0 * se + 0.05 * m_m;
-                let floor = 0.25 * m_m;
-                eprintln!(
-                    "G-HYB-MULT {label} SZA {sza} (one-sided): hybrid {m_h:.5e} \
-                     (se {se_h:.2e}) multiple {m_m:.5e} (se {se_m:.2e}) \
-                     ratio {:.3} bounds [{floor:.3e}, {upper:.3e}]",
-                    m_h / m_m
-                );
-                if m_h.is_nan() || m_h >= upper || m_h <= floor {
-                    failures.push(format!(
-                        "{label} SZA {sza}: hybrid {m_h:.5e} outside \
-                         [{floor:.3e}, {upper:.3e}] around multiple {m_m:.5e}"
-                    ));
+                if forced_capable {
+                    let diff = (m_h - m_m).abs();
+                    let band = 3.0 * se + 0.05 * m_h.max(m_m);
+                    eprintln!(
+                        "G-HYB-MULT {label} SZA {sza} (two-sided, forced): hybrid \
+                         {m_h:.5e} (se {se_h:.2e}) multiple {m_m:.5e} (se {se_m:.2e}) \
+                         diff {diff:.2e} band {band:.2e} ratio {:.3}",
+                        m_h / m_m
+                    );
+                    if diff.is_nan() || diff >= band {
+                        failures.push(format!(
+                            "{label} SZA {sza}: hybrid {m_h:.5e} vs multiple {m_m:.5e} \
+                             (diff {diff:.3e} > band {band:.3e})"
+                        ));
+                    }
+                } else {
+                    let upper = m_m + 3.0 * se + 0.05 * m_m;
+                    let floor = 0.25 * m_m;
+                    eprintln!(
+                        "G-HYB-MULT {label} SZA {sza} (one-sided): hybrid {m_h:.5e} \
+                         (se {se_h:.2e}) multiple {m_m:.5e} (se {se_m:.2e}) \
+                         ratio {:.3} bounds [{floor:.3e}, {upper:.3e}]",
+                        m_h / m_m
+                    );
+                    if m_h.is_nan() || m_h >= upper || m_h <= floor {
+                        failures.push(format!(
+                            "{label} SZA {sza}: hybrid {m_h:.5e} outside \
+                             [{floor:.3e}, {upper:.3e}] around multiple {m_m:.5e}"
+                        ));
+                    }
                 }
             }
         }
@@ -1019,55 +1049,104 @@ mod tests {
         );
     }
 
-    /// G-FORCED-OFF (Fix 1 observable): pre-fix, at SZA >= ZENITH_SZA_START
-    /// (96) with a 1D deck (no field), forced-collision flights sampled from
-    /// GAS-only scout tau: nearly every space-exiting bounce crossed the
-    /// deck as if it were transparent while analog bounces of the same chain
-    /// raced it, INFLATING the multiple-scatter term. Post-fix the chains
-    /// are analog under any gray cloud channel.
+    /// G-FORCED-1D (history: G-FORCED-OFF). Three eras of this gate:
     ///
-    /// The gate keeps the smallest honest observable: 1D-deck hybrid
-    /// radiance at SZA 97 and 100 must be finite, positive (the sky stays
-    /// visible through an OD-2 deck), and BELOW clear sky (a deck can only
-    /// remove or redistribute light; its absorption lives in the shell
-    /// optics). The pre-fix inflated composition is what this pins against.
+    /// 1. PRE-fix bug: at SZA >= ZENITH_SZA_START (96) with a 1D deck,
+    ///    forced-collision flights sampled from GAS-only scout tau and
+    ///    crossed the deck as if it were transparent while analog bounces
+    ///    of the same chain raced it, INFLATING the multiple-scatter term.
+    /// 2. Conservative fix (0cc8bf5): forced mode disabled under ANY cloud
+    ///    channel; unbiased but variance-starved under decks at SZA >= 97
+    ///    (externally measured 0.16-0.22x vs MYSTIC at SZA 99-101). This
+    ///    gate then pinned "forced is off": deck radiance finite, positive,
+    ///    below clear sky.
+    /// 3. NOW: combined-channel forced mode. Forced flights sample the
+    ///    gas-plus-gray-cloud channel exactly (both piecewise constant per
+    ///    shell) and draw the vertex type from the extinction conditional,
+    ///    so forced under the 1D deck is UNBIASED (derivation in photon.rs
+    ///    at the scalar chain's `use_forced`).
+    ///
+    /// The gate now pins that forced-under-cloud matches the ANALOG model
+    /// of the same deck: `ScatteringMode::Multiple` (trace_photon) races
+    /// the identical gray channel on every flight with no forced mode at
+    /// any SZA, is trajectory-independent of the chains, and is the
+    /// externally anchored side (G2/G3 referees). Two-sided band
+    /// 3 x combined seed SE + 5% construction floor (straight midpoint LOS
+    /// vs refracting analog walk), the same construction as G-HYB-MULT.
+    /// Both eras' regression targets stay covered: era-1 inflation fails
+    /// the upper side, era-2 starvation (0.16-0.22x) fails the lower side.
+    /// The below-clear sanity assertion is retained.
     #[test]
-    #[ignore = "g_s2_forced_off_under_1d_cloud: heavy MC"]
-    fn g_s2_forced_off_under_1d_cloud() {
+    #[ignore = "g_s2_forced_under_1d_cloud_matches_multiple: heavy MC"]
+    fn g_s2_forced_under_1d_cloud_matches_multiple() {
         let clear = make_clear_sky_atm();
         let cloudy = builder::build_with_cloud_properties(
             AtmosphereType::UsStandard,
             0.15,
             &thin_deck_props(),
         );
-        let config = SimulationConfig {
+        let hybrid = SimulationConfig {
             view_zenith: 80.0,
             scattering_mode: ScatteringMode::Hybrid,
             photons_per_wavelength: 256,
             polarized: false,
             ..SimulationConfig::default()
         };
-        for sza in [97.0, 100.0] {
-            let (r_clear, se_c) = mc_mean_se(&clear, &config, sza, None, 8);
-            let (r_deck, se_d) = mc_mean_se(&cloudy, &config, sza, None, 8);
+        let multiple = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: 40_000,
+            ..hybrid.clone()
+        };
+        let mut failures = Vec::new();
+        // Photon budgets per SZA. At SZA 97 the forced-under-deck hybrid is
+        // heavy-tailed at tiny budgets (measured ladder, this exact
+        // geometry, deck vs Multiple-at-100k: 256 photons -> seeds scatter
+        // 1.6e-4..7.8e-4 around a 0.5-1.0x ratio; 2048 -> 0.93x with seeds
+        // concentrated; 16384 -> 0.94x), so 2048 is the honest minimum
+        // where the 3-SE band is meaningful. At SZA 100 the hybrid already
+        // matches at 256 (0.94x, diff 25x under band); keep the loop fast.
+        for (sza, hyb_photons) in [(97.0, 2048), (100.0, 256)] {
+            let hybrid = SimulationConfig {
+                photons_per_wavelength: hyb_photons,
+                ..hybrid.clone()
+            };
+            let (r_clear, se_c) = mc_mean_se(&clear, &hybrid, sza, None, 8);
+            let (r_deck, se_d) = mc_mean_se(&cloudy, &hybrid, sza, None, 8);
+            let (r_mult, se_m) = mc_mean_se(&cloudy, &multiple, sza, None, 8);
+            let se_hm = (se_d * se_d + se_m * se_m).sqrt();
+            let diff = (r_deck - r_mult).abs();
+            let band = 3.0 * se_hm + 0.05 * r_deck.max(r_mult);
             eprintln!(
-                "G-FORCED-OFF SZA {sza}: clear {r_clear:.4e} (se {se_c:.2e}) \
-                 deck {r_deck:.4e} (se {se_d:.2e}) deck/clear {:.4}",
-                r_deck / r_clear
+                "G-FORCED-1D SZA {sza}: clear {r_clear:.4e} (se {se_c:.2e}) \
+                 forced-hybrid {r_deck:.4e} (se {se_d:.2e}) multiple {r_mult:.4e} \
+                 (se {se_m:.2e}) hyb/mul {:.4} diff {diff:.2e} band {band:.2e}",
+                r_deck / r_mult
             );
             assert!(
                 r_deck.is_finite() && r_deck > 0.0,
-                "G-FORCED-OFF SZA {sza}: deck radiance must be finite and positive, got {r_deck:.4e}"
+                "G-FORCED-1D SZA {sza}: deck radiance must be finite and positive, got {r_deck:.4e}"
             );
+            // Forced-under-cloud vs the analog reference, two-sided.
+            if diff.is_nan() || diff >= band {
+                failures.push(format!(
+                    "SZA {sza}: forced hybrid {r_deck:.4e} vs multiple {r_mult:.4e} \
+                     (diff {diff:.3e} > band {band:.3e})"
+                ));
+            }
             // Below clear sky, with a 3-sigma statistical allowance.
             let se = (se_c * se_c + se_d * se_d).sqrt();
             assert!(
                 r_deck < r_clear + 3.0 * se,
-                "G-FORCED-OFF SZA {sza}: OD-2 deck must dim the sky: \
+                "G-FORCED-1D SZA {sza}: OD-2 deck must dim the sky: \
                  deck {r_deck:.4e} vs clear {r_clear:.4e} (3 se = {:.2e})",
                 3.0 * se
             );
         }
+        assert!(
+            failures.is_empty(),
+            "G-FORCED-1D: forced-under-cloud disagrees with the analog reference:\n{}",
+            failures.join("\n")
+        );
     }
 
     // ── Phase-function orientation (regression for the supplement-angle bug) ──

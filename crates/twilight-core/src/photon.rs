@@ -58,6 +58,16 @@ fn cross_boundary(
 /// `shadow_ray_transmittance` but in an arbitrary direction and returning
 /// the raw optical depth rather than exp(-tau).
 ///
+/// COMBINED transport channel: the accumulated tau is the gas extinction
+/// PLUS the gray 1D shell cloud extinction (`atm.cloud_extinction`, the
+/// delta-scaled pure-scattering channel, constant per shell so the sum
+/// stays exactly piecewise constant). This is what the combined-channel
+/// forced-collision mode samples from. Clear-sky shells carry 0.0 there,
+/// so clear-sky taus are bit-identical to the gas-only scout. A 3D field
+/// is NOT scouted here: forced mode is 1D-only (see `use_forced` in the
+/// chains) and field runs carry all-zero `cloud_extinction` by the caller
+/// contract.
+///
 /// Early-exits when tau exceeds `FORCED_TAU_CUTOFF` (20.0). At that point
 /// `1 - exp(-20) = 0.999999998` in f64, so the forced-scattering weight
 /// is indistinguishable from 1.0 and the truncated exponential is
@@ -92,7 +102,9 @@ fn scout_tau_to_boundary(
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
-                tau += optics.extinction * dist;
+                // Combined channel: gas + gray 1D shell cloud (0.0 on
+                // clear shells, so clear-sky taus are bit-identical).
+                tau += (optics.extinction + atm.cloud_extinction[shell_idx]) * dist;
 
                 // Refract at boundary (same logic as shadow_ray_transmittance)
                 let boundary_pos = pos + dir * dist;
@@ -151,6 +163,12 @@ fn scout_tau_to_boundary(
 /// as `scout_tau_to_boundary`. Returns `(scatter_pos, dir_at_scatter, shell_idx)`
 /// where the photon scatters.
 ///
+/// COMBINED transport channel, matching `scout_tau_to_boundary` and
+/// `scout_with_vspg_segments`: the consumed tau is gas extinction plus the
+/// gray 1D shell cloud extinction, so a forced flight sampled from the
+/// combined scout tau inverts to the exact combined collision point.
+/// Clear-sky shells add 0.0 (bit-identical to the gas-only advance).
+///
 /// The caller must ensure `tau_target <= tau_max` from a prior scout call,
 /// guaranteeing the scatter point lies within the atmosphere.
 fn advance_to_optical_depth(
@@ -174,16 +192,19 @@ fn advance_to_optical_depth(
     for _ in 0..200 {
         let shell = &atm.shells[shell_idx];
         let optics = &atm.optics[shell_idx][wavelength_idx];
+        // Combined per-shell extinction (gas + gray 1D cloud; 0.0 added on
+        // clear shells, bit-identical there).
+        let sigma_comb = optics.extinction + atm.cloud_extinction[shell_idx];
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((boundary_dist, is_outward)) => {
-                let tau_shell = optics.extinction * boundary_dist;
+                let tau_shell = sigma_comb * boundary_dist;
 
                 if tau_accumulated + tau_shell >= tau_target {
                     // Scatter point is within this shell.
                     let tau_remaining = tau_target - tau_accumulated;
-                    let dist = if optics.extinction > 1e-30 {
-                        tau_remaining / optics.extinction
+                    let dist = if sigma_comb > 1e-30 {
+                        tau_remaining / sigma_comb
                     } else {
                         // Zero extinction: shouldn't reach here if scout
                         // was consistent, but place at boundary as fallback.
@@ -1726,12 +1747,16 @@ fn trace_light_subpath(
     vertices: &mut [LightVertex; BDPT_MAX_LIGHT_VERTICES],
     subpath_idx: usize,
     num_subpaths: usize,
-    // UNUSED, and honestly so: this walk is forced-scattering, gas-only,
-    // and therefore cloud-BLIND, while its connection legs
+    // UNUSED, and honestly so: this walk is forced-scattering with NO
+    // cloud-vertex handling, while its connection legs
     // (transmittance_between_points_spectrum) are cloud-attenuated. BDPT
     // is disabled whenever ANY gray cloud channel is present (3D field or
-    // 1D shell deck; see `bdpt_active` in the driver) until this subpath
-    // is converted to delta-track the channel. The parameter stays so the
+    // 1D shell deck; see `bdpt_active` in the driver). NOTE: the shared
+    // scout/advance machinery is now combined-channel (gas + gray 1D
+    // cloud), so under a deck this walk would sample the combined tau but
+    // score every vertex as gas -- converting it needs the same vertex-
+    // type draw the chains gained (photon.rs `use_forced` derivation);
+    // until then the driver gate stands. The parameter stays so the
     // conversion lands without another signature change.
     _field: Option<&Cloud3DField>,
 ) -> usize {
@@ -2198,7 +2223,10 @@ fn vspg_sample_scatter_tau(
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
-                let tau_shell = optics.extinction * dist;
+                // Combined channel: gas + gray 1D shell cloud (0.0 on
+                // clear shells; see scout_tau_to_boundary).
+                let tau_shell =
+                    (optics.extinction + atm.cloud_extinction[shell_idx]) * dist;
                 let tau_end = tau + tau_shell;
 
                 // Cap at tau_max (the scout capped here too).
@@ -2381,6 +2409,12 @@ fn vspg_sample_from_segments(
 /// performs after `scout_tau_to_boundary`, saving ~33% of shell-walk cost
 /// per forced-scatter bounce at deep twilight.
 ///
+/// COMBINED transport channel (see `scout_tau_to_boundary`): per-shell tau
+/// is gas extinction PLUS the gray 1D shell cloud extinction, both constant
+/// per shell, so the combined tau stays exactly piecewise constant and the
+/// VSPG segment inversion machinery is unchanged. Clear shells add 0.0
+/// (bit-identical taus and segments there).
+///
 /// Returns `(tau_max, hit_ground, num_segments)`. Segments are written to
 /// the caller-provided buffer.
 fn scout_with_vspg_segments(
@@ -2409,7 +2443,10 @@ fn scout_with_vspg_segments(
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
-                let tau_shell = optics.extinction * dist;
+                // Combined channel: gas + gray 1D shell cloud (0.0 on
+                // clear shells; see scout_tau_to_boundary).
+                let tau_shell =
+                    (optics.extinction + atm.cloud_extinction[shell_idx]) * dist;
                 let tau_end = tau + tau_shell;
 
                 // Collect VSPG segment if shell has nonzero optical depth.
@@ -2474,9 +2511,15 @@ fn scout_with_vspg_segments(
 /// wavelengths simultaneously. VSPG segments use the hero wavelength's
 /// tau values and altitude-based importance.
 ///
+/// COMBINED transport channel: every wavelength's tau is the per-shell gas
+/// extinction PLUS the gray 1D shell cloud extinction. The cloud term is
+/// wavelength flat (gray), so per-wavelength tau DIFFERENCES are exactly
+/// the gas differences; the shared cloud tau only enters the hero's forced
+/// weight and sampling density. Clear shells add 0.0 (bit-identical).
+///
 /// Returns `(tau_maxes, hit_ground, num_segments)`. `tau_maxes[w]` gives
-/// the total optical depth for wavelength w. Segments are written to
-/// the caller-provided buffer (hero-wavelength tau values).
+/// the total COMBINED optical depth for wavelength w. Segments are written
+/// to the caller-provided buffer (hero-wavelength combined tau values).
 #[allow(clippy::too_many_arguments)]
 fn scout_with_vspg_segments_alis(
     atm: &AtmosphereModel,
@@ -2504,10 +2547,12 @@ fn scout_with_vspg_segments_alis(
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
-                // Accumulate per-wavelength tau.
+                // Accumulate per-wavelength COMBINED tau (gas + gray 1D
+                // cloud; the cloud term is shared across wavelengths).
+                let cext = atm.cloud_extinction[shell_idx];
                 let hero_tau_before = tau[hero_wl];
                 for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
-                    *tau_w += atm.optics[shell_idx][w].extinction * dist;
+                    *tau_w += (atm.optics[shell_idx][w].extinction + cext) * dist;
                 }
                 let hero_tau_shell = tau[hero_wl] - hero_tau_before;
 
@@ -2639,10 +2684,6 @@ pub fn hybrid_scatter_radiance(
 
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
-
-    // Any gray cloud channel this run? Computed once; disables forced-
-    // collision mode in the chains (gas-only proposal).
-    let cloud_channel = has_cloud_channel(atm, field);
 
     // Dual path: full Stokes [I,Q,U,V] when polarized, scalar when not.
     let mut stokes_total = StokesVector::unpolarized(0.0);
@@ -2826,7 +2867,6 @@ pub fn hybrid_scatter_radiance(
             // whose selection probability cancels the per-type coefficient,
             // so the per-step scale is beta_total = beta_scat + beta_cloud.
             let chain_cloud = ChainCloud {
-                channel: cloud_channel,
                 beta_seed: beta_cloud,
                 g_seed: g_cloud_step,
             };
@@ -3055,14 +3095,16 @@ fn trace_secondary_chain(
     let local_up = start_pos.normalize();
     let cos_sza_local = sun_dir.dot(local_up);
     let sza_deg_local = libm::acos(cos_sza_local.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    // Forced mode disabled under ANY gray cloud channel, 3D field or 1D
-    // shell deck (see the scalar chain note and has_cloud_channel): the
-    // forced flights sample from GAS-only scout tau and neither attenuate
-    // through nor collide in the cloud, while analog bounces of the same
-    // chain race it: a biased composition. Analog-only under cloud is
-    // unbiased, just noisier; combined-channel tracking for the
-    // shell-constant 1D deck is the known follow-up.
-    let use_forced = sza_deg_local >= ZENITH_SZA_START && !cloud.channel;
+    // COMBINED-channel forced mode (see the scalar chain derivation):
+    // under a 1D shell deck the scout/advance machinery accumulates
+    // gas-plus-gray-cloud tau (both piecewise constant per shell, so the
+    // truncated inversion stays exact), the forced weight is the combined
+    // collision probability, and the vertex type is drawn from the exact
+    // extinction conditional at the collision point. Under a 3D FIELD the
+    // per-segment cloud extinction is not shell-constant and the scout
+    // cannot fold it exactly; forced mode stays OFF there (analog delta
+    // tracking is unbiased, see use_forced below).
+    let use_forced = sza_deg_local >= ZENITH_SZA_START && field.is_none();
 
     // Exponential transform bias parameter.
     // Ramps from 0 (SZA < 96) to EXP_TRANSFORM_ALPHA_MAX (SZA >= 106).
@@ -3099,6 +3141,10 @@ fn trace_secondary_chain(
         if forced_this_bounce {
             // Upfront forced scattering: weight = exact scatter probability.
             // No analog free-path walk, no escape, no double-counting.
+            // tau_max is the COMBINED (gas + gray 1D cloud) optical depth,
+            // so under a deck the weight is the combined collision
+            // probability and the flight attenuates through AND can collide
+            // in the cloud.
             let exp_neg_tau = libm::exp(-tau_max);
             weight *= 1.0 - exp_neg_tau;
             let xi = xorshift_f64(&mut rng.tau);
@@ -3108,6 +3154,24 @@ fn trace_secondary_chain(
             pos = sp;
             current_dir = sd;
             scatter_shell = ss;
+
+            // Vertex type from the exact extinction conditional at the
+            // collision shell: cloud with p = sigma_c / (sigma_c + sigma_gas)
+            // (the same first-arrival law the analog race realizes). The
+            // type probabilities cancel the per-type extinction factors
+            // exactly, so no weight correction; a gas vertex carries the
+            // gas SSA below, a cloud vertex is pure scattering. The draw is
+            // taken ONLY when the collision shell carries cloud, so
+            // clear-sky RNG streams are bit-identical to the gas-only code.
+            let sigma_c = atm.cloud_extinction[scatter_shell];
+            if sigma_c > 0.0 {
+                let sigma_gas = atm.optics[scatter_shell][wavelength_idx].extinction;
+                if xorshift_f64(&mut rng.tau) < sigma_c / (sigma_c + sigma_gas) {
+                    cloud_collision = true;
+                    // Forced mode is 1D-only (field is None here).
+                    g_cloud_here = field.map(|f| f.g_at(pos)).unwrap_or(atm.cloud_g_scaled);
+                }
+            }
         } else {
             // Analog scatter with exponential transform plus the gray cloud
             // channel (decomposition tracking; see the scalar chain).
@@ -3468,18 +3532,41 @@ fn trace_secondary_chain_scalar(
     let mut total = 0.0_f64;
 
     // Upfront forced scattering gate (same logic as Stokes version).
-    // Forced mode is DISABLED under ANY gray cloud channel (3D field or
-    // 1D shell deck; see has_cloud_channel): the gas forced-collision
-    // proposal (truncated to atmosphere exit, sampled from GAS-only scout
-    // tau) cannot be composed unbiasedly with the unforced gray cloud
-    // channel without re-deriving the joint truncation, which couples the
-    // two channels and breaks the ALIS factorization. Analog scattering is
-    // always unbiased (the cloud channel makes the analog walk efficient
-    // under a deck), so we take the conservative path the plan authorizes;
-    // combined-channel tracking for the shell-constant 1D deck is the
-    // known follow-up.
+    //
+    // ── COMBINED-channel forced mode: the derivation ────────────────────
+    //
+    // The 1D shell cloud is a gray channel with extinction CONSTANT PER
+    // SHELL (`atm.cloud_extinction`, pure scattering by construction), so
+    // the combined extinction sigma_t = sigma_gas + sigma_c is exactly
+    // piecewise constant along the ray, and the scout/advance machinery
+    // inverts the combined tau exactly (no majorant needed). At a bounce
+    // with combined boundary tau T_t, the physical next-event law is
+    //
+    //   collide at s:  p(s) ds = sigma_t(s) e^{-tau_t(s)} ds,
+    //   type | s:      cloud with sigma_c/sigma_t, gas with sigma_gas/sigma_t,
+    //   escape:        e^{-T_t}.
+    //
+    // Forcing = importance-sample the collision measure with the escape
+    // atom removed: weight *= (1 - e^{-T_t}), s from the truncated
+    // combined density (VSPG segment selection is a further proposal
+    // change with its own exact correction), type from the extinction
+    // conditional at s. The type probabilities cancel the per-type
+    // extinction coefficients exactly (E over type of [f_type / p_type]
+    // telescopes), so the only weight factor is (1 - e^{-T_t}); a gas
+    // vertex then carries the gas SSA (absorption), a cloud vertex is
+    // pure scattering with the gray HG lobe -- IDENTICAL vertex physics
+    // to the analog race, which realizes the same first-arrival law.
+    //
+    // Under a 3D FIELD sigma_c varies inside a shell segment, the scout
+    // cannot fold it exactly, and an unbiased forced flight would need a
+    // per-segment majorant plus truncated-domain delta tracking with
+    // per-wavelength null ratios in the ALIS tracer; forced mode stays
+    // OFF there (analog delta tracking is unbiased) -- the documented
+    // remaining limitation. Field runs carry atm.cloud_extinction == 0
+    // by the caller contract, so the gate below is exact.
+    // ────────────────────────────────────────────────────────────────────
     let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    let use_forced = sza_deg_local >= ZENITH_SZA_START && !cloud.channel;
+    let use_forced = sza_deg_local >= ZENITH_SZA_START && field.is_none();
 
     // Exponential transform bias parameter (same ramp as Stokes version).
     let sza_t_et =
@@ -3562,6 +3649,9 @@ fn trace_secondary_chain_scalar(
             let mut g_cloud_here = 0.0f64;
 
             if forced_this_bounce {
+                // Combined-channel forced flight (see the derivation at
+                // use_forced): tau_max and the segments are gas + gray 1D
+                // cloud, the weight is the combined collision probability.
                 let exp_neg_tau = libm::exp(-tau_max);
                 weight *= 1.0 - exp_neg_tau;
                 // VSPG: sample from pre-collected segments (no re-walk).
@@ -3573,6 +3663,23 @@ fn trace_secondary_chain_scalar(
                 pos = sp;
                 current_dir = sd;
                 scatter_shell = ss;
+
+                // Vertex type from the exact extinction conditional at the
+                // collision shell (the analog race's first-arrival law);
+                // no weight correction (the type probabilities cancel the
+                // per-type coefficients). Drawn ONLY when the collision
+                // shell carries cloud, keeping clear-sky RNG streams
+                // bit-identical to the gas-only code.
+                let sigma_c = atm.cloud_extinction[scatter_shell];
+                if sigma_c > 0.0 {
+                    let sigma_gas = atm.optics[scatter_shell][wavelength_idx].extinction;
+                    if xorshift_f64(&mut local_rng.tau) < sigma_c / (sigma_c + sigma_gas) {
+                        cloud_collision = true;
+                        // Forced mode is 1D-only (field is None here).
+                        g_cloud_here =
+                            field.map(|f| f.g_at(pos)).unwrap_or(atm.cloud_g_scaled);
+                    }
+                }
             } else {
                 let mut scatter_found = false;
                 let mut found_shell = 0usize;
@@ -3911,16 +4018,19 @@ fn cloud_phase_value(cos_theta: f64, g_cloud: f64) -> f64 {
 /// True when ANY gray cloud channel is active for a run: a 3D field is
 /// present, or the 1D per-shell cloud extinction is nonzero somewhere.
 ///
-/// Forced-collision mode and the BDPT light subpath sample GAS-only
-/// proposals (their scouts accumulate `atm.optics` extinction only), so
-/// they can no more compose with the unforced 1D gray channel than with
-/// the field: gating them on `field.is_none()` alone left `--cloud` /
-/// `--weather` runs (1D deck, no field) forcing flights straight through
-/// the deck while analog bounces of the same chain raced it. Gate on THIS
-/// instead. Analog-only under cloud is unbiased, just noisier;
-/// combined-channel tracking for the shell-constant 1D cloud (folding the
-/// gray deck into the per-shell gas total, exact for piecewise-constant
-/// shells) is the known follow-up that would restore forced mode there.
+/// Sole remaining consumer: the BDPT light subpath gate (`bdpt_active`).
+/// The light subpath samples GAS-only proposals and cannot compose with
+/// the unforced gray channel (1D or field), so it stays disabled under
+/// any cloud; converting it is a separate tracked follow-up.
+///
+/// HISTORY: forced-collision mode in the chains used to gate on this too
+/// (the original sin was forced flights sampling GAS-only scout tau and
+/// crossing decks as transparent; the conservative fix disabled forced
+/// mode under any cloud, at the cost of one-sided variance starvation
+/// under 1D decks at SZA >= 97, externally measured at 0.16-0.22x vs
+/// MYSTIC). The chains now fold the shell-constant 1D deck into the
+/// combined transport channel (exact, see the scalar chain's `use_forced`
+/// derivation) and gate only on `field.is_none()`.
 #[inline]
 fn has_cloud_channel(atm: &AtmosphereModel, field: Option<&Cloud3DField>) -> bool {
     field.is_some()
@@ -3930,12 +4040,14 @@ fn has_cloud_channel(atm: &AtmosphereModel, field: Option<&Cloud3DField>) -> boo
 }
 
 /// Cloud context handed from the hybrid drivers to the secondary chains.
+///
+/// NOTE: forced-collision mode no longer gates on a per-run cloud flag.
+/// The 1D shell deck composes with forced mode through the combined
+/// transport channel (see the derivation at the scalar chain's
+/// `use_forced`); only a 3D field disables it, and the chains gate that
+/// on `field.is_none()` directly.
 #[derive(Clone, Copy)]
 struct ChainCloud {
-    /// Any gray cloud channel active this run (3D field or 1D shell deck).
-    /// Computed once per driver by [`has_cloud_channel`]; disables
-    /// forced-collision mode in the chains (gas-only proposal, see there).
-    channel: bool,
     /// Gray cloud scattering coefficient of the seeding LOS step [1/m]:
     /// the step's exact DDA cloud tau divided by ds (the per-shell
     /// constant in the 1D fallback). Zero on clear steps.
@@ -3949,7 +4061,6 @@ impl ChainCloud {
     /// No cloud anywhere (clear-sky steps and unit tests).
     #[cfg(test)]
     const CLEAR: ChainCloud = ChainCloud {
-        channel: false,
         beta_seed: 0.0,
         g_seed: 0.0,
     };
@@ -4021,8 +4132,10 @@ fn scout_tau_to_boundary_alis(
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((dist, is_outward)) => {
+                // Combined channel (see scout_with_vspg_segments_alis).
+                let cext = atm.cloud_extinction[shell_idx];
                 for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
-                    *tau_w += atm.optics[shell_idx][w].extinction * dist;
+                    *tau_w += (atm.optics[shell_idx][w].extinction + cext) * dist;
                 }
 
                 let boundary_pos = pos + dir * dist;
@@ -4071,6 +4184,13 @@ fn scout_tau_to_boundary_alis(
 /// Advances along the ray until the hero wavelength accumulates `tau_target`
 /// optical depth. Returns the position, direction, scatter shell, and the
 /// per-wavelength optical depths at the scatter position.
+///
+/// COMBINED transport channel, matching `scout_with_vspg_segments_alis`:
+/// the hero advances on gas-plus-gray-cloud tau and the returned
+/// per-wavelength taus are combined as well. Since the cloud term is
+/// shared, `taus[w] - taus[hero]` equals the per-wavelength GAS tau
+/// difference, which is exactly what the ALIS forced-flight ratio needs.
+/// Clear shells add 0.0 (bit-identical to the gas-only advance).
 fn advance_to_optical_depth_alis(
     atm: &AtmosphereModel,
     start_pos: Vec3,
@@ -4093,7 +4213,10 @@ fn advance_to_optical_depth_alis(
 
     for _ in 0..200 {
         let shell = &atm.shells[shell_idx];
-        let hero_extinction = atm.optics[shell_idx][hero_wl].extinction;
+        // Combined per-shell extinction (gas + gray 1D cloud; 0.0 on
+        // clear shells, bit-identical there).
+        let cext = atm.cloud_extinction[shell_idx];
+        let hero_extinction = atm.optics[shell_idx][hero_wl].extinction + cext;
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((boundary_dist, is_outward)) => {
@@ -4108,7 +4231,7 @@ fn advance_to_optical_depth_alis(
                         boundary_dist
                     };
                     for (w, tau_w) in tau_accumulated.iter_mut().enumerate().take(num_wl) {
-                        *tau_w += atm.optics[shell_idx][w].extinction * dist;
+                        *tau_w += (atm.optics[shell_idx][w].extinction + cext) * dist;
                     }
                     pos = pos + dir * dist;
                     return (pos, dir, shell_idx, tau_accumulated);
@@ -4117,7 +4240,7 @@ fn advance_to_optical_depth_alis(
                 // Cross boundary
                 hero_tau += tau_shell_hero;
                 for (w, tau_w) in tau_accumulated.iter_mut().enumerate().take(num_wl) {
-                    *tau_w += atm.optics[shell_idx][w].extinction * boundary_dist;
+                    *tau_w += (atm.optics[shell_idx][w].extinction + cext) * boundary_dist;
                 }
 
                 let boundary_pos = pos + dir * boundary_dist;
@@ -4363,13 +4486,48 @@ fn trace_secondary_chain_alis(
     let mut total = [0.0f64; 64];
 
     // Forced scattering + exponential transform setup (same as scalar tracer).
-    // Forced mode disabled under ANY gray cloud channel, 3D field or 1D
-    // shell deck (the gas forced proposal is sampled from GAS-only scout
-    // tau and cannot compose unbiasedly with the gray cloud channel;
-    // analog is unbiased, and combined-channel tracking for the
-    // shell-constant 1D deck is the known follow-up).
+    //
+    // ── COMBINED-channel forced mode under ALIS: the per-wavelength
+    //    argument (the crux) ────────────────────────────────────────────
+    //
+    // The scout accumulates COMBINED tau per wavelength,
+    // tau_t_w = tau_gas_w + tau_c, with the gray cloud term tau_c SHARED
+    // across wavelengths. The hero flight is sampled from its truncated
+    // combined density
+    //
+    //   p_h(s) = sigma_t_h(s) e^{-tau_t_h(s)} / (1 - e^{-T_t_h}),
+    //
+    // with the vertex type drawn from the hero's extinction conditional
+    // P_h(cloud|s) = sigma_c/sigma_t_h. The wavelength-w physical target
+    // for this bounce factorizes over (s, type):
+    //
+    //   f_w(s, cloud) = sigma_c        e^{-tau_t_w(s)},
+    //   f_w(s, gas)   = sigma_gas_w(s) e^{-tau_t_w(s)}.
+    //
+    // The exact per-wavelength IS weight f_w / p_h therefore splits into
+    // the hero factor (1 - e^{-T_t_h}) (applied to hero_weight once,
+    // type-independent) times the ratio applied to wr/pr:
+    //
+    //   cloud vertex: e^{-(tau_t_w - tau_t_h)}
+    //               = e^{-(tau_gas_w - tau_gas_h)}      (tau_c cancels),
+    //   gas vertex:   (sigma_gas_w / sigma_gas_h) e^{-(tau_gas_w - tau_gas_h)}.
+    //
+    // Both are computable from the combined taus the advance returns
+    // (their differences ARE the gas differences, gray cancellation) and
+    // the GAS extinctions at the scatter shell. This is exactly the
+    // existing analog-race ratio structure (survival-only at a cloud
+    // vertex, sigma-ratio times survival at a gas vertex), so wr and pr
+    // stay per-wavelength consistent and the spectral one-sample MIS
+    // family remains a positive path function consistent across hero
+    // choices. Check for w = hero: both ratios are 1, and
+    // hero_weight *= (1 - e^{-T_t_h}) is the scalar-chain factor.
+    //
+    // Under a 3D FIELD (sigma_c not shell-constant) forced mode stays
+    // OFF; see the scalar chain note. Field runs carry
+    // atm.cloud_extinction == 0, so the gate below is exact.
+    // ────────────────────────────────────────────────────────────────────
     let sza_deg_local = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
-    let use_forced = sza_deg_local >= ZENITH_SZA_START && !cloud.channel;
+    let use_forced = sza_deg_local >= ZENITH_SZA_START && field.is_none();
     let sza_t_et =
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
@@ -4457,6 +4615,9 @@ fn trace_secondary_chain_alis(
             let mut g_cloud_here = 0.0f64;
 
             if forced_this_bounce {
+                // Combined-channel forced flight: tau_maxes, the segments
+                // and the advance are all gas + gray 1D cloud (see the
+                // per-wavelength derivation at use_forced).
                 let tau_max_h = tau_maxes[hero_wl];
                 let exp_neg_tau_h = libm::exp(-tau_max_h);
                 let one_minus_exp_h = 1.0 - exp_neg_tau_h;
@@ -4472,6 +4633,8 @@ fn trace_secondary_chain_alis(
                 // normalization ratio multiplied here double-counted the
                 // truncation and suppressed red-channel multiple scatter
                 // by up to ~12x (audit 2026-06-12, empirically confirmed).
+                // The identical argument holds for the combined channel
+                // with sigma -> sigma_t and tau -> tau_t per wavelength.
 
                 // VSPG: sample from pre-collected segments (no re-walk).
                 let (tau_s, vspg_w) = vspg_sample_from_segments(
@@ -4487,9 +4650,38 @@ fn trace_secondary_chain_alis(
                 current_dir = sd;
                 scatter_shell = ss;
 
+                // Vertex type from the hero's extinction conditional at
+                // the collision shell (first-arrival law of the analog
+                // race): cloud with sigma_c / (sigma_c + sigma_gas_hero).
+                // Type probabilities cancel the hero's per-type
+                // coefficients, so hero_weight is untouched; the
+                // per-wavelength type mismatch is carried by wr/pr below.
+                // Drawn ONLY when the collision shell carries cloud, so
+                // clear-sky RNG streams are bit-identical.
+                let sigma_c = atm.cloud_extinction[scatter_shell];
                 let sigma_h = atm.optics[scatter_shell][hero_wl].extinction;
-                if sigma_h > 1e-30 {
-                    let tau_h_pos = taus_at_pos[hero_wl];
+                if sigma_c > 0.0
+                    && xorshift_f64(&mut local_rng.tau) < sigma_c / (sigma_c + sigma_h)
+                {
+                    cloud_collision = true;
+                    // Forced mode is 1D-only (field is None here).
+                    g_cloud_here = field.map(|f| f.g_at(pos)).unwrap_or(atm.cloud_g_scaled);
+                }
+
+                // Per-wavelength ratios (derivation at use_forced). The
+                // combined-tau differences ARE the gas differences (the
+                // shared gray cloud tau cancels); a cloud vertex is gray,
+                // so it carries the transmittance ratio ONLY, while a gas
+                // vertex adds the gas extinction ratio exactly as the
+                // gas-only forced flight did.
+                let tau_h_pos = taus_at_pos[hero_wl];
+                if cloud_collision {
+                    for w in 0..num_wl {
+                        let ratio = libm::exp(-(taus_at_pos[w] - tau_h_pos));
+                        wr[w] *= ratio;
+                        pr[w] *= ratio;
+                    }
+                } else if sigma_h > 1e-30 {
                     for w in 0..num_wl {
                         let sigma_w = atm.optics[scatter_shell][w].extinction;
                         let ratio =
@@ -4993,9 +5185,11 @@ pub fn hybrid_scatter_radiance_alis(
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
 
-    // Any gray cloud channel this run? Computed once; disables forced-
-    // collision mode in the chains and the BDPT light subpath (both are
-    // gas-only proposals).
+    // Any gray cloud channel this run? Computed once; disables the BDPT
+    // light subpath (a gas-only proposal; see bdpt_active). The CHAINS no
+    // longer gate on this: the 1D shell deck composes with forced mode
+    // through the combined transport channel, and only a 3D field keeps
+    // forced mode off (gated on field.is_none() in the chains).
     let cloud_channel = has_cloud_channel(atm, field);
 
     // --- LOS ray-budget redistribution (importance sampling by altitude) ---
@@ -5337,7 +5531,6 @@ pub fn hybrid_scatter_radiance_alis(
             // Cloud-seed mixture context for this step's chains (see the
             // ALIS seed derivation in trace_secondary_chain_alis).
             let chain_cloud = ChainCloud {
-                channel: cloud_channel,
                 beta_seed: beta_cloud,
                 g_seed: g_cloud_step,
             };
@@ -6327,6 +6520,105 @@ mod tests {
             tau
         );
         assert!(!hit_ground, "Outward ray should not hit ground");
+    }
+
+    /// G-FORCED-COMB (combined-channel forced mode, exactness of the
+    /// machinery): with a gray 1D shell deck, the scout must accumulate
+    /// gas PLUS cloud tau (analytically checkable on radial rays), the
+    /// fused VSPG scout must agree with it, the ALIS scout's per-
+    /// wavelength tau DIFFERENCES must be unchanged by the gray deck,
+    /// and the combined advance must invert the combined scout exactly
+    /// (round-trip to the deck interior).
+    #[test]
+    fn scout_and_advance_fold_1d_cloud_exactly() {
+        use crate::atmosphere::{AtmosphereModel, ShellOptics, EARTH_RADIUS_M};
+
+        // Shells 0-1, 1-2, 2-100 km; deck (pure gray scattering) in 1-2 km.
+        let wavelengths = [450.0, 550.0, 650.0];
+        let mut atm = AtmosphereModel::new(&[0.0, 1.0, 2.0, 100.0], &wavelengths);
+        for s in 0..atm.num_shells {
+            for (w, factor) in [2.0, 1.0, 0.5].iter().enumerate() {
+                atm.optics[s][w] = ShellOptics {
+                    extinction: 1e-5 * factor,
+                    ssa: 1.0,
+                    asymmetry: 0.0,
+                    rayleigh_fraction: 1.0,
+                };
+            }
+        }
+        let sigma_c = 2e-3; // deck: tau_c = 2.0 across the 1 km shell
+        atm.cloud_extinction[1] = sigma_c;
+
+        let pos = crate::geometry::Vec3::new(EARTH_RADIUS_M + 1.0, 0.0, 0.0);
+        let dir = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
+
+        // Analytic radial tau at hero (550): gas 1e-5 * 1e5 m + cloud 2.0.
+        let (tau_cloudy, hg) = scout_tau_to_boundary(&atm, pos, dir, 1);
+        assert!(!hg);
+        assert!(
+            (tau_cloudy - 3.0).abs() < 0.01,
+            "combined scout must fold the deck: expected ~3.0, got {tau_cloudy}"
+        );
+
+        // Fused VSPG scout agrees with the plain scout.
+        let mut segs = [VspgSegment {
+            tau_lo: 0.0,
+            tau_hi: 0.0,
+            importance: 1.0,
+        }; VSPG_MAX_SEGMENTS];
+        let (tau_fused, hg_f, n_segs) =
+            scout_with_vspg_segments(&atm, pos, dir, 1, 97.0, &mut segs);
+        assert!(!hg_f);
+        assert!(
+            (tau_fused - tau_cloudy).abs() < 1e-12,
+            "fused scout {tau_fused} != plain scout {tau_cloudy}"
+        );
+        assert!(n_segs >= 3, "expected one segment per shell, got {n_segs}");
+
+        // ALIS scout: gray deck must not change per-wavelength tau
+        // DIFFERENCES (the crux of the ALIS forced ratio).
+        let (taus_c, _, _) =
+            scout_with_vspg_segments_alis(&atm, pos, dir, 1, 3, 97.0, &mut segs);
+        let mut atm_clear = atm.clone();
+        atm_clear.cloud_extinction[1] = 0.0;
+        let (taus_g, _, _) =
+            scout_with_vspg_segments_alis(&atm_clear, pos, dir, 1, 3, 97.0, &mut segs);
+        for w in 0..3 {
+            let d_cloudy = taus_c[w] - taus_c[1];
+            let d_gas = taus_g[w] - taus_g[1];
+            assert!(
+                (d_cloudy - d_gas).abs() < 1e-12,
+                "gray deck changed the per-wavelength tau difference at w={w}: \
+                 {d_cloudy} vs {d_gas}"
+            );
+            // 1e-5 tolerance: the shell walk nudges 1e-3 m past each
+            // boundary (tau_c deficit ~2e-6), identically for every
+            // wavelength (the differences above stay at 1e-12).
+            assert!(
+                (taus_c[w] - taus_g[w] - 2.0).abs() < 1e-5,
+                "every wavelength must carry the same shared cloud tau 2.0, \
+                 got {}",
+                taus_c[w] - taus_g[w]
+            );
+        }
+
+        // Combined advance inverts the combined scout: advancing to a tau
+        // inside the deck must land inside the deck shell at the exact
+        // combined depth.
+        let tau_target = 0.011 + 1.0; // gas of shell 0 (~0.01) + half the deck
+        let (sp, _sd, ss) = advance_to_optical_depth(&atm, pos, dir, tau_target, 1);
+        assert_eq!(ss, 1, "scatter must land in the deck shell");
+        let alt_km = (sp.length() - EARTH_RADIUS_M) / 1000.0;
+        assert!(
+            (1.0..2.0).contains(&alt_km),
+            "scatter altitude {alt_km} km must be inside the 1-2 km deck"
+        );
+        // Round-trip: scout from the scatter point covers the remainder.
+        let (tau_rest, _) = scout_tau_to_boundary(&atm, sp, dir, 1);
+        assert!(
+            (tau_rest + tau_target - tau_cloudy).abs() < 1e-6,
+            "advance/scout round-trip broken: {tau_rest} + {tau_target} != {tau_cloudy}"
+        );
     }
 
     #[test]
