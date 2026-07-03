@@ -263,3 +263,298 @@ physics.
 > June agreement inside the persistent-twilight regime. The residual
 > error is background modeling (agriculture/sea/urban winter), not
 > transport or psychophysics.
+
+## 9. Reference-sky background modeling: the non-desert misses (2026-07-03)
+
+Section 5 identified the sweep's residual error as reference-sky
+("black thread") modeling: the three >= 0.7 deg misses (Assiut
+agricultural +1.29, Tubruq sea +1.49, Birmingham urban winter +1.2 to
++2.1) all judged dawn against a background the pristine desert-cluster
+run does not model. This section models each site's actual background
+with the engine's existing hooks, nothing retuned. Runner:
+`tools/criterion_sites.py --background` (cache-sharing with the
+pristine sweep; engine pinned to the d4f682e release binary throughout,
+so every before/after pair below is single-engine). It supersedes the
+section 6 sensitivity table.
+
+### 9.1 The mechanism, read off the implementation
+
+The khayt margin (khayt.rs `patch_margins`) is
+
+    margin_j = (L_j - L_j^night) / (L_ref x k x C_thr(L_ref))
+
+- `L_j^night` is the median of the deepest three coarse-scan points of
+  patch j itself (khayt.rs `night_baseline`): any time-constant veil
+  cancels in the numerator.
+- A background raises the DETECTION TARGET through `L_ref`, the
+  +-100 deg reference patches: brighter reference means a larger
+  absolute excess is needed, so the crossing comes later = shallower.
+  All three misses are engine-deeper-than-eye: exactly the signature of
+  a modeled reference darker than the observers' real sky.
+- Measured response (TWILIGHT_KHAYT_DEBUG margin curves, Birmingham
+  Dec 10): the spread margin falls 0.29-0.44 dex per degree of
+  depression, so a factor-8 target inflation moves fajr ~2 deg
+  shallower. The panel's winter values sit ~2 deg shallower than the
+  pristine run: they imply a ring reference ~1.4e-2 cd/m^2, i.e. an
+  artificial zenith of ~1.7 mcd/m^2. The Lorenz 2024 atlas at the
+  camera pixel reads 3.595 mcd/m^2: the Birmingham winter miss is
+  QUANTITATIVELY the size of the site's real skyglow (factor ~2 left
+  for the 2024-atlas-vs-2015-epoch and pixel-vs-horizon caveats).
+
+### 9.2 Found on the way: a 1000x unit bug in the skyglow veil
+
+The first --skyglow runs collapsed the whole Birmingham year to
+7.4-9.3 deg regardless of season; a --radiance 0.8 (Bortle 3) "veil"
+moved moonless winter rows by -3.9 deg while the engine's own
+full-moon rows (a brighter physical background!) move only -1.6 deg.
+Root cause, verified in source and by margin-curve ratios
+(dbg_r08_dec10.err: measured target inflation 104-110x where correct
+units predict 1.9x): bortle.rs `radiance_to_zenith_luminance` returns
+mcd/m^2, `quick_estimate` stores that number into
+`SkyglowResult::zenith_luminance` documented as cd/m^2, and the
+khayt veil adds it (x8.11 Duriscoe horizon lift) onto cd/m^2 patch
+luminances. Every skyglow-flagged khayt output is a 1000x-too-bright
+veil; the section 6 Bortle-6 row was this bug, not physics. The legacy
+spectral injection path (`inject_skyglow`) is separately suspect (raw
+VIIRS upward radiance used as observer sky radiance) - flagged, not
+audited here. No Rust was changed in this campaign; the bug is worked
+around exactly, since veil ~ R^0.72:
+
+    R_emul = R_true / 1000^(1/0.72) = R_true / 14677
+
+applies the physically correct veil through the buggy path
+(--skyglow --radiance 0.011086 emulates the measured 3.595 mcd/m^2
+atlas zenith; the residual side effect, the legacy-path spectral
+injection, becomes negligible at that radiance).
+
+The bugged runs were kept (they are a dose-response ladder for the
+veil term, 0.23-29 cd/m^2): even a 0.23 cd/m^2 veil leaves Jun 22 at
+exactly the pristine 11.50 (the June persistent-twilight reference is
+brighter than any urban veil - the veil term is winter-selective,
+which is precisely the shape of the panel's seasonal curve), while
+0.64 cd/m^2 is the first probed level that dents it (10.72).
+
+### 9.3 Birmingham, corrected units: the measured-atlas year
+
+Full OpenFajr panel year, `--skyglow --radiance 0.011086` (= measured
+Lorenz-2024 atlas 3.595 mcd/m^2 artificial zenith through the
+corrected-units emulation), engine otherwise identical to section 3:
+
+| Date 2015 | Panel | Pristine | Atlas veil | Old delta | New delta |
+|---|---|---|---|---|---|
+| Jan 11 | 13.0 | 13.74 | 12.83 | +0.74 | -0.17 |
+| Jan 24 | 12.9 | 14.98 | 12.83 | +2.08 | -0.07 |
+| Feb 22 | 13.7 | 14.86 | 12.83 | +1.16 | -0.87 |
+| Feb 27 | 13.0 | 14.80 | 12.81 | +1.80 | -0.19 |
+| Apr 20 | 15.0 | 14.73 | 12.86 | -0.27 | -2.14 |
+| Apr 27 | 13.7 | 14.19 | 12.84 | +0.49 | -0.86 |
+| May 13 | 13.0 | 14.70 | 12.86 | +1.70 | -0.14 |
+| May 27 | 13.0 | 14.50 | 12.80 | +1.50 | -0.20 |
+| Jun 07 | 12.6 | 12.50 | 12.24 | -0.10 | -0.36 |
+| Jun 22 | 12.5 | 11.50 | 11.50 | -1.00 | -1.00 |
+| Jun 30 | 12.3 | 12.50 | 12.24 | +0.20 | -0.06 |
+| Jul 06 | 13.0 | 12.50 | 12.24 | -0.50 | -0.76 |
+| Jul 18 | 13.8 | 14.50 | 12.84 | +0.70 | -0.96 |
+| Aug 16 | 14.3 | 15.07 | 12.89 | +0.77 | -1.41 |
+| Sep 06 | 14.9 | 14.00 | 12.79 | -0.90 | -2.11 |
+| Sep 23 | 14.6 | 14.87 | 12.83 | +0.27 | -1.77 |
+| Nov 13 | 13.5 | 14.79 | 12.83 | +1.29 | -0.67 |
+| Dec 10 | 12.9 | 14.94 | 12.85 | +2.04 | -0.05 |
+| Dec 25 | 12.6 | 13.38 | 12.76 | +0.78 | +0.16 |
+
+- **Winter (7 rows): RMS 1.51 -> 0.43.** The three worst misses of the
+  sweep (+2.08 Jan 24, +2.04 Dec 10, +1.80 Feb 27) close to -0.07,
+  -0.05, -0.19. Nothing was fitted: the veil is the measured atlas
+  value at the camera pixel.
+- **The lunar signature flattens.** Pristine winter khayt swings 1.6
+  deg between moonless and full-moon mornings; the panel shows no such
+  swing (section 3). Under the real urban veil (2.9e-2 cd/m^2 ring,
+  2.5x the full-moon floor) the engine's swing collapses to 0.09 deg:
+  the moon-blindness of the panel data is REPRODUCED, not explained
+  away.
+- **June holds** (the mechanism test): Jun 22 identical to pristine
+  (11.50), Jun 07/30 move only -0.26. The persistent-twilight
+  reference outshines the veil; the veil term is winter-selective,
+  which is the shape of the panel's curve.
+- **The honest cost: the shoulder peaks flatten.** The constant veil
+  clamps every dark-floor morning to ~12.8, so the panel's spring and
+  autumn peaks (Apr 20 15.0, Sep 06 14.9, Sep 23 14.6, Aug 16 14.3),
+  which the pristine run matched to 0.9 or better, become -1.4 to
+  -2.1 misses. Full-year: RMS 1.14 -> 1.00, mean +0.67 -> -0.72. No
+  CONSTANT veil can produce both the 12.9 winter troughs and the 15.0
+  spring peak; the peak mornings require a reference floor well below
+  the atlas veil.
+- **The residual is wall-clock structured.** Partition the 19 dates by
+  fajr local time: the 7 rows with fajr at/after 05:25 (all winter)
+  match the VEILED engine (RMS 0.43); the 5 rows with fajr between
+  03:54 and 05:20, which include all four panel peaks, match the
+  PRISTINE engine (pristine RMS 0.60 vs veiled 1.73); the 7 rows
+  before 03:50 are floor-dominated either way (0.99 -> 0.62). A
+  zero-parameter duty-cycle partition (veiled iff fajr >= 05:25,
+  pristine otherwise) gives full-year RMS 0.73. This is exactly the
+  shape of UK part-night street lighting (Birmingham's PFI CMS dimmed
+  or switched circuits roughly 00:30-05:30 in this era, relighting
+  before the winter fajr but not the equinox one), and the epoch-mean
+  atlas cannot carry a duty cycle. It is presented as a measured
+  correlation, not a closed attribution: the May 13/27 rows (fajr
+  02:20-03:00, panel-low) fit the constant veil better, as would
+  partial dimming of only some circuits. Nightly veil variability
+  (boundary-layer aerosol and humidity modulate skyglow by factors of
+  several around the clear-sky atlas composite) and the panel's
+  CCD+screen methodology (not dark-adapted naked eyes under the veil)
+  remain the other candidates. A per-night SQM series at the site, or
+  the council's 2015 CMS schedule, would separate them; neither datum
+  was obtained.
+
+Corrected Bortle ladder (Jan 24 / Jun 22 / Dec 10), for sensitivity.
+The "predicted" column was computed BEFORE these runs from the
+pristine margin curve + TVI target inflation alone
+(analyze_background.py math; ring reference 3.4e-4 cd/m^2 inferred
+from the deep-night margin ratios):
+
+| Config | Ring veil cd/m^2 | Jan 24 | Jun 22 | Dec 10 | predicted winter |
+|---|---|---|---|---|---|
+| pristine | 0 | 14.98 | 11.50 | 14.94 | - |
+| Bortle 4 (R=2) | 1.2e-3 | 13.96 | 11.50 | 13.97 | 14.02 |
+| Bortle 5 (R=6) | 2.7e-3 | 13.68 | 11.50 | 13.71 | 13.67 |
+| Bortle 6 (R=15) | 5.3e-3 | 13.56 | 11.50 | 13.60 | 13.35 |
+| measured atlas | 2.9e-2 | 12.83 | 11.50 | 12.85 | 11.8 |
+
+The small-veil regime validates the mechanism arithmetic to
+0.04-0.06 deg on all four winter cells (Bortle 4: 13.96/13.97 vs
+14.02 predicted; Bortle 5: 13.68/13.71 vs 13.67); at the atlas level the
+measured crossing sits ~1 deg above the extrapolation (the margin
+curve steepens below depression 12, where the dump sampled only every
+2 deg). The evening side moves the same way (Dec 10 veiled shafaq
+abyad 14.84 vs pristine 17.22; ahmar 14.94 vs 14.50); no evening
+panel exists at this site to score it.
+
+### 9.4 Birmingham, the other honest winter input: aerosol
+
+UK boundary-layer aerosol (AERONET UK climatology AOD550 ~0.08-0.15)
+is bracketed by continental-clean (0.05) and continental-average
+(0.12); the desert calibration cluster's air is what the khayt edge
+factor was calibrated in, so the honest lever is the EXCESS over that
+baseline, not absolute AOD - the desert type itself (AOD 0.5) applied
+to Hail collapses it 14.46 -> 9.01, a warning against double-counting.
+
+Unlike the veil, aerosol extinction is SEASON-BLIND: it dims the dawn
+band itself (numerator), so it shifts June exactly as it shifts
+December. The measured magnitude of the lever (Assiut: AOD 0.12 =
+-1.9 deg in every season) means any AOD large enough to close the
+Birmingham winter (+2 deg) necessarily drags the matched June rows (12.5 vs
+panel 12.5) down to ~10.5, breaking them. Aerosol therefore cannot be
+the Birmingham winter mechanism; the winter-selective veil can, and
+measured skyglow is the honest input. The 19+8-date aerosol bracket
+runs are queued in the shared cache (`birmingham_aer_cavg`,
+`birmingham_aer_cclean`) to quantify this prediction; their expected
+outcome (winter partially closed, June broken) is falsifiable against
+this paragraph.
+
+### 9.5 Tubruq: sea vs desert background
+
+Same site, same team, two backgrounds, observed offset 1.2 deg (sea
+13.43-13.48 vs desert 14.66-14.70). Two candidate mechanisms:
+
+- Albedo (sea ~0.06 vs desert ~0.30 vs default 0.15): a NULL LEVER.
+
+| Config | Jan 15 | Apr 15 | Jul 15 | Mean | Delta vs obs |
+|---|---|---|---|---|---|
+| pristine (albedo 0.15) | 14.82 | 14.82 | 15.20 | 14.95 | sea +1.49 / desert +0.27 |
+| sea albedo 0.06 | 14.81 | 14.83 | 15.20 | 14.95 | +1.49 |
+| desert albedo 0.30 | 14.82 | 14.82 | 15.19 | 14.94 | +0.26 |
+| sea 0.06 + maritime-clean aerosol | 13.83 | 13.91 | 14.07 | 13.94 | **+0.48** |
+
+  The full 0.06-0.30 bracket moves the khayt by 0.01 deg: at fajr
+  depths the ground is not directly sunlit, so the Lambertian surface
+  term contributes nothing to the twilight arch. Even if it did, the
+  surface is a single global scalar (`build_clear_sky` applies one
+  albedo everywhere): a coastline split, sea toward the dawn azimuth
+  and desert behind, is not representable in the current engine.
+- Marine boundary-layer aerosol along the over-sea dawn path
+  (--aerosol maritime-clean, AOD550 0.06) does the work: mean
+  14.95 -> 13.94 against observed 13.43-13.48.
+
+Verdict: the "sea background" effect is an AEROSOL effect, not an
+albedo effect. Honest marine air closes two thirds of the +1.49 miss
+(residual +0.48); the desert-facing campaign stays matched (+0.26).
+What remains unrepresentable: the aerosol (like the albedo) is
+horizontally uniform, so a run models EITHER the over-sea dawn path OR
+the over-desert one; the same-site simultaneity of the two campaigns
+cannot be captured, and the real marine boundary layer (haze banks,
+sea-spray gradient with fetch) is likely thicker toward the horizon
+than the uniform AOD 0.06 profile. The residual +0.48 is the
+documented model gap.
+
+### 9.6 Assiut: agricultural Nile valley
+
+| Config | Jan 15 | Apr 15 | Oct 15 | Mean | Delta vs 13.665 |
+|---|---|---|---|---|---|
+| pristine | 14.81 | 15.18 | 14.87 | 14.95 | +1.29 |
+| continental-clean (AOD 0.05) | 14.06 | 14.26 | 14.14 | 14.15 | +0.49 |
+| continental-average (AOD 0.12) | 12.92 | 13.01 | 13.10 | 13.01 | -0.66 |
+
+The honest AOD bracket straddles the observation in every season; the
+observed 13.665 corresponds to an excess AOD of ~0.08 over the
+desert-calibration baseline, squarely inside Nile-valley climatology.
+The campaign's own desert sibling (Bahariya 14.6, same team and
+method) minus Assiut is 0.94 deg; the engine's clean-vs-average
+bracket spans 1.14 deg around exactly that offset. Closing beyond the
+bracket needs the site's real AOD series (AERONET/MERRA-2 for 2012-
+2014, or `--weather` for live runs), not a type constant.
+A skyglow probe at the campaign coordinate (27.167 N 31.167 E, which
+is Assiut city) reads 4.121 mcd/m^2 in the 2024 atlas: as bright as
+Birmingham. That value cannot describe the observers' sky: a veil of
+that size would push fajr far shallower than the observed 13.665,
+which the aerosol bracket alone straddles. The reading is the city
+pixel; the NRIAG observing sites were in the agricultural countryside
+("agricultural background" per the paper), outside the propagated
+city dome, and the 2024 epoch further inflates it vs 2012-2014. The
+atlas value at a published campaign coordinate is an upper bound on
+the observers' veil, not an input, whenever the paper says the site
+was rural.
+
+### 9.7 The recipe: modeling a non-desert site
+
+Written to become a README paragraph once the unit fix lands.
+
+1. **Urban skyglow** (the dominant winter lever at mid/high latitude):
+   feed the measured atlas value for the site (`--skyglow`; Lorenz
+   2024 tiles cache under `data/skyglow`), but until the mcd/cd unit
+   bug is fixed it MUST go through the emulation
+   `--radiance <atlas-implied nW>/14677`. Check the paper's site
+   description first: the atlas pixel at a city coordinate is an
+   upper bound if the observers stood in the countryside (Assiut).
+   Expected residual ~0.4 deg on mornings when the lights are actually
+   on; for cities with part-night lighting, any date whose fajr falls
+   inside the dimming window (roughly 00:30-05:30 in the UK) needs the
+   local duty cycle before the veil is trusted. The
+   persistent-twilight season needs no special casing: the veil
+   self-cancels against the bright June floor.
+2. **Sea horizon**: leave `--albedo` alone (measured null lever at
+   fajr depth); model the marine boundary layer with
+   `--aerosol maritime-clean`. Expected: closes ~1.0 deg of a ~1.5 deg
+   sea-background offset; the remaining ~0.5 deg is the documented
+   1D-atmosphere directional limit.
+3. **Agricultural/valley**: bracket with `--aerosol continental-clean`
+   and `--aerosol continental-average`; the observation should land
+   inside the bracket (Assiut: implied excess AOD ~0.08). A measured
+   site AOD (AERONET, MERRA-2) or `--weather` for live dates replaces
+   the bracket with a value. The aerosol flags express EXCESS over the
+   desert-calibration atmosphere: never feed absolute desert
+   climatology to a desert site (the Hail 14.46 -> 9.01 warning).
+4. **Expected residuals after honest modeling**: urban lights-on
+   ~0.4 deg; sea ~0.5 deg; agricultural ~0.5 deg (bracket midpoint),
+   better with measured AOD. All three section 5 misses closed to
+   within ~0.5 deg with measured or climatological inputs and zero
+   retuning; the criterion itself was not touched.
+
+### 9.8 Methods and reproducibility
+
+- All runs: `tools/criterion_sites.py --background` (rerun-safe,
+  cache = raw stdout beside the TSV `criterion_runs_background.tsv`).
+- Engine: single pinned d4f682e release binary for every row, GPU
+  (Metal) hybrid path, 100 secondary rays/step, SZA step 0.5.
+- Tables regenerate with `validation/criterion_runs/
+  analyze_background.py`.
+- The pristine sweep TSV and raw outputs are untouched.
