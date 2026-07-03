@@ -720,7 +720,14 @@ fn gpu_route_to_cpu_reason(
     atm: &twilight_core::atmosphere::AtmosphereModel,
 ) -> Option<&'static str> {
     if input.cloud_field.is_some() {
-        return Some("3D cloud field active (GPU field port pending re-verification)");
+        // The GPU hybrid kernel is parity-validated on real fields
+        // (G-MC-PARITY-3: 0.1 to 1 percent at SZA 95/97/100), but field
+        // dispatches survive the interactive macOS watchdog only as 100
+        // step-windows with inter-buffer yields, measured ~3x SLOWER than
+        // the CPU scan (~32 s vs ~11 s per 100-ray call). Perf routing,
+        // not correctness routing: flip when running headless or on a
+        // non-watchdog backend.
+        return Some("3D cloud field active (GPU parity-validated but watchdog-throttled; CPU scan is faster)");
     }
     let shell_cloud = atm.cloud_extinction.iter().any(|&e| e > 0.0);
     if shell_cloud
@@ -729,9 +736,21 @@ fn gpu_route_to_cpu_reason(
             ScatteringMode::Hybrid | ScatteringMode::Multiple
         )
     {
+        // Multiple: the mcrt kernel has no cloud channel at all.
+        // Hybrid: the combined-channel estimator IS ported and
+        // parity-gated (G-MC-PARITY-3), but a prayer scan is a
+        // sustained stream of hundreds of fan and refinement calls,
+        // and the interactive macOS watchdog kills sustained GPU
+        // saturation (~1.5 s), so every call pays multi-second retry
+        // sleeps: a GPU-routed cloudy khayt pray measured 2h+ hung in
+        // retries vs ~10 min on the CPU scan. Perf routing on
+        // interactive-watchdog platforms, not correctness routing:
+        // one-shot dispatches (cmd_simulate) stay on the GPU, and the
+        // scan routing can flip when running headless.
         return Some(
-            "1D shell cloud with a chain estimator (GPU 1D-cloud chain estimator \
-             pending re-port; the CPU scan is the reference)",
+            "1D shell cloud with a chain estimator (GPU hybrid is \
+             parity-validated but the sustained scan stream is \
+             watchdog-throttled; the CPU scan is faster)",
         );
     }
     None
@@ -2709,10 +2728,12 @@ mod tests {
         }
     }
 
-    /// (b) A 1D shell cloud (from any input source) with a chain-based
-    /// estimator routes to the CPU scan: the GPU hybrid kernel still
-    /// runs the retired T_diff estimator while the CPU runs Stage-2
-    /// explicit scattering.
+    /// (b) A 1D shell cloud (from any input source) with a chain
+    /// estimator routes the SCAN to the CPU: Multiple because the GPU
+    /// mcrt kernel has no cloud channel, hybrid on measured perf (the
+    /// estimator is parity-gated, but the sustained fan/refinement call
+    /// stream self-saturates the interactive macOS watchdog: a routed
+    /// cloudy pray measured 2h+ in retry sleeps vs ~10 min on CPU).
     #[test]
     fn gpu_entry_routes_shell_cloud_chain_modes_to_cpu() {
         use twilight_data::cloud::{default_properties, CloudType};

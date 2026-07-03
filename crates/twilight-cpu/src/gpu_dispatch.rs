@@ -47,15 +47,13 @@ fn check_cloud_chain_supported(
     atm: &AtmosphereModel,
     config: &SimulationConfig,
 ) -> Result<(), GpuError> {
-    if matches!(
-        config.scattering_mode,
-        ScatteringMode::Hybrid | ScatteringMode::Multiple
-    ) && atm.cloud_extinction.iter().any(|&e| e > 0.0)
+    if matches!(config.scattering_mode, ScatteringMode::Multiple)
+        && atm.cloud_extinction.iter().any(|&e| e > 0.0)
     {
         return Err(GpuError::Dispatch(
-            "1D shell cloud with a chain estimator (hybrid/multiple): the GPU \
-             chain kernels still run the retired T_diff closure and no longer \
-             match the CPU reference; use the CPU scan (GPU re-port pending)"
+            "1D shell cloud with the Multiple estimator: the GPU mcrt kernel \
+             has no cloud channel; use the CPU scan (hybrid IS ported and \
+             parity-gated)"
                 .into(),
         ));
     }
@@ -489,15 +487,21 @@ mod tests {
             atm.cloud_extinction.iter().any(|&e| e > 0.0),
             "test atmosphere must actually carry a shell cloud"
         );
-        for mode in [ScatteringMode::Hybrid, ScatteringMode::Multiple] {
-            let cfg = config_with_mode(mode);
-            let err = check_cloud_chain_supported(&atm, &cfg)
-                .expect_err("shell cloud + chain mode must be rejected");
-            assert!(
-                matches!(err, GpuError::Dispatch(_)),
-                "expected Dispatch error, got {err:?}"
-            );
-        }
+        // Multiple: the mcrt kernel has no cloud channel, rejected.
+        let err = check_cloud_chain_supported(&atm, &config_with_mode(ScatteringMode::Multiple))
+            .expect_err("shell cloud + Multiple must be rejected");
+        assert!(
+            matches!(err, GpuError::Dispatch(_)),
+            "expected Dispatch error, got {err:?}"
+        );
+        // Hybrid: the combined-channel estimator is ported and
+        // parity-gated; ONE-SHOT dispatches are supported (the sustained
+        // SCAN stream is routed to the CPU upstream, in the pipeline,
+        // on measured watchdog throttling: not this guard's concern).
+        assert!(
+            check_cloud_chain_supported(&atm, &config_with_mode(ScatteringMode::Hybrid)).is_ok(),
+            "shell cloud + Hybrid one-shot dispatch is supported"
+        );
     }
 
     /// Single mode keeps shell clouds on the GPU (T_diff on both
