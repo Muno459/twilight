@@ -315,17 +315,23 @@ mcd/m^2, `quick_estimate` stores that number into
 khayt veil adds it (x8.11 Duriscoe horizon lift) onto cd/m^2 patch
 luminances. Every skyglow-flagged khayt output is a 1000x-too-bright
 veil; the section 6 Bortle-6 row was this bug, not physics. The legacy
-spectral injection path (`inject_skyglow`) is separately suspect (raw
-VIIRS upward radiance used as observer sky radiance) - flagged, not
-audited here. No Rust was changed in this campaign; the bug is worked
-around exactly, since veil ~ R^0.72:
+spectral injection path (`inject_skyglow`) was separately suspect (raw
+VIIRS upward radiance used as observer sky radiance); it was flagged
+during this campaign and has since been calibrated to the Falchi
+zenith luminance (63e7d84). No Rust was
+changed to produce THIS SECTION'S numbers: every row ran on the pinned
+pre-fix d4f682e engine, with the bug worked around exactly, since
+veil ~ R^0.72:
 
     R_emul = R_true / 1000^(1/0.72) = R_true / 14677
 
 applies the physically correct veil through the buggy path
 (--skyglow --radiance 0.011086 emulates the measured 3.595 mcd/m^2
 atlas zenith; the residual side effect, the legacy-path spectral
-injection, becomes negligible at that radiance).
+injection, becomes negligible at that radiance). The unit fix has
+since landed (a390f2c): on post-fix engines plain `--skyglow` applies
+the correct veil directly, and this section's emulated rows are the
+regression targets it must reproduce.
 
 The bugged runs were kept (they are a dose-response ladder for the
 veil term, 0.23-29 cd/m^2): even a 0.23 cd/m^2 veil leaves Jun 22 at
@@ -440,16 +446,51 @@ to Hail collapses it 14.46 -> 9.01, a warning against double-counting.
 
 Unlike the veil, aerosol extinction is SEASON-BLIND: it dims the dawn
 band itself (numerator), so it shifts June exactly as it shifts
-December. The measured magnitude of the lever (Assiut: AOD 0.12 =
--1.9 deg in every season) means any AOD large enough to close the
-Birmingham winter (+2 deg) necessarily drags the matched June rows (12.5 vs
-panel 12.5) down to ~10.5, breaking them. Aerosol therefore cannot be
-the Birmingham winter mechanism; the winter-selective veil can, and
-measured skyglow is the honest input. The 19+8-date aerosol bracket
-runs are queued in the shared cache (`birmingham_aer_cavg`,
-`birmingham_aer_cclean`) to quantify this prediction; their expected
-outcome (winter partially closed, June broken) is falsifiable against
-this paragraph.
+December. The prediction, written before the bracket runs executed
+(and committed as such): "The measured magnitude of the lever (Assiut:
+AOD 0.12 = -1.9 deg in every season) means any AOD large enough to
+close the Birmingham winter (+2 deg) necessarily drags the matched
+June rows down, breaking them. Aerosol therefore cannot be the
+Birmingham winter mechanism." Here is how it fared (winter 7 rows +
+June 3 rows; deltas vs panel):
+
+| Date 2015 | Panel | Pristine | AOD 0.05 | AOD 0.12 | Old delta | Clean delta | Avg delta |
+|---|---|---|---|---|---|---|---|
+| Jan 11 (moon 72%) | 13.0 | 13.74 | 13.17 | 11.99 | +0.74 | +0.17 | -1.01 |
+| Jan 24 | 12.9 | 14.98 | 14.11 | 13.17 | +2.08 | +1.21 | +0.27 |
+| Feb 22 | 13.7 | 14.86 | 14.01 | 12.91 | +1.16 | +0.31 | -0.79 |
+| Feb 27 | 13.0 | 14.80 | 13.91 | 12.94 | +1.80 | +0.91 | -0.06 |
+| Jun 07 | 12.6 | 12.50 | - | 11.50 | -0.10 | - | -1.10 |
+| Jun 22 | 12.5 | 11.50 | 11.50 | 11.50 | -1.00 | -1.00 | -1.00 |
+| Jun 30 | 12.3 | 12.50 | - | 11.66 | +0.20 | - | -0.64 |
+| Nov 13 | 13.5 | 14.79 | 14.03 | 12.95 | +1.29 | +0.53 | -0.55 |
+| Dec 10 | 12.9 | 14.94 | 14.10 | 13.40 | +2.04 | +1.20 | +0.50 |
+| Dec 25 (moon 99%) | 12.6 | 13.38 | 12.70 | 11.69 | +0.78 | +0.10 | -0.91 |
+
+Winter RMS: pristine 1.51, clean (AOD 0.05) 0.77, average (AOD 0.12)
+0.67. Both brackets improve the winter RMS, but each breaks a
+signature the veil preserves:
+
+- **June breaks under AOD 0.12** as predicted: Jun 07 -0.10 -> -1.10,
+  Jun 30 +0.20 -> -0.64 (the magnitude is capped by the
+  compressed-twilight cliff, not by the aerosol being right).
+- **The lunar signature INVERTS under AOD 0.12**: the moonlit mornings
+  (Jan 11, Dec 25) become the LOWEST winter values (11.99, 11.69,
+  deltas -1.01/-0.91), because slant extinction stacks with the
+  moon-raised reference instead of dominating it the way the veil
+  does. The panel shows no such pattern.
+- **AOD 0.05 preserves both signatures but only half-closes** the
+  moonless rows (Jan 24 +1.21, Dec 10 +1.20).
+
+So the aerosol lever is real (UK air is not desert air, and ~AOD 0.05
+of excess is plausibly present and welcome), but it cannot carry the
+Birmingham winter alone without contradicting June and the moon rows.
+The winter-selective, moon-dominating veil is the mechanism that
+reproduces all three signatures at once, and its measured magnitude
+(9.1, 9.3) is the site's actual skyglow. Stacking measured veil +
+measured monthly AOD is the honest end state; stacking the veil with
+a GUESSED type constant would double-correct (the veiled winter rows
+already sit at -0.1 to -0.2).
 
 ### 9.5 Tubruq: sea vs desert background
 
@@ -516,13 +557,14 @@ was rural.
 
 ### 9.7 The recipe: modeling a non-desert site
 
-Written to become a README paragraph once the unit fix lands.
+README-ready; assumes a post-fix engine (a390f2c or later), where
+`--skyglow` applies correct units directly. On the pre-fix engine that
+produced this section's numbers, replace any skyglow input with the
+emulation `--radiance <atlas-implied nW>/14677`.
 
 1. **Urban skyglow** (the dominant winter lever at mid/high latitude):
    feed the measured atlas value for the site (`--skyglow`; Lorenz
-   2024 tiles cache under `data/skyglow`), but until the mcd/cd unit
-   bug is fixed it MUST go through the emulation
-   `--radiance <atlas-implied nW>/14677`. Check the paper's site
+   2024 tiles cache under `data/skyglow`). Check the paper's site
    description first: the atlas pixel at a city coordinate is an
    upper bound if the observers stood in the countryside (Assiut).
    Expected residual ~0.4 deg on mornings when the lights are actually
@@ -549,12 +591,41 @@ Written to become a README paragraph once the unit fix lands.
    within ~0.5 deg with measured or climatological inputs and zero
    retuning; the criterion itself was not touched.
 
+**What did NOT close, explicitly:**
+
+- Birmingham Apr 20 (-2.14), Sep 06 (-2.11), Sep 23 (-1.77),
+  Aug 16 (-1.41), Jul 18 (-0.96) UNDER THE CONSTANT VEIL: rows the
+  pristine engine already matched, overturned by applying the
+  epoch-mean atlas on mornings whose fajr fell inside the street-light
+  dimming window. Not a transport failure: a constant-background input
+  fed into hours when the background was not constant. Needs the
+  nightly veil (site SQM series or the council CMS schedule), neither
+  of which exists for 2015.
+- Birmingham Jun 22 (-1.00, unchanged in every configuration):
+  pre-existing compressed-twilight cliff row, quantized to the 0.5 deg
+  scan grid; a background input cannot and should not move it (and
+  measurably does not).
+- Tubruq sea (+0.48 after marine aerosol): the uniform-atmosphere
+  limit; the coastline split (sea toward dawn, desert behind) is not
+  representable with one albedo scalar and one aerosol profile.
+- Assiut (+0.49 / -0.66 bracket endpoints): not a failure to close but
+  a failure to PICK, honestly declared: without a measured 2012-2014
+  site AOD the engine gives a bracket, not a value.
+- Wadi Al-Natrun (-0.74, section 5's non-background outlier) was not
+  revisited: no background story, no new input to feed.
+
 ### 9.8 Methods and reproducibility
 
 - All runs: `tools/criterion_sites.py --background` (rerun-safe,
-  cache = raw stdout beside the TSV `criterion_runs_background.tsv`).
+  cache = raw stdout beside the TSV `criterion_runs_background.tsv`;
+  `TWILIGHT_CLI=<path>` pins the binary against parallel rebuilds).
 - Engine: single pinned d4f682e release binary for every row, GPU
-  (Metal) hybrid path, 100 secondary rays/step, SZA step 0.5.
+  (Metal) hybrid path, 100 secondary rays/step, SZA step 0.5. Backend
+  spot check: `--cpu` reproduces the GPU khayt to 0.01 deg
+  (r0.8 Jan 24: 11.09 vs 11.10).
 - Tables regenerate with `validation/criterion_runs/
-  analyze_background.py`.
-- The pristine sweep TSV and raw outputs are untouched.
+  analyze_background.py`; margin-curve dumps via TWILIGHT_KHAYT_DEBUG
+  are cached as `dbg_*.err` beside it.
+- The pristine sweep TSV and raw outputs are untouched; the bugged
+  skyglow runs are retained and labeled as the bug's dose-response
+  evidence.
