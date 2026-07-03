@@ -200,6 +200,12 @@ enum Commands {
         /// RNG seed salt for the MC scattering modes (multi-seed error bars)
         #[arg(long, default_value = "0")]
         seed_salt: u64,
+        /// 3D cloud field sidecar (same loader/validation as `pray
+        /// --cloud-field`). The field owns ALL cloud (transport
+        /// contract), so it cannot be combined with --cloud/--cloud-tau.
+        /// This is the field-radiance referee surface (gate G2b).
+        #[arg(long)]
+        cloud_field: Option<std::path::PathBuf>,
     },
     /// Sky Quality Meter field calibration: predict a night's zenith
     /// sky-brightness curve and compare it against measured SQM logs
@@ -1135,7 +1141,20 @@ fn cmd_compare(
     fast: bool,
     no_refraction: bool,
     seed_salt: u64,
+    cloud_field: Option<twilight_data::cloud_field_builder::OwnedCloudField>,
 ) {
+    // Transport contract: when a 3D field is present it owns ALL cloud,
+    // so the shells must stay cloud-free (same rule as the pipeline's
+    // build_atmosphere). Refuse conflicting cloud options outright.
+    if cloud_field.is_some()
+        && (custom_cloud.is_some() || cloud.to_cloud_type().is_some())
+    {
+        eprintln!(
+            "Error: --cloud-field owns all cloud; it cannot be combined \
+             with --cloud or --cloud-tau."
+        );
+        std::process::exit(1);
+    }
     // Build the atmosphere once.
     let mut atm = if rayleigh_only {
         match &custom_cloud {
@@ -1171,6 +1190,12 @@ fn cmd_compare(
             *n = 1.0;
         }
     }
+    // 3D field: carry the field's asymmetry on the (cloud-free) shells
+    // for the Eddington diffuse factors, exactly as the pipeline does.
+    if let Some(f) = &cloud_field {
+        atm.cloud_g_scaled = f.g_default;
+    }
+    let field_view = cloud_field.as_ref().map(|f| f.view());
 
     // Header with enough metadata to reproduce the run.
     println!(
@@ -1193,6 +1218,12 @@ fn cmd_compare(
             cp.optical_depth * de_scale * (1.0 - ssa_s),
         );
     }
+    if let Some(f) = &cloud_field {
+        println!(
+            "# cloud field: {}x{}x{} voxels, g_default={:.7}, source={} @ {}",
+            f.nz, f.nlat, f.nlon, f.g_default, f.source, f.timestamp
+        );
+    }
     println!("sza_deg,view_zenith_deg,rel_azimuth_deg,wavelength_nm,radiance_w_m2_sr_nm");
 
     for &vz in view_zeniths {
@@ -1211,7 +1242,8 @@ fn cmd_compare(
                 seed_salt,
             };
             for &sza in szas {
-                let result = simulation::simulate_at_sza(&atm, &config, sza, None);
+                let result =
+                    simulation::simulate_at_sza(&atm, &config, sza, field_view.as_ref());
                 for (wl, rad) in result.wavelengths_nm.iter().zip(result.radiance.iter()) {
                     println!("{},{},{},{},{:e}", sza, vz, ra, wl, rad);
                 }
@@ -3404,6 +3436,7 @@ fn main() {
             cloud_ssa,
             cloud_g,
             seed_salt,
+            cloud_field,
         } => {
             // Custom uniform deck for the external slab referee (G2).
             let custom_cloud = cloud_tau.map(|tau| CloudProperties {
@@ -3412,6 +3445,29 @@ fn main() {
                 optical_depth: tau,
                 ssa: cloud_ssa,
                 asymmetry: cloud_g,
+            });
+            // 3D field referee surface: mirrors `pray --cloud-field`
+            // (same loader, same footprint/staleness validation).
+            let cloud_field = cloud_field.as_deref().map(|p| {
+                match twilight_weather::cloud3d::load_field(p) {
+                    Ok(f) => {
+                        eprintln!(
+                            "3D cloud field: {} voxels ({}x{}x{}), source {} @ {}",
+                            f.sigma.iter().filter(|v| **v > 0.0).count(),
+                            f.nz,
+                            f.nlat,
+                            f.nlon,
+                            f.source,
+                            f.timestamp
+                        );
+                        validate_cloud_field_for_observer(&f, lat, lon);
+                        f
+                    }
+                    Err(e) => {
+                        eprintln!("Error: --cloud-field {}: {e}", p.display());
+                        std::process::exit(1);
+                    }
+                }
             });
             cmd_compare(
                 lat,
@@ -3432,6 +3488,7 @@ fn main() {
                 fast,
                 no_refraction,
                 seed_salt,
+                cloud_field,
             );
         }
         Commands::Sqm { action } => match action {
