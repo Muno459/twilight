@@ -302,6 +302,19 @@ pub fn trace_photon(
     let _ = xorshift_f64(rng_state);
 
     let mut pos = observer_pos;
+    // Surface snap: the geographic-to-ECEF round trip can land the
+    // observer radius one ulp BELOW the surface at certain longitudes
+    // (measured: lon 3.0 at the equator rounds 9e-10 m low), where
+    // shell_index() is None and every photon would die on entry with
+    // exactly zero radiance. Snap to the same 1 mm ledge the ground
+    // bounce uses; physically negligible, numerically decisive.
+    {
+        let r0 = pos.length();
+        let ledge = atm.surface_radius() + 1e-3;
+        if r0 < ledge {
+            pos = pos.normalize() * ledge;
+        }
+    }
     let mut dir = initial_dir;
     let mut weight = 1.0;
     let mut result = PhotonResult {
@@ -702,6 +715,15 @@ pub fn trace_photon_polarized(
     let _ = xorshift_f64(rng_state);
 
     let mut pos = observer_pos;
+    // Surface snap: see trace_photon (ulp-below-surface observers
+    // otherwise die on entry with exactly zero radiance).
+    {
+        let r0 = pos.length();
+        let ledge = atm.surface_radius() + 1e-3;
+        if r0 < ledge {
+            pos = pos.normalize() * ledge;
+        }
+    }
     let mut dir = initial_dir;
     let mut weight = 1.0;
     let mut prev_dir = initial_dir; // previous direction for plane rotation
@@ -6192,6 +6214,33 @@ impl McRng {
 #[cfg(test)]
 #[allow(clippy::assertions_on_constants)] // constant-coupling pin tests
 mod tests {
+
+    /// Regression: the geographic-to-ECEF round trip can land the observer
+    /// radius one ulp below the surface (equator, lon 3.0: 9e-10 m low),
+    /// where shell_index() is None; before the entry snap every photon died
+    /// immediately and Multiple returned exactly zero radiance.
+    #[test]
+    fn ulp_below_surface_observer_still_traces() {
+        let atm = make_scattering_atmosphere();
+        let surface = atm.surface_radius();
+        // Build a position exactly one ulp below the surface, pointing up.
+        let up = crate::geometry::Vec3::new(0.0, 0.0, 1.0);
+        let r_low = f64::from_bits(surface.to_bits() - 1);
+        assert!(r_low < surface);
+        let pos = up * r_low;
+        let sun = crate::geometry::Vec3::new(1.0, 0.0, 0.0);
+        let mut seed = 42u64;
+        let mut total = 0.0;
+        for _ in 0..64 {
+            let r = trace_photon(&atm, pos, up, sun, 1, &mut seed, None);
+            total += r.weight;
+        }
+        assert!(
+            total > 0.0,
+            "ulp-below-surface observer produced zero radiance (entry kill)"
+        );
+    }
+
     use super::*;
 
     /// G-CHI (sampled-vs-evaluated, cloud lobe): the gray cloud HG sampler

@@ -46,22 +46,22 @@ enum Commands {
     /// Show solar position and conventional twilight times
     Solar {
         /// Latitude in degrees (north positive)
-        #[arg(short, long)]
+        #[arg(allow_negative_numbers = true, short, long)]
         lat: f64,
         /// Longitude in degrees (east positive)
-        #[arg(short = 'n', long)]
+        #[arg(allow_negative_numbers = true, short = 'n', long)]
         lon: f64,
         /// Date in YYYY-MM-DD format
         #[arg(short, long)]
         date: String,
         /// Timezone offset from UTC (hours)
-        #[arg(short, long, default_value = "0")]
+        #[arg(allow_negative_numbers = true, short, long, default_value = "0")]
         tz: f64,
         /// Elevation above sea level in meters
         #[arg(short, long, default_value = "0")]
         elevation: f64,
         /// Delta T (TT - UT1) in seconds
-        #[arg(long, default_value = "69.184")]
+        #[arg(allow_negative_numbers = true, long, default_value = "69.184")]
         delta_t: f64,
         /// Path to DE440 BSP file for JPL ephemeris comparison
         #[arg(long)]
@@ -70,10 +70,10 @@ enum Commands {
     /// Run MCRT simulation across twilight solar zenith angles
     Mcrt {
         /// Latitude in degrees (north positive)
-        #[arg(short, long)]
+        #[arg(allow_negative_numbers = true, short, long)]
         lat: f64,
         /// Longitude in degrees (east positive)
-        #[arg(short = 'n', long)]
+        #[arg(allow_negative_numbers = true, short = 'n', long)]
         lon: f64,
         /// Start solar zenith angle (degrees)
         #[arg(long, default_value = "90")]
@@ -127,10 +127,10 @@ enum Commands {
     /// sza_deg,view_zenith_deg,rel_azimuth_deg,wavelength_nm,radiance_w_m2_sr_nm
     Compare {
         /// Latitude in degrees (north positive)
-        #[arg(short, long, default_value = "21.4225")]
+        #[arg(allow_negative_numbers = true, short, long, default_value = "21.4225")]
         lat: f64,
         /// Longitude in degrees (east positive)
-        #[arg(short = 'n', long, default_value = "39.8262")]
+        #[arg(allow_negative_numbers = true, short = 'n', long, default_value = "39.8262")]
         lon: f64,
         /// Observer elevation above sea level (meters)
         #[arg(short, long, default_value = "0")]
@@ -231,10 +231,10 @@ enum SqmCommands {
 #[derive(Args)]
 struct SqmArgs {
     /// Latitude in degrees (north positive)
-    #[arg(short, long)]
+    #[arg(allow_negative_numbers = true, short, long)]
     lat: f64,
     /// Longitude in degrees (east positive)
-    #[arg(short = 'n', long)]
+    #[arg(allow_negative_numbers = true, short = 'n', long)]
     lon: f64,
     /// Date in YYYY-MM-DD format: the evening the night STARTS
     #[arg(short, long)]
@@ -250,7 +250,7 @@ struct SqmArgs {
     #[arg(long, default_value = "0.15")]
     albedo: f64,
     /// Delta T (TT - UT1) in seconds
-    #[arg(long, default_value = "69.184")]
+    #[arg(allow_negative_numbers = true, long, default_value = "69.184")]
     delta_t: f64,
     /// Fetch live weather data from Open-Meteo (aerosol/cloud/gas).
     /// Provenance lines print to stdout, so pair with --out when piping
@@ -298,10 +298,10 @@ struct SqmCompareArgs {
 #[derive(Args)]
 struct PrayArgs {
     /// Latitude in degrees (north positive)
-    #[arg(short, long)]
+    #[arg(allow_negative_numbers = true, short, long)]
     lat: f64,
     /// Longitude in degrees (east positive)
-    #[arg(short = 'n', long)]
+    #[arg(allow_negative_numbers = true, short = 'n', long)]
     lon: f64,
     /// Date in YYYY-MM-DD format
     #[arg(short, long)]
@@ -318,7 +318,7 @@ struct PrayArgs {
     #[arg(long, default_value = "0.15")]
     albedo: f64,
     /// Delta T (TT - UT1) in seconds
-    #[arg(long, default_value = "69.184")]
+    #[arg(allow_negative_numbers = true, long, default_value = "69.184")]
     delta_t: f64,
     /// SZA scan resolution in degrees (smaller = more accurate, slower)
     #[arg(long, default_value = "0.5")]
