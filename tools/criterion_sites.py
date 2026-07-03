@@ -266,20 +266,20 @@ BACKGROUND_SITES = {
                           ["--skyglow", "--radiance", "1.0221e-3"]),
 }
 
+# Every time line may carry an optional uncertainty token (e.g.
+# "+-0.5min" or the +-<0.1min floor) and an optional "(+1d)" marker
+# between the time and "(SZA ...". [^(\s]* tolerates the former; the
+# (?:\(\+1d\)\s+)? group the latter (pre-existing lines used \S* which
+# silently failed on the uncertainty suffix: the legacy_fajr TSV gap).
+_TIME_LINE = r":\s+(\S+?)\s+(?:[^(\s]+\s+)?(?:\(\+1d\)\s+)?\(SZA ([\d.]+).?, depression ([\d.]+)"
 PATTERNS = {
-    "khayt_fajr": re.compile(
-        r"Fajr \(khayt al-abyad\):\s+(\S+)\s+\(SZA ([\d.]+).?, depression ([\d.]+)"),
+    "khayt_fajr": re.compile(r"Fajr \(khayt al-abyad\)" + _TIME_LINE),
     "false_dawn_from": re.compile(r"false dawn \(al-fajr al-kadhib\) visible from (\S+)"),
-    "khayt_isha_ahmar": re.compile(
-        r"Isha \(shafaq ahmar\):\s+(\S+)\s+\(SZA ([\d.]+).?, depression ([\d.]+)"),
-    "khayt_isha_abyad": re.compile(
-        r"Isha \(shafaq abyad\):\s+(\S+)\s+\(SZA ([\d.]+).?, depression ([\d.]+)"),
-    "legacy_fajr": re.compile(
-        r"Fajr \(true dawn\):\s+(\S+)\s+\(SZA ([\d.]+).?, depression ([\d.]+)"),
-    "legacy_isha_abyad": re.compile(
-        r"Isha \(al-abyad\):\s+(\S+)\s+\S*\s*\(SZA ([\d.]+).?, depression ([\d.]+)"),
-    "legacy_isha_ahmar": re.compile(
-        r"Isha \(al-ahmar\):\s+(\S+)\s+\S*\s*\(SZA ([\d.]+).?, depression ([\d.]+)"),
+    "khayt_isha_ahmar": re.compile(r"Isha \(shafaq ahmar\)" + _TIME_LINE),
+    "khayt_isha_abyad": re.compile(r"Isha \(shafaq abyad\)" + _TIME_LINE),
+    "legacy_fajr": re.compile(r"Fajr \(true dawn\)" + _TIME_LINE),
+    "legacy_isha_abyad": re.compile(r"Isha \(al-abyad\)" + _TIME_LINE),
+    "legacy_isha_ahmar": re.compile(r"Isha \(al-ahmar\)" + _TIME_LINE),
 }
 
 

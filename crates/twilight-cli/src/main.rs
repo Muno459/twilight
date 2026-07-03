@@ -2320,8 +2320,9 @@ fn report(
     let kh = &output.khayt;
     if let (Some(time), Some(sza)) = (kh.fajr_time, kh.fajr_sza_deg) {
         println!(
-            "  Fajr (khayt al-abyad): {}  (SZA {:.2}°, depression {:.2}°)",
+            "  Fajr (khayt al-abyad): {}{}  (SZA {:.2}°, depression {:.2}°)",
             format_fractional_hour(wall(time)),
+            format_uncertainty(kh.fajr_uncertainty_min),
             sza,
             sza - 90.0
         );
@@ -2339,8 +2340,9 @@ fn report(
     }
     if let (Some(time), Some(sza)) = (kh.isha_ahmar_time, kh.isha_ahmar_sza_deg) {
         println!(
-            "  Isha (shafaq ahmar):   {}  (SZA {:.2}°, depression {:.2}°)",
+            "  Isha (shafaq ahmar):   {}{}  (SZA {:.2}°, depression {:.2}°)",
             format_fractional_hour(wall(time)),
+            format_uncertainty(kh.isha_ahmar_uncertainty_min),
             sza,
             sza - 90.0
         );
@@ -2350,8 +2352,9 @@ fn report(
     }
     if let (Some(time), Some(sza)) = (kh.isha_abyad_time, kh.isha_abyad_sza_deg) {
         println!(
-            "  Isha (shafaq abyad):   {}  (SZA {:.2}°, depression {:.2}°)",
+            "  Isha (shafaq abyad):   {}{}  (SZA {:.2}°, depression {:.2}°)",
             format_fractional_hour(wall(time)),
+            format_uncertainty(kh.isha_abyad_uncertainty_min),
             sza,
             sza - 90.0
         );
