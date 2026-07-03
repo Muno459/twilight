@@ -73,8 +73,14 @@ fn check_cloud_chain_supported(
 /// grid have all-zero low 32 bits, which collapsed to a single constant
 /// when downstream code truncated the seed. The splitmix64 finalizer
 /// spreads the entropy across all 64 bits.
-fn seed_from_sza(sza_deg: f64) -> u64 {
-    let mut z = sza_deg.to_bits();
+fn seed_from_sza(sza_deg: f64, seed_salt: u64) -> u64 {
+    // The salt MUST participate: scan_szas_with_stats varies
+    // config.seed_salt across its K repeats to measure seed-to-seed
+    // spread, and a salt-blind seed makes every GPU repeat bit-identical,
+    // so rel_se collapses to exactly 0 and the CLI reports a Monte Carlo
+    // time with zero statistical uncertainty (while burning K identical
+    // dispatches). Mix the salt through the same splitmix finalizer.
+    let mut z = sza_deg.to_bits() ^ seed_salt.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
@@ -96,11 +102,11 @@ pub fn simulate_at_sza_gpu(
     let gpu_result = match config.scattering_mode {
         ScatteringMode::Single => gpu.single_scatter(obs, view, sun)?,
         ScatteringMode::Multiple => {
-            let seed = seed_from_sza(sza_deg);
+            let seed = seed_from_sza(sza_deg, config.seed_salt);
             gpu.mcrt_trace(obs, view, sun, config.photons_per_wavelength as u32, seed)?
         }
         ScatteringMode::Hybrid => {
-            let seed = seed_from_sza(sza_deg);
+            let seed = seed_from_sza(sza_deg, config.seed_salt);
             gpu.hybrid_scatter(obs, view, sun, config.photons_per_wavelength as u32, seed)?
         }
     };
@@ -151,11 +157,11 @@ pub fn simulate_twilight_scan_gpu(
                 ScatteringMode::Single => BatchKernel::SingleScatter,
                 ScatteringMode::Multiple => BatchKernel::McrtTrace {
                     photons_per_wavelength: config.photons_per_wavelength as u32,
-                    seed: seed_from_sza(sza_deg),
+                    seed: seed_from_sza(sza_deg, config.seed_salt),
                 },
                 ScatteringMode::Hybrid => BatchKernel::Hybrid {
                     secondary_rays: config.photons_per_wavelength as u32,
-                    seed: seed_from_sza(sza_deg),
+                    seed: seed_from_sza(sza_deg, config.seed_salt),
                 },
             };
             BatchRequest {
@@ -212,11 +218,11 @@ pub fn simulate_twilight_szalist_gpu(
                 ScatteringMode::Single => BatchKernel::SingleScatter,
                 ScatteringMode::Multiple => BatchKernel::McrtTrace {
                     photons_per_wavelength: config.photons_per_wavelength as u32,
-                    seed: seed_from_sza(sza_deg),
+                    seed: seed_from_sza(sza_deg, config.seed_salt),
                 },
                 ScatteringMode::Hybrid => BatchKernel::Hybrid {
                     secondary_rays: config.photons_per_wavelength as u32,
-                    seed: seed_from_sza(sza_deg),
+                    seed: seed_from_sza(sza_deg, config.seed_salt),
                 },
             };
             BatchRequest {
