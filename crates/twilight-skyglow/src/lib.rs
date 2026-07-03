@@ -86,9 +86,12 @@ impl Default for SkyglowConfig {
 /// Spectral skyglow result at a particular viewing direction.
 #[derive(Debug, Clone)]
 pub struct SkyglowResult {
-    /// Artificial sky brightness at zenith (cd/m^2).
+    /// Artificial sky brightness at zenith (mcd/m^2: the unit the
+    /// Falchi-fit producer `bortle::radiance_to_zenith_luminance` and
+    /// its named inverse emit; this doc previously said cd/m^2, which
+    /// caused a 1000x veil bug in the khayt consumer).
     pub zenith_luminance: f64,
-    /// Artificial sky brightness at the specified viewing elevation (cd/m^2).
+    /// Artificial sky brightness at the viewing elevation (mcd/m^2).
     pub directional_luminance: f64,
     /// Viewing elevation angle above horizon (degrees) used for directional result.
     pub view_elevation_deg: f64,
@@ -153,8 +156,23 @@ pub fn quick_estimate(radiance_nw: f64, led_fraction: f64) -> SkyglowResult {
     let zenith_lum = bortle::radiance_to_zenith_luminance(radiance_nw);
     let bortle = bortle::luminance_to_bortle(zenith_lum);
 
-    // Generate spectral radiance for the given LED fraction
-    let (spectral, num_wl) = spectrum::mixed_spectrum(radiance_nw, led_fraction);
+    // Generate spectral radiance for the given LED fraction. The mixed
+    // spectrum carries the source SHAPE (HPS/LED); its raw amplitude is
+    // the full upward VIIRS radiance, which is NOT the sky brightness:
+    // only a small scattered fraction returns as skyglow, and the
+    // calibrated amplitude is exactly what the Falchi fit measures.
+    // Scale the spectrum so its photopic luminance equals the Falchi
+    // zenith value (one photometric rail; before this, the legacy
+    // spectral-injection path was ~2 orders of magnitude too bright).
+    let (mut spectral, num_wl) = spectrum::mixed_spectrum(radiance_nw, led_fraction);
+    let wl: Vec<f64> = (0..num_wl).map(|i| 380.0 + 10.0 * i as f64).collect();
+    let phot = twilight_threshold::luminance::photopic_luminance(&wl, &spectral[..num_wl]);
+    if phot > 1e-30 {
+        let scale = (zenith_lum * 1e-3) / phot;
+        for v in spectral.iter_mut().take(num_wl) {
+            *v *= scale;
+        }
+    }
 
     // Angular model: at zenith
     let dir_lum = zenith_lum; // no angular correction for zenith
@@ -198,6 +216,27 @@ pub fn quick_estimate_at_angle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spectral injection must sit on the same photometric rail as
+    /// the Falchi zenith luminance: photopic(spectral) == zenith mcd
+    /// converted to cd/m^2. Regression for the ~2-orders-bright legacy
+    /// inject_skyglow path.
+    #[test]
+    fn spectral_radiance_calibrated_to_falchi_zenith() {
+        for &r in &[1.0f64, 15.0, 60.0] {
+            let sg = quick_estimate(r, 0.3);
+            let wl: Vec<f64> = (0..sg.num_wavelengths).map(|i| 380.0 + 10.0 * i as f64).collect();
+            let phot = twilight_threshold::luminance::photopic_luminance(
+                &wl,
+                &sg.spectral_radiance[..sg.num_wavelengths],
+            );
+            let expect = sg.zenith_luminance * 1e-3;
+            assert!(
+                (phot - expect).abs() <= 1e-9 + 1e-6 * expect,
+                "radiance {r}: photopic {phot:.3e} != zenith {expect:.3e} cd/m^2"
+            );
+        }
+    }
 
     #[test]
     fn default_config_values() {
