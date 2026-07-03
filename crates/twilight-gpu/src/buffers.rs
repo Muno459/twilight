@@ -577,6 +577,18 @@ impl PackedDispatchParams {
             ],
         }
     }
+
+    /// Set the LOS step-window offset (params slot 7, previously pad and
+    /// packed as 0.0 == from_bits(0), so existing callers are bit-identical).
+    /// The hybrid v2 kernel adds this to its threadgroup y-index, letting the
+    /// host split one logical (wavelength x 200 step) dispatch into several
+    /// SMALLER command buffers along the step axis: a STATIC watchdog split
+    /// (never adaptive) for the field path, where a full-grid buffer of
+    /// chain work exceeds the macOS GPU watchdog.
+    pub fn with_step_offset(mut self, step_offset: u32) -> Self {
+        self.data[7] = f32::from_bits(step_offset);
+        self
+    }
 }
 
 // ── Utility ─────────────────────────────────────────────────────────────
