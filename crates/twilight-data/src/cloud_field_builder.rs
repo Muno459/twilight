@@ -151,12 +151,12 @@ pub fn field_from_layers(
         let sigma_s = ext * de_scale * ssa_c;
         g_num += c.optical_depth * c.ssa * g_scaled;
         g_den += c.optical_depth * c.ssa;
-        for iz in 0..nz {
+        for (iz, level) in level_sigma.iter_mut().enumerate().take(nz) {
             let z_lo = iz as f64 * dz;
             let z_hi = z_lo + dz;
             let overlap =
                 (z_hi.min(c.top_km * 1000.0) - z_lo.max(c.base_km * 1000.0)).max(0.0);
-            level_sigma[iz] += (sigma_s * overlap / dz) as f32;
+            *level += (sigma_s * overlap / dz) as f32;
         }
     }
     for iz in 0..nz {

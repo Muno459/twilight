@@ -65,6 +65,7 @@ pub struct MetalBackend {
     pso_single_scatter: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_mcrt_trace: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_hybrid_v2: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    pso_hybrid_ctx: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     pso_garstang: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
     // Test-only: device-side field DDA probe (G-DDA-PARITY). Only read by
     // the #[cfg(test)] field_tau_probe helper, so it is dead in lib builds.
@@ -88,6 +89,12 @@ pub struct MetalBackend {
     info: GpuDeviceInfo,
     config: GpuConfig,
     num_wavelengths: u32,
+    // True when the uploaded atmosphere carries a nonzero 1D shell cloud
+    // deck. Chains diffuse through a deck (tens to hundreds of bounces vs
+    // a few in clear sky), so the hybrid dispatch uses a smaller STATIC
+    // watchdog batch, mirroring the field case. Set at upload, never
+    // adjusted at run time (adaptive batching regressed twice, measured).
+    has_cloud_1d: bool,
 }
 
 // Safety: Metal objects (device, queue, pipeline states, shared buffers) are
@@ -132,6 +139,7 @@ pub(crate) fn init_backend(config: &GpuConfig) -> Result<MetalBackend, GpuError>
     let pso_single_scatter = make_pipeline(&device, &library, "single_scatter_spectrum")?;
     let pso_mcrt_trace = make_pipeline(&device, &library, "mcrt_trace_photon")?;
     let pso_hybrid_v2 = make_pipeline(&device, &library, "hybrid_scatter_v2")?;
+    let pso_hybrid_ctx = make_pipeline(&device, &library, "hybrid_context_prefix")?;
     let pso_garstang = make_pipeline(&device, &library, "garstang_zenith")?;
     let pso_field_tau_probe = make_pipeline(&device, &library, "field_tau_probe")?;
 
@@ -160,6 +168,7 @@ pub(crate) fn init_backend(config: &GpuConfig) -> Result<MetalBackend, GpuError>
         pso_single_scatter,
         pso_mcrt_trace,
         pso_hybrid_v2,
+        pso_hybrid_ctx,
         pso_garstang,
         pso_field_tau_probe,
         buf_atm: None,
@@ -170,6 +179,7 @@ pub(crate) fn init_backend(config: &GpuConfig) -> Result<MetalBackend, GpuError>
         info,
         config: config.clone(),
         num_wavelengths: 0,
+        has_cloud_1d: false,
     })
 }
 
@@ -186,6 +196,10 @@ impl GpuBackend for MetalBackend {
     ) -> Result<(), GpuError> {
         let packed = PackedAtmosphere::pack(atm);
         self.num_wavelengths = packed.num_wavelengths;
+        self.has_cloud_1d = atm.cloud_extinction
+            [..atm.num_shells.min(twilight_core::atmosphere::MAX_SHELLS)]
+            .iter()
+            .any(|&c| c > 0.0);
         self.buf_atm = Some(create_buffer_from_f32(&self.device, &packed.data)?);
         Ok(())
     }
@@ -308,6 +322,9 @@ impl GpuBackend for MetalBackend {
 
         let nw = self.num_wavelengths as usize;
         const MAX_LOS_STEPS: usize = 200;
+        // Mirrors HCTX_STRIDE in twilight.metal (4 header slots + 3 x 64
+        // per-substep slots).
+        const HCTX_STRIDE: usize = 4 + 3 * 64;
         let output_len = nw * MAX_LOS_STEPS;
 
         // Each dispatch traces RAYS_PER_DISPATCH rays across all (wl, step)
@@ -331,7 +348,22 @@ impl GpuBackend for MetalBackend {
         // real fields are far cheaper per ray (empty-tile skips), so this is
         // a floor, not the typical cost. More commit/wait round-trips (~1 ms
         // each) but every command buffer stays safely under the watchdog.
-        let rays_per_dispatch: u32 = if self.buf_field.is_some() { 4 } else { 250 };
+        // A 1D shell deck has cheap per-shell shadow rays but diffusing
+        // chains (tens to hundreds of bounces under an OD 2-10 deck, vs a
+        // few in clear sky), so it gets its own STATIC batch between the
+        // field's 4 and the clear-sky 250. No adaptive batching (regressed
+        // twice, measured).
+        // Field chunks fill all 64 chain lanes (one chain per lane per
+        // step): small ray batches leave 62 of 64 lanes idle and multiply
+        // the number of buffers; the watchdog bound is enforced by the
+        // step-window split below, not by starving the lanes.
+        let rays_per_dispatch: u32 = if self.buf_field.is_some() {
+            64
+        } else if self.has_cloud_1d {
+            25
+        } else {
+            250
+        };
         const DISPATCHES_PER_COMMAND_BUFFER: usize = 1;
         const PARAMS_STRIDE: usize = 16;
         let num_dispatches = secondary_rays.div_ceil(rays_per_dispatch).max(1);
@@ -343,42 +375,83 @@ impl GpuBackend for MetalBackend {
         let buf_output = create_empty_buffer(&self.device, max_chunk * output_len)?;
         let mut accum = vec![0.0f64; output_len];
 
+        // Precompute the deterministic per-(wl, step) eye-path context ONCE
+        // (prefix optical depths, substep split, chain budgets): every ray
+        // chunk reads it instead of recomputing the DDA-heavy block, which
+        // previously multiplied the context cost by the number of
+        // watchdog-sized chunks and saturated the GPU (interactivity kills
+        // on the field path).
+        let field_buf_ctx: &ProtocolObject<dyn MTLBuffer> = self
+            .buf_field
+            .as_deref()
+            .unwrap_or(&self.buf_field_stub);
+        let buf_ctx = create_empty_buffer(&self.device, nw * MAX_LOS_STEPS * HCTX_STRIDE)?;
+        {
+            let params_ctx = PackedDispatchParams::new_with_field(
+                observer_pos,
+                view_dir,
+                sun_dir,
+                secondary_rays, // global budget: the substep allocation domain
+                secondary_rays,
+                0,
+                self.buf_field.is_some(),
+            );
+            let buf_params_ctx = create_buffer_from_f32(&self.device, &params_ctx.data)?;
+            // Same bounded retry as the window dispatcher (idempotent:
+            // the context is a pure function of the geometry).
+            let mut prep_result = Ok(());
+            for attempt in 0..3 {
+                if attempt > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                }
+                prep_result = self.dispatch_kernel(
+                    &self.pso_hybrid_ctx,
+                    &[buf_atm, &buf_params_ctx, &buf_ctx, field_buf_ctx],
+                    (nw * MAX_LOS_STEPS) as u32,
+                );
+                match &prep_result {
+                    Ok(()) => break,
+                    Err(e) => eprintln!("[gpu] hybrid context retry {}/3 after: {e}", attempt + 1),
+                }
+            }
+            prep_result?;
+        }
+
+        // STATIC step-window split for the field path: one (wl x 200 step)
+        // grid of chain work on a 3D field exceeds the macOS GPU watchdog
+        // in a single command buffer, and under an interactive session the
+        // compositor fast-kills buffers past a few hundred ms (measured: a
+        // 50-step window at 4 rays was killed at 0.59 s) AND kills
+        // sustained back-to-back saturation after ~1.5 s (measured: 8
+        // completing 0.2 s windows, then a kill at 0.1 s). So: 100 windows
+        // of 2 steps, each its own command buffer, with a short yield
+        // between them (below). Clear-sky and 1D-deck buffers fit
+        // comfortably and keep one window. Static by regime, never
+        // adaptive (adaptive batching regressed twice, measured).
+        let step_windows: u32 = if self.buf_field.is_some() { 100 } else { 1 };
+        let window_len = (MAX_LOS_STEPS as u32).div_ceil(step_windows);
+
         for chunk_start in (0..num_dispatches as usize).step_by(DISPATCHES_PER_COMMAND_BUFFER) {
             let chunk_len =
                 (num_dispatches as usize - chunk_start).min(DISPATCHES_PER_COMMAND_BUFFER);
-            let mut all_params = Vec::with_capacity(chunk_len * PARAMS_STRIDE);
+            debug_assert_eq!(chunk_len, 1, "hybrid chunking is one dispatch per buffer");
+            let d = chunk_start as u32;
+            let ray_start = d * rays_per_dispatch;
+            let rays_this = (secondary_rays - ray_start).min(rays_per_dispatch);
 
-            for chunk_idx in 0..chunk_len {
-                let d = (chunk_start + chunk_idx) as u32;
-                let ray_start = d * rays_per_dispatch;
-                let rays_this = (secondary_rays - ray_start).min(rays_per_dispatch);
-
-                // Fold the FULL 64-bit seed into the low 32 bits before
-                // packing (splitmix64 finalizer). The previous
-                // `seed & 0xFFFF_FFFF` discarded the high word - and
-                // `sza_deg.to_bits()` for SZAs on a 0.5-degree grid has
-                // all-zero low bits, so every SZA in a prayer scan ran
-                // with base_seed = 0 (identical RNG streams).
-                let folded = {
-                    let mut z = seed;
-                    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                    z ^ (z >> 31)
-                };
-                let ray_seed = (folded & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
-                let params = PackedDispatchParams::new_with_field(
-                    observer_pos,
-                    view_dir,
-                    sun_dir,
-                    secondary_rays,
-                    rays_this,
-                    ray_seed,
-                    self.buf_field.is_some(),
-                );
-                all_params.extend_from_slice(&params.data);
-            }
-
-            let buf_params = create_buffer_from_f32(&self.device, &all_params)?;
+            // Fold the FULL 64-bit seed into the low 32 bits before
+            // packing (splitmix64 finalizer). The previous
+            // `seed & 0xFFFF_FFFF` discarded the high word - and
+            // `sza_deg.to_bits()` for SZAs on a 0.5-degree grid has
+            // all-zero low bits, so every SZA in a prayer scan ran
+            // with base_seed = 0 (identical RNG streams).
+            let folded = {
+                let mut z = seed;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^ (z >> 31)
+            };
+            let ray_seed = (folded & 0xFFFF_FFFF) | ((ray_start as u64) << 32);
 
             // Zero only the portion we'll use (reuse same buffer across chunks)
             let zero_bytes = chunk_len * output_len * std::mem::size_of::<f32>();
@@ -390,18 +463,43 @@ impl GpuBackend for MetalBackend {
                 .buf_field
                 .as_deref()
                 .unwrap_or(&self.buf_field_stub);
-            self.dispatch_hybrid_v2_chunk(
-                &self.pso_hybrid_v2,
-                buf_atm,
-                &buf_params,
-                &buf_output,
-                field_buf,
-                nw as u32,
-                MAX_LOS_STEPS as u32,
-                chunk_len,
-                output_len,
-                PARAMS_STRIDE,
-            )?;
+            for w in 0..step_windows {
+                let step_off = w * window_len;
+                let steps_this = window_len.min(MAX_LOS_STEPS as u32 - step_off);
+                if steps_this == 0 {
+                    break;
+                }
+                let params = PackedDispatchParams::new_with_field(
+                    observer_pos,
+                    view_dir,
+                    sun_dir,
+                    secondary_rays,
+                    rays_this,
+                    ray_seed,
+                    self.buf_field.is_some(),
+                )
+                .with_step_offset(step_off);
+                let buf_params = create_buffer_from_f32(&self.device, &params.data)?;
+                self.dispatch_hybrid_v2_chunk(
+                    &self.pso_hybrid_v2,
+                    buf_atm,
+                    &buf_params,
+                    &buf_output,
+                    field_buf,
+                    &buf_ctx,
+                    nw as u32,
+                    steps_this,
+                    chunk_len,
+                    output_len,
+                    PARAMS_STRIDE,
+                )?;
+                // Yield the GPU to the compositor between field windows:
+                // back-to-back saturation is what triggers the interactivity
+                // kills (static duty-cycle discipline, not adaptive).
+                if step_windows > 1 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
 
             let raw = f32_buffer_slice(&buf_output, chunk_len * output_len);
             check_header_sentinel(raw)?;
@@ -877,10 +975,34 @@ impl MetalBackend {
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
 
+        // Surface command-buffer errors (GPU recovery, watchdog kills):
+        // a silently discarded buffer would otherwise leave partial or
+        // stale output that the sentinel checks cannot always catch.
+        if cmd_buf.status() == objc2_metal::MTLCommandBufferStatus::Error {
+            let err_msg = cmd_buf
+                .error()
+                .map(|e| format!("{}", e))
+                .unwrap_or_else(|| "unknown GPU error".into());
+            return Err(GpuError::Dispatch(format!(
+                "Metal command buffer error: {}",
+                err_msg
+            )));
+        }
+
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)] // GPU dispatch plumbing: buffers + geometry are independent
+    /// Dispatch one hybrid step-window with bounded retries.
+    ///
+    /// A window's output writes are a deterministic function of its inputs
+    /// and land in (wl, step) slots owned by exactly this window, so
+    /// re-submitting after a command-buffer error is exactly idempotent.
+    /// Retries cover the two transient macOS kill classes seen in the
+    /// parity campaigns: InnocentVictim (another process reset the GPU;
+    /// measured killing a 31-minute parity run at its 22nd minute) and
+    /// ImpactingInteractivity (compositor pressure). Three attempts with a
+    /// fixed 1.5 s backoff; the error propagates if the device stays hot.
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_hybrid_v2_chunk(
         &self,
         pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
@@ -888,6 +1010,55 @@ impl MetalBackend {
         params_buffer: &ProtocolObject<dyn MTLBuffer>,
         output_buffer: &ProtocolObject<dyn MTLBuffer>,
         field_buffer: &ProtocolObject<dyn MTLBuffer>,
+        ctx_buffer: &ProtocolObject<dyn MTLBuffer>,
+        num_wavelengths: u32,
+        num_steps: u32,
+        dispatch_count: usize,
+        output_stride_f32: usize,
+        params_stride_f32: usize,
+    ) -> Result<(), GpuError> {
+        const ATTEMPTS: usize = 3;
+        let mut last_err = None;
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+            }
+            match self.dispatch_hybrid_v2_chunk_once(
+                pipeline,
+                atm_buffer,
+                params_buffer,
+                output_buffer,
+                field_buffer,
+                ctx_buffer,
+                num_wavelengths,
+                num_steps,
+                dispatch_count,
+                output_stride_f32,
+                params_stride_f32,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    eprintln!(
+                        "[gpu] hybrid window retry {}/{} after: {e}",
+                        attempt + 1,
+                        ATTEMPTS
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.expect("retry loop ran at least once"))
+    }
+
+    #[allow(clippy::too_many_arguments)] // GPU dispatch plumbing: buffers + geometry are independent
+    fn dispatch_hybrid_v2_chunk_once(
+        &self,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        atm_buffer: &ProtocolObject<dyn MTLBuffer>,
+        params_buffer: &ProtocolObject<dyn MTLBuffer>,
+        output_buffer: &ProtocolObject<dyn MTLBuffer>,
+        field_buffer: &ProtocolObject<dyn MTLBuffer>,
+        ctx_buffer: &ProtocolObject<dyn MTLBuffer>,
         num_wavelengths: u32,
         num_steps: u32,
         dispatch_count: usize,
@@ -929,13 +1100,22 @@ impl MetalBackend {
                 encoder.setBuffer_offset_atIndex(Some(params_buffer), params_byte_offset, 1);
                 encoder.setBuffer_offset_atIndex(Some(output_buffer), output_byte_offset, 2);
                 encoder.setBuffer_offset_atIndex(Some(field_buffer), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(ctx_buffer), 0, 4);
             }
             encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
         }
 
         encoder.endEncoding();
+        let t0 = std::time::Instant::now();
         cmd_buf.commit();
         cmd_buf.waitUntilCompleted();
+        if std::env::var_os("TWILIGHT_GPU_TRACE").is_some() {
+            eprintln!(
+                "[gpu-trace] hybrid chunk: steps={num_steps} wait={:.3}s status={:?}",
+                t0.elapsed().as_secs_f64(),
+                cmd_buf.status()
+            );
+        }
 
         let status = cmd_buf.status();
         if status == objc2_metal::MTLCommandBufferStatus::Error {

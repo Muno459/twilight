@@ -114,6 +114,14 @@ pub struct PrayerTimeInput {
     /// pipeline is a library and must stay silent; everything a caller
     /// needs to display travels in [`PrayerTimeOutput`] fields.
     pub verbose: bool,
+    /// Base RNG seed salt for the MC scattering modes. The K per-SZA
+    /// seed-salted repeats are derived from it (base * 1009 + k), so
+    /// base 0 reproduces the historical streams bit-for-bit while any
+    /// other base yields fully disjoint streams - the salt-stability
+    /// protocol for validating reported uncertainties. Overridable via
+    /// the TWILIGHT_SEED_SALT environment variable (the CLI does not
+    /// expose a flag).
+    pub seed_salt: u64,
 }
 
 impl Default for PrayerTimeInput {
@@ -146,6 +154,7 @@ impl Default for PrayerTimeInput {
             polarized: true,
             solar_f107: None,
             verbose: false,
+            seed_salt: 0,
         }
     }
 }
@@ -711,7 +720,14 @@ fn gpu_route_to_cpu_reason(
     atm: &twilight_core::atmosphere::AtmosphereModel,
 ) -> Option<&'static str> {
     if input.cloud_field.is_some() {
-        return Some("3D cloud field active (GPU field port pending re-verification)");
+        // The GPU hybrid kernel is parity-validated on real fields
+        // (G-MC-PARITY-3: 0.1 to 1 percent at SZA 95/97/100), but field
+        // dispatches survive the interactive macOS watchdog only as 100
+        // step-windows with inter-buffer yields, measured ~3x SLOWER than
+        // the CPU scan (~32 s vs ~11 s per 100-ray call). Perf routing,
+        // not correctness routing: flip when running headless or on a
+        // non-watchdog backend.
+        return Some("3D cloud field active (GPU parity-validated but watchdog-throttled; CPU scan is faster)");
     }
     let shell_cloud = atm.cloud_extinction.iter().any(|&e| e > 0.0);
     if shell_cloud
@@ -720,9 +736,21 @@ fn gpu_route_to_cpu_reason(
             ScatteringMode::Hybrid | ScatteringMode::Multiple
         )
     {
+        // Multiple: the mcrt kernel has no cloud channel at all.
+        // Hybrid: the combined-channel estimator IS ported and
+        // parity-gated (G-MC-PARITY-3), but a prayer scan is a
+        // sustained stream of hundreds of fan and refinement calls,
+        // and the interactive macOS watchdog kills sustained GPU
+        // saturation (~1.5 s), so every call pays multi-second retry
+        // sleeps: a GPU-routed cloudy khayt pray measured 2h+ hung in
+        // retries vs ~10 min on the CPU scan. Perf routing on
+        // interactive-watchdog platforms, not correctness routing:
+        // one-shot dispatches (cmd_simulate) stay on the GPU, and the
+        // scan routing can flip when running headless.
         return Some(
-            "1D shell cloud with a chain estimator (GPU 1D-cloud chain estimator \
-             pending re-port; the CPU scan is the reference)",
+            "1D shell cloud with a chain estimator (GPU hybrid is \
+             parity-validated but the sustained scan stream is \
+             watchdog-throttled; the CPU scan is faster)",
         );
     }
     None
@@ -860,6 +888,10 @@ struct SzaStats {
     /// Relative standard error of the mean mesopic luminance per SZA
     /// (0.0 for deterministic runs or K = 1).
     rel_se: Vec<f64>,
+    /// Relative standard error of the mean red-band luminance per SZA:
+    /// the isha al-ahmar crossings run on the red channel, whose MC
+    /// noise differs from the mesopic (it integrates fewer wavelengths).
+    rel_se_red: Vec<f64>,
 }
 
 /// Run the scan over `szas` K times with independent seed salts and return
@@ -885,7 +917,10 @@ fn scan_szas_with_stats(
 
     let run_once = |salt: u64| -> Vec<SpectralResult> {
         let mut cfg = config.clone();
-        cfg.seed_salt = salt;
+        // Derive the per-repeat salt from the caller's base salt: base 0
+        // reproduces the historical streams (salts 0..K) bit-for-bit;
+        // any other base yields disjoint streams for salt-stability runs.
+        cfg.seed_salt = config.seed_salt.wrapping_mul(1009).wrapping_add(salt);
         if let Some(f) = scan_list {
             f(atm, &cfg, szas)
         } else {
@@ -901,6 +936,18 @@ fn scan_szas_with_stats(
 
     let mut results = Vec::with_capacity(n_sza);
     let mut rel_se = Vec::with_capacity(n_sza);
+    let mut rel_se_red = Vec::with_capacity(n_sza);
+    // Relative SE of the mean of a per-run luminance functional.
+    let rel_se_of = |per_run: &[f64]| -> f64 {
+        let kf = per_run.len() as f64;
+        let m: f64 = per_run.iter().sum::<f64>() / kf;
+        if m > 1e-300 {
+            let var: f64 = per_run.iter().map(|l| (l - m) * (l - m)).sum::<f64>() / (kf - 1.0);
+            (var.sqrt() / kf.sqrt()) / m
+        } else {
+            0.0
+        }
+    };
     for i in 0..n_sza {
         let mut mean = runs[0][i].clone();
         let num_wl = mean.radiance.len();
@@ -913,9 +960,9 @@ fn scan_szas_with_stats(
             mean.radiance[w] /= k as f64;
         }
 
-        // Mesopic luminance per run -> SE of the mean.
-        let se = if k > 1 {
-            let lums: Vec<f64> = runs
+        // Mesopic + red luminance per run -> SE of the means.
+        let (se, se_red) = if k > 1 {
+            let mes: Vec<f64> = runs
                 .iter()
                 .map(|run| {
                     twilight_threshold::luminance::mesopic_luminance(
@@ -924,21 +971,28 @@ fn scan_szas_with_stats(
                     )
                 })
                 .collect();
-            let m: f64 = lums.iter().sum::<f64>() / k as f64;
-            if m > 1e-300 {
-                let var: f64 =
-                    lums.iter().map(|l| (l - m) * (l - m)).sum::<f64>() / (k as f64 - 1.0);
-                (var.sqrt() / (k as f64).sqrt()) / m
-            } else {
-                0.0
-            }
+            let red: Vec<f64> = runs
+                .iter()
+                .map(|run| {
+                    twilight_threshold::luminance::red_band_luminance(
+                        &run[i].wavelengths_nm,
+                        &run[i].radiance,
+                    )
+                })
+                .collect();
+            (rel_se_of(&mes), rel_se_of(&red))
         } else {
-            0.0
+            (0.0, 0.0)
         };
         results.push(mean);
         rel_se.push(se);
+        rel_se_red.push(se_red);
     }
-    SzaStats { results, rel_se }
+    SzaStats {
+        results,
+        rel_se,
+        rel_se_red,
+    }
 }
 
 /// Physical night-sky background [cd/m^2] toward a view direction at a
@@ -1001,11 +1055,21 @@ fn night_sky_total(
 
 /// Times and diagnostics from the khayt al-abyad pass (see
 /// [`crate::khayt`]). All times are local fractional hours.
+///
+/// Every event carries its honest resolution: `*_sigma_deg` is the
+/// total 1-sigma crossing uncertainty in SZA (MC noise + residual
+/// refinement-bracket quantization + Jensen bias bound, see
+/// [`crate::khayt::KhaytCrossing::sigma_deg`]) and `*_uncertainty_min`
+/// is the same propagated to the clock minute through the local
+/// dt/dSZA slope. A caller printing a khayt time should print the
+/// minute uncertainty next to it.
 #[derive(Debug, Clone, Default)]
 pub struct KhaytTimes {
     /// Fajr sadiq: white-thread distinctness WITH lateral spread.
     pub fajr_time: Option<f64>,
     pub fajr_sza_deg: Option<f64>,
+    pub fajr_sigma_deg: Option<f64>,
+    pub fajr_uncertainty_min: Option<f64>,
     /// Al-fajr al-kadhib: central distinctness without spread (the
     /// zodiacal wedge), when it precedes sadiq.
     pub kadhib_time: Option<f64>,
@@ -1013,11 +1077,45 @@ pub struct KhaytTimes {
     /// Shafi'i/Maliki/Hanbali.
     pub isha_ahmar_time: Option<f64>,
     pub isha_ahmar_sza_deg: Option<f64>,
+    pub isha_ahmar_sigma_deg: Option<f64>,
+    pub isha_ahmar_uncertainty_min: Option<f64>,
     /// Isha per shafaq al-abyad (white distinctness disappears) - Hanafi.
     pub isha_abyad_time: Option<f64>,
     pub isha_abyad_sza_deg: Option<f64>,
+    pub isha_abyad_sigma_deg: Option<f64>,
+    pub isha_abyad_uncertainty_min: Option<f64>,
     /// Contrast margin per band azimuth at the Fajr crossing (diagnostic).
     pub fajr_margins: Vec<f64>,
+}
+
+/// Artificial-skyglow veil on the khayt horizon ring:
+/// (mesopic, red) luminance in cd/m^2 added to every fan patch.
+///
+/// UNIT CONTRACT (regression-pinned by `khayt_skyglow_veil_unit_pin`):
+/// `SkyglowResult::zenith_luminance` carries the Falchi-fit value from
+/// `bortle::radiance_to_zenith_luminance`, which is in MILLI-cd/m^2
+/// (its struct doc says cd/m^2; the producer and its named inverse
+/// `zenith_luminance_to_radiance(luminance_mcd)` disagree with that
+/// doc, and every mcd-labeled display field agrees with the producer).
+/// The khayt patch photometry is in cd/m^2, so the veil is
+///
+///   veil = zenith_luminance [mcd/m^2] * 1e-3 * enhancement_factor(elev)
+///
+/// Before 2026-07 the 1e-3 was missing here: every --skyglow/--bortle
+/// khayt output overstated the artificial veil by three orders of
+/// magnitude (a Bortle-6 city veiled the dawn band like a floodlight).
+/// The red share comes from the skyglow's own spectrum (HPS/LED mix).
+fn khayt_skyglow_veil(sg: &SkyglowResult, band_zenith_deg: f64) -> (f64, f64) {
+    let elev = 90.0 - band_zenith_deg;
+    let lift = twilight_skyglow::angular::enhancement_factor(elev);
+    let mes = sg.zenith_luminance * 1e-3 * lift;
+    // Red share from the skyglow's own spectrum (HPS vs LED mix).
+    let n = sg.num_wavelengths.min(sg.spectral_radiance.len());
+    let wl: Vec<f64> = (0..n).map(|i| 380.0 + 10.0 * i as f64).collect();
+    let mes_s = twilight_threshold::luminance::mesopic_luminance(&wl, &sg.spectral_radiance[..n]);
+    let red_s = twilight_threshold::luminance::red_band_luminance(&wl, &sg.spectral_radiance[..n]);
+    let red_frac = if mes_s > 1e-30 { red_s / mes_s } else { 0.3 };
+    (mes, mes * red_frac)
 }
 
 /// The khayt al-abyad pass: simulate the fan of sky patches, compose
@@ -1027,6 +1125,17 @@ pub struct KhaytTimes {
 /// The MCRT radiance depends only on (SZA, relative azimuth), so ONE fan
 /// scan serves both Fajr and Isha; only the celestial background (moon,
 /// zodiacal geometry) is evaluated per side.
+///
+/// RESOLUTION CHAIN: the fan is scanned at 1 deg SZA steps (cost:
+/// every step is band+ref directions x K seeds of MCRT), then EVERY
+/// reported crossing is adaptively refined by [`crate::khayt`] with
+/// extra fan evaluations (same directions, same K-seed protocol,
+/// served through the `eval` callbacks below and cached across events
+/// and sides) until the crossing bracket reaches
+/// [`crate::khayt::REFINE_TARGET_BRACKET_DEG`] or the MC noise floor.
+/// The residual bracket and MC noise travel to the caller in the
+/// `*_sigma_deg` / `*_uncertainty_min` fields - reported times are no
+/// longer quantized to the scan grid.
 #[allow(clippy::too_many_arguments)]
 fn khayt_pass(
     input: &PrayerTimeInput,
@@ -1037,7 +1146,9 @@ fn khayt_pass(
     engine: &mut SolarEngine,
     max_sza: f64,
 ) -> KhaytTimes {
-    use crate::khayt::{detect, KhaytParams, KhaytScan, PatchLum};
+    use crate::khayt::{detect_refined, FanEval, KhaytParams, KhaytScan, PatchLum, RefineEvents};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
 
     let params = KhaytParams::default();
     let lo = 93.0_f64;
@@ -1076,27 +1187,56 @@ fn khayt_pass(
 
     // ── MCRT fan: per-direction luminance curves. Side-independent
     // unless terrain forces per-side patch elevations.
+
+    /// Per-direction MCRT sample at one SZA: mean luminances over the
+    /// K seed-salted repeats plus their relative standard errors.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct DirSample {
+        mes: f64,
+        red: f64,
+        relse_mes: f64,
+        relse_red: f64,
+    }
+
     let thr_cfg = threshold::ThresholdConfig::default();
-    let sim_dir = |offset: f64, view_zenith: f64| -> Vec<(f64, f64)> {
+    // The K-seed protocol of the fan: identical for the coarse scan and
+    // for every refinement point.
+    const FAN_K_SEEDS: usize = 2;
+    let sim_dir = |offset: f64, view_zenith: f64, sza_list: &[f64]| -> Vec<DirSample> {
         let mut cfg = base_config.clone();
         cfg.view_zenith = view_zenith;
         cfg.view_azimuth = Some(base_config.solar_azimuth + offset);
-        let stats = scan_szas_with_stats(atm, &cfg, &szas, 2, scan, scan_list);
+        let stats = scan_szas_with_stats(atm, &cfg, sza_list, FAN_K_SEEDS, scan, scan_list);
         stats
             .results
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(i, r)| {
                 let a = threshold::analyze_twilight(
                     r.sza_deg,
                     &r.wavelengths_nm,
                     &r.radiance,
                     &thr_cfg,
                 );
-                (a.luminance_mesopic, a.luminance_red)
+                DirSample {
+                    mes: a.luminance_mesopic,
+                    red: a.luminance_red,
+                    relse_mes: stats.rel_se[i],
+                    relse_red: stats.rel_se_red[i],
+                }
             })
             .collect()
     };
-    let fan_for = |sun_az: Option<f64>| -> (Vec<Vec<(f64, f64)>>, Vec<Vec<(f64, f64)>>, Vec<f64>, Vec<f64>) {
+    // One side's dawn-band fan: (band patch curves, reference patch
+    // curves, band patch view zeniths, reference patch view zeniths),
+    // each curve a per-SZA DirSample series.
+    type FanCurves = (
+        Vec<Vec<DirSample>>,
+        Vec<Vec<DirSample>>,
+        Vec<f64>,
+        Vec<f64>,
+    );
+    let fan_for = |sun_az: Option<f64>| -> FanCurves {
         let band_z: Vec<f64> = params
             .band_offsets_deg
             .iter()
@@ -1107,17 +1247,17 @@ fn khayt_pass(
             .iter()
             .map(|&o| zenith_for(sun_az, o))
             .collect();
-        let band: Vec<Vec<(f64, f64)>> = params
+        let band: Vec<Vec<DirSample>> = params
             .band_offsets_deg
             .iter()
             .zip(&band_z)
-            .map(|(&o, &z)| sim_dir(o, z))
+            .map(|(&o, &z)| sim_dir(o, z, &szas))
             .collect();
-        let refs: Vec<Vec<(f64, f64)>> = params
+        let refs: Vec<Vec<DirSample>> = params
             .ref_offsets_deg
             .iter()
             .zip(&ref_z)
-            .map(|(&o, &z)| sim_dir(o, z))
+            .map(|(&o, &z)| sim_dir(o, z, &szas))
             .collect();
         (band, refs, band_z, ref_z)
     };
@@ -1149,24 +1289,7 @@ fn khayt_pass(
     // equal veil still raises adaptation and suppresses contrast, which
     // is its physically dominant effect on detection).
     let (sg_mes, sg_red) = match &input.skyglow {
-        Some(sg) => {
-            let elev = 90.0 - params.band_zenith_deg;
-            let lift = twilight_skyglow::angular::enhancement_factor(elev);
-            let mes = sg.zenith_luminance * lift;
-            // Red share from the skyglow's own spectrum (HPS vs LED mix).
-            let n = sg.num_wavelengths.min(sg.spectral_radiance.len());
-            let wl: Vec<f64> = (0..n).map(|i| 380.0 + 10.0 * i as f64).collect();
-            let mes_s = twilight_threshold::luminance::mesopic_luminance(
-                &wl,
-                &sg.spectral_radiance[..n],
-            );
-            let red_s = twilight_threshold::luminance::red_band_luminance(
-                &wl,
-                &sg.spectral_radiance[..n],
-            );
-            let red_frac = if mes_s > 1e-30 { red_s / mes_s } else { 0.3 };
-            (mes, mes * red_frac)
-        }
+        Some(sg) => khayt_skyglow_veil(sg, params.band_zenith_deg),
         None => (0.0, 0.0),
     };
 
@@ -1226,22 +1349,39 @@ fn khayt_pass(
         pick(anchors.last().unwrap())
     };
 
+    // Patch composition: MCRT + celestial background + skyglow. The
+    // background and skyglow are deterministic addends, so they DILUTE
+    // the relative MC error of the total; the PatchLum rel SEs are the
+    // MCRT SEs rescaled by the MCRT share of the total.
+    let patch_from = |d: &DirSample, bg: f64| -> PatchLum {
+        let mes = d.mes + bg + sg_mes;
+        let red = d.red + bg * params.celestial_red_fraction + sg_red;
+        PatchLum {
+            mesopic: mes,
+            red,
+            rel_se_mes: if mes > 0.0 {
+                d.relse_mes * d.mes / mes
+            } else {
+                0.0
+            },
+            rel_se_red: if red > 0.0 {
+                d.relse_red * d.red / red
+            } else {
+                0.0
+            },
+        }
+    };
+
     let assemble = |anchors: &[(f64, Vec<f64>, Vec<f64>)],
-                    bm: &[Vec<(f64, f64)>],
-                    rm: &[Vec<(f64, f64)>]|
+                    bm: &[Vec<DirSample>],
+                    rm: &[Vec<DirSample>]|
      -> KhaytScan {
         let band = szas
             .iter()
             .enumerate()
             .map(|(i, &sza)| {
                 (0..params.band_offsets_deg.len())
-                    .map(|j| {
-                        let bg = interp(anchors, sza, j, false);
-                        PatchLum {
-                            mesopic: bm[j][i].0 + bg + sg_mes,
-                            red: bm[j][i].1 + bg * params.celestial_red_fraction + sg_red,
-                        }
-                    })
+                    .map(|j| patch_from(&bm[j][i], interp(anchors, sza, j, false)))
                     .collect()
             })
             .collect();
@@ -1250,13 +1390,7 @@ fn khayt_pass(
             .enumerate()
             .map(|(i, &sza)| {
                 (0..params.ref_offsets_deg.len())
-                    .map(|j| {
-                        let bg = interp(anchors, sza, j, true);
-                        PatchLum {
-                            mesopic: rm[j][i].0 + bg + sg_mes,
-                            red: rm[j][i].1 + bg * params.celestial_red_fraction + sg_red,
-                        }
-                    })
+                    .map(|j| patch_from(&rm[j][i], interp(anchors, sza, j, true)))
                     .collect()
             })
             .collect();
@@ -1269,19 +1403,104 @@ fn khayt_pass(
 
     let morning_anchors = celestial_side(true, &band_z_m, &ref_z_m);
     let evening_anchors = celestial_side(false, &band_z_e, &ref_z_e);
-    let morning = detect(
+
+    // ── Adaptive-refinement plumbing: extra fan rows at solver-chosen
+    // SZAs, MCRT cached per (fan geometry, SZA) so points are shared
+    // across events and (terrain-inactive) across sides; only the
+    // celestial-background composition differs per side.
+    let mcrt_cache: RefCell<HashMap<(u8, i64), Vec<DirSample>>> = RefCell::new(HashMap::new());
+    let fan_rows = |side_key: u8, band_z: &[f64], ref_z: &[f64], sza: f64| -> Vec<DirSample> {
+        let key = (side_key, (sza * 1e4).round() as i64);
+        if let Some(rows) = mcrt_cache.borrow().get(&key) {
+            return rows.clone();
+        }
+        let one = [sza];
+        let rows: Vec<DirSample> = params
+            .band_offsets_deg
+            .iter()
+            .zip(band_z)
+            .chain(params.ref_offsets_deg.iter().zip(ref_z))
+            .map(|(&o, &z)| sim_dir(o, z, &one)[0])
+            .collect();
+        mcrt_cache.borrow_mut().insert(key, rows.clone());
+        rows
+    };
+    let compose = |anchors: &[(f64, Vec<f64>, Vec<f64>)],
+                   rows: &[DirSample],
+                   sza: f64|
+     -> (Vec<PatchLum>, Vec<PatchLum>) {
+        let nb = params.band_offsets_deg.len();
+        let band = (0..nb)
+            .map(|j| patch_from(&rows[j], interp(anchors, sza, j, false)))
+            .collect();
+        let refs = (0..params.ref_offsets_deg.len())
+            .map(|j| patch_from(&rows[nb + j], interp(anchors, sza, j, true)))
+            .collect();
+        (band, refs)
+    };
+    let evening_key: u8 = if terrain_active { 1 } else { 0 };
+
+    let mut eval_m = |sza: f64| -> Option<(Vec<PatchLum>, Vec<PatchLum>)> {
+        let rows = fan_rows(0, &band_z_m, &ref_z_m, sza);
+        Some(compose(&morning_anchors, &rows, sza))
+    };
+    let eval_m_dyn: &mut FanEval<'_> = &mut eval_m;
+    let morning = detect_refined(
         &assemble(&morning_anchors, &band_mcrt, &ref_mcrt),
         &params.for_side(true),
+        Some(eval_m_dyn),
+        RefineEvents {
+            spread: true,
+            central: true,
+            ahmar: false,
+        },
     );
-    let evening = detect(
+    let mut eval_e = |sza: f64| -> Option<(Vec<PatchLum>, Vec<PatchLum>)> {
+        let rows = fan_rows(evening_key, &band_z_e, &ref_z_e, sza);
+        Some(compose(&evening_anchors, &rows, sza))
+    };
+    let eval_e_dyn: &mut FanEval<'_> = &mut eval_e;
+    let evening = detect_refined(
         &assemble(&evening_anchors, &band_mcrt_e, &ref_mcrt_e),
         &params.for_side(false),
+        Some(eval_e_dyn),
+        RefineEvents {
+            spread: true,
+            central: false,
+            ahmar: true,
+        },
     );
+
+    // Crossing sigma [deg] -> clock-minute uncertainty through the
+    // local dt/dSZA slope. Near the night's maximum depth the +0.25
+    // probe can fall off the zenith curve; probe the shallow side then.
+    let sigma_minutes = |engine: &mut SolarEngine,
+                         sza: f64,
+                         sigma_deg: f64,
+                         t0: Option<f64>,
+                         w0: f64,
+                         w1: f64,
+                         morning: bool|
+     -> Option<f64> {
+        let t0 = t0?;
+        let (t1, dd) =
+            match engine.find_zenith_crossing_robust(sza + 0.25, w0, w1, 0.0001, morning) {
+                Some(t) => (t, 0.25),
+                None => (
+                    engine.find_zenith_crossing_robust(sza - 0.25, w0, w1, 0.0001, morning)?,
+                    -0.25,
+                ),
+            };
+        Some(sigma_deg * ((t1 - t0) / dd).abs() * 60.0)
+    };
 
     let mut out = KhaytTimes::default();
     if let Some(c) = morning.sadiq {
         out.fajr_sza_deg = Some(c.sza_deg);
+        out.fajr_sigma_deg = Some(c.sigma_deg);
         out.fajr_time = engine.find_zenith_crossing_robust(c.sza_deg, 0.0, 12.0, 0.0001, true);
+        out.fajr_uncertainty_min =
+            sigma_minutes(engine, c.sza_deg, c.sigma_deg, out.fajr_time, 0.0, 12.0, true);
         out.fajr_margins = morning.margins_at_sadiq.clone();
     }
     if let Some(c) = morning.kadhib {
@@ -1289,13 +1508,53 @@ fn khayt_pass(
     }
     if let Some(c) = evening.ahmar {
         out.isha_ahmar_sza_deg = Some(c.sza_deg);
+        out.isha_ahmar_sigma_deg = Some(c.sigma_deg);
         out.isha_ahmar_time =
             engine.find_zenith_crossing_robust(c.sza_deg, 12.0, 28.0, 0.0001, false);
+        out.isha_ahmar_uncertainty_min = sigma_minutes(
+            engine,
+            c.sza_deg,
+            c.sigma_deg,
+            out.isha_ahmar_time,
+            12.0,
+            28.0,
+            false,
+        );
     }
     if let Some(c) = evening.sadiq {
         out.isha_abyad_sza_deg = Some(c.sza_deg);
+        out.isha_abyad_sigma_deg = Some(c.sigma_deg);
         out.isha_abyad_time =
             engine.find_zenith_crossing_robust(c.sza_deg, 12.0, 28.0, 0.0001, false);
+        out.isha_abyad_uncertainty_min = sigma_minutes(
+            engine,
+            c.sza_deg,
+            c.sigma_deg,
+            out.isha_abyad_time,
+            12.0,
+            28.0,
+            false,
+        );
+    }
+    // Resolution accounting to stderr for validation runs (the CLI
+    // does not print the khayt sigma fields; this makes them visible
+    // without changing the parsed stdout format).
+    if std::env::var("TWILIGHT_KHAYT_DEBUG").is_ok() {
+        let dump = |name: &str, c: Option<crate::khayt::KhaytCrossing>, unc: Option<f64>| {
+            if let Some(c) = c {
+                eprintln!(
+                    "khayt resolution {name}: sza {:.4} deg, sigma {:.4} deg \
+                     (bracket half {:.4} deg), ~{:.2} min",
+                    c.sza_deg,
+                    c.sigma_deg,
+                    c.bracket_half_deg,
+                    unc.unwrap_or(f64::NAN)
+                );
+            }
+        };
+        dump("fajr_sadiq", morning.sadiq, out.fajr_uncertainty_min);
+        dump("isha_ahmar", evening.ahmar, out.isha_ahmar_uncertainty_min);
+        dump("isha_abyad", evening.sadiq, out.isha_abyad_uncertainty_min);
     }
     out
 }
@@ -1335,9 +1594,12 @@ struct ScanData {
     /// Spectral results sorted by SZA, near-duplicates removed
     /// (fine-scan points replace their coarse versions).
     results: Vec<SpectralResult>,
-    /// (SZA, relative standard error of the mesopic luminance) for every
-    /// scanned point, coarse and fine.
-    se_by_sza: Vec<(f64, f64)>,
+    /// (SZA, relative SE of the mesopic luminance, relative SE of the
+    /// red-band luminance) for every scanned point, coarse and fine.
+    /// Fine entries are pushed AFTER their coarse twins, so a
+    /// last-match lookup returns the SE of the point that survived
+    /// dedup.
+    se_by_sza: Vec<(f64, f64, f64)>,
 }
 
 /// Threshold-crossing SZAs [deg] for the three absolute-threshold events.
@@ -1365,10 +1627,14 @@ struct PrayerClockTimes {
 }
 
 /// Outcome of the celestial-background refloat: possibly updated
-/// crossings plus the human-readable note for the caller.
+/// crossings (re-fit against the refloated thresholds, so they carry
+/// the same debiased-fit resolution as the first pass) plus the
+/// human-readable note for the caller.
 struct CelestialRefloat {
     szas: CrossingSzas,
     times: PrayerClockTimes,
+    /// Sigmas for the re-fit crossings; None fields keep the caller's.
+    sigmas: CrossingSigmas,
     note: String,
 }
 
@@ -1495,10 +1761,10 @@ fn run_adaptive_scan(
     if input.verbose {
         eprintln!("{:.1?}", coarse_t0.elapsed());
     }
-    let mut se_by_sza: Vec<(f64, f64)> = coarse_szas
+    let mut se_by_sza: Vec<(f64, f64, f64)> = coarse_szas
         .iter()
-        .zip(coarse_stats.rel_se.iter())
-        .map(|(&s, &e)| (s, e))
+        .enumerate()
+        .map(|(i, &s)| (s, coarse_stats.rel_se[i], coarse_stats.rel_se_red[i]))
         .collect();
     let coarse_results = coarse_stats.results;
 
@@ -1567,7 +1833,7 @@ fn run_adaptive_scan(
             eprintln!("{:.1?}", fine_t0.elapsed());
         }
         for (i, r) in fine_stats.results.into_iter().enumerate() {
-            se_by_sza.push((r.sza_deg, fine_stats.rel_se[i]));
+            se_by_sza.push((r.sza_deg, fine_stats.rel_se[i], fine_stats.rel_se_red[i]));
             fine_results.push(r);
         }
     }
@@ -1686,48 +1952,108 @@ fn apply_high_latitude_relative_mode(
     (relative_result, true)
 }
 
+/// One legacy threshold crossing: local log-linear fit with the Jensen
+/// debias, MC sigma, and an honest resolution fallback.
+///
+/// JENSEN DEBIAS: the fit takes ln of MC MEAN luminances; for a noisy
+/// mean E[ln L_hat] = ln L - relSE^2/2 + O(relSE^4), a deterministic
+/// fajr-late / isha-early offset of relSE^2/(2|slope|) in SZA (0.2-3 s
+/// of clock time at production noise levels) that a CI cannot
+/// represent. Each window point is therefore debiased BY CONSTRUCTION
+/// (multiplied by exp(relSE^2/2), exact to first order) before the
+/// fit; the O(relSE^4) remainder is negligible against the MC sigma.
+///
+/// FALLBACK: when the fit is impossible (cliff-shaped or non-monotone
+/// window), the pairwise-interpolated `sza0` stands, and instead of a
+/// silent None-sigma the local grid half-spacing is reported as a
+/// uniform-distribution sigma (half / sqrt(3)) - the honest resolution
+/// of a crossing localized only to one scan cell.
+fn fit_one_crossing(
+    analyses: &[TwilightAnalysis],
+    se_by_sza: &[(f64, f64, f64)],
+    sza0: f64,
+    pick: &dyn Fn(&TwilightAnalysis) -> f64,
+    red_channel: bool,
+    thresh: f64,
+) -> (f64, Option<f64>) {
+    let channel_se = |e: &(f64, f64, f64)| if red_channel { e.2 } else { e.1 };
+    // SE of the specific scanned point (last match wins: fine entries
+    // follow their coarse twins and are the ones kept after dedup).
+    let point_rel_se = |sza: f64| -> f64 {
+        se_by_sza
+            .iter()
+            .filter(|e| (e.0 - sza).abs() <= 0.02)
+            .map(channel_se)
+            .next_back()
+            .unwrap_or(0.0)
+    };
+    // Neighborhood SE for the sigma: max over the fit window.
+    let window_rel_se = |sza: f64| -> f64 {
+        se_by_sza
+            .iter()
+            .filter(|e| (e.0 - sza).abs() <= SE_WINDOW_DEG)
+            .map(channel_se)
+            .fold(0.0f64, f64::max)
+    };
+    let window: Vec<(f64, f64)> = analyses
+        .iter()
+        .filter(|a| (a.sza_deg - sza0).abs() <= FIT_WINDOW_DEG)
+        .map(|a| {
+            let relse = point_rel_se(a.sza_deg);
+            (a.sza_deg, pick(a) * libm::exp(0.5 * relse * relse))
+        })
+        .collect();
+    match threshold::fit_crossing_loglinear(&window, thresh) {
+        Some((fitted, slope)) => {
+            let sigma_sza = window_rel_se(fitted) / slope.abs().max(1e-6);
+            (fitted, Some(sigma_sza))
+        }
+        None => {
+            // Local scan spacing around sza0 = the residual resolution.
+            let mut below = f64::NEG_INFINITY;
+            let mut above = f64::INFINITY;
+            for a in analyses {
+                if a.sza_deg <= sza0 && a.sza_deg > below {
+                    below = a.sza_deg;
+                }
+                if a.sza_deg > sza0 && a.sza_deg < above {
+                    above = a.sza_deg;
+                }
+            }
+            let spacing = if below.is_finite() && above.is_finite() {
+                above - below
+            } else {
+                FINE_STEP_DEG
+            };
+            (sza0, Some(0.5 * spacing / 3f64.sqrt()))
+        }
+    }
+}
+
 /// Crossing-on-fit + confidence interval.
 ///
 /// Refine each pairwise crossing with a local log-linear least-squares
-/// fit (robust to single noisy MC samples), and propagate the per-SZA
-/// standard error into a sigma on the crossing SZA:
+/// fit (robust to single noisy MC samples, Jensen-debiased - see
+/// [`fit_one_crossing`]), and propagate the per-SZA standard error into
+/// a sigma on the crossing SZA:
 ///   sigma_sza = rel_SE(luminance) / |d(lnL)/dSZA|.
 fn fit_crossings(
     input: &PrayerTimeInput,
     result: &threshold::PrayerTimeResult,
-    se_by_sza: &[(f64, f64)],
+    se_by_sza: &[(f64, f64, f64)],
     used_relative_thresholds: bool,
 ) -> (CrossingSzas, CrossingSigmas) {
-    let lookup_rel_se = |sza: f64| -> f64 {
-        se_by_sza
-            .iter()
-            .filter(|(s, _)| (s - sza).abs() <= SE_WINDOW_DEG)
-            .map(|(_, e)| *e)
-            .fold(0.0f64, f64::max)
-    };
-    let fit_window = |pick: &dyn Fn(&TwilightAnalysis) -> f64, around: f64| -> Vec<(f64, f64)> {
-        result
-            .analyses
-            .iter()
-            .filter(|a| (a.sza_deg - around).abs() <= FIT_WINDOW_DEG)
-            .map(|a| (a.sza_deg, pick(a)))
-            .collect()
-    };
     let refine = |sza_opt: Option<f64>,
                   pick: &dyn Fn(&TwilightAnalysis) -> f64,
+                  red_channel: bool,
                   thresh: f64|
      -> (Option<f64>, Option<f64>) {
         let Some(sza0) = sza_opt else {
             return (None, None);
         };
-        let window = fit_window(pick, sza0);
-        match threshold::fit_crossing_loglinear(&window, thresh) {
-            Some((fitted, slope)) => {
-                let sigma_sza = lookup_rel_se(fitted) / slope.abs().max(1e-6);
-                (Some(fitted), Some(sigma_sza))
-            }
-            None => (Some(sza0), None),
-        }
+        let (fitted, sigma) =
+            fit_one_crossing(&result.analyses, se_by_sza, sza0, pick, red_channel, thresh);
+        (Some(fitted), sigma)
     };
     // Under high-latitude mode the fit must target the floated thresholds.
     let floor_of = |pick: &dyn Fn(&TwilightAnalysis) -> f64| -> f64 {
@@ -1750,16 +2076,19 @@ fn fit_crossings(
     let (fajr, fajr_sigma) = refine(
         result.fajr_sza_deg,
         &|a| a.luminance_mesopic,
+        false,
         effective(cfg.fajr_luminance, &|a| a.luminance_mesopic),
     );
     let (isha_abyad, abyad_sigma) = refine(
         result.isha_abyad_sza_deg,
         &|a| a.luminance_mesopic,
+        false,
         effective(cfg.isha_abyad_luminance, &|a| a.luminance_mesopic),
     );
     let (isha_ahmar, ahmar_sigma) = refine(
         result.isha_ahmar_sza_deg,
         &|a| a.luminance_red,
+        true,
         effective(cfg.isha_ahmar_red_luminance, &|a| a.luminance_red),
     );
     (
@@ -1812,6 +2141,7 @@ fn refloat_on_celestial_background(
     input: &PrayerTimeInput,
     engine: &mut SolarEngine,
     analyses: &[TwilightAnalysis],
+    se_by_sza: &[(f64, f64, f64)],
     szas: CrossingSzas,
     times: PrayerClockTimes,
 ) -> Option<CelestialRefloat> {
@@ -1871,17 +2201,63 @@ fn refloat_on_celestial_background(
     if refined.fajr_sza_deg.is_none() && refined.isha_abyad_sza_deg.is_none() {
         // Trigger fired but the refloated thresholds found no crossings:
         // keep the first-pass values, still report the note.
-        return Some(CelestialRefloat { szas, times, note });
+        return Some(CelestialRefloat {
+            szas,
+            times,
+            sigmas: CrossingSigmas::default(),
+            note,
+        });
     }
+    // Re-fit each refloated crossing against ITS threshold: the
+    // pairwise interpolation above localizes, the debiased local fit
+    // supplies the final value and sigma (same resolution discipline as
+    // the first pass; previously the refloat skipped the fit and kept
+    // stale sigmas).
+    let refit = |sza_opt: Option<f64>,
+                 pick: &dyn Fn(&TwilightAnalysis) -> f64,
+                 red_channel: bool,
+                 thresh: f64|
+     -> (Option<f64>, Option<f64>) {
+        match sza_opt {
+            Some(s0) => {
+                let (s, sig) = fit_one_crossing(analyses, se_by_sza, s0, pick, red_channel, thresh);
+                (Some(s), sig)
+            }
+            None => (None, None),
+        }
+    };
+    let (fajr, fajr_sigma) = refit(
+        refined.fajr_sza_deg,
+        &|a| a.luminance_mesopic,
+        false,
+        refined_config.fajr_luminance,
+    );
+    let (isha_abyad, abyad_sigma) = refit(
+        refined.isha_abyad_sza_deg,
+        &|a| a.luminance_mesopic,
+        false,
+        refined_config.isha_abyad_luminance,
+    );
+    let (isha_ahmar, ahmar_sigma) = refit(
+        refined.isha_ahmar_sza_deg,
+        &|a| a.luminance_red,
+        true,
+        refined_config.isha_ahmar_red_luminance,
+    );
     let new_szas = CrossingSzas {
-        fajr: refined.fajr_sza_deg.or(szas.fajr),
-        isha_abyad: refined.isha_abyad_sza_deg.or(szas.isha_abyad),
-        isha_ahmar: refined.isha_ahmar_sza_deg.or(szas.isha_ahmar),
+        fajr: fajr.or(szas.fajr),
+        isha_abyad: isha_abyad.or(szas.isha_abyad),
+        isha_ahmar: isha_ahmar.or(szas.isha_ahmar),
     };
     let new_times = crossings_to_times(engine, new_szas);
     Some(CelestialRefloat {
         szas: new_szas,
         times: new_times,
+        sigmas: CrossingSigmas {
+            fajr: fajr_sigma,
+            isha_abyad: abyad_sigma,
+            isha_ahmar: ahmar_sigma,
+        },
         note,
     })
 }
@@ -1904,8 +2280,17 @@ fn propagate_uncertainty(
         let (Some(s0), Some(t0), Some(sig)) = (sza, t, sigma) else {
             return None;
         };
-        let t1 = engine.find_zenith_crossing_robust(s0 + 0.25, lo, hi, 0.0001, descending)?;
-        let dtdsza = ((t1 - t0) / 0.25).abs() * 60.0; // minutes per degree
+        // Near the night's maximum SZA the deep-side probe can fall off
+        // the zenith curve; probe the shallow side instead.
+        let (t1, dd) = match engine.find_zenith_crossing_robust(s0 + 0.25, lo, hi, 0.0001, descending)
+        {
+            Some(t) => (t, 0.25),
+            None => (
+                engine.find_zenith_crossing_robust(s0 - 0.25, lo, hi, 0.0001, descending)?,
+                -0.25,
+            ),
+        };
+        let dtdsza = ((t1 - t0) / dd).abs() * 60.0; // minutes per degree
         Some(sig * dtdsza)
     };
     UncertaintyMinutes {
@@ -1954,6 +2339,14 @@ fn compute_prayer_times_inner(
         .and_then(|h| engine.azimuth_at_hour(h))
         .unwrap_or(270.0);
 
+    // Base seed salt: input field, overridable by environment for
+    // salt-stability runs without CLI plumbing. Base 0 (the default)
+    // reproduces the historical RNG streams bit-for-bit.
+    let base_salt = std::env::var("TWILIGHT_SEED_SALT")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(input.seed_salt);
+
     let config = SimulationConfig {
         latitude: input.latitude,
         longitude: input.longitude,
@@ -1965,7 +2358,7 @@ fn compute_prayer_times_inner(
         scattering_mode: input.scattering_mode,
         photons_per_wavelength: input.photons_per_wavelength,
         polarized: input.polarized,
-        seed_salt: 0,
+        seed_salt: base_salt,
     };
 
     // MCRT passes 1 + 2.
@@ -2000,18 +2393,29 @@ fn compute_prayer_times_inner(
         fit_crossings(input, &prayer_result, &se_by_sza, used_relative_thresholds);
     let fitted_times = crossings_to_times(&mut engine, fitted_szas);
 
-    let (final_szas, final_times, celestial_refloat) = match refloat_on_celestial_background(
-        input,
-        &mut engine,
-        &prayer_result.analyses,
-        fitted_szas,
-        fitted_times,
-    ) {
-        Some(r) => (r.szas, r.times, Some(r.note)),
-        None => (fitted_szas, fitted_times, None),
-    };
+    let (final_szas, final_times, final_sigmas, celestial_refloat) =
+        match refloat_on_celestial_background(
+            input,
+            &mut engine,
+            &prayer_result.analyses,
+            &se_by_sza,
+            fitted_szas,
+            fitted_times,
+        ) {
+            Some(r) => {
+                // Refloated crossings carry re-fit sigmas; events the
+                // refloat left alone keep the first-pass sigma.
+                let merged = CrossingSigmas {
+                    fajr: r.sigmas.fajr.or(sigmas.fajr),
+                    isha_abyad: r.sigmas.isha_abyad.or(sigmas.isha_abyad),
+                    isha_ahmar: r.sigmas.isha_ahmar.or(sigmas.isha_ahmar),
+                };
+                (r.szas, r.times, merged, Some(r.note))
+            }
+            None => (fitted_szas, fitted_times, sigmas, None),
+        };
 
-    let uncertainty = propagate_uncertainty(&mut engine, final_szas, final_times, sigmas);
+    let uncertainty = propagate_uncertainty(&mut engine, final_szas, final_times, final_sigmas);
 
     // ── THE KHAYT AL-ABYAD PASS (primary criterion) ────────────────
     // Simulate the horizon fan and detect the Quranic contrast events:
@@ -2324,10 +2728,12 @@ mod tests {
         }
     }
 
-    /// (b) A 1D shell cloud (from any input source) with a chain-based
-    /// estimator routes to the CPU scan: the GPU hybrid kernel still
-    /// runs the retired T_diff estimator while the CPU runs Stage-2
-    /// explicit scattering.
+    /// (b) A 1D shell cloud (from any input source) with a chain
+    /// estimator routes the SCAN to the CPU: Multiple because the GPU
+    /// mcrt kernel has no cloud channel, hybrid on measured perf (the
+    /// estimator is parity-gated, but the sustained fan/refinement call
+    /// stream self-saturates the interactive macOS watchdog: a routed
+    /// cloudy pray measured 2h+ in retry sleeps vs ~10 min on CPU).
     #[test]
     fn gpu_entry_routes_shell_cloud_chain_modes_to_cpu() {
         use twilight_data::cloud::{default_properties, CloudType};
@@ -2603,6 +3009,36 @@ mod tests {
             !output.persistent_twilight,
             "Mecca should not have persistent twilight"
         );
+
+        // Every reported khayt event must carry its resolution
+        // accounting end-to-end: a crossing SZA without a sigma (or a
+        // time without a minute uncertainty) would mean the residual
+        // bracket / MC noise was silently absorbed again.
+        let kh = &output.khayt;
+        assert!(
+            kh.fajr_sza_deg.is_none() || kh.fajr_sigma_deg.is_some(),
+            "khayt fajr SZA reported without sigma"
+        );
+        assert!(
+            kh.fajr_time.is_none() || kh.fajr_uncertainty_min.is_some(),
+            "khayt fajr time reported without minute uncertainty"
+        );
+        assert!(
+            kh.isha_ahmar_sza_deg.is_none() || kh.isha_ahmar_sigma_deg.is_some(),
+            "khayt isha ahmar SZA reported without sigma"
+        );
+        assert!(
+            kh.isha_ahmar_time.is_none() || kh.isha_ahmar_uncertainty_min.is_some(),
+            "khayt isha ahmar time reported without minute uncertainty"
+        );
+        assert!(
+            kh.isha_abyad_sza_deg.is_none() || kh.isha_abyad_sigma_deg.is_some(),
+            "khayt isha abyad SZA reported without sigma"
+        );
+        assert!(
+            kh.isha_abyad_time.is_none() || kh.isha_abyad_uncertainty_min.is_some(),
+            "khayt isha abyad time reported without minute uncertainty"
+        );
     }
 
     #[test]
@@ -2819,6 +3255,44 @@ mod tests {
         add_refine_region(&mut regions, 100.0, 95.0, 108.0); // lo > hi after clamping
                                                              // lo=100, hi=95 → hi <= lo → should not add
         assert_eq!(regions.len(), 0, "Inverted region should not be added");
+    }
+
+    // ── khayt skyglow veil unit contract ──
+
+    /// UNIT PIN: `SkyglowResult::zenith_luminance` is in mcd/m^2 (the
+    /// Falchi fit L = 0.092 * R^0.72 produces mcd); the khayt veil is
+    /// cd/m^2. A Bortle-6-class radiance (15 nW/cm^2/sr) must yield a
+    /// horizon-ring veil of 0.092e-3 * 15^0.72 * enhancement_factor(3)
+    /// ~ 5.2e-3 cd/m^2. Before the 1e-3 interface fix this returned
+    /// ~5.2 cd/m^2 (photopic city-sky levels): every --skyglow khayt
+    /// output overstated the artificial veil 1000x.
+    #[test]
+    fn khayt_skyglow_veil_unit_pin() {
+        let radiance_nw = 15.0;
+        let sg = twilight_skyglow::quick_estimate(radiance_nw, 0.5);
+        let band_zenith_deg = 87.0; // the khayt ring: 3 deg elevation
+        let (mes, red) = khayt_skyglow_veil(&sg, band_zenith_deg);
+
+        // Exact contract against the producer and the angular model.
+        let lift = twilight_skyglow::angular::enhancement_factor(90.0 - band_zenith_deg);
+        let expected = sg.zenith_luminance * 1e-3 * lift;
+        assert!(
+            (mes - expected).abs() <= 1e-12 * expected.max(1.0),
+            "veil {mes} vs contract {expected}"
+        );
+
+        // Independent literal pin (the parallel validation campaign's
+        // corrected-units emulation): 0.092e-3 * R^0.72 * 8.11 cd/m^2.
+        let documented = 0.092e-3 * radiance_nw.powf(0.72) * 8.11;
+        assert!(
+            (mes / documented - 1.0).abs() < 0.01,
+            "veil {mes} cd/m^2 must match the documented corrected \
+             formula {documented} (a 1000x regression fails this by \
+             three orders of magnitude)"
+        );
+
+        // Red share comes from the skyglow spectrum and stays a share.
+        assert!(red > 0.0 && red < mes, "red {red} vs mes {mes}");
     }
 
     // ── set_time_from_fractional_hour ──

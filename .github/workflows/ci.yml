@@ -1,0 +1,81 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev, overhaul, field-perf, validation-campaigns]
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Weekly heavy-gate run (Mondays 02:00 UTC); the default suites
+    # deliberately keep the multi-hour MC gates behind #[ignore], so
+    # without this job the load-bearing physics gates never run in CI.
+    - cron: "0 2 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  hygiene:
+    name: Source hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Hard project rule: no em or en dashes anywhere in sources, docs,
+      # or tooling (enforced on git history as well).
+      - name: No em/en dashes
+        run: |
+          if grep -rnP '\xe2\x80\x94|\xe2\x80\x93' \
+              --include='*.rs' --include='*.py' --include='*.md' \
+              --include='*.metal' --include='*.toml' \
+              crates tools docs README.md 2>/dev/null; then
+            echo 'em/en dash found (project hard rule)'; exit 1
+          fi
+
+  test:
+    name: Default suites (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (all targets)
+        run: cargo check --workspace --all-targets
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # Release mode: the MC tests are calibrated for release; debug
+      # runs of them take CPU-hours (documented project convention).
+      - name: Test (release, default suites)
+        run: cargo test --workspace --release
+
+  test-macos:
+    name: Default suites + Metal (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # GitHub arm64 macOS runners expose a Metal device, so the GPU
+      # parity suite runs for real here (device-present init failure
+      # PANICS by design; only a truly absent device skips).
+      - name: Test with Metal (release)
+        run: cargo test --workspace --release --features twilight-gpu/metal
+
+  heavy-gates:
+    name: Physics gates (ignored suite)
+    # Scheduled weekly and on manual dispatch only: ~2 h of MC.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The g_s1/g_s2 physics gates and the independent slab referee.
+      # The libRadtran tiers (g2/g3) need a local libRadtran build and
+      # stay manual; everything else runs here.
+      - name: Core ignored gates
+        run: cargo test -p twilight-core --release -- --ignored
+      - name: CPU ignored gates
+        run: cargo test -p twilight-cpu --release -- --ignored

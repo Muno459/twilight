@@ -3,7 +3,7 @@
 // Four compute kernels for GPU-accelerated twilight radiative transfer:
 //   1. single_scatter_spectrum   - Deterministic LOS integration
 //   2. mcrt_trace_photon         - Backward MC with next-event estimation
-//   3. hybrid_scatter            - LOS + secondary MC chains (reparallelized)
+//   3. hybrid_scatter_v2         - LOS + secondary MC chains (ray-parallel)
 //   4. garstang_zenith           - Light pollution skyglow
 //
 // Buffer layout matches crates/twilight-gpu/src/buffers.rs (v2) exactly.
@@ -37,16 +37,62 @@ constant uint MAX_WAVELENGTHS = 64;
 constant uint MAX_LOS_STEPS = 200;
 constant uint MAX_SCATTERS = 100;
 constant uint HYBRID_LOS_STEPS = 200;
-constant uint HYBRID_MAX_BOUNCES = 50;
-// v1 kernel (step-parallel) uses 256 threads.
-// v2 kernel (ray-parallel) uses 64 threads to stay within Metal's per-
-// threadgroup stack limit -- each trace_secondary_chain needs ~2-4 KB
-// stack per thread, and 256 * 4 KB = 1 MB would exceed the default.
-constant uint HYBRID_THREADGROUP_SIZE = 256;
+// Chain bounce cap. The CPU reference runs BOUNCE_SAFETY_LIMIT = 10000
+// (effectively unbiased: chains terminate by escape or f32 weight decay,
+// never by this backstop); the old GPU cap of 50 was invisible in clear sky
+// (chains die by ssa and escape within a few bounces) but truncates real
+// energy under a conservative cloud deck: a cloud collision never shrinks
+// the weight, so photons diffusing through an OD-2+ deck routinely exceed
+// 50 scatters. 2000 keeps the loop bounded for the macOS GPU watchdog while
+// the truncated tail (random-walk escape-time tail at tau* <= 10) sits far
+// below the MC noise floor.
+constant uint HYBRID_MAX_BOUNCES = 2000;
+// Chain bounce cap under a 3D FIELD. Every bounce there pays a field-DDA
+// shadow ray (~ms), so the 2000-bounce cap put worst-case command buffers
+// far past the macOS GPU watchdog (measured: ImpactingInteractivity kills
+// on the real Padborg field at watchdog batch 4, then a cooldown window
+// fast-kills the pipeline). 400 keeps the worst buffer under the watchdog
+// at batch 4 and is numerically negligible: for a delta-scaled deck of
+// tau* <= 10, in-deck survival past n scatters decays like
+// exp(-n pi^2 / (4 tau*^2)), i.e. ~5e-5 of chain weight past 400 scatters
+// at tau* = 10 (real retrieved fields sit at tau* of a few: ~e-100), far
+// below the MC noise floor at any gate budget. The 1D shell deck keeps the
+// full 2000 cap: its per-bounce cost has no DDA and its buffers fit.
+constant uint HYBRID_FIELD_MAX_BOUNCES = 400;
+
+// Per-(wavelength, step) eye-path context, precomputed ONCE per hybrid run
+// by hybrid_context_prefix and read by every hybrid_scatter_v2 chunk. The
+// context (gas/cloud prefix optical depths, substep split, substep cloud
+// taus, importance-allocated chain budgets) is deterministic per geometry;
+// recomputing it redundantly in every watchdog-sized ray chunk made the
+// field path spend ~50x its chain work on context DDAs and saturated the
+// GPU into interactivity kills (the same reason the retired
+// hybrid_los_prefix kernel existed for the gas prefix).
+constant uint HCTX_TAU_OBS   = 0;         // gas tau, observer -> step start
+constant uint HCTX_TAU_CLOUD = 1;         // cloud tau, observer -> step start
+constant uint HCTX_K_SUB     = 2;         // substep count [uint bits], 0 = invalid step
+constant uint HCTX_SPARE     = 3;
+constant uint HCTX_SUB_TAU   = 4;         // 64 x per-substep cloud tau
+constant uint HCTX_SUB_START = 4 + 64;    // 64 x global chain range start [uint bits]
+constant uint HCTX_SUB_COUNT = 4 + 128;   // 64 x global chain count [uint bits]
+constant uint HCTX_STRIDE    = 4 + 192;   // 196 f32 per (wl, step)
+// The hybrid v2 (ray-parallel) kernel uses 64 threads to stay within
+// Metal's per-threadgroup stack limit -- each trace_secondary_chain needs
+// ~2-4 KB stack per thread.
 constant uint HYBRID_V2_THREADGROUP_SIZE = 64;
 constant uint SIMD_WIDTH = 32;
-constant uint NUM_SIMD_GROUPS = HYBRID_THREADGROUP_SIZE / SIMD_WIDTH; // 8
 constant uint HYBRID_V2_NUM_SIMD_GROUPS = HYBRID_V2_THREADGROUP_SIZE / SIMD_WIDTH; // 2
+
+// The hybrid eye-path quadrature approximates INT source(s) e^{-tau(s)} ds
+// over a step by source(mid) * e^{-tau_mid} * ds. With a per-step cloud tau
+// of x this carries a factor e^{-x/2} / [(1 - e^{-x})/x]: 0.98 at x = 0.25
+// but 0.18 at x = 7.5 (a 750 m step through a tau* = 10 deck). Steps whose
+// cloud tau exceeds this bound are subdivided so the midpoint rule stays
+// within ~0.03 percent (port of the CPU CLOUD_SUBSTEP_TAU).
+constant float CLOUD_SUBSTEP_TAU = 0.25f;
+// Cap on quadrature substeps per coarse LOS step (bounds cost and the
+// per-thread arrays; port of the CPU CLOUD_MAX_SUBSTEPS).
+constant uint CLOUD_MAX_SUBSTEPS = 64;
 
 // Buffer header. buffers.rs packs the u32 magic/version words bit-for-bit
 // into f32 slots via f32::from_bits, so the shader compares bit patterns
@@ -190,6 +236,20 @@ inline float cloud_diffuse_transmittance(device const float* atm, float tau_clou
     if (tau_cloud <= 0.0f) return 1.0f;
     float g = atm[ATM_CLOUD_G_SCALED];
     return 1.0f / (1.0f + 0.75f * tau_cloud * (1.0f - g));
+}
+
+// True when ANY gray cloud channel is active for a run: a 3D field is bound,
+// or the 1D per-shell cloud extinction is nonzero somewhere. Port of the CPU
+// has_cloud_channel. Selects the chain-mode Beer-Lambert shadow path (the
+// clear-sky fast path is value-identical there but skips the per-shell cloud
+// reads).
+inline bool atm_has_cloud_channel(device const float* atm, bool field_present) {
+    if (field_present) return true;
+    uint ns = atm_num_shells(atm);
+    for (uint s = 0; s < ns; s++) {
+        if (read_cloud_extinction(atm, s) > 0.0f) return true;
+    }
+    return false;
 }
 
 // ============================================================================
@@ -730,6 +790,13 @@ inline float3 read_sun_dir(device const float* params) {
 }
 inline uint read_photons_per_wl(device const float* params) {
     return as_type<uint>(params[12]);
+}
+// LOS step-window offset (slot 7, 0 when the host does not split): added to
+// the threadgroup y-index so a (wl x 200) hybrid dispatch can be issued as
+// several smaller command buffers along the step axis (static watchdog
+// split for the field path).
+inline uint read_step_offset(device const float* params) {
+    return as_type<uint>(params[7]);
 }
 inline uint read_secondary_rays(device const float* params) {
     return as_type<uint>(params[13]);
@@ -1345,16 +1412,22 @@ float shadow_ray_transmittance(device const float* atm, float3 start_pos,
     return fast::exp(-tau) * cloud_diffuse_transmittance(atm, tau_cloud);
 }
 
-// Field-aware shadow ray (Stage 3): the gray cloud channel is delta-tracked
-// explicitly in the chains, so every transmittance leg uses Beer-Lambert
-// exp(-tau_cloud) with tau_cloud integrated by the field DDA over each
-// straight in-shell segment (pos/dir taken BEFORE the refraction step,
-// matching the CPU's cloud_tau_segment call site). Port of
+// Chain-mode shadow ray: the gray cloud channel is delta-tracked explicitly
+// in the chains, so every transmittance leg uses Beer-Lambert exp(-tau_cloud)
+// with tau_cloud integrated by the field DDA over each straight in-shell
+// segment (pos/dir taken BEFORE the refraction step, matching the CPU's
+// cloud_tau_segment call site) when a field is bound, or accumulated from
+// the per-shell 1D cloud extinction otherwise: one implementation, two
+// sigma sources, exactly like the CPU
 // shadow_ray_transmittance(field, CloudTransmittance::BeerLambert).
-float shadow_ray_transmittance_field(device const float* atm, device const float* fld,
-                                     bool field_present, float3 start_pos,
-                                     float3 sun_dir, uint wl_idx) {
-    if (!field_present) {
+// NO T_diff anywhere on chain paths (mixing it with explicit cloud
+// scattering double-counts the diffusion). Clear-sky runs (no channel) take
+// the pre-existing fast path, which is value-identical there (tau_cloud is
+// identically zero, so its T_diff factor is 1).
+float shadow_ray_transmittance_chain(device const float* atm, device const float* fld,
+                                     bool field_present, bool cloud_channel,
+                                     float3 start_pos, float3 sun_dir, uint wl_idx) {
+    if (!cloud_channel) {
         return shadow_ray_transmittance(atm, start_pos, sun_dir, wl_idx);
     }
     uint ns = atm_num_shells(atm);
@@ -1396,7 +1469,10 @@ float shadow_ray_transmittance_field(device const float* atm, device const float
         // threshold to the CPU trace_transmittance so the backends match.
         if (tau + tau_cloud > 35.0f) return 0.0f;
         // Cloud tau for this straight segment: pos/dir BEFORE refraction.
-        tau_cloud += field_tau_along(fld, pos, dir, bnd.dist);
+        // Field DDA when bound, per-shell 1D extinction otherwise.
+        tau_cloud += field_present
+            ? field_tau_along(fld, pos, dir, bnd.dist)
+            : read_cloud_extinction(atm, us) * bnd.dist;
 
         float3 boundary_pos = pos + dir * bnd.dist;
         float target_r = bnd.is_outward ? r_outer : r_inner;
@@ -1423,6 +1499,63 @@ float shadow_ray_transmittance_field(device const float* atm, device const float
 
     // Clear-air Beer-Lambert x cloud Beer-Lambert (explicit scattering).
     return fast::exp(-tau) * fast::exp(-tau_cloud);
+}
+
+// Total path length of the ray origin + t*dir, t in [0, t_max], inside the
+// spherical shell annulus [r_inner, r_outer]. Analytic (no stepping),
+// port of the CPU single_scatter::ray_path_through_shell. The DS-precision
+// ray_sphere_intersect keeps the f32 interval endpoints stable at Earth
+// scale.
+float ray_path_through_shell(float3 origin, float3 dir,
+                             float r_inner, float r_outer, float t_max) {
+    RaySphereHit outer = ray_sphere_intersect(origin, dir, r_outer);
+    if (!outer.hit) return 0.0f;
+    float o0 = max(outer.t_near, 0.0f);
+    float o1 = min(outer.t_far, t_max);
+    if (o1 <= o0 + 1e-6f) return 0.0f;
+
+    RaySphereHit inner = ray_sphere_intersect(origin, dir, r_inner);
+    float i0 = 0.0f;
+    float i1 = 0.0f;
+    bool has_inner = false;
+    if (inner.hit) {
+        i0 = max(inner.t_near, 0.0f);
+        i1 = min(inner.t_far, t_max);
+        has_inner = (i1 > i0 + 1e-6f);
+    }
+    if (!has_inner) return o1 - o0;
+
+    // Shell interval = outer interval minus inner interval: 0, 1, or 2 segments.
+    float total = 0.0f;
+    float seg1_end = min(o1, i0);
+    if (seg1_end > o0) total += seg1_end - o0;
+    float seg2_start = max(o0, i1);
+    if (o1 > seg2_start) total += o1 - seg2_start;
+    return total;
+}
+
+// Exact cloud optical depth of one straight eye-path (sub)step: the shared
+// field DDA when a field is bound, else analytic per-shell path lengths
+// through the 1D shell deck. Port of the CPU eye_step_cloud_tau, which
+// replaced the previous eye-path convention (midpoint-classified shell
+// sigma times the WHOLE step): a 750 m zenith step one third below a deck
+// still got full-deck extinction over its entire length, inflating the
+// deck's in-scatter source and the eye cloud OD by up to 1.5x.
+float eye_step_cloud_tau(device const float* atm, device const float* fld,
+                         bool field_present, float3 start, float3 dir, float ds) {
+    if (field_present) {
+        return field_tau_along(fld, start, dir, ds);
+    }
+    float tau = 0.0f;
+    uint ns = atm_num_shells(atm);
+    for (uint s = 0; s < ns; s++) {
+        float sigma_c = read_cloud_extinction(atm, s);
+        if (sigma_c <= 0.0f) continue;
+        uint shell_base = ATM_SHELLS_START + s * ATM_SHELL_STRIDE;
+        tau += sigma_c
+            * ray_path_through_shell(start, dir, atm[shell_base], atm[shell_base + 1], ds);
+    }
+    return tau;
 }
 
 // ============================================================================
@@ -1547,7 +1680,34 @@ struct SecondarySetup {
     float n_zenith;
     float m_term;
     float alpha_et;
+    // Forced-collision gate, computed by the caller as
+    // (sza >= ZENITH_SZA_START_DEG) && !field_present. Forced mode composes
+    // EXACTLY with the shell-constant 1D gray cloud deck (combined transport
+    // channel: scout/advance accumulate gas + cloud tau, both piecewise
+    // constant per shell, so the truncated inversion stays exact and the
+    // vertex type is drawn from the extinction conditional at the collision
+    // shell; port of the CPU combined-channel forced mode, ac673c7). A 3D
+    // FIELD's per-segment cloud extinction is NOT shell-constant, so forced
+    // mode stays OFF there (analog delta tracking is unbiased), mirroring
+    // the CPU `use_forced && field.is_none()` gate.
     uint use_forced;
+    // SZA-adaptive forced-scatter tau floor (port of the CPU
+    // forced_tau_min_for_sza sigmoid: 0.05 at SZA <= 100, 0.02 at >= 104).
+    float forced_tau_min;
+    // Any gray cloud channel active this run (3D field or 1D shells)?
+    // Selects the chain-mode Beer-Lambert shadow path.
+    uint cloud_channel;
+    // Gray cloud scattering coefficient of the seeding LOS substep [1/m]
+    // (the substep's exact cloud tau / sub_ds). Zero on clear substeps: the
+    // seed type draw is then skipped so clear-sky RNG streams keep their
+    // structure (port of the CPU ChainCloud::beta_seed).
+    float beta_seed;
+    // Bounce cap for this run: HYBRID_MAX_BOUNCES normally,
+    // HYBRID_FIELD_MAX_BOUNCES under a 3D field (watchdog bound; see the
+    // constants for the truncation-tail justification).
+    uint max_bounces;
+    // Delta-scaled asymmetry g* for a cloud-seeded vertex.
+    float g_seed;
 };
 
 inline BranchParams branch_params_for_sza(float sza_deg) {
@@ -1741,6 +1901,20 @@ kernel void mcrt_trace_photon(
     float surface_radius = atm_surface_radius(atm);
 
     float3 pos = observer_pos;
+    // Surface snap (port of the CPU trace_photon entry snap, d4f682e): an
+    // observer whose radius rounds BELOW the surface lands where
+    // shell_index is -1 and every photon dies on entry with exactly zero
+    // radiance. In f32 the rounding granularity at Earth radius is ~0.5 m,
+    // so snap to the same BOUNDARY_NUDGE_M ledge the ground bounce uses
+    // (the CPU's 1 mm ledge vanishes in f32); physically negligible,
+    // numerically decisive.
+    {
+        float r0 = length(pos);
+        float ledge = surface_radius + BOUNDARY_NUDGE_M;
+        if (r0 > 0.0f && r0 < ledge) {
+            pos = pos * (ledge / r0);
+        }
+    }
     float3 dir = view_dir;
     float3 prev_dir = dir; // for Stokes scattering plane tracking
     float4 stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
@@ -1904,7 +2078,13 @@ ScoutResult scout_tau_to_boundary(device const float* atm, float3 start_pos,
         ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
         if (!bnd.found) return ScoutResult{tau, false};
 
-        tau += extinction * bnd.dist;
+        // COMBINED transport channel (port of the CPU scout_tau_to_boundary,
+        // ac673c7): gas extinction PLUS the gray 1D shell cloud extinction,
+        // both piecewise constant per shell so the sum stays exactly
+        // piecewise constant. Clear-sky shells add 0.0 (bit-identical to the
+        // gas-only scout). A 3D field is never scouted (forced mode is
+        // 1D-only; field runs carry all-zero cloud_extinction).
+        tau += (extinction + read_cloud_extinction(atm, us)) * bnd.dist;
 
         float3 boundary_pos = pos + dir * bnd.dist;
         float target_r = bnd.is_outward ? r_outer : r_inner;
@@ -1964,17 +2144,22 @@ AdvanceResult advance_to_optical_depth(device const float* atm, float3 start_pos
         float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
         float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
         uint optics_idx = us * MAX_WAVELENGTHS + wl_idx;
-        float extinction = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE];
+        // Combined per-shell extinction (gas + gray 1D cloud), matching the
+        // combined scout so a forced flight sampled from the combined tau
+        // inverts to the exact combined collision point (CPU
+        // advance_to_optical_depth, ac673c7). Clear shells add 0.0.
+        float sigma_comb = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE]
+                         + read_cloud_extinction(atm, us);
 
         ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
         if (!bnd.found) return AdvanceResult{pos, dir, us};
 
-        float tau_shell = extinction * bnd.dist;
+        float tau_shell = sigma_comb * bnd.dist;
 
         if (tau_acc + tau_shell >= tau_target) {
             // Scatter point is within this shell
             float tau_remaining = tau_target - tau_acc;
-            float dist = (extinction > 1e-30f) ? tau_remaining / extinction : bnd.dist;
+            float dist = (sigma_comb > 1e-30f) ? tau_remaining / sigma_comb : bnd.dist;
             pos = pos + dir * dist;
             return AdvanceResult{pos, dir, us};
         }
@@ -2002,7 +2187,7 @@ AdvanceResult advance_to_optical_depth(device const float* atm, float3 start_pos
 }
 
 // ============================================================================
-// Secondary chain tracer (used by hybrid_scatter kernel)
+// Secondary chain tracer (used by the hybrid_scatter_v2 kernel)
 //
 // Full Stokes [I,Q,U,V] propagation through the secondary chain.
 // Tracks the photon's polarization state (normalized, I=1) through
@@ -2056,11 +2241,31 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
                                     setup.term_axis_dir, setup.alpha_p,
                                     setup.alpha_z, setup.alpha_t,
                                     setup.n_zenith, setup.m_term, start_optics);
+    // Cloud-seed mixture (port of the CPU derivation at the scalar chain
+    // seed): the seeding substep's orders-2+ source is
+    // beta_gas * INT P_gas/4pi L + beta_cloud * INT P_HG/4pi L. One type
+    // draw selects the vertex type with p_c = beta_cloud / beta_total; the
+    // selection probability cancels the per-type coefficient exactly, so
+    // the caller scales the chain average by beta_total = beta_gas +
+    // beta_cloud and the expectation is exact. The draw is consumed ONLY
+    // when the seeding substep carries cloud, so clear-sky RNG streams keep
+    // their structure; the walk after the seed is vertex-type agnostic.
+    // Per-flight stream order (single GPU stream serializing the CPU's
+    // dir/ctl/tau streams in event order): seed jitter + direction draws,
+    // then this type draw, then the walk draws.
+    bool seed_is_cloud = false;
+    if (setup.beta_seed > 0.0f) {
+        float beta_gas_seed = start_optics.extinction * start_optics.ssa;
+        float p_c = setup.beta_seed / (setup.beta_seed + beta_gas_seed);
+        seed_is_cloud = xorshift_f32(rng) < p_c;
+    }
     // prev_dir_in is the LOS view direction: the physical seed-scatter
-    // cosine is omega.view (matches the CPU convention).
-    float w0 = (q_seed > 1e-30f)
-        ? mixed_phase(dot(dir, prev_dir_in), start_optics) * INV_4PI / q_seed
-        : 0.0f;
+    // cosine is omega.view (matches the CPU convention). A cloud seed swaps
+    // the numerator phase to the gray HG lobe against the SAME q.
+    float phase_seed = seed_is_cloud
+        ? henyey_greenstein_phase(dot(dir, prev_dir_in), setup.g_seed)
+        : mixed_phase(dot(dir, prev_dir_in), start_optics);
+    float w0 = (q_seed > 1e-30f) ? phase_seed * INV_4PI / q_seed : 0.0f;
 
     // Seed polarization: unpolarized (the exact treatment would Mueller-
     // rotate the omega->view seed scatter; multiply-scattered light is
@@ -2078,15 +2283,15 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
 
     KahanAccum total_I, total_Q, total_U, total_V;
 
-    for (uint scatter_iter = 0; scatter_iter < HYBRID_MAX_BOUNCES; scatter_iter++) {
+    for (uint scatter_iter = 0; scatter_iter < setup.max_bounces; scatter_iter++) {
         // --- Decide scatter mode for this bounce ---
         bool forced_this_bounce = false;
         float tau_max = 0.0f;
 
-        // Forced mode is disabled when a 3D cloud field is present: the gas
-        // forced proposal cannot compose unbiasedly with the gray cloud
-        // channel (matches the CPU `use_forced && field.is_none()` gate).
-        if (setup.use_forced != 0u && !field_present) {
+        // setup.use_forced already encodes the field gate (forced mode is
+        // disabled only under a 3D field; the shell-constant 1D deck folds
+        // into the combined scout/advance channel, see SecondarySetup).
+        if (setup.use_forced != 0u) {
             ScoutResult scout = scout_tau_to_boundary(atm, pos, current_dir, wl_idx);
             tau_max = scout.tau;
             // Force scatter only when path exits to space, optical depth is
@@ -2094,9 +2299,8 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
             // lower bound, chains at high altitude (tau ~ 1e-5) get killed by
             // weight *= (1 - exp(-tau)) ~ tau, losing 5 orders of magnitude
             // per bounce. The CPU falls back to analog mode for small tau.
-            float forced_tau_min = (setup.alpha_et > 0.3f) ? 0.02f : 0.05f;
             forced_this_bounce = !scout.hit_ground
-                              && tau_max >= forced_tau_min
+                              && tau_max >= setup.forced_tau_min
                               && tau_max < FORCED_TAU_CUTOFF;
         }
 
@@ -2109,7 +2313,11 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
         float g_cloud_here = 0.0f;
 
         if (forced_this_bounce) {
-            // Upfront forced scattering (unbiased): no analog walk, no double-counting
+            // Upfront forced scattering (unbiased): no analog walk, no
+            // double-counting. tau_max is the COMBINED (gas + gray 1D cloud)
+            // optical depth, so under a deck the weight is the combined
+            // collision probability and the flight attenuates through AND
+            // can collide in the cloud.
             float exp_neg_tau = exp(-tau_max);
             weight *= (1.0f - exp_neg_tau);
             if (weight < 1e-30f) break;
@@ -2119,163 +2327,44 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
             pos = adv.pos;
             current_dir = adv.dir;
             scatter_shell = adv.shell_idx;
-        } else if (!field_present) {
-            // Analog scatter: standard shell-by-shell free-path walk
-            // (legacy 1D shell-cloud path, unchanged: Eddington diffuse
-            // transmittance handled by shadow_ray_transmittance / the LOS
-            // prefix; no gray cloud channel).
-            bool scatter_found = false;
 
-            for (uint step = 0; step < 200; step++) {
-                float r = length(pos);
-                int sidx = shell_index_binary(atm, r);
-                if (sidx < 0) break; // exited atmosphere
-
-                uint us = uint(sidx);
-                ShellGeom sh = read_shell(atm, us);
-                ShellOptics op = read_optics(atm, us, wl_idx);
-
-                if (op.extinction < 1e-20f) {
-                    ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
-                    if (!bnd.found) break;
-                    float3 boundary_pos = pos + current_dir * bnd.dist;
-                    boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
-                    float n_from = read_refractive_index(atm, us);
-                    uint next_s = bnd.is_outward ? us + 1 : us - 1;
-                    float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
-                    current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
-                    pos = radial_nudge(boundary_pos, bnd.is_outward);
-                    continue;
+            // Vertex type from the exact extinction conditional at the
+            // collision shell: cloud with p = sigma_c / (sigma_c + sigma_gas)
+            // (the same first-arrival law the analog race realizes). The
+            // type probabilities cancel the per-type extinction factors
+            // exactly, so no weight correction; a gas vertex carries the
+            // gas SSA below, a cloud vertex is pure scattering. The draw is
+            // taken ONLY when the collision shell carries cloud, so
+            // clear-sky RNG streams keep their structure (CPU ac673c7).
+            float sigma_c_f = read_cloud_extinction(atm, scatter_shell);
+            if (sigma_c_f > 0.0f) {
+                float sigma_gas_f = atm[ATM_OPTICS_START
+                    + (scatter_shell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
+                if (xorshift_f32(rng) < sigma_c_f / (sigma_c_f + sigma_gas_f)) {
+                    cloud_collision = true;
+                    // Forced mode is 1D-only (no field here): the gray
+                    // deck's delta-scaled asymmetry.
+                    g_cloud_here = atm[ATM_CLOUD_G_SCALED];
                 }
-
-                // Exponential transform: modified extinction.
-                // Bias axis tilted toward terminator at deep twilight.
-                float cos_bias = dot(current_dir, setup.term_axis_dir);
-                float sigma = op.extinction;
-                float sigma_prime = sigma * (1.0f - setup.alpha_et * cos_bias);
-                // If sigma_prime <= 0, ET bias is too strong for this direction.
-                // Fall back to unbiased extinction (no bias introduced).
-                if (sigma_prime <= 0.0f) sigma_prime = sigma;
-
-                float xi = xorshift_f32(rng);
-                float free_path = -log(xi) / sigma_prime;
-
-                ShellBoundary bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
-                if (!bnd.found) break;
-
-                if (free_path >= bnd.dist) {
-                    // Boundary crossing weight correction
-                    if (setup.alpha_et > 0.0f) {
-                        float et_arg = -setup.alpha_et * sigma * cos_bias * bnd.dist;
-                        // Use expm1 form for small arguments to avoid cancellation,
-                        // and clamp large arguments to avoid overflow.
-                        // exp(x) for |x| < 80 is safe in f32 (~3.4e34).
-                        // For |x| >= 80, the weight correction is astronomically
-                        // large or small; the chain is effectively dead either way,
-                        // so we terminate rather than silently skip the correction
-                        // (which would leave the estimator sampling from the wrong
-                        // distribution without compensating).
-                        if (fabs(et_arg) < 80.0f) {
-                            weight *= exp(et_arg);
-                        } else {
-                            weight = 0.0f; // chain is dead
-                        }
-                    }
-                    if (!isfinite(weight)) break;
-
-                    // Fast path: inward crossing from shell 0 is the ground boundary.
-                    if (!bnd.is_outward && us == 0u) {
-                        float3 boundary_pos = pos + current_dir * bnd.dist;
-                        boundary_pos = snap_to_radius(boundary_pos, sh.r_inner);
-                        float3 normal = normalize(boundary_pos);
-                        // Ground-bounce NEE: direct solar illumination of ground point
-                        float cos_sun_ground = dot(sun_dir, normal);
-                        if (cos_sun_ground > 0.0f) {
-                            float t_sun_gb = shadow_ray_transmittance(atm, boundary_pos, sun_dir, wl_idx);
-                            if (t_sun_gb > 1e-30f) {
-                                float albedo_nee = read_albedo(atm, wl_idx);
-                                float nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
-                                if (isfinite(nee_gb)) total_I.add(nee_gb);
-                            }
-                        }
-                        float albedo = read_albedo(atm, wl_idx);
-                        weight *= albedo;
-                        if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
-                        prev_dir = current_dir;
-                        current_dir = sample_hemisphere(normal, rng);
-                        pos = radial_nudge(boundary_pos, true);
-                        stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
-                        continue;
-                    }
-
-                    float3 boundary_pos = pos + current_dir * bnd.dist;
-                    boundary_pos = snap_to_radius(boundary_pos, bnd.is_outward ? sh.r_outer : sh.r_inner);
-
-                    // Ground reflection: depolarizes
-                    if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
-                        float3 normal = normalize(boundary_pos);
-                        // Ground-bounce NEE
-                        float cos_sun_ground = dot(sun_dir, normal);
-                        if (cos_sun_ground > 0.0f) {
-                            float t_sun_gb = shadow_ray_transmittance(atm, boundary_pos, sun_dir, wl_idx);
-                            if (t_sun_gb > 1e-30f) {
-                                float albedo_nee = read_albedo(atm, wl_idx);
-                                float nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
-                                if (isfinite(nee_gb)) total_I.add(nee_gb);
-                            }
-                        }
-                        float albedo = read_albedo(atm, wl_idx);
-                        weight *= albedo;
-                        if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
-                        prev_dir = current_dir;
-                        current_dir = sample_hemisphere(normal, rng);
-                        pos = radial_nudge(boundary_pos, true);
-                        stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
-                        continue;
-                    }
-
-                    // Refract and nudge past boundary
-                    {
-                        float n_from = read_refractive_index(atm, us);
-                        uint next_s = bnd.is_outward ? us + 1 : us - 1;
-                        float n_to = (next_s < atm_num_shells(atm)) ? read_refractive_index(atm, next_s) : 1.0f;
-                        current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
-                    }
-                    pos = radial_nudge(boundary_pos, bnd.is_outward);
-                    continue;
-                }
-
-                // Scatter within this shell.
-                // Weight correction: (sigma/sigma') * exp(-alpha * sigma * cos_bias * d)
-                // If the exp argument would overflow f32, terminate the chain
-                // rather than silently skipping the correction (which would leave
-                // the estimator sampling from the transformed distribution without
-                // the compensating weight, introducing bias).
-                if (setup.alpha_et > 0.0f) {
-                    float et_arg = -setup.alpha_et * sigma * cos_bias * free_path;
-                    if (fabs(et_arg) < 80.0f) {
-                        weight *= (sigma / sigma_prime) * exp(et_arg);
-                    } else {
-                        weight = 0.0f; // chain is dead
-                    }
-                }
-                if (!isfinite(weight)) break;
-                pos = pos + current_dir * free_path;
-                scatter_shell = us;
-                scatter_found = true;
-                break;
             }
-
-            if (!scatter_found) break; // chain terminates: escaped atmosphere
         } else {
             // Analog scatter WITH the gray cloud channel (decomposition
-            // tracking; port of trace_secondary_chain's field path). The gas
-            // channel keeps the exponential transform; a separate gray cloud
-            // Poisson process races over each segment, the shorter free flight
-            // wins. A cloud collision is pure HG scatter (no SSA, no weight
-            // change). The cloud budget is drawn ONCE per free flight from the
-            // SAME rng stream, carried (undiminished by gas events) across
-            // shell crossings, redrawn only after a collision or ground bounce.
+            // tracking; port of the CPU trace_secondary_chain analog arm,
+            // ONE implementation for clear sky and both cloud
+            // representations). The gas channel keeps the exponential
+            // transform; a separate gray cloud Poisson process races over
+            // each segment, the shorter free flight wins. The cloud
+            // collision distance comes from exact inversion: the field DDA
+            // (field_advance_to_tau) when a field is bound, or the analytic
+            // per-shell inversion for the 1D shell deck (the CPU
+            // cloud_flight_segment None arm). A cloud collision is pure HG
+            // scatter (no SSA, no weight change); Beer-Lambert cloud on
+            // every NEE leg; NO T_diff anywhere on chain paths. The cloud
+            // budget is drawn ONCE per free flight from the SAME rng stream
+            // (matching the CPU rng.tau per-flight order; in clear sky the
+            // race is inert but the draw still advances the stream, like
+            // the CPU), carried (undiminished by gas events) across shell
+            // crossings, redrawn only after a collision or ground bounce.
             bool scatter_found = false;
             uint found_shell = 0u;
             // tau_c_remaining = -ln(1 - u + 1e-30), one draw at flight start.
@@ -2311,7 +2400,18 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
                 // Race the gray cloud channel over the segment up to the gas
                 // event (gas scatter at free_path or boundary crossing).
                 float gas_cap = min(free_path, bnd.dist);
-                float cloud_dist = field_advance_to_tau(fld, pos, current_dir, gas_cap, tau_c_remaining);
+                float cloud_dist = -1.0f;
+                float tau_pass = 0.0f;
+                if (field_present) {
+                    cloud_dist = field_advance_to_tau(fld, pos, current_dir, gas_cap, tau_c_remaining);
+                } else {
+                    float sigma_c = read_cloud_extinction(atm, us);
+                    if (sigma_c > 0.0f) {
+                        float dist_c = tau_c_remaining / sigma_c;
+                        if (dist_c <= gas_cap) cloud_dist = dist_c;
+                        else tau_pass = sigma_c * gas_cap;
+                    }
+                }
                 if (cloud_dist >= 0.0f) {
                     // Cloud wins. ET gas weight correction for the distance
                     // actually travelled (gray cloud ratio = 1).
@@ -2322,14 +2422,18 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
                     }
                     if (!isfinite(weight)) break;
                     pos = pos + current_dir * cloud_dist;
-                    g_cloud_here = field_g_at(fld, pos);
+                    g_cloud_here = field_present ? field_g_at(fld, pos)
+                                                 : atm[ATM_CLOUD_G_SCALED];
                     found_shell = us;
                     scatter_found = true;
                     cloud_collision = true;
                     break;
                 } else {
                     // No cloud collision in this segment: consume its cloud tau.
-                    tau_c_remaining -= field_tau_along(fld, pos, current_dir, gas_cap);
+                    if (field_present) {
+                        tau_pass = field_tau_along(fld, pos, current_dir, gas_cap);
+                    }
+                    tau_c_remaining -= tau_pass;
                 }
 
                 if (free_path >= bnd.dist) {
@@ -2346,9 +2450,19 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
                     // Ground reflection.
                     if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
                         float3 normal = normalize(boundary_pos);
+                        // Snap the bounce point ABOVE the surface (port of
+                        // the CPU r_surface + 1e-3 snap, 2f09385; a 1 mm
+                        // ledge vanishes in f32 at Earth radius, so use the
+                        // boundary nudge, which exceeds the f32 ULP). The
+                        // snapped point has a shell, so the ground shadow
+                        // ray sees the real gas+cloud attenuation instead of
+                        // escaping through an empty atmosphere.
+                        float3 ground_pos = normal * (surface_radius + BOUNDARY_NUDGE_M);
                         float cos_sun_ground = dot(sun_dir, normal);
                         if (cos_sun_ground > 0.0f) {
-                            float t_sun_gb = shadow_ray_transmittance_field(atm, fld, field_present, boundary_pos, sun_dir, wl_idx);
+                            float t_sun_gb = shadow_ray_transmittance_chain(
+                                atm, fld, field_present, setup.cloud_channel != 0u,
+                                ground_pos, sun_dir, wl_idx);
                             if (t_sun_gb > 1e-30f) {
                                 float albedo_nee = read_albedo(atm, wl_idx);
                                 float nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
@@ -2360,7 +2474,7 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
                         if (!isfinite(weight) || fabs(weight) < 1e-30f) break;
                         prev_dir = current_dir;
                         current_dir = sample_hemisphere(normal, rng);
-                        pos = radial_nudge(boundary_pos, true);
+                        pos = ground_pos;
                         stokes = float4(1.0f, 0.0f, 0.0f, 0.0f);
                         // New free flight: redraw the cloud budget.
                         tau_c_remaining = -log(1.0f - xorshift_f32(rng) + 1e-30f);
@@ -2407,7 +2521,8 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
         // unpolarized); a gas vertex applies the Mueller matrix to the
         // photon's actual Stokes state.
         if (isfinite(weight) && fabs(weight) > 1e-30f) {
-            float t_sun_sec = shadow_ray_transmittance_field(atm, fld, field_present, pos, sun_dir, wl_idx);
+            float t_sun_sec = shadow_ray_transmittance_chain(
+                atm, fld, field_present, setup.cloud_channel != 0u, pos, sun_dir, wl_idx);
             if (t_sun_sec > 1e-30f) {
                 float cos_angle_nee = clamp(dot(sun_dir, current_dir), -1.0f, 1.0f);
                 float4 nee_stokes;
@@ -2504,302 +2619,194 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
 }
 
 // ============================================================================
-// Kernel 3: hybrid_scatter (REPARALLELIZED)
-//
-// Old design: 1 thread per wavelength (catastrophic GPU underutilization --
-//   only 21 of thousands of cores active, 23x slower than CPU).
-//
-// New design: 1 THREADGROUP per wavelength, 256 threads per threadgroup.
-//   Each thread handles one LOS step with its own secondary ray loop.
-//   Per-wavelength reduction via simd_sum() + threadgroup shared memory.
-//
-// Dispatch: num_wavelengths threadgroups of 256 threads each.
-//   wl_idx  = threadgroup_position_in_grid  (which wavelength)
-//   step_idx = thread_position_in_threadgroup (which LOS step)
-//
-// Output: radiance[wl_idx] (f32) -- one value per wavelength.
+// The v1 step-parallel hybrid_scatter kernel and its hybrid_los_prefix helper
+// were REMOVED: no host pipeline state referenced them, and the v1 chain path
+// embodied the retired T_diff eye-path estimator (chain code must carry NO
+// T_diff; the gray cloud channel is explicit). hybrid_scatter_v2 below is the
+// only hybrid kernel.
 // ============================================================================
 
-kernel void hybrid_scatter(
-    device const float* atm       [[buffer(0)]],
-    device const float* params    [[buffer(1)]],
-    device float*       output    [[buffer(2)]],
-    uint wl_idx    [[threadgroup_position_in_grid]],
-    uint step_idx  [[thread_position_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_id   [[simdgroup_index_in_threadgroup]]
+// ============================================================================
+// Kernel 3a: hybrid_context_prefix
+//
+// One thread per (wavelength, step): precomputes the deterministic eye-path
+// context for hybrid_scatter_v2 (see the HCTX constants). Runs ONCE per
+// hybrid_scatter call; every ray chunk then reads the context instead of
+// recomputing the prefix and substep DDAs. Fully parallel (no redundant
+// uniform execution), so the context costs one pass regardless of how many
+// watchdog-sized chunks the ray budget needs.
+// ============================================================================
+
+kernel void hybrid_context_prefix(
+    device const float* atm    [[buffer(0)]],
+    device const float* params [[buffer(1)]],
+    device float*       ctx    [[buffer(2)]],
+    device const float* fld    [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
 ) {
-    // Uniform across the grid: all threads return before any barrier.
-    if (!atm_header_valid(atm)) {
-        if (wl_idx == 0 && step_idx == 0) output[0] = HEADER_SENTINEL;
-        return;
-    }
+    if (!atm_header_valid(atm)) return; // main kernel raises the sentinel
     uint num_wl = atm_num_wavelengths(atm);
+    uint wl_idx = tid / HYBRID_LOS_STEPS;
+    uint step_idx = tid % HYBRID_LOS_STEPS;
     if (wl_idx >= num_wl) return;
 
     float3 observer_pos = read_observer(params);
     float3 view_dir     = read_view_dir(params);
-    float3 sun_dir      = read_sun_dir(params);
     uint secondary_rays = read_secondary_rays(params);
+    bool field_present  = read_field_present(params);
 
     float toa_radius = atm_toa_radius(atm);
     float surface_radius = atm_surface_radius(atm);
 
-    // ── LOS geometry (all threads compute same values) ──────────────────
-    RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
-    bool valid_los = toa_hit.hit && toa_hit.t_far > 0.0f;
-
-    uint num_steps = 0;
+    // Same step geometry as hybrid_scatter_v2.
+    bool valid = true;
     float ds = 0.0f;
-
-    if (valid_los) {
-        float los_max = toa_hit.t_far;
-        RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
-        bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
-        float los_end = hits_ground ? ground_hit.t_near : los_max;
-        if (los_end > 0.0f) {
-            num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
-            ds = los_end / float(num_steps);
-        }
-    }
-
-    // ── Phase 1: Each thread computes extinction*ds for its LOS step ────
-    // Store in shared memory for the optical depth prefix computation.
-
-    threadgroup float shared_ext_ds[HYBRID_THREADGROUP_SIZE];
-
-    float my_ext_ds = 0.0f;
-    float my_beta_scat = 0.0f;
-    float3 scatter_pos = float3(0.0f);
-    int my_sidx = -1;
-    ShellOptics my_op = {};
-
-    if (valid_los && step_idx < num_steps) {
-        float s = (float(step_idx) + 0.5f) * ds;
-        scatter_pos = observer_pos + view_dir * s;
-        float r = length(scatter_pos);
-
-        if (r <= toa_radius && r >= surface_radius) {
-            my_sidx = shell_index_binary(atm, r);
-            if (my_sidx >= 0) {
-                my_op = read_optics(atm, uint(my_sidx), wl_idx);
-                my_ext_ds = my_op.extinction * ds;
-                my_beta_scat = my_op.extinction * my_op.ssa;
-            }
-        }
-    }
-
-    float my_cloud_ds = (my_sidx >= 0) ? read_cloud_extinction(atm, uint(my_sidx)) * ds : 0.0f;
-    shared_ext_ds[step_idx] = my_ext_ds;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // ── Phase 2: Compute exclusive prefix tau_obs via threadgroup scan ───
-    // This replaces the old O(N^2) per-thread summation with a Blelloch scan
-    // over shared_ext_ds. step_idx gets tau_obs = sum(shared_ext_ds[0..step_idx-1]).
-    // The cloud (delta-scaled scattering) tau is scanned in lockstep so the
-    // eye path applies Eddington diffuse transmission for the cloud portion.
-
-    threadgroup float shared_prefix[HYBRID_THREADGROUP_SIZE];
-    threadgroup float shared_cloud_prefix[HYBRID_THREADGROUP_SIZE];
-    shared_prefix[step_idx] = shared_ext_ds[step_idx];
-    shared_cloud_prefix[step_idx] = my_cloud_ds;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Upsweep (reduce) phase
-    for (uint offset = 1u; offset < HYBRID_THREADGROUP_SIZE; offset <<= 1u) {
-        uint idx = ((step_idx + 1u) * offset * 2u) - 1u;
-        if (idx < HYBRID_THREADGROUP_SIZE) {
-            shared_prefix[idx] += shared_prefix[idx - offset];
-            shared_cloud_prefix[idx] += shared_cloud_prefix[idx - offset];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    // Convert inclusive reduce tree to exclusive scan
-    if (step_idx == HYBRID_THREADGROUP_SIZE - 1u) {
-        shared_prefix[step_idx] = 0.0f;
-        shared_cloud_prefix[step_idx] = 0.0f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Downsweep phase
-    for (uint offset = HYBRID_THREADGROUP_SIZE >> 1u; offset > 0u; offset >>= 1u) {
-        uint idx = ((step_idx + 1u) * offset * 2u) - 1u;
-        if (idx < HYBRID_THREADGROUP_SIZE) {
-            float t = shared_prefix[idx - offset];
-            shared_prefix[idx - offset] = shared_prefix[idx];
-            shared_prefix[idx] += t;
-            float tc = shared_cloud_prefix[idx - offset];
-            shared_cloud_prefix[idx - offset] = shared_cloud_prefix[idx];
-            shared_cloud_prefix[idx] += tc;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    float tau_obs = (step_idx < num_steps) ? shared_prefix[step_idx] : 0.0f;
-    float tau_cloud_obs = (step_idx < num_steps) ? shared_cloud_prefix[step_idx] : 0.0f;
-    float t_obs = exp(-(tau_obs + my_ext_ds * 0.5f))
-                * cloud_diffuse_transmittance(atm, tau_cloud_obs + my_cloud_ds * 0.5f);
-
-    // ── Phase 3: Compute per-step Stokes contribution ─────────────────
-    // Full [I,Q,U,V] propagation. Single-scatter NEE applies Mueller to
-    // unpolarized sunlight [1,0,0,0]. Secondary chains track Stokes state
-    // through all bounces.
-    float4 contribution = float4(0.0f);
-
-    if (valid_los && step_idx < num_steps && my_sidx >= 0
-        && my_beta_scat > 1e-30f && t_obs > 1e-30f)
+    float step_start_s = 0.0f;
     {
-        // Per-thread RNG: unique seed for (wavelength, step) pair
-        ulong rng = read_rng_seed(params) + ulong(wl_idx);
-        rng *= 6364136223846793005ul;
-        rng += ulong(step_idx);
-        rng *= 2862933555777941757ul;
-        rng += 1ul;
-
-        // Order 1: deterministic single-scatter NEE (Stokes)
-        float t_sun = shadow_ray_transmittance(atm, scatter_pos, sun_dir, wl_idx);
-        if (t_sun > 1e-30f) {
-            float cos_theta_1 = dot(sun_dir, view_dir);
-            float A_1, B_1, C_1;
-            stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
-            float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;
-            float4 ss_stokes = float4(A_1, B_1, 0.0f, 0.0f);
-            contribution += ss_stokes * scale_1;
-        }
-
-        // Orders 2+: MC secondary chains (full Stokes propagation)
-        if (secondary_rays > 0) {
-            float3 local_up = normalize(scatter_pos);
-            float cos_sza = dot(sun_dir, local_up);
-            float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
-            BranchParams bp = branch_params_for_sza(sza_deg);
-            float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
-                                   / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
-            SecondarySetup setup;
-            setup.local_up = local_up;
-            setup.term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
-            setup.alpha_p = 1.0f - bp.zenith_frac;
-            setup.alpha_z = bp.zenith_frac * (1.0f - bp.term_share);
-            setup.alpha_t = bp.zenith_frac * bp.term_share;
-            setup.n_zenith = bp.n_zenith;
-            setup.m_term = bp.m_term;
-            setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
-            setup.use_forced = (sza_deg >= ZENITH_SZA_START_DEG) ? 1u : 0u;
-
-            KahanAccum mc_I, mc_Q, mc_U, mc_V;
-            for (uint ray = 0; ray < secondary_rays; ray++) {
-                // Legacy v1 kernel (no PSO, no field): pass atm as a dummy
-                // field pointer with field_present = false (never read).
-                float4 chain = trace_secondary_chain(atm, atm, false,
-                                                      scatter_pos, sun_dir, wl_idx,
-                                                      my_op, view_dir, setup,
-                                                      ray, secondary_rays, rng);
-                mc_I.add(chain.x);
-                mc_Q.add(chain.y);
-                mc_U.add(chain.z);
-                mc_V.add(chain.w);
-            }
-            float inv_rays = 1.0f / float(secondary_rays);
-            float4 mc_avg = float4(mc_I.result(), mc_Q.result(),
-                                    mc_U.result(), mc_V.result()) * inv_rays;
-            float scale_m = my_beta_scat * t_obs * ds;
-            contribution += mc_avg * scale_m;
-        }
-    }
-
-    // ── Phase 4: Two-level Stokes reduction ─────────────────────────────
-    float4 simd_total = simd_sum(contribution);
-
-    threadgroup float4 shared_sums[NUM_SIMD_GROUPS];
-    if (simd_lane == 0) {
-        shared_sums[simd_id] = simd_total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (step_idx == 0) {
-        float4 total = float4(0.0f);
-        for (uint i = 0; i < NUM_SIMD_GROUPS; i++) {
-            total += shared_sums[i];
-        }
-        output[wl_idx] = total.x;
-    }
-}
-
-// ============================================================================
-// Kernel 3p: hybrid_los_prefix
-//
-// Precomputes cumulative LOS optical depth for all (wavelength, step) pairs.
-// Dispatch: num_wavelengths threads (1D).
-// Output: tau_prefix[wl * HYBRID_LOS_STEPS + step] = cumulative tau to step.
-//         Negative value = step beyond LOS end (invalid).
-//
-// This runs ONCE per geometry and is reused across split-dispatch chunks,
-// eliminating the O(steps^2) serial prefix that was in hybrid_scatter_v2.
-// ============================================================================
-
-kernel void hybrid_los_prefix(
-    device const float* atm         [[buffer(0)]],
-    device const float* params      [[buffer(1)]],
-    device float*       tau_prefix  [[buffer(2)]],
-    uint wl_idx [[thread_position_in_grid]]
-) {
-    // Sentinel overlaps the -1.0 "step beyond LOS end" marker, which is
-    // acceptable: the host treats both as no-data for slot 0.
-    if (!atm_header_valid(atm)) {
-        if (wl_idx == 0) tau_prefix[0] = HEADER_SENTINEL;
-        return;
-    }
-    uint num_wl = atm_num_wavelengths(atm);
-    if (wl_idx >= num_wl) return;
-
-    float3 observer_pos = read_observer(params);
-    float3 view_dir     = read_view_dir(params);
-
-    float toa_radius = atm_toa_radius(atm);
-    float surface_radius = atm_surface_radius(atm);
-
-    RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
-    if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
-        for (uint s = 0; s < HYBRID_LOS_STEPS; s++)
-            tau_prefix[wl_idx * HYBRID_LOS_STEPS + s] = -1.0f;
-        return;
-    }
-
-    float los_max = toa_hit.t_far;
-    RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
-    bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
-    float los_end = hits_ground ? ground_hit.t_near : los_max;
-
-    if (los_end <= 0.0f) {
-        for (uint s = 0; s < HYBRID_LOS_STEPS; s++)
-            tau_prefix[wl_idx * HYBRID_LOS_STEPS + s] = -1.0f;
-        return;
-    }
-
-    uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
-    float ds = los_end / float(num_steps);
-
-    // O(num_steps) cumulative scan -- replaces O(num_steps^2) per-step prefix
-    float running_tau = 0.0f;
-    for (uint step = 0; step < HYBRID_LOS_STEPS; step++) {
-        if (step >= num_steps) {
-            tau_prefix[wl_idx * HYBRID_LOS_STEPS + step] = -1.0f;
-            continue;
-        }
-        // tau to the START of this step (before this step's contribution)
-        tau_prefix[wl_idx * HYBRID_LOS_STEPS + step] = running_tau;
-
-        float s_mid = (float(step) + 0.5f) * ds;
-        float3 pos = observer_pos + view_dir * s_mid;
-        float r = length(pos);
-        if (r <= toa_radius && r >= surface_radius) {
-            int sidx = shell_index_binary(atm, r);
-            if (sidx >= 0) {
-                ShellOptics op = read_optics(atm, uint(sidx), wl_idx);
-                running_tau += op.extinction * ds;
+        RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
+        if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
+            valid = false;
+        } else {
+            float los_max = toa_hit.t_far;
+            RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+            bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
+            float los_end = hits_ground ? ground_hit.t_near : los_max;
+            if (los_end <= 0.0f) {
+                valid = false;
+            } else {
+                uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
+                if (step_idx >= num_steps) {
+                    valid = false;
+                } else {
+                    ds = los_end / float(num_steps);
+                    step_start_s = float(step_idx) * ds;
+                }
             }
         }
+    }
+
+    uint base = tid * HCTX_STRIDE;
+    if (!valid) {
+        ctx[base + HCTX_K_SUB] = as_type<float>(0u); // marks the step invalid
+        return;
+    }
+
+    uint global_total_rays = read_photons_per_wl(params);
+    if (global_total_rays == 0u) global_total_rays = secondary_rays;
+
+    bool cloud_channel = false;
+    uint k_sub = 1;
+    float sub_ds = 0.0f;
+    float sub_tau_cloud[CLOUD_MAX_SUBSTEPS];
+    uint sub_ray_start[CLOUD_MAX_SUBSTEPS];
+    uint sub_ray_count[CLOUD_MAX_SUBSTEPS];
+    float tau_obs_prefix = 0.0f;
+    float tau_cloud_prefix = 0.0f;
+
+    if (valid) {
+        cloud_channel = atm_has_cloud_channel(atm, field_present);
+        float3 step_start = observer_pos + view_dir * step_start_s;
+        // Exact cloud tau of the COARSE step: one field DDA or the 1D
+        // analytic per-shell path lengths (CPU eye_step_cloud_tau).
+        float tau_cloud_coarse = cloud_channel
+            ? eye_step_cloud_tau(atm, fld, field_present, step_start, view_dir, ds)
+            : 0.0f;
+        if (tau_cloud_coarse > CLOUD_SUBSTEP_TAU) {
+            k_sub = clamp(uint(ceil(tau_cloud_coarse / CLOUD_SUBSTEP_TAU)),
+                          2u, CLOUD_MAX_SUBSTEPS);
+        }
+        sub_ds = ds / float(k_sub);
+
+        if (k_sub == 1u) {
+            sub_tau_cloud[0] = tau_cloud_coarse;
+            sub_ray_start[0] = 0u;
+            sub_ray_count[0] = global_total_rays;
+        } else {
+            // Importance weights: estimated contribution of each substep
+            // (source strength times eye transmittance into it), the CPU
+            // formula (tc + tg) * exp(-(cloud prefix + tc/2)).
+            float sub_w[CLOUD_MAX_SUBSTEPS];
+            float sum_w = 0.0f;
+            float tau_pref = 0.0f;
+            for (uint j = 0; j < k_sub; j++) {
+                float3 sub_start = observer_pos
+                    + view_dir * (step_start_s + float(j) * sub_ds);
+                float tc = eye_step_cloud_tau(atm, fld, field_present,
+                                              sub_start, view_dir, sub_ds);
+                sub_tau_cloud[j] = tc;
+                float3 mid = sub_start + view_dir * (sub_ds * 0.5f);
+                float tg = 0.0f;
+                int smid = shell_index_binary(atm, length(mid));
+                if (smid >= 0) {
+                    tg = atm[ATM_OPTICS_START
+                        + (uint(smid) * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE]
+                        * sub_ds;
+                }
+                float w = (tc + tg) * exp(-(tau_pref + 0.5f * tc));
+                sub_w[j] = w;
+                sum_w += w;
+                tau_pref += tc;
+            }
+            // Allocation: n_j = round(N * w_j / sum_w), min 1 (the CPU
+            // formula), cumulatively capped so the substep ranges PARTITION
+            // [0, N) (the CPU can overshoot N by a few tail chains and
+            // simply runs them; the GPU global ray domain is fixed by the
+            // dispatch, so the tail is capped instead -- a variance-only
+            // difference on near-zero-weight substeps).
+            uint assigned = 0u;
+            for (uint j = 0; j < k_sub; j++) {
+                uint remaining = k_sub - 1u - j;
+                uint nj;
+                if (sum_w > 1e-30f) {
+                    nj = uint(round(float(global_total_rays) * sub_w[j] / sum_w));
+                } else {
+                    nj = max(global_total_rays / k_sub, 1u);
+                }
+                nj = max(nj, 1u);
+                uint cap = (global_total_rays > assigned + remaining)
+                    ? (global_total_rays - assigned - remaining) : 1u;
+                nj = min(nj, cap);
+                sub_ray_start[j] = assigned;
+                sub_ray_count[j] = nj;
+                assigned += nj;
+            }
+        }
+
+        // Eye-path prefix optical depths to the START of this coarse step.
+        // Gas: per-step midpoint quadrature over the previous coarse steps
+        // (the CPU accumulates substep-resolved gas tau inside cloudy
+        // prefix steps; gas extinction is smooth on the 8 km scale height,
+        // so the coarse-midpoint prefix differs by far less than the f32
+        // budget - a documented quadrature deviation, not an estimator
+        // one). Cloud: ONE exact call over the whole prefix (integral
+        // additivity makes it equal to the CPU per-substep accumulation).
+        for (uint j = 0; j < step_idx; j++) {
+            float sj = (float(j) + 0.5f) * ds;
+            float3 pj = observer_pos + view_dir * sj;
+            float rj = length(pj);
+            if (rj <= toa_radius && rj >= surface_radius) {
+                int sj_idx = shell_index_binary(atm, rj);
+                if (sj_idx >= 0) {
+                    tau_obs_prefix += atm[ATM_OPTICS_START
+                        + (uint(sj_idx) * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE]
+                        * ds;
+                }
+            }
+        }
+        if (cloud_channel && step_idx > 0u) {
+            tau_cloud_prefix = eye_step_cloud_tau(atm, fld, field_present,
+                                                  observer_pos, view_dir, step_start_s);
+        }
+    }
+
+    ctx[base + HCTX_TAU_OBS] = tau_obs_prefix;
+    ctx[base + HCTX_TAU_CLOUD] = tau_cloud_prefix;
+    ctx[base + HCTX_K_SUB] = as_type<float>(k_sub);
+    ctx[base + HCTX_SPARE] = 0.0f;
+    for (uint j = 0; j < k_sub; j++) {
+        ctx[base + HCTX_SUB_TAU + j] = sub_tau_cloud[j];
+        ctx[base + HCTX_SUB_START + j] = as_type<float>(sub_ray_start[j]);
+        ctx[base + HCTX_SUB_COUNT + j] = as_type<float>(sub_ray_count[j]);
     }
 }
 
@@ -2808,15 +2815,37 @@ kernel void hybrid_los_prefix(
 //
 // Dispatch: (num_wavelengths, num_steps) threadgroups of 64 threads each.
 //   tg_pos.x = wavelength index
-//   tg_pos.y = LOS step index
-//   thread_in_tg.x = ray index within this step
+//   tg_pos.y = COARSE LOS step index
+//   thread_in_tg.x = chain lane within this step
 //
-// Each thread traces ceil(secondary_rays / 64) chains. Results are reduced
-// via simd_sum + Kahan in shared memory. Output layout:
-//   output[wl * HYBRID_LOS_STEPS + step] -- CPU sums across steps.
+// Port of the CPU hybrid_scatter_radiance (polarized per-wavelength path),
+// including the cloud-adaptive eye-path substepping: each coarse step whose
+// exact cloud tau exceeds CLOUD_SUBSTEP_TAU is subdivided (up to
+// CLOUD_MAX_SUBSTEPS), the substeps get importance-allocated shares of the
+// GLOBAL chain budget, and every substep carries its own order-1 NEE (gas +
+// gray cloud), gas/cloud seed mixture, and beta_total chain scale.
+// Cloud-free steps keep one substep and the pre-substepping structure.
 //
-// Buffer 3 (tau_prefix) is precomputed by hybrid_los_prefix and reused
-// across split-dispatch chunks (same LOS geometry).
+// The step context (substep taus, budgets, prefix optical depths) is
+// computed redundantly on ALL threads: the values are uniform, so the SIMD
+// groups execute the block once in lockstep, and no threadgroup memory or
+// barrier is needed for it (the per-substep arrays would not fit the old
+// thread-0 + shared-scalar design).
+//
+// Split-dispatch contract (host: metal.rs hybrid_scatter): one dispatch
+// covers global chain indices [ray_offset, ray_offset + secondary_rays).
+// The substep budget allocation n_j partitions the GLOBAL budget
+// [0, global_total_rays) identically in every chunk (it is deterministic),
+// so each global chain index lands in exactly one substep with a
+// well-defined local stratification index. Per-chain output is scaled by
+// scale_m_j * (global_total_rays / n_j): the host divides the accumulated
+// sum by global_total_rays, recovering the CPU's per-substep mean times
+// scale_m_j. The deterministic order-1 terms are multiplied by THIS
+// dispatch's ray count so they survive the same division across chunks.
+//
+// Output layout: output[wl * HYBRID_LOS_STEPS + step] -- host sums steps.
+// Buffer 3 (fld) is the packed 3D cloud field (a stub when
+// field_present == 0; never read then).
 // ============================================================================
 
 kernel void hybrid_scatter_v2(
@@ -2824,13 +2853,16 @@ kernel void hybrid_scatter_v2(
     device const float* params      [[buffer(1)]],
     device float*       output      [[buffer(2)]],
     device const float* fld         [[buffer(3)]],
+    device const float* ctx         [[buffer(4)]],
     uint3 tg_pos    [[threadgroup_position_in_grid]],
     uint3 tid_in_tg [[thread_position_in_threadgroup]],
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_id    [[simdgroup_index_in_threadgroup]]
 ) {
     uint wl_idx = tg_pos.x;
-    uint step_idx = tg_pos.y;
+    // Absolute LOS step index: threadgroup y plus the host's step-window
+    // offset (0 when unsplit).
+    uint step_idx = tg_pos.y + read_step_offset(params);
     uint ray_lane = tid_in_tg.x;
 
     // Uniform across the grid: all threads return before any barrier.
@@ -2846,112 +2878,164 @@ kernel void hybrid_scatter_v2(
     uint secondary_rays = read_secondary_rays(params);
     bool field_present  = read_field_present(params);
 
-    threadgroup uint shared_valid;
-    threadgroup float shared_ds;
-    threadgroup float3 shared_scatter_pos;
-    threadgroup ShellOptics shared_op;
-    threadgroup float shared_beta_scat;
-    threadgroup float shared_t_obs;
-    threadgroup SecondarySetup shared_setup;
+    float toa_radius = atm_toa_radius(atm);
+    float surface_radius = atm_surface_radius(atm);
 
-    if (ray_lane == 0) {
-        bool valid = (wl_idx < num_wl);
-        float toa_radius = atm_toa_radius(atm);
-        float surface_radius = atm_surface_radius(atm);
-        float ds = 0.0f;
-        float3 scatter_pos = float3(0.0f);
-        ShellOptics my_op = {};
-        float my_beta_scat = 0.0f;
-        int my_sidx = -1;
-        float t_obs = 0.0f;
-        SecondarySetup setup = {};
-
-        if (valid) {
-            RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
-            if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
+    // ── Uniform coarse-step geometry ─────────────────────────────────────
+    bool valid = (wl_idx < num_wl);
+    float ds = 0.0f;
+    float step_start_s = 0.0f;
+    if (valid) {
+        RaySphereHit toa_hit = ray_sphere_intersect(observer_pos, view_dir, toa_radius);
+        if (!toa_hit.hit || toa_hit.t_far <= 0.0f) {
+            valid = false;
+        } else {
+            float los_max = toa_hit.t_far;
+            RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
+            bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
+            float los_end = hits_ground ? ground_hit.t_near : los_max;
+            if (los_end <= 0.0f) {
                 valid = false;
             } else {
-                float los_max = toa_hit.t_far;
-                RaySphereHit ground_hit = ray_sphere_intersect(observer_pos, view_dir, surface_radius);
-                bool hits_ground = ground_hit.hit && ground_hit.t_near > 1e-3f && ground_hit.t_near < los_max;
-                float los_end = hits_ground ? ground_hit.t_near : los_max;
-                if (los_end <= 0.0f) {
+                uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
+                if (step_idx >= num_steps) {
                     valid = false;
                 } else {
-                    uint num_steps = min(HYBRID_LOS_STEPS, uint(los_end / 500.0f) + 20u);
                     ds = los_end / float(num_steps);
-                    if (step_idx >= num_steps) {
-                        valid = false;
-                    } else {
-                        float s = (float(step_idx) + 0.5f) * ds;
-                        scatter_pos = observer_pos + view_dir * s;
-                        float r = length(scatter_pos);
-                        if (r > toa_radius || r < surface_radius) {
-                            valid = false;
-                        } else {
-                            my_sidx = shell_index_binary(atm, r);
-                            if (my_sidx < 0) {
-                                valid = false;
-                            } else {
-                                my_op = read_optics(atm, uint(my_sidx), wl_idx);
-                                my_beta_scat = my_op.extinction * my_op.ssa;
-                                if (my_beta_scat < 1e-30f) {
-                                    valid = false;
-                                }
-                            }
-                        }
-                    }
+                    step_start_s = float(step_idx) * ds;
                 }
             }
         }
+    }
 
-        if (valid) {
-            float tau_obs = 0.0f;
-            float tau_cloud_obs = 0.0f;
-            for (uint j = 0; j < step_idx; j++) {
-                float sj = (float(j) + 0.5f) * ds;
-                float3 pj = observer_pos + view_dir * sj;
-                float rj = length(pj);
-                if (rj <= toa_radius && rj >= surface_radius) {
-                    int sj_idx = shell_index_binary(atm, rj);
-                    if (sj_idx >= 0) {
-                        ShellOptics oj = read_optics(atm, uint(sj_idx), wl_idx);
-                        tau_obs += oj.extinction * ds;
-                        // Cloud: per-step midpoint extinction (field sigma_at
-                        // when present, else the 1D shell array), matching the
-                        // CPU cloud_ext_at point-sample quadrature.
-                        float cloud_ext_j = field_present
-                            ? field_sigma_at(fld, pj)
-                            : read_cloud_extinction(atm, uint(sj_idx));
-                        tau_cloud_obs += cloud_ext_j * ds;
+    // Global chain budget (stratification + substep allocation domain).
+    uint global_total_rays = read_photons_per_wl(params);
+    if (global_total_rays == 0u) global_total_rays = secondary_rays;
+    // ray_offset from upper 32 bits of the seed (split-dispatch).
+    ulong raw_seed = read_rng_seed(params);
+    uint ray_offset = uint(raw_seed >> 32);
+    ulong base_seed = raw_seed & 0xFFFFFFFFul;
+    // Per-thread RNG stream, continued across this thread's substeps and
+    // chains (unchanged formula: seeded by wavelength, coarse step, and
+    // absolute thread lane).
+    ulong seed_input = base_seed
+        ^ (ulong(wl_idx) * 0x9E3779B97F4A7C15ul)
+        ^ (ulong(step_idx) << 16)
+        ^ (ulong(ray_lane + ray_offset) << 32);
+    ulong rng = splitmix64(seed_input);
+
+    // ── Precomputed eye-path context (hybrid_context_prefix) ────────────
+    // Deterministic per geometry, identical in every chunk: read, not
+    // recomputed (see the HCTX constants for why).
+    bool cloud_channel = false;
+    uint k_sub = 1;
+    float sub_ds = 0.0f;
+    float tau_obs_prefix = 0.0f;
+    float tau_cloud_prefix = 0.0f;
+    uint ctx_base = (wl_idx * HYBRID_LOS_STEPS + step_idx) * HCTX_STRIDE;
+    if (valid) {
+        cloud_channel = atm_has_cloud_channel(atm, field_present);
+        k_sub = as_type<uint>(ctx[ctx_base + HCTX_K_SUB]);
+        if (k_sub == 0u) {
+            valid = false;
+        } else {
+            sub_ds = ds / float(k_sub);
+            tau_obs_prefix = ctx[ctx_base + HCTX_TAU_OBS];
+            tau_cloud_prefix = ctx[ctx_base + HCTX_TAU_CLOUD];
+        }
+    }
+
+    float my_contribution = 0.0f;
+
+    // ── Serial substep loop (uniform control flow; only the chain loop
+    // inside diverges per thread, in trip count) ─────────────────────────
+    if (valid) {
+        float running_tau = tau_obs_prefix;
+        float running_tau_cloud = tau_cloud_prefix;
+        for (uint sub = 0; sub < k_sub; sub++) {
+            float s = step_start_s + (float(sub) + 0.5f) * sub_ds;
+            float3 scatter_pos = observer_pos + view_dir * s;
+            float r = length(scatter_pos);
+            if (r > toa_radius || r < surface_radius) continue;
+            int my_sidx = shell_index_binary(atm, r);
+            if (my_sidx < 0) continue;
+
+            ShellOptics my_op = read_optics(atm, uint(my_sidx), wl_idx);
+            float my_beta_scat = my_op.extinction * my_op.ssa;
+            float tau_cloud_step = ctx[ctx_base + HCTX_SUB_TAU + sub];
+            float beta_cloud = tau_cloud_step / sub_ds;
+
+            // A substep contributes when EITHER channel scatters here (the
+            // CPU skips only when both are absent).
+            if (my_beta_scat < 1e-30f && beta_cloud <= 0.0f) {
+                running_tau += my_op.extinction * sub_ds;
+                running_tau_cloud += tau_cloud_step;
+                continue;
+            }
+
+            // Chain-mode eye transmittance: Beer-Lambert for gas AND cloud
+            // (explicit cloud scattering supplies the diffusion that T_diff
+            // used to approximate; mixing them double-counts). Single exp
+            // is more precise than multiplied exps in f32. Clear sky: the
+            // cloud terms are identically zero.
+            float t_obs = exp(-(running_tau + my_op.extinction * sub_ds * 0.5f
+                                + running_tau_cloud + tau_cloud_step * 0.5f));
+            if (t_obs < 1e-30f) break; // LOS opaque: later substeps darker still
+
+            // Local asymmetry for this substep's cloud source terms
+            // (order-1 NEE and cloud-seeded chains).
+            float g_cloud_step = 0.0f;
+            if (beta_cloud > 0.0f) {
+                g_cloud_step = field_present ? field_g_at(fld, scatter_pos)
+                                             : atm[ATM_CLOUD_G_SCALED];
+            }
+
+            // Order 1: deterministic NEE, computed ONCE per run (lane 0 of
+            // the chunk containing global ray 0) and scaled by the GLOBAL
+            // ray total: the host divides the accumulated sum by that same
+            // total, restoring the deterministic term exactly. (The old
+            // per-chunk recomputation scaled by each chunk's ray count
+            // summed to the identical value but re-paid the substep shadow
+            // DDAs in every one of the watchdog-sized field chunks.)
+            if (ray_lane == 0u && ray_offset == 0u) {
+                float t_sun = shadow_ray_transmittance_chain(
+                    atm, fld, field_present, cloud_channel,
+                    scatter_pos, sun_dir, wl_idx);
+                if (t_sun > 1e-30f) {
+                    float cos_theta_1 = dot(sun_dir, view_dir);
+                    float A_1, B_1, C_1;
+                    stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
+                    float scale_1 = my_beta_scat * INV_4PI * t_sun * t_obs * sub_ds;
+                    my_contribution += A_1 * scale_1 * float(global_total_rays);
+                    // Cloud in-scatter source, order-1 NEE (gray channel):
+                    // the deterministic sun -> cloud -> eye term,
+                    // beta_cloud * P_HG(g*)/4pi * T_sun * T_obs * ds.
+                    // Without it every path whose eye-nearest vertex is a
+                    // cloud scatter is dropped (the dominant radiance under
+                    // an overcast deck). The cloud vertex is a depolarizing
+                    // HG: I-term only (the CPU order-1 cloud NEE, 0cc8bf5).
+                    if (beta_cloud > 0.0f) {
+                        float scale_c = beta_cloud
+                            * henyey_greenstein_phase(cos_theta_1, g_cloud_step)
+                            * INV_4PI * t_sun * t_obs * sub_ds;
+                        my_contribution += scale_c * float(global_total_rays);
                     }
                 }
             }
 
-            // Single exp is more precise and faster than two multiplied exps.
-            // exp(a)*exp(b) = exp(a+b), but the product loses precision
-            // when both are small (the f32 multiply rounds twice).
-            float cloud_ext_step = field_present
-                ? field_sigma_at(fld, scatter_pos)
-                : read_cloud_extinction(atm, uint(my_sidx));
-            float my_cloud_ds = cloud_ext_step * ds;
-            // Cloud transmittance on the eye LOS: Beer-Lambert in chain mode
-            // (explicit in-cloud scattering supplies the diffusion T_diff used
-            // to approximate; mixing them double-counts), Eddington diffuse for
-            // the legacy 1D path.
-            float cloud_t_obs = field_present
-                ? exp(-(tau_cloud_obs + my_cloud_ds * 0.5f))
-                : cloud_diffuse_transmittance(atm, tau_cloud_obs + my_cloud_ds * 0.5f);
-            t_obs = exp(-(tau_obs + my_op.extinction * ds * 0.5f)) * cloud_t_obs;
-            if (t_obs < 1e-30f) {
-                valid = false;
-            } else if (secondary_rays > 0u) {
+            // Orders 2+: MC chains. This substep owns global chain indices
+            // [lo, lo + n_sub); this dispatch covers [ray_offset,
+            // ray_offset + secondary_rays); this thread takes every 64th of
+            // the intersection.
+            uint n_sub = as_type<uint>(ctx[ctx_base + HCTX_SUB_COUNT + sub]);
+            if (secondary_rays > 0u && n_sub > 0u) {
                 float3 local_up = normalize(scatter_pos);
                 float cos_sza = dot(sun_dir, local_up);
                 float sza_deg = acos(clamp(cos_sza, -1.0f, 1.0f)) * (180.0f / PI);
                 BranchParams bp = branch_params_for_sza(sza_deg);
                 float sza_t_et = clamp((sza_deg - ZENITH_SZA_START_DEG)
                                        / (ZENITH_SZA_FULL_DEG - ZENITH_SZA_START_DEG), 0.0f, 1.0f);
+                SecondarySetup setup;
                 setup.local_up = local_up;
                 setup.term_axis_dir = terminator_axis(local_up, sun_dir, bp.tilt_rad);
                 setup.alpha_p = 1.0f - bp.zenith_frac;
@@ -2960,83 +3044,65 @@ kernel void hybrid_scatter_v2(
                 setup.n_zenith = bp.n_zenith;
                 setup.m_term = bp.m_term;
                 setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
-                setup.use_forced = (sza_deg >= ZENITH_SZA_START_DEG) ? 1u : 0u;
+                // Forced mode: on at deep twilight, off only under a 3D
+                // field (the 1D deck composes via the combined channel).
+                setup.use_forced =
+                    (sza_deg >= ZENITH_SZA_START_DEG && !field_present) ? 1u : 0u;
+                // The CPU forced_tau_min_for_sza sigmoid:
+                // 0.05 - 0.03 * sigmoid(sza - 102).
+                setup.forced_tau_min =
+                    0.05f - 0.03f / (1.0f + exp(-(sza_deg - 102.0f)));
+                setup.cloud_channel = cloud_channel ? 1u : 0u;
+                setup.beta_seed = beta_cloud;
+                setup.g_seed = g_cloud_step;
+                setup.max_bounces = field_present ? HYBRID_FIELD_MAX_BOUNCES
+                                                  : HYBRID_MAX_BOUNCES;
+
+                // Cloud-seed mixture: each chain estimates
+                // beta_gas*I_gas + beta_cloud*I_cloud with one type draw
+                // whose selection probability cancels the per-type
+                // coefficient, so the substep scale is beta_total (the CPU
+                // scale_m). The (N / n_sub) factor folds this substep's
+                // 1/n_sub mean against the host's global 1/N division.
+                float scale_m = (my_beta_scat + beta_cloud) * t_obs * sub_ds
+                    * (float(global_total_rays) / float(n_sub));
+
+                uint lo = as_type<uint>(ctx[ctx_base + HCTX_SUB_START + sub]);
+                uint hi = lo + n_sub;
+                uint glo = max(lo, ray_offset);
+                uint ghi = min(hi, ray_offset + secondary_rays);
+                KahanAccum mc_I;
+                if (glo < ghi) {
+                    // First relative index >= (glo - ray_offset) owned by
+                    // this lane (relative indices stripe mod 64 across the
+                    // threadgroup, unchanged from the pre-substep kernel).
+                    uint rel0 = glo - ray_offset;
+                    uint first = rel0
+                        + ((ray_lane + HYBRID_V2_THREADGROUP_SIZE
+                            - (rel0 % HYBRID_V2_THREADGROUP_SIZE))
+                           % HYBRID_V2_THREADGROUP_SIZE);
+                    for (uint rel = first; rel + ray_offset < ghi;
+                         rel += HYBRID_V2_THREADGROUP_SIZE) {
+                        uint g = rel + ray_offset;
+                        float4 chain = trace_secondary_chain(
+                            atm, fld, field_present, scatter_pos, sun_dir,
+                            wl_idx, my_op, view_dir, setup,
+                            g - lo, n_sub, rng);
+                        float val = chain.x * scale_m;
+                        if (isfinite(val)) {
+                            mc_I.add(val);
+                        }
+                    }
+                }
+                float mc_result = mc_I.result();
+                if (isfinite(mc_result)) {
+                    my_contribution += mc_result;
+                }
             }
+
+            running_tau += my_op.extinction * sub_ds;
+            running_tau_cloud += tau_cloud_step;
         }
-
-        shared_valid = valid ? 1u : 0u;
-        shared_ds = ds;
-        shared_scatter_pos = scatter_pos;
-        shared_op = my_op;
-        shared_beta_scat = my_beta_scat;
-        shared_t_obs = t_obs;
-        shared_setup = setup;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    bool valid = (shared_valid != 0u);
-    float ds = shared_ds;
-    float3 scatter_pos = shared_scatter_pos;
-    ShellOptics my_op = shared_op;
-    float my_beta_scat = shared_beta_scat;
-    float t_obs = shared_t_obs;
-    SecondarySetup setup = shared_setup;
-
-    float my_contribution = 0.0f;
-
-    // Single-scatter NEE (only thread 0)
-    // Multiply by secondary_rays because CPU divides ALL output by secondary_rays.
-    // SS is deterministic and must survive that division unchanged.
-    if (valid && ray_lane == 0) {
-        float t_sun = shadow_ray_transmittance_field(atm, fld, field_present, scatter_pos, sun_dir, wl_idx);
-        if (t_sun > 1e-30f) {
-            float cos_theta_1 = dot(sun_dir, view_dir);
-            float A_1, B_1, C_1;
-            stokes_ABC(cos_theta_1, my_op, A_1, B_1, C_1);
-            float scale_1 = my_beta_scat / (4.0f * PI) * t_sun * t_obs * ds;
-            my_contribution += A_1 * scale_1 * float(secondary_rays);
-        }
-    }
-
-    // Secondary chains: each thread traces a subset of rays
-    if (valid && secondary_rays > 0) {
-        // ray_offset from upper 32 bits of seed (for split-dispatch)
-        ulong raw_seed = read_rng_seed(params);
-        uint ray_offset = uint(raw_seed >> 32);
-        ulong base_seed = raw_seed & 0xFFFFFFFFul;
-        // global_total_rays for stratification (encoded in photons_per_wl)
-        uint global_total_rays = read_photons_per_wl(params);
-        if (global_total_rays == 0u) global_total_rays = secondary_rays;
-
-        ulong seed_input = base_seed
-            ^ (ulong(wl_idx) * 0x9E3779B97F4A7C15ul)
-            ^ (ulong(step_idx) << 16)
-            ^ (ulong(ray_lane + ray_offset) << 32);
-        ulong rng = splitmix64(seed_input);
-
-        // Raw sum without inv_rays -- CPU divides in f64 after reduction
-        float scale_m = my_beta_scat * t_obs * ds;
-        KahanAccum mc_I;
-        for (uint ray = ray_lane; ray < secondary_rays; ray += HYBRID_V2_THREADGROUP_SIZE) {
-            uint global_ray = ray + ray_offset;
-            float4 chain = trace_secondary_chain(atm, fld, field_present,
-                                                  scatter_pos, sun_dir, wl_idx,
-                                                  my_op, view_dir, setup,
-                                                  global_ray, global_total_rays, rng);
-            float val = chain.x * scale_m;
-            if (isfinite(val)) {
-                mc_I.add(val);
-            }
-        }
-        float mc_result = mc_I.result();
-        if (isfinite(mc_result)) {
-            my_contribution += mc_result;
-        }
-        // Debug: track how many non-finite chain values were dropped
-        // (Remove after debugging)
-        // If mc_result is not finite, the chain produced inf/NaN values
-        // that Kahan couldn't save. This means the underlying chain
-        // has f32 overflow in weight * nee_stokes, not just in ET.
     }
 
     // Guard: zero out non-finite contributions
