@@ -948,6 +948,275 @@ def compare_g3_cloud_twilight(lrt):
 
 
 # ---------------------------------------------------------------------------
+# DEEP: the ultra-deep referee campaign (thick decks at SZA 101-103).
+#
+# The last variance-limited regime of the G3 program: at SZA >= 101 under
+# tau* 1-3 decks BOTH sides of the G3 comparison were MC-noise-limited
+# (MYSTIC 1e8 backward SE ~10-12%, twilight hybrid seed CV 21-74% at 16k
+# photons -> LOW-POWER verdicts). This tier shrinks both:
+#
+#   referee side: the SAME g3 deck construction (delta-scaled uniform
+#     1-2 km slab, spherical 1D backward MYSTIC, mc_vroom, mc_std) at an
+#     ultra budget - MC_BACKWARD_PHOTONS (default 3e8, up to 1e9) per
+#     case, cached per-case exactly like g3 (case.done == deck text).
+#
+#   twilight side: the per-wavelength STOKES chain (the production
+#     polarized hybrid), which since this campaign runs FORCED-COLLISION
+#     flights both under the 1D shell deck (combined channel, exact) and
+#     under a 3D FIELD (per-shell majorant + truncated null-collision
+#     delta tracking; derivation in photon.rs at the scalar chain's
+#     `use_forced`). Both representations of the SAME deck are refereed:
+#       path=1d     the 1D shell deck (atm.cloud_extinction),
+#       path=field  the equivalent horizontally uniform 3D field
+#                   (background_column continues the deck to infinity),
+#     driven through the `deep_referee_runner` harness test in
+#     crates/twilight-cpu/src/simulation.rs (12+ seeds, three referee
+#     wavelengths only - the CLI compare surface would compute all 64).
+#
+# Absolute comparison on the shared TSIS-1 10 nm solar table, zenith
+# view, no refraction on either side. Systematic floor 5% as in g3
+# (solar-table interpolation, afglus 120 km top vs twilight 150 km) plus
+# noted residuals: the twilight side is polarized Stokes vs MYSTIC
+# scalar (~1-3% on I), and the field path omits the folded cloud
+# absorption only when built clear (the runner clones the 1D atmosphere
+# and zeroes the shells, so absorption handling is identical).
+#
+# Verdicts: PASS/FAIL with band = 3*sqrt(se_tw^2 + se_MYSTIC^2) +
+# 5% * MYSTIC, LOW-POWER when the band exceeds half the referee value.
+# The acceptance question for the campaign is precisely whether the
+# SZA 101-103 rows move from LOW-POWER to gated.
+#
+# Env knobs: MC_BACKWARD_PHOTONS (referee budget), DEEP_SEEDS,
+# DEEP_HYB_PHOTONS, DEEP_MYSTIC_WORKERS, DEEP_MYSTIC_ONLY=1 (run/cache
+# the referee side only - lets the slow MYSTIC runs start before the
+# twilight build is ready).
+# ---------------------------------------------------------------------------
+DEEP_SZAS = [101.0, 103.0]
+DEEP_TAUS = [1.0, 3.0]
+DEEP_WLS = [450.0, 550.0, 650.0]
+DEEP_SEEDS = int(os.environ.get("DEEP_SEEDS", "12"))
+DEEP_HYB_PHOTONS = int(os.environ.get("DEEP_HYB_PHOTONS", "16000"))
+DEEP_MYSTIC_PHOTONS = int(os.environ.get("MC_BACKWARD_PHOTONS", "300000000"))
+DEEP_MYSTIC_WORKERS = int(os.environ.get("DEEP_MYSTIC_WORKERS", "4"))
+DEEP_SYS_FLOOR = 0.05
+DEEP_MYSTIC_ONLY = os.environ.get("DEEP_MYSTIC_ONLY") == "1"
+
+
+def deep_run_mystic_case(lrt: Path, solar: Path, wc: Path, tau_star: float,
+                         sza: float, wl: float):
+    """One ultra-budget spherical-backward MYSTIC run, cached like the
+    g3 cases (case.done ties cache validity to a COMPLETED run), except
+    MIXED-BUDGET tolerant: a completed case whose deck differs ONLY in
+    mc_photons stays valid (a 1e9 top-up of the deepest rows must not be
+    clobbered by a 3e8 table rerun, and vice versa); the CACHED photon
+    count is what gets reported."""
+    photons = DEEP_MYSTIC_PHOTONS
+    tag = f"deep_mystic_tau{tau_star:g}_sza{sza:g}_wl{wl:g}"
+    workdir = OUT_DIR / "deep" / tag
+    workdir.mkdir(parents=True, exist_ok=True)
+    deck = g3_mystic_deck(lrt, solar, wc, tau_star, sza, wl, photons)
+    inp = workdir / "case.inp"
+    done = workdir / "case.done"
+
+    def _strip_ph(text: str) -> str:
+        return "\n".join(l for l in text.splitlines()
+                          if not l.startswith("mc_photons"))
+    cached_txt = done.read_text() if done.exists() else None
+    cached = (cached_txt is not None
+              and _strip_ph(cached_txt) == _strip_ph(deck)
+              and (workdir / "mc.rad.spc").exists())
+    if cached:
+        for l in cached_txt.splitlines():
+            if l.startswith("mc_photons"):
+                photons = int(l.split()[1])
+    if not cached:
+        done.unlink(missing_ok=True)
+        inp.write_text(deck)
+        with open(inp) as fi, open(workdir / "case.out", "w") as fo:
+            r = subprocess.run([str(lrt / "bin" / "uvspec")], stdin=fi,
+                               stdout=fo, stderr=subprocess.PIPE, text=True,
+                               cwd=workdir)
+        if r.returncode != 0:
+            print(f"  MYSTIC {tag}: FAILED/KILLED (rc={r.returncode}) - "
+                  f"dropped\n{r.stderr[:500]}", flush=True)
+            return None, None, photons
+        done.write_text(deck)
+
+    def read_spc(name):
+        p = workdir / name
+        if not p.exists():
+            return None
+        parts = p.read_text().split()
+        return float(parts[4]) * 1e-3 if len(parts) >= 5 else None  # mW -> W
+    rad = read_spc("mc.rad.spc")
+    se = read_spc("mc.rad.std.spc")
+    print(f"  MYSTIC {tag}: rad={rad if rad is not None else float('nan'):.4e} "
+          f"se={se if se is not None else float('nan'):.1e} "
+          f"({photons:.0e} photons)", flush=True)
+    return rad, se, photons
+
+
+def deep_run_twilight(tau_star: float, path: str) -> dict:
+    """Twilight side for one (tau*, path), JSON-cached under
+    validation/deep so a completed run survives re-invocations of the
+    tier (the twilight side is hours of MC).
+
+    path == "field": the `deep_referee_runner` cargo harness (production
+      polarized STOKES per-wavelength chains on the equivalent uniform
+      3D field, the estimator this campaign lands field-forced mode
+      for). DEEP_WLS restricts the wavelength set (the 16k x 12-seed
+      budget goes to 550 nm; 450/650 run at reduced budget separately).
+    path == "1d": the CLI ALIS hybrid (`compare --fast`), the SAME
+      estimator and protocol as the July-02 G3 campaign rows this tier
+      extends (1D forced mode, all three wavelengths in one pass).
+
+    Returns {(sza, wl): [per-seed radiance W/m^2/sr/nm]}."""
+    import json
+    cache = OUT_DIR / "deep" / f"twilight_{path}_tau{tau_star:g}.json"
+    if cache.exists():
+        raw = json.loads(cache.read_text())
+        print(f"  twilight {path} tau*={tau_star:g}: cached "
+              f"({raw['seeds']} seeds x {raw['photons']} photons)",
+              flush=True)
+        return {tuple(float(x) for x in k.split(":")): v
+                for k, v in raw["rows"].items()}
+
+    table: dict = {}
+    if path == "1d":
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            tables = list(ex.map(
+                lambda s: g3_run_twilight(tau_star, "hybrid", s, DEEP_SZAS,
+                                          DEEP_HYB_PHOTONS),
+                range(1, DEEP_SEEDS + 1)))
+        for t in tables:
+            for k, v in t.items():
+                table.setdefault(k, []).append(v)
+    else:
+        env = os.environ.copy()
+        env.update({
+            "DEEP_TAU_STAR": f"{tau_star:g}",
+            "DEEP_PATH": path,
+            "DEEP_SEEDS": str(DEEP_SEEDS),
+            "DEEP_PHOTONS": str(DEEP_HYB_PHOTONS),
+            "DEEP_SZAS": ",".join(f"{s:g}" for s in DEEP_SZAS),
+            "DEEP_WLS": os.environ.get("DEEP_WLS", "550"),
+        })
+        cmd = ["cargo", "test", "-p", "twilight-cpu", "--release", "--",
+               "--ignored", "--nocapture", "deep_referee_runner"]
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO,
+                           env=env)
+        if r.returncode != 0:
+            sys.exit(f"deep_referee_runner failed (tau*={tau_star}, "
+                     f"{path}):\n{r.stdout[-2000:]}\n{r.stderr[-2000:]}")
+        for line in r.stdout.splitlines():
+            if not line.startswith("DEEPCSV,"):
+                continue
+            _, p, ts, _seed, sza, wl, rad = line.split(",")
+            assert p == path and abs(float(ts) - tau_star) < 1e-9
+            table.setdefault((float(sza), float(wl)), []).append(float(rad))
+    if not table:
+        sys.exit(f"twilight side produced no rows (tau*={tau_star}, {path})")
+    cache.write_text(json.dumps({
+        "seeds": DEEP_SEEDS, "photons": DEEP_HYB_PHOTONS,
+        "rows": {f"{k[0]:g}:{k[1]:g}": v for k, v in table.items()},
+    }))
+    return table
+
+
+def compare_deep(lrt):
+    """DEEP campaign: both deck representations of the twilight Stokes
+    hybrid vs ultra-budget spherical backward MYSTIC at SZA 101/103."""
+    if lrt is None:
+        sys.exit("deep needs libRadtran (set LIBRADTRAN_DIR)")
+    from concurrent.futures import ThreadPoolExecutor
+
+    solar = g2_solar_file()
+    wc = g2_wc_file()
+    print("=== DEEP: thick decks at SZA 101-103 (ultra-budget MYSTIC "
+          "backward referee) ===")
+    print(f"  referee: {DEEP_MYSTIC_PHOTONS:.0e} photons/case; twilight: "
+          f"{DEEP_SEEDS} seeds x {DEEP_HYB_PHOTONS} photons, Stokes "
+          f"per-wavelength chains, paths 1d+field")
+
+    # ---- MYSTIC referee pool (started first) ------------------------------
+    mystic_cases = [(ts, sza, wl) for ts in DEEP_TAUS
+                    for sza in DEEP_SZAS for wl in DEEP_WLS]
+    mystic_pool = ThreadPoolExecutor(max_workers=DEEP_MYSTIC_WORKERS)
+    mystic_futs = {c: mystic_pool.submit(deep_run_mystic_case, lrt, solar,
+                                         wc, *c)
+                   for c in mystic_cases}
+    if DEEP_MYSTIC_ONLY:
+        mystic = {c: f.result() for c, f in mystic_futs.items()}
+        mystic_pool.shutdown()
+        n_ok = sum(1 for v in mystic.values() if v[0] is not None)
+        print(f"  DEEP_MYSTIC_ONLY: {n_ok}/{len(mystic)} referee cases "
+              f"cached under {OUT_DIR / 'deep'}")
+        return n_ok == len(mystic)
+
+    # ---- twilight side (cargo harness; builds on first call) --------------
+    tw: dict = {}  # (tau, path) -> {(sza, wl): (mean, se)}
+    for ts in DEEP_TAUS:
+        for path in ("1d", "field"):
+            seeds_tbl = deep_run_twilight(ts, path)
+            tw[(ts, path)] = {k: g2_mean_se(v) for k, v in seeds_tbl.items()}
+            print(f"  twilight {path:5s} tau*={ts:g}: done", flush=True)
+
+    # ---- collect MYSTIC ----------------------------------------------------
+    mystic = {c: f.result() for c, f in mystic_futs.items()}
+    mystic_pool.shutdown()
+
+    # ---- gate + table -------------------------------------------------------
+    out_csv = OUT_DIR / "deep_regime_results.csv"
+    n_pass = n_fail = n_lowpow = n_noref = 0
+    with open(out_csv, "w") as f:
+        w = csv.writer(f)
+        w.writerow(["tau_star", "sza", "wl", "path", "tw", "tw_se",
+                    "mystic", "mystic_se", "mystic_photons",
+                    "tw_over_mystic", "band_over_mystic", "verdict"])
+        for ts in DEEP_TAUS:
+            for sza in DEEP_SZAS:
+                for wl in DEEP_WLS:
+                    my, myse, nph = mystic[(ts, sza, wl)]
+                    for path in ("1d", "field"):
+                        m_se = tw[(ts, path)].get((sza, wl))
+                        if m_se is None:
+                            continue  # not budgeted (e.g. field 450/650)
+                        m, se = m_se
+                        if my is None or my <= 0:
+                            n_noref += 1
+                            w.writerow([ts, sza, wl, path, f"{m:.4e}",
+                                        f"{se:.2e}", "0", "", f"{nph:.0e}",
+                                        "", "", "NO-REF"])
+                            continue
+                        band = 3.0 * math.sqrt(se * se + (myse or 0.0) ** 2) \
+                            + DEEP_SYS_FLOOR * my
+                        if band > 0.5 * my:
+                            v = "LOW-POWER"
+                            n_lowpow += 1
+                        elif abs(m - my) <= band:
+                            v = "PASS"
+                            n_pass += 1
+                        else:
+                            v = "FAIL"
+                            n_fail += 1
+                        w.writerow([ts, sza, wl, path, f"{m:.4e}",
+                                    f"{se:.2e}", f"{my:.4e}",
+                                    f"{myse:.2e}", f"{nph:.0e}",
+                                    f"{m / my:.4f}", f"{band / my:.4f}", v])
+                        print(f"  tau*={ts:4g} SZA {sza:5.1f} wl {wl:3.0f} "
+                              f"{path:5s}: {m / my:5.2f}x  band "
+                              f"{band / my:5.2f}  [{v}]  "
+                              f"my={my:.3e}+-{(myse or 0.0):.1e}", flush=True)
+
+    print(f"\n  gate: {n_pass} pass / {n_fail} fail / {n_lowpow} low-power "
+          f"/ {n_noref} no-ref (both paths gated: the campaign question "
+          f"is whether SZA 101-103 leaves LOW-POWER)")
+    print(f"  full table: {out_csv}")
+    return n_fail == 0
+
+
+# ---------------------------------------------------------------------------
 # G3-CUBE (transport plan G2b): synthetic 3D cube at daytime SZA vs MYSTIC 3D.
 #
 # STATUS: decks-prepared. The campaign cannot execute against the public
@@ -1137,7 +1406,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tier", choices=["1a", "1b", "1b-deep", "2", "3", "g2",
-                                       "g3-cloud-twilight", "g3-cube"],
+                                       "g3-cloud-twilight", "g3-cube",
+                                       "deep"],
                     default=None)
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--decks-only", action="store_true",
@@ -1180,6 +1450,8 @@ def main():
             ok &= compare_g2(lrt)
         elif tier == "g3-cloud-twilight":
             ok &= compare_g3_cloud_twilight(lrt)
+        elif tier == "deep":
+            ok &= compare_deep(lrt)
         elif tier == "g3-cube":
             ok &= g3cube_emit(lrt)
         elif tier in ("2", "3"):

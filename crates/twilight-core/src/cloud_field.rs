@@ -572,6 +572,80 @@ impl<'a> Cloud3DField<'a> {
         }
     }
 
+    /// Max cloud sigma over ONE z level [1/m]: the max over the level's
+    /// macro-tile majorants (or, when `macrocell_max` is empty, over the
+    /// level's voxel row directly), joined with `background_column[iz]`
+    /// (out-of-footprint points inside the z range return exactly that).
+    /// A pointwise majorant of `sigma_at` over EVERY position whose
+    /// altitude falls in level `iz`: voxels are covered by the tile
+    /// maxima (or the direct scan), out-of-footprint by the background
+    /// term, and the f32 -> f64 casts are exact so domination survives
+    /// the widening. Feeds the per-shell majorants of the field
+    /// forced-collision mode (photon.rs `field_shell_majorants`).
+    pub fn level_max_sigma(&self, iz: usize) -> f64 {
+        if iz >= self.nz {
+            return 0.0;
+        }
+        let mut m = 0.0f32;
+        if !self.macrocell_max.is_empty() {
+            let ntlat = self.nlat.div_ceil(self.tile);
+            let ntlon = self.nlon.div_ceil(self.tile);
+            let row = &self.macrocell_max[iz * ntlat * ntlon..(iz + 1) * ntlat * ntlon];
+            for &v in row {
+                if v > m {
+                    m = v;
+                }
+            }
+        } else {
+            let n = self.nlat * self.nlon;
+            for &v in &self.sigma[iz * n..(iz + 1) * n] {
+                if v > m {
+                    m = v;
+                }
+            }
+        }
+        if iz < self.background_column.len() {
+            let bg = self.background_column[iz];
+            if bg > m {
+                m = bg;
+            }
+        }
+        m as f64
+    }
+
+    /// Conservative majorant of `sigma_at` over the radial band
+    /// [r_lo, r_hi] (absolute ECEF radii, any order): the max of
+    /// `level_max_sigma` over every z level the band touches, 0 when the
+    /// band misses the grid z range entirely (`sigma_at` is 0 outside
+    /// [z0, z_top) by construction, in AND out of footprint). Level
+    /// bounds are floored/clamped OUTWARD, so a band endpoint exactly on
+    /// a level boundary includes both neighbours: never under-covers.
+    pub fn band_max_sigma(&self, r_lo: f64, r_hi: f64) -> f64 {
+        if self.nz == 0 {
+            return 0.0;
+        }
+        let z_lo = r_lo.min(r_hi) - EARTH_RADIUS_M;
+        let z_hi = r_lo.max(r_hi) - EARTH_RADIUS_M;
+        if z_hi < self.z0_m || z_lo >= self.z_top_m() {
+            return 0.0;
+        }
+        let i_lo = libm::floor((z_lo - self.z0_m) / self.dz_m).max(0.0) as usize;
+        let i_hi_f = libm::floor((z_hi - self.z0_m) / self.dz_m);
+        let i_hi = if i_hi_f < 0.0 {
+            return 0.0;
+        } else {
+            (i_hi_f as usize).min(self.nz - 1)
+        };
+        let mut m = 0.0f64;
+        for iz in i_lo..=i_hi {
+            let v = self.level_max_sigma(iz);
+            if v > m {
+                m = v;
+            }
+        }
+        m
+    }
+
     /// Distance to the nearest COARSE (macro-tile) boundary: the z-grid
     /// stays fine (sigma varies per level), lat/lon crossings use the tile
     /// spacing. Lets a provably empty tile be crossed in one step.

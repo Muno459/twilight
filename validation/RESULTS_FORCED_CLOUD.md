@@ -316,3 +316,41 @@ byte-compared:
    externally unrefereed in 3D); see the design section for the exact
    majorant/null-ratio machinery a field extension needs.
 4. BDPT light subpath: unchanged, off under any cloud channel.
+
+## 2026-07-04 addendum: the 3D-field forced mode SHIPPED (deep-regime campaign)
+
+Residual 3 above is closed for the PER-WAVELENGTH chains: the Stokes
+production chain (trace_secondary_chain) and the scalar chain
+(trace_secondary_chain_scalar) now run forced-collision flights under
+3D fields via per-shell majorants plus truncated null-collision delta
+tracking, exactly the machinery the design section sketched, with the
+single-sigma simplification that motivated it: a per-wavelength chain
+carries NO null weight ratios, so the all-wavelength-majorant tail
+problem never arises. ALIS remains ANALOG under fields by design (the
+per-wavelength null ratios under an all-wavelength majorant are the
+same heavy-tail machinery this document deferred; its gate is
+unchanged at `field.is_none()`).
+
+Construction, telescoping unbiasedness proof, estimator gates
+(analytic first-collision law, majorant invariance, uniform == 1D),
+bit-identity table, the forced-vs-analog variance ledger, the
+ultra-budget MYSTIC referee table at SZA 101-103, and the new
+physics-constraint gates: see validation/RESULTS_DEEP_REGIME.md.
+
+Review round 2 fixes landed alongside, in this campaign's files:
+
+1. VSPG segment-buffer overflow (both fused scouts): overflow segments
+   were silently dropped while tau kept accumulating, so the sampler
+   normalized by p_sum < 1 - e^{-tau_max} (head over-weighted, tail
+   never sampled; reachable only via reflection-multiplied crossings).
+   Fixed by extending the last segment across the overflow tau
+   (neutral importance; the segment set must TILE [0, tau_max]), with
+   an observability counter and a TIR-waveguide regression test.
+2. G-HYB-MULT budgets raised (16 seeds; 2048/8192 photons) so the
+   two-sided bands actually bite (~20 percent at SZA 97, printed per
+   row), and the 3D-field SZA-97 branch upgraded from one-sided
+   (analog-starvation era) to TWO-SIDED now that field chains are
+   forced: a starved field estimator now fails the lower side.
+3. G-FORCED-1D rewritten as a scale-free RATIO gate (|hyb/mul - 1|
+   within 3 x CV-derived SE + 5 percent) at raised budgets; the old
+   SZA-100 absolute band exceeded the means and could not fail.
