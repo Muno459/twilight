@@ -1,28 +1,45 @@
 //! GPU compute backend for the Twilight MCRT engine.
 //!
-//! Currently provides a single backend: **Metal** (`.metal` shaders,
-//! `objc2-metal` host) for Apple GPUs. The backend implements the
-//! [`GpuBackend`] trait and uses the buffer packing code in [`buffers`] to
-//! convert the CPU reference engine's `f64` atmosphere model into
-//! GPU-friendly `f32` layouts exactly once per upload.
+//! Two backends exist, both implementing the [`GpuBackend`] trait over the
+//! shared buffer packing in [`buffers`]:
 //!
-//! Other backends (CUDA, Vulkan, WebGPU) do not exist. The host-side code
-//! that once claimed to support them was deleted because the corresponding
-//! shaders were never written and the features could not compile.
+//! - **Metal** (`shaders/twilight.metal`, `objc2-metal` host): the original
+//!   reference implementation for Apple GPUs.
+//! - **wgpu** (`shaders/twilight.wgsl`, `wgpu` host): a portable WGSL
+//!   translation of the same kernels that runs on any wgpu-supported
+//!   adapter (Vulkan, DX12, Metal-via-wgpu, GL), unlocking headless Linux
+//!   servers and NVIDIA hardware.
+//!
+//! Both backends pack the CPU reference engine's `f64` atmosphere model
+//! into identical f32 layouts (byte-for-byte the same buffers), so the two
+//! GPU stacks are directly comparable against the one CPU specification.
 //!
 //! # Feature gates
 //!
 //! ```toml
-//! twilight-gpu = { version = "0.1", features = ["metal"] }
+//! twilight-gpu = { version = "0.1", features = ["metal"] }          # Apple
+//! twilight-gpu = { version = "0.1", features = ["wgpu"] }           # portable
+//! twilight-gpu = { version = "0.1", features = ["metal", "wgpu"] }  # both
 //! ```
 //!
-//! Without the `metal` feature this crate only provides the buffer-packing
+//! Without either feature this crate only provides the buffer-packing
 //! layer and the [`GpuBackend`] trait.
+//!
+//! # Backend selection
+//!
+//! [`try_init`] prefers Metal when both backends are compiled in and a
+//! Metal device is present (macOS behavior unchanged). The environment
+//! variable `TWILIGHT_GPU_BACKEND=wgpu|metal` overrides both the built-in
+//! order and `GpuConfig::preferred_backend` -- its purpose is testing the
+//! wgpu backend on machines where Metal would otherwise win.
 
 pub mod buffers;
 
 #[cfg(feature = "metal")]
 pub mod metal;
+
+#[cfg(feature = "wgpu")]
+pub mod wgpu_backend;
 
 #[cfg(test)]
 mod oracle;
@@ -90,12 +107,15 @@ impl std::error::Error for GpuError {}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendKind {
     Metal,
+    /// Portable WebGPU backend (Vulkan / DX12 / Metal-via-wgpu / GL).
+    Wgpu,
 }
 
 impl core::fmt::Display for BackendKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             BackendKind::Metal => write!(f, "Metal"),
+            BackendKind::Wgpu => write!(f, "wgpu"),
         }
     }
 }
@@ -342,9 +362,11 @@ pub trait GpuBackend: Send {
 
 /// Detect which GPU backends are available at runtime.
 ///
-/// Returns `[Metal]` on Apple platforms when the `metal` feature is
-/// compiled in and a device responds to a lightweight probe; otherwise
-/// an empty list. Does not compile shaders or allocate buffers.
+/// Metal is listed FIRST when available (Apple platforms, `metal` feature):
+/// the pre-existing preference order is unchanged by the wgpu port. The
+/// wgpu backend is listed when its feature is compiled in and an adapter
+/// responds to a lightweight probe. Does not compile shaders or allocate
+/// buffers.
 pub fn detect_backends() -> Vec<BackendKind> {
     #[allow(unused_mut)]
     let mut available = Vec::new();
@@ -357,17 +379,46 @@ pub fn detect_backends() -> Vec<BackendKind> {
         }
     }
 
+    // wgpu: any adapter on any backend (Vulkan / DX12 / Metal / GL).
+    #[cfg(feature = "wgpu")]
+    {
+        if probe_wgpu() {
+            available.push(BackendKind::Wgpu);
+        }
+    }
+
     available
+}
+
+/// Backend preference from the `TWILIGHT_GPU_BACKEND` environment variable
+/// (`wgpu` or `metal`, case-insensitive). Unset or unrecognized => None.
+/// This override exists so the wgpu backend can be exercised on machines
+/// where Metal would otherwise be selected (wgpu then runs over its own
+/// Metal driver: two independent GPU stacks against one CPU spec).
+fn env_backend_override() -> Option<BackendKind> {
+    let val = std::env::var("TWILIGHT_GPU_BACKEND").ok()?;
+    match val.to_ascii_lowercase().as_str() {
+        "metal" => Some(BackendKind::Metal),
+        "wgpu" => Some(BackendKind::Wgpu),
+        other => {
+            eprintln!(
+                "Warning: TWILIGHT_GPU_BACKEND={other:?} not recognized \
+                 (expected 'metal' or 'wgpu'); ignoring"
+            );
+            None
+        }
+    }
 }
 
 /// Select the best available backend, respecting user preference.
 ///
-/// If `preferred` is `Some` and that backend is available, use it.
-/// Otherwise, pick the first available from [`detect_backends`].
+/// Precedence: `TWILIGHT_GPU_BACKEND` env override, then `preferred`,
+/// then the first available from [`detect_backends`] (Metal first on
+/// Apple platforms when both are compiled in).
 pub fn select_backend(preferred: Option<BackendKind>) -> Option<BackendKind> {
     let available = detect_backends();
 
-    if let Some(pref) = preferred {
+    if let Some(pref) = env_backend_override().or(preferred) {
         if available.contains(&pref) {
             return Some(pref);
         }
@@ -390,6 +441,8 @@ pub fn try_init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     match kind {
         #[cfg(feature = "metal")]
         BackendKind::Metal => init_metal(config),
+        #[cfg(feature = "wgpu")]
+        BackendKind::Wgpu => init_wgpu(config),
         #[allow(unreachable_patterns)]
         _ => Err(GpuError::BackendUnavailable(kind)),
     }
@@ -405,4 +458,14 @@ fn probe_metal() -> bool {
 #[cfg(feature = "metal")]
 fn init_metal(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     metal::init(config)
+}
+
+#[cfg(feature = "wgpu")]
+fn probe_wgpu() -> bool {
+    wgpu_backend::probe()
+}
+
+#[cfg(feature = "wgpu")]
+fn init_wgpu(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
+    wgpu_backend::init(config)
 }

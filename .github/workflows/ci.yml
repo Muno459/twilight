@@ -50,7 +50,7 @@ jobs:
         run: cargo test --workspace --release
 
   test-macos:
-    name: Default suites + Metal (macOS)
+    name: Default suites + Metal + wgpu (macOS)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -59,8 +59,27 @@ jobs:
       # GitHub arm64 macOS runners expose a Metal device, so the GPU
       # parity suite runs for real here (device-present init failure
       # PANICS by design; only a truly absent device skips).
-      - name: Test with Metal (release)
-        run: cargo test --workspace --release --features twilight-gpu/metal
+      - name: Test with Metal and wgpu (release)
+        run: cargo test --workspace --release --features "twilight-gpu/metal twilight-gpu/wgpu"
+
+  gpu-physics-gates:
+    name: GPU physics gates (ignored suite, macOS)
+    # The review found the heavy job was ubuntu-only and scoped to
+    # core+cpu, so no ignored GPU physics gate EVER ran in CI. This job
+    # runs them on real Metal hardware weekly and on dispatch.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The synthetic (no-external-file) gates: checkerboard DDA parity,
+      # clear-sky and uniform/checkerboard field MC parity, on both
+      # backends. Real-field gates need /tmp/padborg_field.bin and stay
+      # local (they print a loud skip banner).
+      - name: Metal + wgpu ignored gates
+        run: cargo test -p twilight-gpu --release --features "metal wgpu" -- --ignored
 
   heavy-gates:
     name: Physics gates (ignored suite)

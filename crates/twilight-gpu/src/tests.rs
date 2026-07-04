@@ -600,9 +600,250 @@ fn run_hybrid_sanity(backend: &mut dyn crate::GpuBackend, label: &str) -> usize 
 
 // ── Metal backend integration tests ─────────────────────────────────────
 
+#[cfg(any(feature = "metal", feature = "wgpu"))]
+mod field_fixtures {
+    // Checkerboard field + ray fan shared by the Metal and wgpu DDA
+    // parity gates (pure twilight-data/core constructions).
+    // ── small vector helpers for the geometry gates ──
+    pub fn ecef_point(lat_deg: f64, lon_deg: f64, alt_m: f64) -> [f64; 3] {
+        let p = twilight_core::geometry::geographic_to_ecef(lat_deg, lon_deg, alt_m);
+        [p.x, p.y, p.z]
+    }
+    pub fn normalize3(v: [f64; 3]) -> [f64; 3] {
+        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / n, v[1] / n, v[2] / n]
+    }
+    pub fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+
+    pub fn run_cloudy_mc_parity(
+        gpu: &mut dyn crate::GpuBackend,
+        atm: &twilight_core::atmosphere::AtmosphereModel,
+        field: Option<&twilight_core::cloud_field::Cloud3DField>,
+        label: &str,
+        lat: f64,
+        lon: f64,
+        view_zenith: f64,
+        secondary_rays: usize,
+        num_seeds: usize,
+        cases: &[(f64, f64, f64)],
+    ) {
+        gpu.upload_atmosphere(atm).unwrap();
+        gpu.upload_field(field).unwrap();
+
+        let solar_azimuth = 270.0;
+        let obs_pos = twilight_core::geometry::geographic_to_ecef(lat, lon, 0.0);
+        let view = twilight_core::geometry::solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
+        let obs_arr = [obs_pos.x, obs_pos.y, obs_pos.z];
+        let view_arr = [view.x, view.y, view.z];
+
+        let num_wl = atm.num_wavelengths;
+
+        for &(sza_deg, min_ratio, max_ratio) in cases {
+            let sun = twilight_core::geometry::solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+            let sun_arr = [sun.x, sun.y, sun.z];
+
+            // CPU reference, one thread per seed: the per-seed streams are
+            // independent by construction, so parallelizing over seeds is
+            // bit-identical to the serial loop and ~num_seeds x faster (the
+            // CPU side dominates the gate wall time).
+            let cpu_totals: Vec<f64> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..num_seeds)
+                    .map(|seed_idx| {
+                        scope.spawn(move || {
+                            let mut cpu_total = 0.0f64;
+                            for w in 0..num_wl {
+                                let mut rng = (seed_idx as u64)
+                                    .wrapping_mul(2862933555777941757)
+                                    .wrapping_add(sza_deg.to_bits())
+                                    .wrapping_mul(6364136223846793005)
+                                    .wrapping_add(w as u64)
+                                    .wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1);
+                                cpu_total += twilight_core::photon::hybrid_scatter_radiance(
+                                    atm, obs_pos, view, sun, w, secondary_rays, &mut rng, true,
+                                    field,
+                                );
+                            }
+                            cpu_total
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+            let cpu_mean = cpu_totals.iter().sum::<f64>() / num_seeds as f64;
+
+            let mut gpu_totals = Vec::with_capacity(num_seeds);
+            for seed_idx in 0..num_seeds {
+                let seed = (seed_idx as u64)
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(sza_deg.to_bits());
+                let gpu_result = gpu
+                    .hybrid_scatter(obs_arr, view_arr, sun_arr, secondary_rays as u32, seed)
+                    .unwrap();
+                gpu_totals.push(gpu_result.radiance[..num_wl].iter().sum::<f64>());
+            }
+            let gpu_mean = gpu_totals.iter().sum::<f64>() / num_seeds as f64;
+
+            let ratio = if cpu_mean.abs() > 1e-30 {
+                gpu_mean / cpu_mean
+            } else if gpu_mean.abs() > 1e-30 {
+                f64::INFINITY
+            } else {
+                1.0
+            };
+            let cv = |xs: &[f64], mean: f64| -> f64 {
+                if mean.abs() < 1e-300 || xs.len() < 2 {
+                    return 0.0;
+                }
+                (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (xs.len() - 1) as f64)
+                    .sqrt()
+                    / mean.abs()
+            };
+            let cpu_cv = cv(&cpu_totals, cpu_mean);
+            let gpu_cv = cv(&gpu_totals, gpu_mean);
+            // Standard error of the ratio of two independent seed means.
+            let se_ratio = ((cpu_cv * cpu_cv + gpu_cv * gpu_cv) / num_seeds as f64).sqrt();
+            eprintln!(
+                "G-MC-PARITY-3 [{label}] SZA={sza_deg:.1}: CPU_mean={cpu_mean:.4e} (CV={cpu_cv:.3}), GPU_mean={gpu_mean:.4e} (CV={gpu_cv:.3}), ratio={ratio:.4} +- {se_ratio:.4} (band [{min_ratio}, {max_ratio}])"
+            );
+            if cpu_mean.abs() < 1e-30 && gpu_mean.abs() < 1e-30 {
+                continue;
+            }
+            assert!(
+                ratio >= min_ratio && ratio <= max_ratio,
+                "G-MC-PARITY-3 [{label}] SZA={sza_deg}: GPU/CPU ratio {ratio:.4} outside [{min_ratio}, {max_ratio}] (se_ratio {se_ratio:.4})\nCPU seeds: {cpu_totals:?}\nGPU seeds: {gpu_totals:?}"
+            );
+        }
+    }
+
+    pub const CB_NZ: usize = 4;
+    pub const CB_N: usize = 27;
+    pub const CB_TILE: usize = 8;
+    pub const CB_NT: usize = 4; // ceil(27 / 8)
+    pub const CB_SIGMA: f32 = 5e-4;
+    const CB_BG: f32 = 1.3e-4;
+
+    pub fn checkerboard_owned_field() -> twilight_data::cloud_field_builder::OwnedCloudField {
+        let mut sigma = vec![0.0f32; CB_NZ * CB_N * CB_N];
+        for iz in 0..CB_NZ {
+            for ilat in 0..CB_N {
+                for ilon in 0..CB_N {
+                    if (ilat / CB_TILE + ilon / CB_TILE).is_multiple_of(2) {
+                        sigma[(iz * CB_N + ilat) * CB_N + ilon] = CB_SIGMA;
+                    }
+                }
+            }
+        }
+        // Majorant derivation, same as the twilight-data builder.
+        let mut mm = vec![0.0f32; CB_NZ * CB_NT * CB_NT];
+        for iz in 0..CB_NZ {
+            for ilat in 0..CB_N {
+                for ilon in 0..CB_N {
+                    let v = sigma[(iz * CB_N + ilat) * CB_N + ilon];
+                    let m = &mut mm[(iz * CB_NT + ilat / CB_TILE) * CB_NT + ilon / CB_TILE];
+                    if v > *m {
+                        *m = v;
+                    }
+                }
+            }
+        }
+        // NOTE: background/majorants set literally (NOT derive(): the CPU
+        // referee geometry pins bg = 1.3e-4, not the horizontal mean).
+        twilight_data::cloud_field_builder::OwnedCloudField {
+            sigma,
+            g_star: vec![],
+            background_column: vec![CB_BG; CB_NZ],
+            macrocell_max: mm,
+            tile: CB_TILE,
+            nz: CB_NZ,
+            nlat: CB_N,
+            nlon: CB_N,
+            z0_m: 1000.0,
+            dz_m: 500.0,
+            lat0_deg: -0.27,
+            lon0_deg: -0.27,
+            dlat_deg: 0.02,
+            dlon_deg: 0.02,
+            g_default: 0.46,
+            timestamp: "synthetic".into(),
+            source: "checkerboard".into(),
+        }
+    }
+
+    pub fn east_of(p: [f64; 3]) -> [f64; 3] {
+        normalize3([-p[1], p[0], 0.0])
+    }
+
+    fn north_of(p: [f64; 3]) -> [f64; 3] {
+        cross3(normalize3(p), east_of(p))
+    }
+
+    fn axpy(a: f64, x: [f64; 3], b: f64, y: [f64; 3]) -> [f64; 3] {
+        [a * x[0] + b * y[0], a * x[1] + b * y[1], a * x[2] + b * y[2]]
+    }
+
+    /// The checkerboard referee fan (port of cb_ray_fan + the BUG 1 and
+    /// BUG 3 regression rays from cloud_field.rs): boundary-aligned,
+    /// grazing, lateral-entry, and through-the-top geometries.
+    pub fn cb_ray_fan() -> Vec<(&'static str, [f64; 3], [f64; 3], f64)> {
+        let deg = std::f64::consts::PI / 180.0;
+        let p1 = ecef_point(0.0, -0.26, 1250.0);
+        let p2 = ecef_point(-0.26, 0.005, 1250.0);
+        let p3 = ecef_point(-0.252, -0.252, 1100.0);
+        let p4 = ecef_point(0.004, -0.26, 1050.0);
+        let z4 = 89.5 * deg;
+        let d4 = normalize3(axpy(z4.cos(), normalize3(p4), z4.sin(), east_of(p4)));
+        let p5 = ecef_point(0.01, -0.60, 1250.0);
+        let p6 = ecef_point(0.0, -0.10, 5000.0);
+        let d6 = normalize3(axpy(1.0, east_of(p6), -0.08, normalize3(p6)));
+        let p7 = ecef_point(-0.02, -0.05, 0.0);
+        let d7 = normalize3(axpy(0.5, normalize3(p7), 0.75f64.sqrt(), east_of(p7)));
+        let mut fan = vec![
+            ("east along lon", p1, east_of(p1), 80_000.0),
+            ("north along lat", p2, north_of(p2), 80_000.0),
+            (
+                "diagonal",
+                p3,
+                normalize3(axpy(1.0, east_of(p3), 1.0, north_of(p3))),
+                100_000.0,
+            ),
+            ("grazing zen 89.5", p4, d4, 200_000.0),
+            ("lateral entry from outside", p5, east_of(p5), 150_000.0),
+            ("entry from above z_top", p6, d6, 80_000.0),
+            ("from below through z0", p7, d7, 10_000.0),
+        ];
+        // BUG 1 fan: coarse-skip landings exactly on the empty-to-occupied
+        // tile plane at lon -0.11 (start mid empty tile, and pinned on the
+        // plane with both fp parities; in f32 the eps offsets collapse onto
+        // the plane itself, which is exactly the landing-parity case the
+        // midpoint classification must survive).
+        for (label, lon_start) in [
+            ("bug1 start mid empty tile", -0.19),
+            ("bug1 on plane -eps", -0.11 - 1e-9),
+            ("bug1 on plane", -0.11),
+            ("bug1 on plane +eps", -0.11 + 1e-9),
+        ] {
+            let p0 = ecef_point(0.0, lon_start, 1250.0);
+            fan.push((label, p0, east_of(p0), 40_000.0));
+        }
+        // BUG 3 ray: partial EMPTY edge tile out through the footprint edge
+        // into the nonzero background (the edge is off the tile lattice).
+        let p8 = ecef_point(0.132, 0.22, 1250.0);
+        fan.push(("bug3 partial-tile edge", p8, east_of(p8), 60_000.0));
+        fan
+    }
+}
+
 #[cfg(feature = "metal")]
 mod layer4_metal {
     use super::*;
+    use super::field_fixtures::*;
     use crate::{BackendKind, GpuBackend, GpuConfig};
 
     fn try_metal() -> Option<Box<dyn crate::GpuBackend>> {
@@ -1317,6 +1558,27 @@ mod layer4_metal {
     /// suite. The synthetic checkerboard gate below is unconditional, so a
     /// missing file no longer silences the geometry gate, but the skip of
     /// the real-data half still deserves a banner.
+    /// FNV-1a-64 of the EXACT /tmp/padborg_field.bin snapshot (2026-07-02
+    /// SEVIRI scan, 5242880 bytes) that the tight padborg parity bands
+    /// were derived from. A regenerated field is a DIFFERENT experiment:
+    /// nearly-clear regenerations pass while exercising no cloud code,
+    /// heavy-overcast ones fail spuriously (review round 2), so the
+    /// tight bands apply only to the pinned snapshot and any other file
+    /// gets envelope bands plus a loud banner.
+    const PADBORG_FIXTURE_FNV1A64: u64 = 0xE2F5_478E_359B_99A8;
+
+    fn padborg_fixture_is_pinned() -> bool {
+        let Ok(data) = std::fs::read("/tmp/padborg_field.bin") else {
+            return false;
+        };
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in &data {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1_0000_0000_01b3);
+        }
+        h == PADBORG_FIXTURE_FNV1A64
+    }
+
     fn load_padborg_field() -> Option<twilight_data::cloud_field_builder::OwnedCloudField> {
         let path = std::path::Path::new("/tmp/padborg_field.bin");
         if !path.exists() {
@@ -1349,122 +1611,6 @@ mod layer4_metal {
     // alternating empty/occupied tiles (maximizing empty-to-occupied
     // boundary landings: BUG 1's precondition). Runs UNCONDITIONALLY (no
     // external file), unlike the real-field gate.
-    const CB_NZ: usize = 4;
-    const CB_N: usize = 27;
-    const CB_TILE: usize = 8;
-    const CB_NT: usize = 4; // ceil(27 / 8)
-    const CB_SIGMA: f32 = 5e-4;
-    const CB_BG: f32 = 1.3e-4;
-
-    fn checkerboard_owned_field() -> twilight_data::cloud_field_builder::OwnedCloudField {
-        let mut sigma = vec![0.0f32; CB_NZ * CB_N * CB_N];
-        for iz in 0..CB_NZ {
-            for ilat in 0..CB_N {
-                for ilon in 0..CB_N {
-                    if (ilat / CB_TILE + ilon / CB_TILE).is_multiple_of(2) {
-                        sigma[(iz * CB_N + ilat) * CB_N + ilon] = CB_SIGMA;
-                    }
-                }
-            }
-        }
-        // Majorant derivation, same as the twilight-data builder.
-        let mut mm = vec![0.0f32; CB_NZ * CB_NT * CB_NT];
-        for iz in 0..CB_NZ {
-            for ilat in 0..CB_N {
-                for ilon in 0..CB_N {
-                    let v = sigma[(iz * CB_N + ilat) * CB_N + ilon];
-                    let m = &mut mm[(iz * CB_NT + ilat / CB_TILE) * CB_NT + ilon / CB_TILE];
-                    if v > *m {
-                        *m = v;
-                    }
-                }
-            }
-        }
-        // NOTE: background/majorants set literally (NOT derive(): the CPU
-        // referee geometry pins bg = 1.3e-4, not the horizontal mean).
-        twilight_data::cloud_field_builder::OwnedCloudField {
-            sigma,
-            g_star: vec![],
-            background_column: vec![CB_BG; CB_NZ],
-            macrocell_max: mm,
-            tile: CB_TILE,
-            nz: CB_NZ,
-            nlat: CB_N,
-            nlon: CB_N,
-            z0_m: 1000.0,
-            dz_m: 500.0,
-            lat0_deg: -0.27,
-            lon0_deg: -0.27,
-            dlat_deg: 0.02,
-            dlon_deg: 0.02,
-            g_default: 0.46,
-            timestamp: "synthetic".into(),
-            source: "checkerboard".into(),
-        }
-    }
-
-    fn east_of(p: [f64; 3]) -> [f64; 3] {
-        normalize3([-p[1], p[0], 0.0])
-    }
-
-    fn north_of(p: [f64; 3]) -> [f64; 3] {
-        cross3(normalize3(p), east_of(p))
-    }
-
-    fn axpy(a: f64, x: [f64; 3], b: f64, y: [f64; 3]) -> [f64; 3] {
-        [a * x[0] + b * y[0], a * x[1] + b * y[1], a * x[2] + b * y[2]]
-    }
-
-    /// The checkerboard referee fan (port of cb_ray_fan + the BUG 1 and
-    /// BUG 3 regression rays from cloud_field.rs): boundary-aligned,
-    /// grazing, lateral-entry, and through-the-top geometries.
-    fn cb_ray_fan() -> Vec<(&'static str, [f64; 3], [f64; 3], f64)> {
-        let deg = std::f64::consts::PI / 180.0;
-        let p1 = ecef_point(0.0, -0.26, 1250.0);
-        let p2 = ecef_point(-0.26, 0.005, 1250.0);
-        let p3 = ecef_point(-0.252, -0.252, 1100.0);
-        let p4 = ecef_point(0.004, -0.26, 1050.0);
-        let z4 = 89.5 * deg;
-        let d4 = normalize3(axpy(z4.cos(), normalize3(p4), z4.sin(), east_of(p4)));
-        let p5 = ecef_point(0.01, -0.60, 1250.0);
-        let p6 = ecef_point(0.0, -0.10, 5000.0);
-        let d6 = normalize3(axpy(1.0, east_of(p6), -0.08, normalize3(p6)));
-        let p7 = ecef_point(-0.02, -0.05, 0.0);
-        let d7 = normalize3(axpy(0.5, normalize3(p7), 0.75f64.sqrt(), east_of(p7)));
-        let mut fan = vec![
-            ("east along lon", p1, east_of(p1), 80_000.0),
-            ("north along lat", p2, north_of(p2), 80_000.0),
-            (
-                "diagonal",
-                p3,
-                normalize3(axpy(1.0, east_of(p3), 1.0, north_of(p3))),
-                100_000.0,
-            ),
-            ("grazing zen 89.5", p4, d4, 200_000.0),
-            ("lateral entry from outside", p5, east_of(p5), 150_000.0),
-            ("entry from above z_top", p6, d6, 80_000.0),
-            ("from below through z0", p7, d7, 10_000.0),
-        ];
-        // BUG 1 fan: coarse-skip landings exactly on the empty-to-occupied
-        // tile plane at lon -0.11 (start mid empty tile, and pinned on the
-        // plane with both fp parities; in f32 the eps offsets collapse onto
-        // the plane itself, which is exactly the landing-parity case the
-        // midpoint classification must survive).
-        for (label, lon_start) in [
-            ("bug1 start mid empty tile", -0.19),
-            ("bug1 on plane -eps", -0.11 - 1e-9),
-            ("bug1 on plane", -0.11),
-            ("bug1 on plane +eps", -0.11 + 1e-9),
-        ] {
-            let p0 = ecef_point(0.0, lon_start, 1250.0);
-            fan.push((label, p0, east_of(p0), 40_000.0));
-        }
-        // BUG 3 ray: partial EMPTY edge tile out through the footprint edge
-        // into the nonzero background (the edge is off the tile lattice).
-        let p8 = ecef_point(0.132, 0.22, 1250.0);
-        fan.push(("bug3 partial-tile edge", p8, east_of(p8), 60_000.0));
-        fan
-    }
 
     /// G-DDA-PARITY-2 (synthetic, unconditional): device field_tau_along
     /// vs the live CPU tau_along on the checkerboard fan, within the f32
@@ -1698,108 +1844,6 @@ mod layer4_metal {
     /// bands justified from measured seed CVs, never borrowed from another
     /// table).
     #[allow(clippy::too_many_arguments)]
-    fn run_cloudy_mc_parity(
-        gpu: &mut crate::metal::MetalBackend,
-        atm: &twilight_core::atmosphere::AtmosphereModel,
-        field: Option<&twilight_core::cloud_field::Cloud3DField>,
-        label: &str,
-        lat: f64,
-        lon: f64,
-        view_zenith: f64,
-        secondary_rays: usize,
-        num_seeds: usize,
-        cases: &[(f64, f64, f64)],
-    ) {
-        use crate::GpuBackend;
-        gpu.upload_atmosphere(atm).unwrap();
-        gpu.upload_field(field).unwrap();
-
-        let solar_azimuth = 270.0;
-        let obs_pos = twilight_core::geometry::geographic_to_ecef(lat, lon, 0.0);
-        let view = twilight_core::geometry::solar_direction_ecef(view_zenith, solar_azimuth, lat, lon);
-        let obs_arr = [obs_pos.x, obs_pos.y, obs_pos.z];
-        let view_arr = [view.x, view.y, view.z];
-
-        let num_wl = atm.num_wavelengths;
-
-        for &(sza_deg, min_ratio, max_ratio) in cases {
-            let sun = twilight_core::geometry::solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
-            let sun_arr = [sun.x, sun.y, sun.z];
-
-            // CPU reference, one thread per seed: the per-seed streams are
-            // independent by construction, so parallelizing over seeds is
-            // bit-identical to the serial loop and ~num_seeds x faster (the
-            // CPU side dominates the gate wall time).
-            let cpu_totals: Vec<f64> = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..num_seeds)
-                    .map(|seed_idx| {
-                        scope.spawn(move || {
-                            let mut cpu_total = 0.0f64;
-                            for w in 0..num_wl {
-                                let mut rng = (seed_idx as u64)
-                                    .wrapping_mul(2862933555777941757)
-                                    .wrapping_add(sza_deg.to_bits())
-                                    .wrapping_mul(6364136223846793005)
-                                    .wrapping_add(w as u64)
-                                    .wrapping_mul(6364136223846793005)
-                                    .wrapping_add(1);
-                                cpu_total += twilight_core::photon::hybrid_scatter_radiance(
-                                    atm, obs_pos, view, sun, w, secondary_rays, &mut rng, true,
-                                    field,
-                                );
-                            }
-                            cpu_total
-                        })
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            let cpu_mean = cpu_totals.iter().sum::<f64>() / num_seeds as f64;
-
-            let mut gpu_totals = Vec::with_capacity(num_seeds);
-            for seed_idx in 0..num_seeds {
-                let seed = (seed_idx as u64)
-                    .wrapping_mul(2862933555777941757)
-                    .wrapping_add(sza_deg.to_bits());
-                let gpu_result = gpu
-                    .hybrid_scatter(obs_arr, view_arr, sun_arr, secondary_rays as u32, seed)
-                    .unwrap();
-                gpu_totals.push(gpu_result.radiance[..num_wl].iter().sum::<f64>());
-            }
-            let gpu_mean = gpu_totals.iter().sum::<f64>() / num_seeds as f64;
-
-            let ratio = if cpu_mean.abs() > 1e-30 {
-                gpu_mean / cpu_mean
-            } else if gpu_mean.abs() > 1e-30 {
-                f64::INFINITY
-            } else {
-                1.0
-            };
-            let cv = |xs: &[f64], mean: f64| -> f64 {
-                if mean.abs() < 1e-300 || xs.len() < 2 {
-                    return 0.0;
-                }
-                (xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (xs.len() - 1) as f64)
-                    .sqrt()
-                    / mean.abs()
-            };
-            let cpu_cv = cv(&cpu_totals, cpu_mean);
-            let gpu_cv = cv(&gpu_totals, gpu_mean);
-            // Standard error of the ratio of two independent seed means.
-            let se_ratio = ((cpu_cv * cpu_cv + gpu_cv * gpu_cv) / num_seeds as f64).sqrt();
-            eprintln!(
-                "G-MC-PARITY-3 [{label}] SZA={sza_deg:.1}: CPU_mean={cpu_mean:.4e} (CV={cpu_cv:.3}), GPU_mean={gpu_mean:.4e} (CV={gpu_cv:.3}), ratio={ratio:.4} +- {se_ratio:.4} (band [{min_ratio}, {max_ratio}])"
-            );
-            if cpu_mean.abs() < 1e-30 && gpu_mean.abs() < 1e-30 {
-                continue;
-            }
-            assert!(
-                ratio >= min_ratio && ratio <= max_ratio,
-                "G-MC-PARITY-3 [{label}] SZA={sza_deg}: GPU/CPU ratio {ratio:.4} outside [{min_ratio}, {max_ratio}] (se_ratio {se_ratio:.4})\nCPU seeds: {cpu_totals:?}\nGPU seeds: {gpu_totals:?}"
-            );
-        }
-    }
-
     /// G-MC-PARITY-3 (extra): uniform synthetic field, GPU vs CPU
     /// hybrid+field.
     ///
@@ -1879,8 +1923,20 @@ mod layer4_metal {
         let view = owned.view();
         let lat = 54.83;
         let lon = 9.36;
-        let cases: &[(f64, f64, f64)] =
-            &[(95.0, 0.94, 1.06), (97.0, 0.88, 1.12), (100.0, 0.65, 1.35)];
+        // Tight bands are valid ONLY for the pinned band-derivation
+        // snapshot; any regenerated field gets envelope bands (still a
+        // real parity check, honestly labeled).
+        let pinned = padborg_fixture_is_pinned();
+        let cases: &[(f64, f64, f64)] = if pinned {
+            &[(95.0, 0.94, 1.06), (97.0, 0.88, 1.12), (100.0, 0.65, 1.35)]
+        } else {
+            eprintln!("==========================================================");
+            eprintln!("NOTE: /tmp/padborg_field.bin is NOT the pinned band");
+            eprintln!("snapshot (fnv1a64 mismatch): applying ENVELOPE bands.");
+            eprintln!("Re-derive tight bands (8-seed CVs) to re-pin a new scan.");
+            eprintln!("==========================================================");
+            &[(95.0, 0.78, 1.25), (97.0, 0.60, 1.60), (100.0, 0.35, 2.50)]
+        };
         run_cloudy_mc_parity(&mut gpu, &atm, Some(&view), "padborg", lat, lon, 85.0, 100, 8, cases);
     }
 
@@ -1911,9 +1967,12 @@ mod layer4_metal {
     /// its band [0.20, 2.30] is a sanity envelope around the measured
     /// 0.571 +- 0.278 (consistent with unity at 1.5 se), NOT a precision
     /// parity claim; precision at SZA 100 is carried by the clear-sky gate
-    /// (ratio 1.010 +- 0.028) and the field gates. The envelope still fails
-    /// the era-1 forced-transparency inflation (>2.3x) and the era-2
-    /// starvation (0.16-0.22x).
+    /// (ratio 1.010 +- 0.028) and the field gates. The envelope fails the
+    /// era-1 forced-transparency inflation (>2.3x) and the sub-0.20 part
+    /// of the era-2 starvation class; the 0.20-0.22x top of that class
+    /// PASSES this row (review round 2) and is caught only
+    /// probabilistically by the SZA-97 row's [0.60, 1.45] band, so a
+    /// starvation regression must not rely on this row alone.
     #[test]
     #[ignore = "heavy CPU MC reference; run explicitly for G-MC-PARITY-3"]
     fn metal_cloud1d_mc_parity_stratus() {
@@ -2010,22 +2069,6 @@ mod layer4_metal {
         }
     }
 
-    // ── small vector helpers for the geometry gates ──
-    fn ecef_point(lat_deg: f64, lon_deg: f64, alt_m: f64) -> [f64; 3] {
-        let p = twilight_core::geometry::geographic_to_ecef(lat_deg, lon_deg, alt_m);
-        [p.x, p.y, p.z]
-    }
-    fn normalize3(v: [f64; 3]) -> [f64; 3] {
-        let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
-        [v[0] / n, v[1] / n, v[2] / n]
-    }
-    fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-        [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    }
 }
 
 /// Cross-backend parity tolerance. Backends use the same f32 arithmetic
@@ -4185,3 +4228,231 @@ fn diagnostic_hybrid_gpu_vs_cpu_deep_twilight() {
         }
     }
 }
+
+
+// ── WGSL offset synchronization ─────────────────────────────────────────
+// The WGSL shader hard-codes the packed-buffer offsets; this parse test
+// pins them to the buffers.rs constants exactly like the Metal
+// offset-parse test, so a layout change cannot silently desynchronize
+// the portable backend.
+#[cfg(feature = "wgpu")]
+#[test]
+fn wgsl_offsets_match_buffers_rs() {
+    let src = include_str!("../shaders/twilight.wgsl");
+    let grab = |name: &str| -> u32 {
+        let pat = format!("const {name}: u32 = ");
+        let i = src.find(&pat).unwrap_or_else(|| panic!("{name} not in WGSL"));
+        let rest = &src[i + pat.len()..];
+        let end = rest.find('u').unwrap();
+        rest[..end].trim().parse().unwrap()
+    };
+    use crate::buffers::atm_offsets as o;
+    assert_eq!(grab("ATM_HEADER_MAGIC") as usize, o::HEADER_MAGIC);
+    assert_eq!(grab("ATM_HEADER_VERSION") as usize, o::HEADER_VERSION);
+    assert_eq!(grab("ATM_NUM_SHELLS") as usize, o::NUM_SHELLS);
+    assert_eq!(grab("ATM_NUM_WAVELENGTHS") as usize, o::NUM_WAVELENGTHS);
+    assert_eq!(grab("ATM_SHELLS_START") as usize, o::SHELLS_START);
+    assert_eq!(grab("ATM_SHELL_STRIDE") as usize, o::SHELL_STRIDE);
+    assert_eq!(grab("ATM_OPTICS_START") as usize, o::OPTICS_START);
+    assert_eq!(grab("ATM_OPTICS_STRIDE") as usize, o::OPTICS_STRIDE);
+}
+
+// ── Layer 4w: wgpu backend (portable WGSL translation) ──────────────────
+#[cfg(feature = "wgpu")]
+mod layer4_wgpu {
+    use super::*;
+    use crate::{BackendKind, GpuBackend, GpuConfig};
+
+    /// Same init discipline as try_metal: no adapter at all is a
+    /// legitimate skip; an adapter that fails init means the WGSL does
+    /// not compile or the pipeline layout is wrong, and the suite must
+    /// FAIL loudly, never skip (the vacuous-pass lesson).
+    fn try_wgpu() -> Option<Box<dyn crate::GpuBackend>> {
+        let config = GpuConfig {
+            preferred_backend: Some(BackendKind::Wgpu),
+            ..Default::default()
+        };
+        match crate::try_init(&config) {
+            Ok(gpu) => Some(gpu),
+            Err(crate::GpuError::NoDevice) => None,
+            Err(e) => panic!("wgpu adapter present but backend init failed: {e}"),
+        }
+    }
+
+    /// The WGSL must compile and the six pipelines must build on any
+    /// present adapter (naga validation runs inside init).
+    #[test]
+    fn wgpu_init_compiles_shader() {
+        if let Some(gpu) = try_wgpu() {
+            let info = gpu.device_info();
+            assert!(matches!(info.backend, BackendKind::Wgpu));
+            std::eprintln!("wgpu adapter: {}", info.name);
+        }
+    }
+
+    /// Deterministic single-scatter parity against the CPU oracle,
+    /// through the shared harness the Metal backend uses.
+    #[test]
+    fn wgpu_single_scatter_matches_cpu() {
+        if let Some(mut gpu) = try_wgpu() {
+            let checked = run_single_scatter_parity(gpu.as_mut(), "wgpu");
+            assert!(checked > 0, "parity harness compared zero samples");
+        }
+    }
+
+    /// G-DDA-PARITY-2 on wgpu: the device-side field traversal against
+    /// the live CPU tau_along on the checkerboard fan (the geometry that
+    /// pinned the landing-parity and footprint-capping bugs), plus the
+    /// majorant-less fine-walk cross-check. Concrete backend needed for
+    /// the probe entry point.
+    /// G-MC-PARITY-3w: wgpu hybrid vs the CPU reference, clear sky.
+    /// Bands are the measured-CV bands the Metal gate derived for this
+    /// exact configuration (same protocol, same seeds).
+    #[test]
+    fn wgpu_clear_mc_parity() {
+        if let Some(mut gpu) = try_wgpu() {
+            let atm = twilight_data::builder::build_clear_sky(
+                twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+                0.15,
+            );
+            let cases: &[(f64, f64, f64)] =
+                &[(95.0, 0.94, 1.06), (97.0, 0.88, 1.12), (100.0, 0.65, 1.35)];
+            super::field_fixtures::run_cloudy_mc_parity(
+                gpu.as_mut(),
+                &atm,
+                None,
+                "wgpu-clear",
+                54.83,
+                9.36,
+                85.0,
+                100,
+                8,
+                cases,
+            );
+        }
+    }
+
+    /// G-MC-PARITY-3w on the checkerboard FIELD (the full cloud-chain x
+    /// field-DDA COMPOSITION through the wgpu path; the traversal itself
+    /// is pinned separately by G-DDA-PARITY-2w and the chain estimator
+    /// by the clear-sky gate).
+    ///
+    /// VENUE NOTE (measured 2026-07-04): on an interactive Mac the
+    /// compositor throttles long wgpu compute submissions, so field
+    /// chain dispatches run minutes each and the full 3-SZA, 8-seed
+    /// gate extrapolates to ~16 h; the SAME binary's clear-sky gate
+    /// runs in 17 s. This gate therefore runs the single most
+    /// discriminating case (SZA 97: combined-channel forced mode on
+    /// both backends) at 4 seeds with Metal's proven tiny-dispatch
+    /// shape (TWILIGHT_WGPU_WINDOWS=50 TWILIGHT_WGPU_RAYS=8 or
+    /// smaller). Run the full 3-SZA gate on headless hardware (Linux/
+    /// NVIDIA or a macOS box with the display asleep), where the
+    /// throttle does not exist.
+    #[test]
+    #[ignore = "heavy; run explicitly (see venue note) for the wgpu field gate"]
+    fn wgpu_field_mc_parity_checkerboard() {
+        if let Some(mut gpu) = try_wgpu() {
+            let atm = twilight_data::builder::build_clear_sky(
+                twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+                0.15,
+            );
+            let owned = super::field_fixtures::checkerboard_owned_field();
+            let view = owned.view();
+            // Envelope band at 4 seeds (se ~ 2x the 16-seed derivation):
+            // still fails the era-1 (>2.3x) and era-2 starvation (<0.25x)
+            // classes this gate exists to catch.
+            let cases: &[(f64, f64, f64)] = &[(97.0, 0.25, 2.20)];
+            super::field_fixtures::run_cloudy_mc_parity(
+                gpu.as_mut(),
+                &atm,
+                Some(&view),
+                "wgpu-checkerboard",
+                54.83,
+                9.36,
+                85.0,
+                100,
+                4,
+                cases,
+            );
+        }
+    }
+
+    #[test]
+    fn wgpu_field_dda_checkerboard_matches_cpu() {
+        use super::field_fixtures::*;
+        let config = GpuConfig {
+            preferred_backend: Some(BackendKind::Wgpu),
+            ..Default::default()
+        };
+        let mut gpu = match crate::wgpu_backend::init_concrete(&config) {
+            Ok(g) => g,
+            Err(crate::GpuError::NoDevice) => return,
+            Err(e) => panic!("wgpu adapter present but init failed: {e}"),
+        };
+        let owned = checkerboard_owned_field();
+        let view = owned.view();
+
+        let fan = cb_ray_fan();
+        let rays: Vec<[f64; 7]> = fan
+            .iter()
+            .map(|&(_, p0, d, t)| [p0[0], p0[1], p0[2], t, d[0], d[1], d[2]])
+            .collect();
+        let cpu_tau: Vec<f64> = fan
+            .iter()
+            .map(|&(_, p0, d, t)| {
+                view.tau_along(
+                    twilight_core::geometry::Vec3::new(p0[0], p0[1], p0[2]),
+                    twilight_core::geometry::Vec3::new(d[0], d[1], d[2]),
+                    t,
+                )
+            })
+            .collect();
+
+        gpu.upload_field(Some(&view)).unwrap();
+        let gpu_tau = gpu.field_tau_probe(&rays).unwrap();
+
+        let fine_owned = twilight_data::cloud_field_builder::OwnedCloudField {
+            macrocell_max: vec![],
+            ..checkerboard_owned_field()
+        };
+        let fine_view = fine_owned.view();
+        gpu.upload_field(Some(&fine_view)).unwrap();
+        let gpu_tau_fine = gpu.field_tau_probe(&rays).unwrap();
+
+        let rtol = 5e-3;
+        let atol = 2e-2;
+        let mut max_rel = 0.0f64;
+        for (i, &(label, ..)) in fan.iter().enumerate() {
+            let (c, g, gf) = (cpu_tau[i], gpu_tau[i], gpu_tau_fine[i]);
+            let abs = (g - c).abs();
+            let rel = if c > 1e-9 { abs / c } else { abs };
+            max_rel = max_rel.max(rel);
+            std::eprintln!(
+                "  G-DDA-PARITY-2w [{label}]: cpu {c:.6} wgpu {g:.6} fine {gf:.6} rel {rel:.2e}"
+            );
+            assert!(
+                abs <= atol || rel <= rtol,
+                "G-DDA-PARITY-2w [{label}]: cpu={c:.8} wgpu={g:.8} abs={abs:.3e} rel={rel:.3e}"
+            );
+            let rel_fine = (g - gf).abs() / gf.max(1e-9);
+            assert!(
+                rel_fine <= 1e-3,
+                "G-DDA-PARITY-2w [{label}]: macro {g:.8} vs fine {gf:.8} (rel {rel_fine:.3e})"
+            );
+        }
+        std::eprintln!(
+            "G-DDA-PARITY-2w (checkerboard): {} rays, max_rel={max_rel:.3e}",
+            fan.len()
+        );
+        let idx_bug1 = fan
+            .iter()
+            .position(|&(l, ..)| l == "bug1 start mid empty tile")
+            .unwrap();
+        assert!(
+            gpu_tau[idx_bug1] > 0.9 * (CB_SIGMA as f64) * 16_000.0,
+            "occupied tile chord dropped: wgpu tau {:.4}",
+            gpu_tau[idx_bug1]
+        );
+    }
+}
+

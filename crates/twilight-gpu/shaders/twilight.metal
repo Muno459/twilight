@@ -2657,6 +2657,12 @@ kernel void hybrid_context_prefix(
 
     float toa_radius = atm_toa_radius(atm);
     float surface_radius = atm_surface_radius(atm);
+    // Eye-path entry snap (d4f682e class): an observer whose f32 radius
+    // rounds below the surface makes the nearest LOS substeps land at
+    // shell_index < 0 and silently vanish (review round 2).
+    if (length(observer_pos) < surface_radius + BOUNDARY_NUDGE_M) {
+        observer_pos = normalize(observer_pos) * (surface_radius + BOUNDARY_NUDGE_M);
+    }
 
     // Same step geometry as hybrid_scatter_v2.
     bool valid = true;
@@ -2753,6 +2759,19 @@ kernel void hybrid_context_prefix(
             // simply runs them; the GPU global ray domain is fixed by the
             // dispatch, so the tail is capped instead -- a variance-only
             // difference on near-zero-weight substeps).
+            if (global_total_rays < k_sub) {
+                // Fewer rays than substeps: a disjoint partition would
+                // leave (k_sub - N) substeps with ray ranges beyond the
+                // dispatch domain, silently DROPPING their in-scatter
+                // contribution (an order-2+ bias, review round 2). Give
+                // every substep the full range instead: each is averaged
+                // over all N chains, which is unbiased (substeps become
+                // correlated: variance only).
+                for (uint j = 0; j < k_sub; j++) {
+                    sub_ray_start[j] = 0u;
+                    sub_ray_count[j] = global_total_rays;
+                }
+            } else {
             uint assigned = 0u;
             for (uint j = 0; j < k_sub; j++) {
                 uint remaining = k_sub - 1u - j;
@@ -2769,6 +2788,7 @@ kernel void hybrid_context_prefix(
                 sub_ray_start[j] = assigned;
                 sub_ray_count[j] = nj;
                 assigned += nj;
+            }
             }
         }
 
@@ -2879,6 +2899,14 @@ kernel void hybrid_scatter_v2(
     bool field_present  = read_field_present(params);
 
     float toa_radius = atm_toa_radius(atm);
+    {
+        // Eye-path entry snap: see hybrid_context_prefix (must match, or
+        // the context and the chain walk disagree about the first substep).
+        float srad = atm_surface_radius(atm);
+        if (length(observer_pos) < srad + BOUNDARY_NUDGE_M) {
+            observer_pos = normalize(observer_pos) * (srad + BOUNDARY_NUDGE_M);
+        }
+    }
     float surface_radius = atm_surface_radius(atm);
 
     // ── Uniform coarse-step geometry ─────────────────────────────────────

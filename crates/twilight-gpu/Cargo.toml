@@ -8,6 +8,10 @@ description = "Metal GPU compute backend for twilight MCRT"
 [features]
 default = []
 metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "dep:block2"]
+# Portable WebGPU backend (Vulkan / DX12 / Metal-via-wgpu / GL). Runs the
+# WGSL translation of the same transport on any wgpu-supported adapter,
+# including headless Linux servers and NVIDIA hardware.
+wgpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
 
 [dependencies]
 twilight-core = { workspace = true }
@@ -24,6 +28,11 @@ objc2-metal = { version = "0.3", optional = true, features = [
     "MTLArgument", "MTLCommandEncoder", "MTLTypes",
 ] }
 block2 = { version = "0.6", optional = true }
+
+# wgpu backend (portable: Vulkan / DX12 / Metal / GL)
+wgpu = { version = "28", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true }
 
 [dev-dependencies]
 twilight-cpu = { workspace = true }
