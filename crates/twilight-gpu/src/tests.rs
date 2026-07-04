@@ -621,6 +621,7 @@ mod field_fixtures {
         ]
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn run_cloudy_mc_parity(
         gpu: &mut dyn crate::GpuBackend,
         atm: &twilight_core::atmosphere::AtmosphereModel,
