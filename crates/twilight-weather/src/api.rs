@@ -306,8 +306,7 @@ pub fn fetch_weather_at(
     date: &str,
     hour_utc: f64,
 ) -> Result<WeatherConditions, WeatherError> {
-    let hour = (hour_utc.rem_euclid(24.0)).round() as usize % 24;
-    let target = format!("{}T{:02}:00", date, hour);
+    let target = hourly_target(date, hour_utc);
 
     let weather_url = format!(
         "{}?latitude={}&longitude={}&hourly=cloud_cover,cloud_cover_low,cloud_cover_mid,cloud_cover_high,visibility,relative_humidity_2m,weather_code&start_date={}&end_date={}&timezone=UTC",
@@ -373,14 +372,22 @@ pub fn fetch_weather_at(
     ))
 }
 
-/// Fetch and deserialize JSON from a URL, retrying transient failures.
-pub(crate) fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, WeatherError> {
+/// Round a fractional UTC hour to the "YYYY-MM-DDTHH:00" key the
+/// Open-Meteo hourly series use. Shared by the weather and AOD feeds so
+/// both sample the SAME prayer-relevant hour.
+pub(crate) fn hourly_target(date: &str, hour_utc: f64) -> String {
+    let hour = (hour_utc.rem_euclid(24.0)).round() as usize % 24;
+    format!("{}T{:02}:00", date, hour)
+}
+
+/// Fetch a URL body as text, retrying transient failures.
+pub(crate) fn fetch_text(url: &str) -> Result<String, WeatherError> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_millis(REQUEST_TIMEOUT_MS)))
         .build()
         .new_agent();
 
-    let body = crate::retry::with_retries(WeatherError::is_transient, || {
+    crate::retry::with_retries(WeatherError::is_transient, || {
         let mut response = agent
             .get(url)
             .call()
@@ -389,12 +396,24 @@ pub(crate) fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T,
             .body_mut()
             .read_to_string()
             .map_err(|e| WeatherError::from_ureq(e, url))
-    })?;
+    })
+}
 
-    serde_json::from_str(&body).map_err(|e| {
+/// Deserialize a JSON body fetched from `url` (context for errors).
+pub(crate) fn parse_json<T: serde::de::DeserializeOwned>(
+    body: &str,
+    url: &str,
+) -> Result<T, WeatherError> {
+    serde_json::from_str(body).map_err(|e| {
         let head: String = body.chars().take(200).collect();
         WeatherError::parse(format!("invalid JSON from {url}: {e} (body: {head})"))
     })
+}
+
+/// Fetch and deserialize JSON from a URL, retrying transient failures.
+pub(crate) fn fetch_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, WeatherError> {
+    let body = fetch_text(url)?;
+    parse_json(&body, url)
 }
 
 #[cfg(test)]

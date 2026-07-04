@@ -1,0 +1,9 @@
+site	engine_date	aod_date	aod_550	excess_550	aod_sigma	khayt_fajr_dep	khayt_fajr_time	khayt_fajr_pm_min	legacy_fajr_dep	sigma_crossing	sigma_skyglow_cal	sigma_skyglow_duty	sigma_aerosol	sigma_total_deg	extra
+assiut	2013-01-15	2026-01-15	0.05	0.0	0.04	14.85	05:39:16	5.4min	14.85	1.1095	0.0	0.0	0.3061	1.1509	--aerosol continental-average
+assiut	2013-04-15	2026-04-15	0.15	0.05	0.06	14.46	04:27:45	2.9min	14.53	0.1843	0.0	0.0	0.5802	0.6088	--aerosol continental-average
+assiut	2013-10-15	2025-10-15	0.32	0.22	0.094	13.01	04:59:57	1.3min	12.96	0.237	0.0	0.0	0.1599	0.2859	--aerosol continental-average
+birmingham	2015-12-10	2025-12-10	0.08	0.0	0.046	12.3	06:39:23	7.2min	13.77	0.0727	0.2034	0.937	0.3176	1.0126	--skyglow
+mecca	2015-12-21	2025-12-21	0.11	0.01	0.052	15.07	05:47:32	3.0min	14.52	0.4784	0.0	0.0	0.473	0.6727	
+tubruq	2010-01-15	2026-01-15	0.06	0.0	0.042	15.02	06:13:44	1.2min	14.77	0.2336	0.0	0.0	0.0686	0.2435	--albedo 0.06 --aerosol maritime-clean
+tubruq	2010-04-15	2026-04-15	0.38	0.28	0.106	8.73	05:17:05	21.2min	13.2	4.2248	0.0	0.0	0.4163	4.2452	--albedo 0.06 --aerosol maritime-clean
+tubruq	2010-07-15	2025-07-15	0.12	0.02	0.054	14.63	04:11:33	1.8min	14.82	0.1868	0.0	0.0	0.2359	0.3009	--albedo 0.06 --aerosol maritime-clean

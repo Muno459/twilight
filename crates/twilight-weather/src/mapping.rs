@@ -30,23 +30,57 @@ const CLOUD_COVER_THRESHOLD: f64 = 10.0;
 
 /// Map weather observations to aerosol properties.
 ///
-/// The key insight is that we use the *measured* AOD from the air quality
-/// API, not the default AOD for the type. The type selection only determines
-/// the other optical properties (SSA, asymmetry, Angstrom exponent, scale
-/// height) which depend on aerosol composition.
+/// The MEASURED AOD from the air quality API decides the optical depth;
+/// the type selection only determines the other optical properties
+/// (SSA, asymmetry, Angstrom exponent, scale height), which depend on
+/// aerosol composition.
 ///
-/// Type selection logic:
+/// EXCESS SEMANTICS (default since 2026-07): the engine's aerosol input
+/// expresses excess over the desert-calibration baseline, not absolute
+/// AOD - feeding an absolute value double-counts the aerosol the
+/// calibration air already contained (the Hail 14.46 -> 9.01 warning,
+/// RESULTS_CRITERION_SITES.md section 9.4/9.7). The measured value is
+/// therefore reduced by [`crate::aod::AOD_BASELINE_550`] (clamped at
+/// zero: air cleaner than the calibration baseline maps to NO aerosol,
+/// and the clamp is noted in the description). Type selection still
+/// uses the ABSOLUTE value, since composition indicators describe the
+/// real column. Set env `TWILIGHT_WEATHER_AOD=0` to opt back into the
+/// pre-2026-07 absolute behavior (for A/B comparison only; it
+/// double-counts and is not the production path).
+///
+/// Type selection logic (absolute AOD):
 /// - High dust (>20 ug/m3): Desert (coarse mineral particles, low Angstrom)
 /// - AOD > 0.20 with low dust: Urban (fine anthropogenic particles, high Angstrom)
 /// - AOD 0.08-0.20: ContinentalAverage
 /// - AOD 0.04-0.08: ContinentalClean
 /// - AOD < 0.04: no aerosol (pristine)
 pub fn map_aerosol(conditions: &WeatherConditions) -> Option<AerosolProperties> {
+    let legacy_absolute = std::env::var("TWILIGHT_WEATHER_AOD").is_ok_and(|v| v == "0");
+    map_aerosol_mode(conditions, !legacy_absolute)
+}
+
+/// [`map_aerosol`] with the excess/absolute mode explicit (testable
+/// without process-global env mutation).
+pub fn map_aerosol_mode(
+    conditions: &WeatherConditions,
+    excess_mode: bool,
+) -> Option<AerosolProperties> {
     let aod = conditions.aod_550;
 
     if aod < AOD_THRESHOLD {
         return None;
     }
+    let engine_aod = if excess_mode {
+        let excess = crate::aod::excess_over_baseline(aod);
+        if excess <= 0.0 {
+            // Measured air is at/below the calibration baseline: the
+            // no-aerosol atmosphere IS the closest expressible state.
+            return None;
+        }
+        excess
+    } else {
+        aod
+    };
 
     // Select type based on composition indicators.
     //
@@ -82,9 +116,9 @@ pub fn map_aerosol(conditions: &WeatherConditions) -> Option<AerosolProperties> 
     // Get the type's default properties for SSA, asymmetry, etc.
     let defaults = aerosol::default_properties(base_type);
 
-    // Override AOD with the measured value
+    // Override AOD with the measured value (excess in the default mode).
     Some(AerosolProperties {
-        aod_550: aod,
+        aod_550: engine_aod,
         ..defaults
     })
 }
@@ -332,20 +366,39 @@ pub fn describe(
 ) -> String {
     let mut parts = Vec::new();
 
-    // Aerosol description
+    // Aerosol description. Type names key off the ABSOLUTE measured
+    // AOD (composition of the real column); the engine value in
+    // `props.aod_550` is the excess over the calibration baseline.
     match aerosol {
+        None if conditions.aod_550 >= AOD_THRESHOLD => parts.push(format!(
+            "AOD {:.2} measured, at/below the calibration baseline {:.2} \
+             (running the calibration atmosphere; no excess aerosol)",
+            conditions.aod_550,
+            crate::aod::AOD_BASELINE_550
+        )),
         None => parts.push("Clear sky (pristine, AOD < 0.04)".to_string()),
         Some(props) => {
+            let abs_aod = conditions.aod_550;
             let type_name = if conditions.dust_ug_m3 > DUST_THRESHOLD {
                 "desert dust"
-            } else if props.aod_550 > 0.20 {
+            } else if abs_aod > 0.20 {
                 "urban haze"
-            } else if props.aod_550 > 0.08 {
+            } else if abs_aod > 0.08 {
                 "continental haze"
             } else {
                 "light haze"
             };
-            parts.push(format!("AOD {:.2} ({})", props.aod_550, type_name));
+            if (props.aod_550 - abs_aod).abs() > 1e-9 {
+                parts.push(format!(
+                    "AOD {:.2} measured ({}), excess {:.2} over calibration baseline {:.2}",
+                    abs_aod,
+                    type_name,
+                    props.aod_550,
+                    crate::aod::AOD_BASELINE_550
+                ));
+            } else {
+                parts.push(format!("AOD {:.2} ({})", abs_aod, type_name));
+            }
         }
     }
 
@@ -509,12 +562,17 @@ mod tests {
         c.relative_humidity = 85.0;
         c.pm2_5_ug_m3 = 4.0;
         c.pm10_ug_m3 = 18.0; // coarse sea salt
-        c.aod_550 = 0.10;
+        c.aod_550 = 0.15; // above the 0.10 baseline: excess 0.05
         let a = map_aerosol(&c).expect("aerosol expected");
         assert!(
             a.angstrom_exponent < 0.8,
             "marine air should select a maritime (low-Angstrom) type, got alpha={}",
             a.angstrom_exponent
+        );
+        assert!(
+            (a.aod_550 - 0.05).abs() < 1e-9,
+            "engine AOD should be the excess, got {}",
+            a.aod_550
         );
     }
     use crate::WeatherConditions;
@@ -551,19 +609,24 @@ mod tests {
     }
 
     #[test]
-    fn aod_at_threshold_produces_aerosol() {
+    fn aod_at_or_below_baseline_maps_to_no_excess_aerosol() {
+        // 0.05 is above the modeling threshold but below the 0.10
+        // calibration baseline: the calibration atmosphere already
+        // contains that much aerosol, so no excess input is produced.
         let mut c = base_conditions();
         c.aod_550 = 0.05;
-        assert!(map_aerosol(&c).is_some());
+        assert!(map_aerosol(&c).is_none());
+        // The pre-2026-07 absolute mode (A/B only) still produces one.
+        assert!(map_aerosol_mode(&c, false).is_some());
     }
 
     #[test]
-    fn continental_clean_range() {
+    fn legacy_absolute_mode_preserved_for_ab_comparison() {
         let mut c = base_conditions();
         c.aod_550 = 0.06;
         c.dust_ug_m3 = 0.0;
-        let props = map_aerosol(&c).unwrap();
-        // Continental clean has angstrom ~1.3
+        let props = map_aerosol_mode(&c, false).unwrap();
+        // Continental clean has angstrom ~1.3; absolute AOD travels.
         assert!((props.angstrom_exponent - 1.3).abs() < 0.01);
         assert!((props.aod_550 - 0.06).abs() < 0.001);
     }
@@ -574,8 +637,10 @@ mod tests {
         c.aod_550 = 0.15;
         c.dust_ug_m3 = 0.0;
         let props = map_aerosol(&c).unwrap();
+        // Type selected on the ABSOLUTE 0.15 (continental average);
+        // the engine carries the 0.05 excess over the baseline.
         assert!((props.angstrom_exponent - 1.3).abs() < 0.01);
-        assert!((props.aod_550 - 0.15).abs() < 0.001);
+        assert!((props.aod_550 - 0.05).abs() < 0.001);
     }
 
     #[test]
@@ -599,12 +664,12 @@ mod tests {
     }
 
     #[test]
-    fn measured_aod_always_used() {
+    fn measured_excess_always_used() {
         let mut c = base_conditions();
         c.aod_550 = 0.42;
         c.dust_ug_m3 = 0.0;
         let props = map_aerosol(&c).unwrap();
-        assert!((props.aod_550 - 0.42).abs() < 0.001);
+        assert!((props.aod_550 - 0.32).abs() < 0.001, "0.42 - 0.10 baseline");
     }
 
     // ── Cloud type selection ──

@@ -1258,6 +1258,11 @@ struct WeatherBlock {
     aerosol: Option<AerosolProperties>,
     cloud: Option<CloudProperties>,
     gas: Option<GasComposition>,
+    /// Input sigma of the measured AOD product (None: climatology
+    /// bracket applies downstream). Flows into
+    /// `PrayerTimeInput::aod_sigma_550` for the background-uncertainty
+    /// propagation.
+    aod_sigma_550: Option<f64>,
     description: String,
 }
 
@@ -1334,6 +1339,7 @@ fn weather_block(
                 aerosol: params.aerosol,
                 cloud: params.cloud,
                 gas: params.gas_composition,
+                aod_sigma_550: params.aod_sigma_550,
             }
         }
         Err(e) => {
@@ -1343,6 +1349,7 @@ fn weather_block(
                 aerosol: None,
                 cloud: None,
                 gas: None,
+                aod_sigma_550: None,
                 description: "US Standard 1976 (clear sky, weather fetch failed)".to_string(),
             }
         }
@@ -1707,7 +1714,12 @@ fn resolve_skyglow(args: &PrayArgs, year: i32, month: i32, day: i32) -> Option<S
         }
     };
 
-    let result = twilight_skyglow::quick_estimate_at_angle(radiance, args.led_fraction, 10.0);
+    // The legacy scan observes at VIEW_ZENITH_DEG = 85 (5 deg elevation);
+    // the injected veil must be lifted for THAT elevation, not a
+    // hard-coded 10 deg (which under-veiled the legacy path by the
+    // 5-vs-10-deg enhancement ratio: urban legacy fajr ~1 min early,
+    // review round 2).
+    let result = twilight_skyglow::quick_estimate_at_angle(radiance, args.led_fraction, 5.0);
     let lum_mcd = twilight_skyglow::bortle::radiance_to_zenith_luminance(radiance);
     println!(
         "Skyglow:    Bortle {}, zenith {:.2} mcd/m^2, LED fraction {:.0}%",
@@ -1738,21 +1750,21 @@ fn build_input(
     solar_f107: Option<f64>,
 ) -> PrayerTimeInput {
     let (year, month, day) = date;
-    let (aerosol_type, cloud_type, custom_aerosol, custom_cloud, o3_du, no2_density) = match weather
-    {
-        Some(w) => {
-            let (o3, no2) = w
-                .gas
-                .map(|gc| (gc.o3_column_du, gc.no2_surface_density))
-                .unwrap_or((None, None));
-            (None, None, w.aerosol, w.cloud, o3, no2)
-        }
-        None => {
-            let at = args.aerosol.to_aerosol_type();
-            let ct = args.cloud.to_cloud_type();
-            (at, ct, None, None, None, None)
-        }
-    };
+    let (aerosol_type, cloud_type, custom_aerosol, custom_cloud, o3_du, no2_density, aod_sigma) =
+        match weather {
+            Some(w) => {
+                let (o3, no2) = w
+                    .gas
+                    .map(|gc| (gc.o3_column_du, gc.no2_surface_density))
+                    .unwrap_or((None, None));
+                (None, None, w.aerosol, w.cloud, o3, no2, w.aod_sigma_550)
+            }
+            None => {
+                let at = args.aerosol.to_aerosol_type();
+                let ct = args.cloud.to_cloud_type();
+                (at, ct, None, None, None, None, None)
+            }
+        };
     PrayerTimeInput {
         latitude: args.lat,
         longitude: args.lon,
@@ -1768,6 +1780,7 @@ fn build_input(
         cloud_type,
         custom_aerosol,
         custom_cloud,
+        aod_sigma_550: aod_sigma,
         de440_path: args.de440.clone(),
         scattering_mode: args.scattering.to_scattering_mode(),
         photons_per_wavelength: args.photons,

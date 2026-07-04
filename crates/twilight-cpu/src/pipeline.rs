@@ -60,8 +60,21 @@ pub struct PrayerTimeInput {
     /// Cloud type. None for clear sky.
     pub cloud_type: Option<CloudType>,
     /// Custom aerosol properties (overrides aerosol_type when set).
-    /// Used by the weather API integration to pass measured AOD values.
+    /// Used by the weather API integration to pass measured AOD values;
+    /// by the excess convention (RESULTS_CRITERION_SITES.md section
+    /// 9.7) `aod_550` here carries the excess over the engine's
+    /// desert-calibration baseline, not an absolute column.
     pub custom_aerosol: Option<AerosolProperties>,
+    /// 1-sigma uncertainty [AOD550] of the aerosol input, when it is a
+    /// MEASURED value with a product uncertainty (the weather AOD feed:
+    /// `twilight_weather::AtmosphericParams::aod_sigma_550`; CLI wiring
+    /// is one line in `build_input`, interim switch is the env var
+    /// TWILIGHT_AOD_SIGMA_550). None with `custom_aerosol` set falls
+    /// back to the CAMS envelope; None with only `aerosol_type` set
+    /// means a climatology guess and gets the bracket sigma
+    /// ([`AOD_CLIMATOLOGY_SIGMA`]). Feeds the background-uncertainty
+    /// propagation only - never the transport.
+    pub aod_sigma_550: Option<f64>,
     /// Custom cloud properties (overrides cloud_type when set).
     /// Used by the weather API integration to pass derived cloud params.
     pub custom_cloud: Option<CloudProperties>,
@@ -140,6 +153,7 @@ impl Default for PrayerTimeInput {
             aerosol_type: None,
             cloud_type: None,
             custom_aerosol: None,
+            aod_sigma_550: None,
             custom_cloud: None,
             cloud_layers: None,
             cloud_field: None,
@@ -221,11 +235,14 @@ const FIT_WINDOW_DEG: f64 = 0.6;
 const EXTINCTION_K_GAS: f64 = 0.16;
 
 /// Aerosol V-band extinction per unit AOD at 550 nm [mag/airmass]; the
-/// measured AOD from the weather feed converts through this slope.
+/// measured EXCESS AOD from the weather feed converts through this
+/// slope on top of the baseline term below.
 const EXTINCTION_K_PER_AOD: f64 = 1.2;
 
-/// Assumed aerosol extinction term [mag/airmass] when no measured AOD
-/// is available (clear continental background).
+/// Baseline aerosol extinction term [mag/airmass]: the clean
+/// calibration-baseline air (clear continental background). Always
+/// present; aerosol inputs express EXCESS over it (section 9.7), so
+/// their contribution ADDS to this term instead of replacing it.
 const EXTINCTION_K_DEFAULT_AEROSOL: f64 = 0.05;
 
 /// Celestial-background refloat trigger: re-float the detection
@@ -233,6 +250,52 @@ const EXTINCTION_K_DEFAULT_AEROSOL: f64 = 0.05;
 /// the dark-sky constant by more than this fraction (moonlit nights,
 /// strong airglow, Milky Way pointing).
 const REFLOAT_TRIGGER_FRACTION: f64 = 0.25;
+
+// ── Background-input uncertainty constants ─────────────────────────
+//
+// The transport is validated; the criterion's residual error at
+// non-desert sites is the QUALITY OF THE BACKGROUND INPUTS - the
+// skyglow atlas value and the aerosol optical depth
+// (validation/RESULTS_CRITERION_SITES.md section 9). These constants
+// turn the documented input uncertainties into crossing-SZA sigma
+// terms, so every reported prayer-time uncertainty carries them
+// instead of silently pretending the inputs were exact.
+
+/// 1-sigma ln-uncertainty of the artificial-skyglow veil taken from the
+/// radiance atlas. Falchi et al. 2016 validate the world atlas against
+/// ground SQM/photometer campaigns at ~20-30 percent of radiance; the
+/// Lorenz 2024 tiles inherit the method. 0.30 ln units (~ +35/-26
+/// percent) covers that calibration plus a near-epoch drift allowance.
+/// DECADE-scale epoch extrapolation (a 2015 run against the 2024 atlas)
+/// is larger (section 9.1 measured a residual factor ~2 at Birmingham)
+/// and is NOT claimed here; it appears as an honest validation residual
+/// instead of being laundered into every run's sigma.
+const SKYGLOW_ATLAS_SIGMA_LN: f64 = 0.30;
+
+/// Aerosol lever in LN-MARGIN units per unit excess AOD550.
+///
+/// Provenance: the section 9 bracket runs measured the crossing shift
+/// at 13-17 deg per unit excess AOD (single pinned engine, nothing
+/// fitted):
+///   Assiut     (14.15 - 13.01) / (0.12 - 0.05) = 16.3 deg/AOD
+///   Birmingham (14.98 - 14.11) / 0.05 = 17.4;
+///              (14.11 - 13.17) / 0.07 = 13.4
+///   Tubruq     (14.95 - 13.94) / 0.06 = 16.8
+/// Those shifts were realized on margin curves whose measured slope is
+/// 0.29-0.44 dex/deg (center 0.365 dex/deg = 0.84 ln/deg, section 9.1),
+/// so the underlying ln-margin sensitivity is ~16 x 0.84 = 13.5 ln per
+/// unit AOD. Dividing by the crossing's OWN measured slope reproduces
+/// both the typical 16 deg/AOD lever and the measured immunity of
+/// cliff-shaped crossings (Birmingham Jun 22: "a background input
+/// cannot and should not move it, and measurably does not").
+const AOD_LEVER_LN_PER_AOD: f64 = 13.5;
+
+/// 1-sigma [AOD550] assigned to a CLIMATOLOGY aerosol input (a type
+/// constant guessed for the site, no measured value). The engine's own
+/// validation bracket for unknown non-desert air is clean-to-average,
+/// excess 0.05 to 0.12 (sections 9.4/9.6); treated as a uniform
+/// distribution over that span: (0.12 - 0.05) / sqrt(12) ~ 0.0202.
+const AOD_CLIMATOLOGY_SIGMA: f64 = 0.07 / 3.464_101_615_137_754_4;
 
 /// Which solar position engine was used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -679,6 +742,10 @@ fn build_atmosphere(input: &PrayerTimeInput) -> twilight_core::atmosphere::Atmos
 /// When `de440_path` is set in the input, the pipeline uses JPL DE440
 /// for all solar position computations. Otherwise falls back to SPA.
 pub fn compute_prayer_times(input: &PrayerTimeInput) -> PrayerTimeOutput {
+    // Interim measured-AOD switches (TWILIGHT_AOD_EXCESS_550 /
+    // TWILIGHT_AOD_SIGMA_550) until the CLI flags are wired.
+    let env_override = background_env_input(input);
+    let input = env_override.as_ref().unwrap_or(input);
     let atm = build_atmosphere(input);
     // The field is captured by the scan closure (ScanFn stays
     // reference-free); Cloud3DField is a Copy view over the owned data.
@@ -776,6 +843,10 @@ pub fn compute_prayer_times_gpu(
 ) -> PrayerTimeOutput {
     use crate::gpu_dispatch;
 
+    // Interim measured-AOD switches, same as the CPU entry (idempotent,
+    // so the CPU-routing fallback below re-applying them is harmless).
+    let env_override = background_env_input(input);
+    let input = env_override.as_ref().unwrap_or(input);
     let atm = build_atmosphere(input);
 
     // Cloud routing BEFORE any GPU call: see gpu_route_to_cpu_reason.
@@ -1024,11 +1095,18 @@ fn night_sky_total(
         view_zenith_deg,
         view_azimuth_deg: az,
         solar_f107: input.solar_f107.unwrap_or(130.0),
+        // Excess semantics: the aerosol input (custom or type constant)
+        // expresses EXCESS over the calibration baseline, so the
+        // night-sky extinction is gas + the baseline aerosol term + the
+        // excess converted through the AOD slope.
         extinction_k: EXTINCTION_K_GAS
-            + input
-                .custom_aerosol
-                .map(|a| EXTINCTION_K_PER_AOD * a.aod_550)
-                .unwrap_or(EXTINCTION_K_DEFAULT_AEROSOL),
+            + EXTINCTION_K_DEFAULT_AEROSOL
+            + EXTINCTION_K_PER_AOD
+                * input
+                    .custom_aerosol
+                    .or_else(|| input.aerosol_type.map(aerosol::default_properties))
+                    .map(|a| a.aod_550)
+                    .unwrap_or(0.0),
     };
     // Real JPL ephemeris for the Moon when the BSP is loaded; truncated
     // Meeus series otherwise.
@@ -1057,12 +1135,16 @@ fn night_sky_total(
 /// [`crate::khayt`]). All times are local fractional hours.
 ///
 /// Every event carries its honest resolution: `*_sigma_deg` is the
-/// total 1-sigma crossing uncertainty in SZA (MC noise + residual
-/// refinement-bracket quantization + Jensen bias bound, see
-/// [`crate::khayt::KhaytCrossing::sigma_deg`]) and `*_uncertainty_min`
-/// is the same propagated to the clock minute through the local
-/// dt/dSZA slope. A caller printing a khayt time should print the
-/// minute uncertainty next to it.
+/// total 1-sigma crossing uncertainty in SZA - the crossing's own term
+/// (MC noise + residual refinement-bracket quantization + Jensen bias
+/// bound, see [`crate::khayt::KhaytCrossing::sigma_deg`]) root-sum-
+/// squared with the BACKGROUND-INPUT term (skyglow atlas calibration,
+/// street-light duty cycle, aerosol input; see [`BackgroundSigma`]) -
+/// and `*_uncertainty_min` is the same propagated to the clock minute
+/// through the local dt/dSZA slope. The background component alone is
+/// reported in `*_background_sigma_deg` so callers (and the
+/// TWILIGHT_KHAYT_DEBUG dump) can inspect the split. A caller printing
+/// a khayt time should print the minute uncertainty next to it.
 #[derive(Debug, Clone, Default)]
 pub struct KhaytTimes {
     /// Fajr sadiq: white-thread distinctness WITH lateral spread.
@@ -1070,6 +1152,9 @@ pub struct KhaytTimes {
     pub fajr_sza_deg: Option<f64>,
     pub fajr_sigma_deg: Option<f64>,
     pub fajr_uncertainty_min: Option<f64>,
+    /// Background-input share of `fajr_sigma_deg` (None when the run
+    /// carries no background inputs to be uncertain about).
+    pub fajr_background_sigma_deg: Option<f64>,
     /// Al-fajr al-kadhib: central distinctness without spread (the
     /// zodiacal wedge), when it precedes sadiq.
     pub kadhib_time: Option<f64>,
@@ -1079,11 +1164,15 @@ pub struct KhaytTimes {
     pub isha_ahmar_sza_deg: Option<f64>,
     pub isha_ahmar_sigma_deg: Option<f64>,
     pub isha_ahmar_uncertainty_min: Option<f64>,
+    /// Background-input share of `isha_ahmar_sigma_deg`.
+    pub isha_ahmar_background_sigma_deg: Option<f64>,
     /// Isha per shafaq al-abyad (white distinctness disappears) - Hanafi.
     pub isha_abyad_time: Option<f64>,
     pub isha_abyad_sza_deg: Option<f64>,
     pub isha_abyad_sigma_deg: Option<f64>,
     pub isha_abyad_uncertainty_min: Option<f64>,
+    /// Background-input share of `isha_abyad_sigma_deg`.
+    pub isha_abyad_background_sigma_deg: Option<f64>,
     /// Contrast margin per band azimuth at the Fajr crossing (diagnostic).
     pub fajr_margins: Vec<f64>,
 }
@@ -1097,34 +1186,275 @@ pub struct KhaytTimes {
 /// (its struct doc says cd/m^2; the producer and its named inverse
 /// `zenith_luminance_to_radiance(luminance_mcd)` disagree with that
 /// doc, and every mcd-labeled display field agrees with the producer).
-/// The khayt patch photometry is in cd/m^2, so the veil is
+/// The khayt patch photometry is MESOPIC cd/m^2, so the veil is read
+/// from the calibrated spectrum's own mesopic and red bands, lifted by
+/// enhancement_factor(elev); the spectrum is calibrated so that its
+/// photopic luminance equals zenith_luminance * 1e-3 exactly, which
+/// ties the whole veil to the Falchi rail while weighting it by the
+/// source's real spectrum (HPS vs LED).
 ///
-///   veil = zenith_luminance [mcd/m^2] * 1e-3 * enhancement_factor(elev)
-///
-/// Before 2026-07 the 1e-3 was missing here: every --skyglow/--bortle
-/// khayt output overstated the artificial veil by three orders of
-/// magnitude (a Bortle-6 city veiled the dawn band like a floodlight).
-/// The red share comes from the skyglow's own spectrum (HPS/LED mix).
+/// History: before 2026-07 the 1e-3 was missing (a 1000x veil,
+/// Bortle-6 like a floodlight), and after that fix the PHOTOPIC value
+/// was used directly as the mesopic veil (over-veiling HPS cities);
+/// both are pinned by `khayt_skyglow_veil_unit_pin`.
 fn khayt_skyglow_veil(sg: &SkyglowResult, band_zenith_deg: f64) -> (f64, f64) {
     let elev = 90.0 - band_zenith_deg;
     let lift = twilight_skyglow::angular::enhancement_factor(elev);
-    let mes = sg.zenith_luminance * 1e-3 * lift;
-    // Red share from the skyglow's own spectrum (HPS vs LED mix).
+    // The Falchi zenith value is a PHOTOPIC luminance; the khayt patch
+    // photometry is mesopic. The spectral radiance is calibrated so that
+    // photopic(spectral) == zenith_luminance * 1e-3 exactly (one
+    // photometric rail, twilight-skyglow), so the spectrum's own mesopic
+    // and red bands ARE the correctly weighted veil: an HPS-heavy city
+    // (scotopic-poor) veils the mesopic band LESS than its photopic
+    // value, an LED city slightly more. Using the photopic value
+    // directly as mesopic over-veiled HPS cities (review round 2).
     let n = sg.num_wavelengths.min(sg.spectral_radiance.len());
     let wl: Vec<f64> = (0..n).map(|i| 380.0 + 10.0 * i as f64).collect();
     let mes_s = twilight_threshold::luminance::mesopic_luminance(&wl, &sg.spectral_radiance[..n]);
     let red_s = twilight_threshold::luminance::red_band_luminance(&wl, &sg.spectral_radiance[..n]);
-    let red_frac = if mes_s > 1e-30 { red_s / mes_s } else { 0.3 };
-    (mes, mes * red_frac)
+    if mes_s > 1e-30 {
+        (mes_s * lift, red_s * lift)
+    } else {
+        // No spectrum (zero radiance): no veil.
+        (0.0, 0.0)
+    }
+}
+
+// ── Background-input uncertainty propagation ───────────────────────
+
+/// Background-input contribution to one crossing's 1-sigma [deg SZA].
+/// Kept as separate terms so the debug dump (TWILIGHT_KHAYT_DEBUG) and
+/// tests can inspect each; the pipeline folds the RSS total into the
+/// crossing sigma.
+#[derive(Debug, Clone, Copy, Default)]
+struct BackgroundSigma {
+    /// Skyglow atlas calibration/epoch term.
+    skyglow_cal_deg: f64,
+    /// Street-light duty-cycle (bimodal veil) term.
+    skyglow_duty_deg: f64,
+    /// Aerosol-input term (climatology bracket or measured product).
+    aerosol_deg: f64,
+}
+
+impl BackgroundSigma {
+    fn total_deg(&self) -> f64 {
+        (self.skyglow_cal_deg * self.skyglow_cal_deg
+            + self.skyglow_duty_deg * self.skyglow_duty_deg
+            + self.aerosol_deg * self.aerosol_deg)
+            .sqrt()
+    }
+
+    /// Root-sum-square the background total with the crossing's own
+    /// sigma (MC + bracket + Jensen): independent error sources.
+    fn fold_into(&self, sigma_deg: f64) -> f64 {
+        let b = self.total_deg();
+        (sigma_deg * sigma_deg + b * b).sqrt()
+    }
+}
+
+/// The khayt detection target modulo constant factors:
+/// L_ref x C_thr(L_ref). The k_contrast and edge factors are the same
+/// on both sides of any perturbation, so they cancel in every RATIO of
+/// targets - which is all the propagation uses.
+fn khayt_target(l_ref: f64) -> f64 {
+    let l = l_ref.max(1e-12);
+    l * threshold::contrast_threshold_weber(l)
+}
+
+/// Skyglow veil sigma terms [deg] on a khayt crossing:
+/// (atlas calibration, street-light duty cycle).
+///
+/// MECHANISM (measured, section 9.1/9.3): the veil raises the reference
+/// ("black thread") patches. A time-constant veil cancels in the margin
+/// NUMERATOR (the per-patch night baseline subtracts it) but inflates
+/// the detection TARGET L_ref x k x C_thr(L_ref); a target inflation of
+/// d ln-units moves the crossing by d / |slope|, with slope the
+/// crossing's own measured d(ln margin)/dSZA (0.29-0.44 dex/deg =
+/// 0.67-1.01 ln/deg on the Birmingham margin curves; the Bortle ladder
+/// validated this arithmetic to 0.04-0.06 deg in the small-veil
+/// regime, section 9.3).
+///
+/// - CALIBRATION term: the atlas radiance uncertainty
+///   ([`SKYGLOW_ATLAS_SIGMA_LN`]), propagated by symmetric ln
+///   perturbation of the veiled target.
+/// - DUTY-CYCLE term: where street lighting DOMINATES the reference
+///   sky, the nightly veil is BIMODAL, not merely noisy - part-night
+///   switching (the UK 00:30-05:30 pattern, section 9.3) toggles the
+///   reference between the full atlas veil (lights on) and the natural
+///   sky (lights off), and no data feed carries the schedule. Modeled
+///   as an equal-probability two-point distribution: sigma = half the
+///   on/off crossing shift. The true distribution is also ASYMMETRIC
+///   (lights-off can only move fajr EARLIER/deeper); KhaytTimes carries
+///   one number per event, so the widened symmetric sigma is reported
+///   and the asymmetry lives in this comment and the debug dump.
+fn skyglow_sigma_terms(
+    natural_ref: f64,
+    veil: f64,
+    slope_ln_per_deg: f64,
+    duty_cycle: bool,
+) -> (f64, f64) {
+    if veil <= 0.0 || natural_ref <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let sa = slope_ln_per_deg.abs().max(1e-3);
+    let s = SKYGLOW_ATLAS_SIGMA_LN;
+    let hi = khayt_target(natural_ref + veil * libm::exp(s));
+    let lo = khayt_target(natural_ref + veil * libm::exp(-s));
+    let cal = libm::log(hi / lo).abs() / 2.0 / sa;
+    let duty = if duty_cycle {
+        let on = khayt_target(natural_ref + veil);
+        let off = khayt_target(natural_ref);
+        libm::log(on / off).abs() / 2.0 / sa
+    } else {
+        0.0
+    };
+    (cal, duty)
+}
+
+/// Aerosol sigma term [deg] on a crossing: the measured ln-margin lever
+/// ([`AOD_LEVER_LN_PER_AOD`]) times the AOD-input sigma, over the
+/// crossing's own ln-slope.
+fn aerosol_sigma_deg(sigma_aod: f64, slope_ln_per_deg: f64) -> f64 {
+    if sigma_aod <= 0.0 {
+        return 0.0;
+    }
+    AOD_LEVER_LN_PER_AOD * sigma_aod / slope_ln_per_deg.abs().max(1e-3)
+}
+
+/// Resolve the 1-sigma AOD550 uncertainty of THIS run's aerosol input.
+///
+/// Priority:
+/// 1. an explicit product sigma (`aod_sigma_550`, wired or via the
+///    interim env TWILIGHT_AOD_SIGMA_550);
+/// 2. a `custom_aerosol` without a wired sigma: the CAMS envelope
+///    0.03 + 0.2 x AOD applied to the excess it carries (a slight
+///    understatement of the absolute-value envelope; the baseline share
+///    of the error largely cancels in the excess by construction);
+/// 3. a guessed `aerosol_type` climatology constant: the clean-to-
+///    average bracket sigma ([`AOD_CLIMATOLOGY_SIGMA`]);
+/// 4. no aerosol input: nothing to propagate (None).
+///
+/// CLAMP ASYMMETRY (cases 1-2, measured values only): the engine input
+/// is the excess over the calibration baseline, floored at zero, so
+/// near the baseline the product error is ONE-SIDED - the excess cannot
+/// excurse down by more than itself. The measured-value sigma is
+/// therefore the mean of its two sides,
+///     sigma_eff = (sigma + min(sigma, excess)) / 2:
+/// the full product sigma when the excess is comfortably positive, half
+/// at the clamp (measured at/below the baseline: only the upward half
+/// can move the answer), and the widened-symmetric stand-in for the
+/// skewed truth in between (KhaytTimes carries one number per event;
+/// the asymmetry is documented here and visible in the debug dump).
+/// A climatology bracket sigma is on the excess directly and is not
+/// clamp-adjusted.
+fn aerosol_input_aod_sigma(input: &PrayerTimeInput) -> Option<f64> {
+    let excess = input
+        .custom_aerosol
+        .map(|a| a.aod_550.max(0.0))
+        .unwrap_or(0.0);
+    let one_sided = |s: f64| (s + s.min(excess)) / 2.0;
+    if let Some(s) = input.aod_sigma_550 {
+        let s = s.max(0.0);
+        // A wired product sigma next to a TYPE-only input (no measured
+        // custom excess) carries no clamp information: use as given.
+        if input.custom_aerosol.is_none() && input.aerosol_type.is_some() {
+            return Some(s);
+        }
+        return Some(one_sided(s));
+    }
+    if input.custom_aerosol.is_some() {
+        return Some(one_sided(0.03 + 0.20 * excess));
+    }
+    if input.aerosol_type.is_some() {
+        return Some(AOD_CLIMATOLOGY_SIGMA);
+    }
+    None
+}
+
+/// Street-light duty-cycle mode from the environment:
+/// TWILIGHT_SKYGLOW_DUTY_CYCLE=0 declares the lights steady all night
+/// (calibration term only), =1 forces the bimodal term; unset = AUTO
+/// (`None`): the caller applies the term when the artificial veil
+/// exceeds the natural reference sky - a veil-DOMINATED reference is
+/// exactly the regime where part-night switching flips the answer.
+fn skyglow_duty_cycle_env() -> Option<bool> {
+    match std::env::var("TWILIGHT_SKYGLOW_DUTY_CYCLE") {
+        Ok(v) if v == "0" => Some(false),
+        Ok(v) if v == "1" => Some(true),
+        _ => None,
+    }
+}
+
+fn env_f64(name: &str) -> Option<f64> {
+    std::env::var(name).ok().and_then(|v| v.parse::<f64>().ok())
+}
+
+/// Apply the measured-AOD overrides to a run input. `excess` replaces
+/// the aerosol input with the given excess-over-baseline AOD550
+/// (<= 0 = run the calibration atmosphere, no excess aerosol); `sigma`
+/// sets the product uncertainty. Returns None when nothing changes.
+///
+/// The optical CARRIER for a positive excess is the existing
+/// custom_aerosol, else the aerosol_type default, else
+/// continental-average optics - the same mid-range convention the
+/// weather mapping applies to unclassified haze.
+fn apply_background_overrides(
+    input: &PrayerTimeInput,
+    excess: Option<f64>,
+    sigma: Option<f64>,
+) -> Option<PrayerTimeInput> {
+    if excess.is_none() && sigma.is_none() {
+        return None;
+    }
+    let mut out = input.clone();
+    if let Some(e) = excess {
+        if e > 0.0 {
+            let carrier = input
+                .custom_aerosol
+                .or_else(|| input.aerosol_type.map(aerosol::default_properties))
+                .unwrap_or_else(|| {
+                    aerosol::default_properties(AerosolType::ContinentalAverage)
+                });
+            out.custom_aerosol = Some(AerosolProperties {
+                aod_550: e,
+                ..carrier
+            });
+        } else {
+            out.custom_aerosol = None;
+            out.aerosol_type = None;
+        }
+    }
+    if let Some(s) = sigma {
+        out.aod_sigma_550 = Some(s.max(0.0));
+    }
+    Some(out)
+}
+
+/// Interim env switches for the measured-AOD path, applied at both
+/// pipeline entry points. The CLI flag wiring (one line each, owned by
+/// the CLI work stream) supersedes these:
+/// - TWILIGHT_AOD_EXCESS_550: excess-over-baseline AOD550 for this run
+///   (`twilight_weather::aod::fetch_aod_550_at` produces it);
+/// - TWILIGHT_AOD_SIGMA_550: its 1-sigma product uncertainty.
+fn background_env_input(input: &PrayerTimeInput) -> Option<PrayerTimeInput> {
+    apply_background_overrides(
+        input,
+        env_f64("TWILIGHT_AOD_EXCESS_550"),
+        env_f64("TWILIGHT_AOD_SIGMA_550"),
+    )
 }
 
 /// The khayt al-abyad pass: simulate the fan of sky patches, compose
 /// per-patch totals (MCRT + celestial background + skyglow), and detect
 /// the Quranic contrast events on both sides of the night.
 ///
-/// The MCRT radiance depends only on (SZA, relative azimuth), so ONE fan
-/// scan serves both Fajr and Isha; only the celestial background (moon,
-/// zodiacal geometry) is evaluated per side.
+/// The MCRT radiance depends only on (SZA, relative azimuth) when the
+/// atmosphere is invariant under rotation about the observer, and then
+/// ONE fan scan serves both Fajr and Isha with only the celestial
+/// background (moon, zodiacal geometry) evaluated per side. Terrain and
+/// a georeferenced 3D cloud field break that symmetry: the sides then
+/// get separate fans, and under a field the sun is placed at each
+/// side's real absolute azimuth (see `field_asymmetric` below).
 ///
 /// RESOLUTION CHAIN: the fan is scanned at 1 deg SZA steps (cost:
 /// every step is band+ref directions x K seeds of MCRT), then EVERY
@@ -1184,6 +1514,17 @@ fn khayt_pass(
     };
     let sun_az_morning = side_sun_azimuth(engine, true);
     let sun_az_evening = side_sun_azimuth(engine, false);
+    // A georeferenced 3D cloud field breaks the azimuthal symmetry the
+    // shared fan relies on: MCRT radiance is a function of (SZA,
+    // relative azimuth) ONLY when the atmosphere is invariant under
+    // rotation about the observer, which a voxel field is not. Under a
+    // field the sun must be placed at each side's REAL absolute azimuth
+    // so dawn rays cross the actual eastern sky (a cloud bank east of
+    // the observer must dim the fajr band and must NOT dim isha). The
+    // remaining within-side azimuth drift between the mid-scan anchor
+    // and the crossing (~10-20 deg) is a stated approximation; the
+    // corrected error was the wrong-SIDE placement (up to 180 deg).
+    let field_asymmetric = input.cloud_field.is_some();
 
     // ── MCRT fan: per-direction luminance curves. Side-independent
     // unless terrain forces per-side patch elevations.
@@ -1202,10 +1543,26 @@ fn khayt_pass(
     // The K-seed protocol of the fan: identical for the coarse scan and
     // for every refinement point.
     const FAN_K_SEEDS: usize = 2;
-    let sim_dir = |offset: f64, view_zenith: f64, sza_list: &[f64]| -> Vec<DirSample> {
+    let sim_dir = |offset: f64,
+                   view_zenith: f64,
+                   sza_list: &[f64],
+                   sun_az_abs: Option<f64>|
+     -> Vec<DirSample> {
         let mut cfg = base_config.clone();
         cfg.view_zenith = view_zenith;
-        cfg.view_azimuth = Some(base_config.solar_azimuth + offset);
+        match sun_az_abs {
+            // Azimuth-asymmetric atmosphere (3D cloud field): sun at the
+            // side's real absolute azimuth, view offset from it.
+            Some(az) => {
+                cfg.solar_azimuth = az;
+                cfg.view_azimuth = Some(az + offset);
+            }
+            // Azimuth-symmetric: the relative frame is exact and lets
+            // both sides share one fan.
+            None => {
+                cfg.view_azimuth = Some(base_config.solar_azimuth + offset);
+            }
+        }
         let stats = scan_szas_with_stats(atm, &cfg, sza_list, FAN_K_SEEDS, scan, scan_list);
         stats
             .results
@@ -1247,17 +1604,18 @@ fn khayt_pass(
             .iter()
             .map(|&o| zenith_for(sun_az, o))
             .collect();
+        let az_abs = if field_asymmetric { sun_az } else { None };
         let band: Vec<Vec<DirSample>> = params
             .band_offsets_deg
             .iter()
             .zip(&band_z)
-            .map(|(&o, &z)| sim_dir(o, z, &szas))
+            .map(|(&o, &z)| sim_dir(o, z, &szas, az_abs))
             .collect();
         let refs: Vec<Vec<DirSample>> = params
             .ref_offsets_deg
             .iter()
             .zip(&ref_z)
-            .map(|(&o, &z)| sim_dir(o, z, &szas))
+            .map(|(&o, &z)| sim_dir(o, z, &szas, az_abs))
             .collect();
         (band, refs, band_z, ref_z)
     };
@@ -1273,12 +1631,13 @@ fn khayt_pass(
             .iter()
             .any(|&az| h.angle_at(az) + 1.0 > 90.0 - params.band_zenith_deg)
     });
-    let (band_mcrt, ref_mcrt, band_z_m, ref_z_m) = fan_for(if terrain_active {
+    let sides_split = terrain_active || field_asymmetric;
+    let (band_mcrt, ref_mcrt, band_z_m, ref_z_m) = fan_for(if sides_split {
         sun_az_morning
     } else {
         None
     });
-    let (band_mcrt_e, ref_mcrt_e, band_z_e, ref_z_e) = if terrain_active {
+    let (band_mcrt_e, ref_mcrt_e, band_z_e, ref_z_e) = if sides_split {
         fan_for(sun_az_evening)
     } else {
         (band_mcrt.clone(), ref_mcrt.clone(), band_z_m.clone(), ref_z_m.clone())
@@ -1288,9 +1647,24 @@ fn khayt_pass(
     // (azimuthal structure of city glow is unknown from the atlas; an
     // equal veil still raises adaptation and suppresses contrast, which
     // is its physically dominant effect on detection).
-    let (sg_mes, sg_red) = match &input.skyglow {
-        Some(sg) => khayt_skyglow_veil(sg, params.band_zenith_deg),
-        None => (0.0, 0.0),
+    // The veil's angular lift depends on the patch elevation, and
+    // terrain RAISES patches (band_z drops below params.band_zenith_deg):
+    // a valley urban site must not keep the 3-degree-ring lift on
+    // patches that actually sit at 10 degrees (review round 2). One
+    // veil per side at that side's mean band zenith; the per-patch
+    // spread within a side is second order in the lift curve.
+    let side_veil = |band_z: &[f64]| -> (f64, f64) {
+        match &input.skyglow {
+            Some(sg) => {
+                let mean_z = if band_z.is_empty() {
+                    params.band_zenith_deg
+                } else {
+                    band_z.iter().sum::<f64>() / band_z.len() as f64
+                };
+                khayt_skyglow_veil(sg, mean_z)
+            }
+            None => (0.0, 0.0),
+        }
     };
 
     // ── Celestial background per patch per side: anchors in SZA,
@@ -1353,7 +1727,8 @@ fn khayt_pass(
     // background and skyglow are deterministic addends, so they DILUTE
     // the relative MC error of the total; the PatchLum rel SEs are the
     // MCRT SEs rescaled by the MCRT share of the total.
-    let patch_from = |d: &DirSample, bg: f64| -> PatchLum {
+    let patch_from = |d: &DirSample, bg: f64, veil: (f64, f64)| -> PatchLum {
+        let (sg_mes, sg_red) = veil;
         let mes = d.mes + bg + sg_mes;
         let red = d.red + bg * params.celestial_red_fraction + sg_red;
         PatchLum {
@@ -1374,14 +1749,15 @@ fn khayt_pass(
 
     let assemble = |anchors: &[(f64, Vec<f64>, Vec<f64>)],
                     bm: &[Vec<DirSample>],
-                    rm: &[Vec<DirSample>]|
+                    rm: &[Vec<DirSample>],
+                    veil: (f64, f64)|
      -> KhaytScan {
         let band = szas
             .iter()
             .enumerate()
             .map(|(i, &sza)| {
                 (0..params.band_offsets_deg.len())
-                    .map(|j| patch_from(&bm[j][i], interp(anchors, sza, j, false)))
+                    .map(|j| patch_from(&bm[j][i], interp(anchors, sza, j, false), veil))
                     .collect()
             })
             .collect();
@@ -1390,7 +1766,7 @@ fn khayt_pass(
             .enumerate()
             .map(|(i, &sza)| {
                 (0..params.ref_offsets_deg.len())
-                    .map(|j| patch_from(&rm[j][i], interp(anchors, sza, j, true)))
+                    .map(|j| patch_from(&rm[j][i], interp(anchors, sza, j, true), veil))
                     .collect()
             })
             .collect();
@@ -1409,7 +1785,12 @@ fn khayt_pass(
     // across events and (terrain-inactive) across sides; only the
     // celestial-background composition differs per side.
     let mcrt_cache: RefCell<HashMap<(u8, i64), Vec<DirSample>>> = RefCell::new(HashMap::new());
-    let fan_rows = |side_key: u8, band_z: &[f64], ref_z: &[f64], sza: f64| -> Vec<DirSample> {
+    let fan_rows = |side_key: u8,
+                    sun_az_abs: Option<f64>,
+                    band_z: &[f64],
+                    ref_z: &[f64],
+                    sza: f64|
+     -> Vec<DirSample> {
         let key = (side_key, (sza * 1e4).round() as i64);
         if let Some(rows) = mcrt_cache.borrow().get(&key) {
             return rows.clone();
@@ -1420,33 +1801,38 @@ fn khayt_pass(
             .iter()
             .zip(band_z)
             .chain(params.ref_offsets_deg.iter().zip(ref_z))
-            .map(|(&o, &z)| sim_dir(o, z, &one)[0])
+            .map(|(&o, &z)| sim_dir(o, z, &one, sun_az_abs)[0])
             .collect();
         mcrt_cache.borrow_mut().insert(key, rows.clone());
         rows
     };
     let compose = |anchors: &[(f64, Vec<f64>, Vec<f64>)],
                    rows: &[DirSample],
-                   sza: f64|
+                   sza: f64,
+                   veil: (f64, f64)|
      -> (Vec<PatchLum>, Vec<PatchLum>) {
         let nb = params.band_offsets_deg.len();
         let band = (0..nb)
-            .map(|j| patch_from(&rows[j], interp(anchors, sza, j, false)))
+            .map(|j| patch_from(&rows[j], interp(anchors, sza, j, false), veil))
             .collect();
         let refs = (0..params.ref_offsets_deg.len())
-            .map(|j| patch_from(&rows[nb + j], interp(anchors, sza, j, true)))
+            .map(|j| patch_from(&rows[nb + j], interp(anchors, sza, j, true), veil))
             .collect();
         (band, refs)
     };
-    let evening_key: u8 = if terrain_active { 1 } else { 0 };
+    let evening_key: u8 = if sides_split { 1 } else { 0 };
+    let az_abs_m = if field_asymmetric { sun_az_morning } else { None };
+    let az_abs_e = if field_asymmetric { sun_az_evening } else { None };
+    let veil_m = side_veil(&band_z_m);
+    let veil_e = side_veil(&band_z_e);
 
     let mut eval_m = |sza: f64| -> Option<(Vec<PatchLum>, Vec<PatchLum>)> {
-        let rows = fan_rows(0, &band_z_m, &ref_z_m, sza);
-        Some(compose(&morning_anchors, &rows, sza))
+        let rows = fan_rows(0, az_abs_m, &band_z_m, &ref_z_m, sza);
+        Some(compose(&morning_anchors, &rows, sza, veil_m))
     };
     let eval_m_dyn: &mut FanEval<'_> = &mut eval_m;
     let morning = detect_refined(
-        &assemble(&morning_anchors, &band_mcrt, &ref_mcrt),
+        &assemble(&morning_anchors, &band_mcrt, &ref_mcrt, veil_m),
         &params.for_side(true),
         Some(eval_m_dyn),
         RefineEvents {
@@ -1456,12 +1842,12 @@ fn khayt_pass(
         },
     );
     let mut eval_e = |sza: f64| -> Option<(Vec<PatchLum>, Vec<PatchLum>)> {
-        let rows = fan_rows(evening_key, &band_z_e, &ref_z_e, sza);
-        Some(compose(&evening_anchors, &rows, sza))
+        let rows = fan_rows(evening_key, az_abs_e, &band_z_e, &ref_z_e, sza);
+        Some(compose(&evening_anchors, &rows, sza, veil_e))
     };
     let eval_e_dyn: &mut FanEval<'_> = &mut eval_e;
     let evening = detect_refined(
-        &assemble(&evening_anchors, &band_mcrt_e, &ref_mcrt_e),
+        &assemble(&evening_anchors, &band_mcrt_e, &ref_mcrt_e, veil_e),
         &params.for_side(false),
         Some(eval_e_dyn),
         RefineEvents {
@@ -1470,6 +1856,76 @@ fn khayt_pass(
             ahmar: true,
         },
     );
+
+    // ── Background-input uncertainty (section 9): the crossing's own
+    // sigma covers MC noise, bracket resolution, and the Jensen bound;
+    // the terms below cover the INPUTS the reference sky was built from
+    // (skyglow atlas value, aerosol optical depth). Computed per
+    // crossing, because both the veil response and the aerosol lever
+    // scale with the crossing's own measured margin slope.
+    let aod_sigma = aerosol_input_aod_sigma(input);
+    let duty_env = skyglow_duty_cycle_env();
+    // Natural (unveiled) reference-ring luminance at a given SZA: mean
+    // over the reference patches of MCRT + celestial, interpolated on
+    // the coarse fan grid. Feeds only the perturbation RATIOS of the
+    // uncertainty terms; grid-level accuracy is ample there.
+    let mcrt_ref_interp = |rm: &[Vec<DirSample>], j: usize, sza: f64, red: bool| -> f64 {
+        let pick = |d: &DirSample| if red { d.red } else { d.mes };
+        if sza <= szas[0] {
+            return pick(&rm[j][0]);
+        }
+        for i in 1..szas.len() {
+            if sza <= szas[i] {
+                let f = (sza - szas[i - 1]) / (szas[i] - szas[i - 1]);
+                return pick(&rm[j][i - 1]) * (1.0 - f) + pick(&rm[j][i]) * f;
+            }
+        }
+        pick(&rm[j][szas.len() - 1])
+    };
+    let natural_ref_level = |rm: &[Vec<DirSample>],
+                             anchors: &[(f64, Vec<f64>, Vec<f64>)],
+                             sza: f64,
+                             red: bool|
+     -> f64 {
+        let n = params.ref_offsets_deg.len().max(1);
+        (0..params.ref_offsets_deg.len())
+            .map(|j| {
+                let m = mcrt_ref_interp(rm, j, sza, red);
+                let cel = interp(anchors, sza, j, true);
+                if red {
+                    m + cel * params.celestial_red_fraction
+                } else {
+                    m + cel
+                }
+            })
+            .sum::<f64>()
+            / n as f64
+    };
+    let background_for = |c: &crate::khayt::KhaytCrossing,
+                          morning_side: bool,
+                          red: bool|
+     -> BackgroundSigma {
+        let (rm, anchors, side_v) = if morning_side {
+            (&ref_mcrt, &morning_anchors, veil_m)
+        } else {
+            (&ref_mcrt_e, &evening_anchors, veil_e)
+        };
+        let veil = if red { side_v.1 } else { side_v.0 };
+        let natural = natural_ref_level(rm, anchors, c.sza_deg, red);
+        // AUTO duty-cycle: bimodal veil where street light DOMINATES
+        // the reference (see skyglow_duty_cycle_env for the override).
+        let duty = duty_env.unwrap_or(natural > 0.0 && veil > natural);
+        let (skyglow_cal_deg, skyglow_duty_deg) =
+            skyglow_sigma_terms(natural, veil, c.slope, duty);
+        BackgroundSigma {
+            skyglow_cal_deg,
+            skyglow_duty_deg,
+            aerosol_deg: aod_sigma
+                .map(|s| aerosol_sigma_deg(s, c.slope))
+                .unwrap_or(0.0),
+        }
+    };
+    let has_background_inputs = input.skyglow.is_some() || aod_sigma.is_some();
 
     // Crossing sigma [deg] -> clock-minute uncertainty through the
     // local dt/dSZA slope. Near the night's maximum depth the +0.25
@@ -1495,46 +1951,59 @@ fn khayt_pass(
     };
 
     let mut out = KhaytTimes::default();
+    let mut dbg_terms: Vec<(&str, f64, BackgroundSigma, f64)> = Vec::new();
     if let Some(c) = morning.sadiq {
+        let bg = background_for(&c, true, false);
+        let total = bg.fold_into(c.sigma_deg);
         out.fajr_sza_deg = Some(c.sza_deg);
-        out.fajr_sigma_deg = Some(c.sigma_deg);
+        out.fajr_sigma_deg = Some(total);
+        out.fajr_background_sigma_deg = has_background_inputs.then(|| bg.total_deg());
         out.fajr_time = engine.find_zenith_crossing_robust(c.sza_deg, 0.0, 12.0, 0.0001, true);
         out.fajr_uncertainty_min =
-            sigma_minutes(engine, c.sza_deg, c.sigma_deg, out.fajr_time, 0.0, 12.0, true);
+            sigma_minutes(engine, c.sza_deg, total, out.fajr_time, 0.0, 12.0, true);
         out.fajr_margins = morning.margins_at_sadiq.clone();
+        dbg_terms.push(("fajr_sadiq", c.sigma_deg, bg, total));
     }
     if let Some(c) = morning.kadhib {
         out.kadhib_time = engine.find_zenith_crossing_robust(c.sza_deg, 0.0, 12.0, 0.0001, true);
     }
     if let Some(c) = evening.ahmar {
+        let bg = background_for(&c, false, true);
+        let total = bg.fold_into(c.sigma_deg);
         out.isha_ahmar_sza_deg = Some(c.sza_deg);
-        out.isha_ahmar_sigma_deg = Some(c.sigma_deg);
+        out.isha_ahmar_sigma_deg = Some(total);
+        out.isha_ahmar_background_sigma_deg = has_background_inputs.then(|| bg.total_deg());
         out.isha_ahmar_time =
             engine.find_zenith_crossing_robust(c.sza_deg, 12.0, 28.0, 0.0001, false);
         out.isha_ahmar_uncertainty_min = sigma_minutes(
             engine,
             c.sza_deg,
-            c.sigma_deg,
+            total,
             out.isha_ahmar_time,
             12.0,
             28.0,
             false,
         );
+        dbg_terms.push(("isha_ahmar", c.sigma_deg, bg, total));
     }
     if let Some(c) = evening.sadiq {
+        let bg = background_for(&c, false, false);
+        let total = bg.fold_into(c.sigma_deg);
         out.isha_abyad_sza_deg = Some(c.sza_deg);
-        out.isha_abyad_sigma_deg = Some(c.sigma_deg);
+        out.isha_abyad_sigma_deg = Some(total);
+        out.isha_abyad_background_sigma_deg = has_background_inputs.then(|| bg.total_deg());
         out.isha_abyad_time =
             engine.find_zenith_crossing_robust(c.sza_deg, 12.0, 28.0, 0.0001, false);
         out.isha_abyad_uncertainty_min = sigma_minutes(
             engine,
             c.sza_deg,
-            c.sigma_deg,
+            total,
             out.isha_abyad_time,
             12.0,
             28.0,
             false,
         );
+        dbg_terms.push(("isha_abyad", c.sigma_deg, bg, total));
     }
     // Resolution accounting to stderr for validation runs (the CLI
     // does not print the khayt sigma fields; this makes them visible
@@ -1555,6 +2024,15 @@ fn khayt_pass(
         dump("fajr_sadiq", morning.sadiq, out.fajr_uncertainty_min);
         dump("isha_ahmar", evening.ahmar, out.isha_ahmar_uncertainty_min);
         dump("isha_abyad", evening.sadiq, out.isha_abyad_uncertainty_min);
+        // The sigma split: crossing-own term vs each background-input
+        // term (all 1-sigma deg SZA; total = RSS).
+        for (name, own, bg, total) in &dbg_terms {
+            eprintln!(
+                "khayt sigma terms {name}: crossing {:.4}, skyglow_cal {:.4}, \
+                 skyglow_duty {:.4}, aerosol {:.4} -> total {:.4} deg",
+                own, bg.skyglow_cal_deg, bg.skyglow_duty_deg, bg.aerosol_deg, total
+            );
+        }
     }
     out
 }
@@ -1618,6 +2096,16 @@ struct CrossingSigmas {
     isha_ahmar: Option<f64>,
 }
 
+/// d(lnL)/dSZA of the local crossing fits [1/deg]. None when the fit
+/// was impossible and the crossing is only grid-localized; the
+/// background-input fold then leaves that event's sigma unchanged.
+#[derive(Clone, Copy, Default)]
+struct CrossingSlopes {
+    fajr: Option<f64>,
+    isha_abyad: Option<f64>,
+    isha_ahmar: Option<f64>,
+}
+
 /// Clock times [local fractional hours] for the three events.
 #[derive(Clone, Copy, Default)]
 struct PrayerClockTimes {
@@ -1635,6 +2123,8 @@ struct CelestialRefloat {
     times: PrayerClockTimes,
     /// Sigmas for the re-fit crossings; None fields keep the caller's.
     sigmas: CrossingSigmas,
+    /// Fit slopes of the re-fit crossings; None fields keep the caller's.
+    slopes: CrossingSlopes,
     note: String,
 }
 
@@ -1968,6 +2458,11 @@ fn apply_high_latitude_relative_mode(
 /// silent None-sigma the local grid half-spacing is reported as a
 /// uniform-distribution sigma (half / sqrt(3)) - the honest resolution
 /// of a crossing localized only to one scan cell.
+///
+/// Returns (crossing SZA, sigma, d(lnL)/dSZA of the local fit); the
+/// slope is None on the fallback path (no constant is fabricated) and
+/// feeds the background-input uncertainty fold
+/// ([`fold_legacy_background`]).
 fn fit_one_crossing(
     analyses: &[TwilightAnalysis],
     se_by_sza: &[(f64, f64, f64)],
@@ -1975,7 +2470,7 @@ fn fit_one_crossing(
     pick: &dyn Fn(&TwilightAnalysis) -> f64,
     red_channel: bool,
     thresh: f64,
-) -> (f64, Option<f64>) {
+) -> (f64, Option<f64>, Option<f64>) {
     let channel_se = |e: &(f64, f64, f64)| if red_channel { e.2 } else { e.1 };
     // SE of the specific scanned point (last match wins: fine entries
     // follow their coarse twins and are the ones kept after dedup).
@@ -2006,7 +2501,7 @@ fn fit_one_crossing(
     match threshold::fit_crossing_loglinear(&window, thresh) {
         Some((fitted, slope)) => {
             let sigma_sza = window_rel_se(fitted) / slope.abs().max(1e-6);
-            (fitted, Some(sigma_sza))
+            (fitted, Some(sigma_sza), Some(slope))
         }
         None => {
             // Local scan spacing around sza0 = the residual resolution.
@@ -2025,7 +2520,7 @@ fn fit_one_crossing(
             } else {
                 FINE_STEP_DEG
             };
-            (sza0, Some(0.5 * spacing / 3f64.sqrt()))
+            (sza0, Some(0.5 * spacing / 3f64.sqrt()), None)
         }
     }
 }
@@ -2042,18 +2537,18 @@ fn fit_crossings(
     result: &threshold::PrayerTimeResult,
     se_by_sza: &[(f64, f64, f64)],
     used_relative_thresholds: bool,
-) -> (CrossingSzas, CrossingSigmas) {
+) -> (CrossingSzas, CrossingSigmas, CrossingSlopes) {
     let refine = |sza_opt: Option<f64>,
                   pick: &dyn Fn(&TwilightAnalysis) -> f64,
                   red_channel: bool,
                   thresh: f64|
-     -> (Option<f64>, Option<f64>) {
+     -> (Option<f64>, Option<f64>, Option<f64>) {
         let Some(sza0) = sza_opt else {
-            return (None, None);
+            return (None, None, None);
         };
-        let (fitted, sigma) =
+        let (fitted, sigma, slope) =
             fit_one_crossing(&result.analyses, se_by_sza, sza0, pick, red_channel, thresh);
-        (Some(fitted), sigma)
+        (Some(fitted), sigma, slope)
     };
     // Under high-latitude mode the fit must target the floated thresholds.
     let floor_of = |pick: &dyn Fn(&TwilightAnalysis) -> f64| -> f64 {
@@ -2073,19 +2568,19 @@ fn fit_crossings(
         }
     };
     let cfg = &input.threshold_config;
-    let (fajr, fajr_sigma) = refine(
+    let (fajr, fajr_sigma, fajr_slope) = refine(
         result.fajr_sza_deg,
         &|a| a.luminance_mesopic,
         false,
         effective(cfg.fajr_luminance, &|a| a.luminance_mesopic),
     );
-    let (isha_abyad, abyad_sigma) = refine(
+    let (isha_abyad, abyad_sigma, abyad_slope) = refine(
         result.isha_abyad_sza_deg,
         &|a| a.luminance_mesopic,
         false,
         effective(cfg.isha_abyad_luminance, &|a| a.luminance_mesopic),
     );
-    let (isha_ahmar, ahmar_sigma) = refine(
+    let (isha_ahmar, ahmar_sigma, ahmar_slope) = refine(
         result.isha_ahmar_sza_deg,
         &|a| a.luminance_red,
         true,
@@ -2101,6 +2596,11 @@ fn fit_crossings(
             fajr: fajr_sigma,
             isha_abyad: abyad_sigma,
             isha_ahmar: ahmar_sigma,
+        },
+        CrossingSlopes {
+            fajr: fajr_slope,
+            isha_abyad: abyad_slope,
+            isha_ahmar: ahmar_slope,
         },
     )
 }
@@ -2205,6 +2705,7 @@ fn refloat_on_celestial_background(
             szas,
             times,
             sigmas: CrossingSigmas::default(),
+            slopes: CrossingSlopes::default(),
             note,
         });
     }
@@ -2217,28 +2718,29 @@ fn refloat_on_celestial_background(
                  pick: &dyn Fn(&TwilightAnalysis) -> f64,
                  red_channel: bool,
                  thresh: f64|
-     -> (Option<f64>, Option<f64>) {
+     -> (Option<f64>, Option<f64>, Option<f64>) {
         match sza_opt {
             Some(s0) => {
-                let (s, sig) = fit_one_crossing(analyses, se_by_sza, s0, pick, red_channel, thresh);
-                (Some(s), sig)
+                let (s, sig, slope) =
+                    fit_one_crossing(analyses, se_by_sza, s0, pick, red_channel, thresh);
+                (Some(s), sig, slope)
             }
-            None => (None, None),
+            None => (None, None, None),
         }
     };
-    let (fajr, fajr_sigma) = refit(
+    let (fajr, fajr_sigma, fajr_slope) = refit(
         refined.fajr_sza_deg,
         &|a| a.luminance_mesopic,
         false,
         refined_config.fajr_luminance,
     );
-    let (isha_abyad, abyad_sigma) = refit(
+    let (isha_abyad, abyad_sigma, abyad_slope) = refit(
         refined.isha_abyad_sza_deg,
         &|a| a.luminance_mesopic,
         false,
         refined_config.isha_abyad_luminance,
     );
-    let (isha_ahmar, ahmar_sigma) = refit(
+    let (isha_ahmar, ahmar_sigma, ahmar_slope) = refit(
         refined.isha_ahmar_sza_deg,
         &|a| a.luminance_red,
         true,
@@ -2258,8 +2760,104 @@ fn refloat_on_celestial_background(
             isha_abyad: abyad_sigma,
             isha_ahmar: ahmar_sigma,
         },
+        slopes: CrossingSlopes {
+            fajr: fajr_slope,
+            isha_abyad: abyad_slope,
+            isha_ahmar: ahmar_slope,
+        },
         note,
     })
+}
+
+/// Fold the background-input terms into the legacy crossing sigmas -
+/// the cheap first-order version of the khayt treatment (the khayt is
+/// the primary criterion and carries the full machinery):
+///
+/// - SKYGLOW: `inject_skyglow` adds the veil spectrum to every scanned
+///   spectrum, so near a crossing d lnL = f x d ln(veil) with f the
+///   veil's share of the threshold-level luminance; the atlas
+///   calibration term is f x [`SKYGLOW_ATLAS_SIGMA_LN`] / |d lnL/dSZA|.
+///   The street-light duty-cycle bimodal term is khayt-only: the
+///   lights-off shift ln(1 - f) diverges as f -> 1, and the legacy
+///   absolute path is the comparison method, not the primary
+///   (documented omission).
+/// - AEROSOL: the khayt-measured dawn-band dimming lever
+///   ([`AOD_LEVER_LN_PER_AOD`]) over this crossing's own fitted
+///   ln-slope. The lever was measured on the khayt criterion; the
+///   numerator dimming of the dawn light is the mechanism both
+///   criteria share, and no legacy-specific measured constant exists -
+///   using the measured one beats inventing an airmass formula.
+///
+/// Thresholds are the dark anchors of the run config; under the
+/// high-latitude relative mode (or a refloat) the true floated
+/// thresholds are HIGHER, so the veil share f - and this term - is
+/// overstated there: conservative in the honest direction. Events
+/// whose fit produced no slope (grid-localized cliffs) keep their
+/// resolution sigma unchanged: no constant is fabricated.
+fn fold_legacy_background(
+    input: &PrayerTimeInput,
+    sigmas: CrossingSigmas,
+    slopes: CrossingSlopes,
+) -> CrossingSigmas {
+    let aod_sigma = aerosol_input_aod_sigma(input);
+    let (veil_mes, veil_red) = match &input.skyglow {
+        Some(sg) => {
+            let n = sg.num_wavelengths.min(sg.spectral_radiance.len());
+            let wl: Vec<f64> = (0..n).map(|i| 380.0 + 10.0 * i as f64).collect();
+            (
+                twilight_threshold::luminance::mesopic_luminance(&wl, &sg.spectral_radiance[..n]),
+                twilight_threshold::luminance::red_band_luminance(&wl, &sg.spectral_radiance[..n]),
+            )
+        }
+        None => (0.0, 0.0),
+    };
+    if veil_mes <= 0.0 && aod_sigma.is_none() {
+        return sigmas;
+    }
+    let cfg = &input.threshold_config;
+    let fold = |sigma: Option<f64>, slope: Option<f64>, veil: f64, thresh: f64| -> Option<f64> {
+        let sigma = sigma?;
+        let Some(slope) = slope else {
+            return Some(sigma);
+        };
+        let sa = slope.abs().max(1e-3);
+        let f = if thresh > 0.0 {
+            (veil / thresh).min(1.0)
+        } else {
+            0.0
+        };
+        let sky = f * SKYGLOW_ATLAS_SIGMA_LN / sa;
+        let aer = aod_sigma
+            .map(|s| aerosol_sigma_deg(s, slope))
+            .unwrap_or(0.0);
+        Some((sigma * sigma + sky * sky + aer * aer).sqrt())
+    };
+    let out = CrossingSigmas {
+        fajr: fold(sigmas.fajr, slopes.fajr, veil_mes, cfg.fajr_luminance),
+        isha_abyad: fold(
+            sigmas.isha_abyad,
+            slopes.isha_abyad,
+            veil_mes,
+            cfg.isha_abyad_luminance,
+        ),
+        isha_ahmar: fold(
+            sigmas.isha_ahmar,
+            slopes.isha_ahmar,
+            veil_red,
+            cfg.isha_ahmar_red_luminance,
+        ),
+    };
+    if std::env::var("TWILIGHT_KHAYT_DEBUG").is_ok() {
+        let show = |name: &str, before: Option<f64>, after: Option<f64>| {
+            if let (Some(b), Some(a)) = (before, after) {
+                eprintln!("legacy sigma fold {name}: {b:.4} -> {a:.4} deg (background inputs)");
+            }
+        };
+        show("fajr", sigmas.fajr, out.fajr);
+        show("isha_abyad", sigmas.isha_abyad, out.isha_abyad);
+        show("isha_ahmar", sigmas.isha_ahmar, out.isha_ahmar);
+    }
+    out
 }
 
 /// Convert crossing-SZA sigmas to minutes using the local dt/dSZA slope
@@ -2295,12 +2893,16 @@ fn propagate_uncertainty(
     };
     UncertaintyMinutes {
         fajr: sigma_minutes(szas.fajr, times.fajr, sigmas.fajr, 0.0, 12.0, true),
+        // The isha crossing window extends past midnight (12, 28), and
+        // high-latitude isha regularly lands there: the uncertainty
+        // probe must search the SAME window or a past-midnight isha
+        // silently loses its sigma (review round 2).
         isha_abyad: sigma_minutes(
             szas.isha_abyad,
             times.isha_abyad,
             sigmas.isha_abyad,
             12.0,
-            24.0,
+            28.0,
             false,
         ),
         isha_ahmar: sigma_minutes(
@@ -2308,7 +2910,7 @@ fn propagate_uncertainty(
             times.isha_ahmar,
             sigmas.isha_ahmar,
             12.0,
-            24.0,
+            28.0,
             false,
         ),
     }
@@ -2389,11 +2991,11 @@ fn compute_prayer_times_inner(
     let (prayer_result, used_relative_thresholds) =
         apply_high_latitude_relative_mode(input, base_result);
 
-    let (fitted_szas, sigmas) =
+    let (fitted_szas, sigmas, slopes) =
         fit_crossings(input, &prayer_result, &se_by_sza, used_relative_thresholds);
     let fitted_times = crossings_to_times(&mut engine, fitted_szas);
 
-    let (final_szas, final_times, final_sigmas, celestial_refloat) =
+    let (final_szas, final_times, final_sigmas, final_slopes, celestial_refloat) =
         match refloat_on_celestial_background(
             input,
             &mut engine,
@@ -2410,10 +3012,19 @@ fn compute_prayer_times_inner(
                     isha_abyad: r.sigmas.isha_abyad.or(sigmas.isha_abyad),
                     isha_ahmar: r.sigmas.isha_ahmar.or(sigmas.isha_ahmar),
                 };
-                (r.szas, r.times, merged, Some(r.note))
+                let merged_slopes = CrossingSlopes {
+                    fajr: r.slopes.fajr.or(slopes.fajr),
+                    isha_abyad: r.slopes.isha_abyad.or(slopes.isha_abyad),
+                    isha_ahmar: r.slopes.isha_ahmar.or(slopes.isha_ahmar),
+                };
+                (r.szas, r.times, merged, merged_slopes, Some(r.note))
             }
-            None => (fitted_szas, fitted_times, sigmas, None),
+            None => (fitted_szas, fitted_times, sigmas, slopes, None),
         };
+
+    // Background-input terms (skyglow atlas, aerosol input) fold into
+    // the legacy sigmas the same way they RSS into the khayt sigmas.
+    let final_sigmas = fold_legacy_background(input, final_sigmas, final_slopes);
 
     let uncertainty = propagate_uncertainty(&mut engine, final_szas, final_times, final_sigmas);
 
@@ -3269,30 +3880,268 @@ mod tests {
     #[test]
     fn khayt_skyglow_veil_unit_pin() {
         let radiance_nw = 15.0;
-        let sg = twilight_skyglow::quick_estimate(radiance_nw, 0.5);
+        // Pure HPS (led_fraction 0): the strongest mesopic-vs-photopic
+        // discrimination (scotopic-poor source).
+        let sg = twilight_skyglow::quick_estimate(radiance_nw, 0.0);
         let band_zenith_deg = 87.0; // the khayt ring: 3 deg elevation
         let (mes, red) = khayt_skyglow_veil(&sg, band_zenith_deg);
-
-        // Exact contract against the producer and the angular model.
         let lift = twilight_skyglow::angular::enhancement_factor(90.0 - band_zenith_deg);
-        let expected = sg.zenith_luminance * 1e-3 * lift;
+
+        // Exact contract: the veil is the calibrated spectrum's own
+        // MESOPIC band, lifted.
+        let n = sg.num_wavelengths;
+        let wl: Vec<f64> = (0..n).map(|i| 380.0 + 10.0 * i as f64).collect();
+        let mes_s = twilight_threshold::luminance::mesopic_luminance(
+            &wl,
+            &sg.spectral_radiance[..n],
+        );
         assert!(
-            (mes - expected).abs() <= 1e-12 * expected.max(1.0),
-            "veil {mes} vs contract {expected}"
+            (mes - mes_s * lift).abs() <= 1e-12 * mes.max(1e-30),
+            "veil {mes} vs mesopic contract {}",
+            mes_s * lift
         );
 
-        // Independent literal pin (the parallel validation campaign's
-        // corrected-units emulation): 0.092e-3 * R^0.72 * 8.11 cd/m^2.
+        // The photopic Falchi value must NOT be used as the mesopic
+        // veil: for pure HPS the mesopic/photopic ratio is materially
+        // below 1 (regression pin for the review-round-2 finding).
+        let photopic_veil = sg.zenith_luminance * 1e-3 * lift;
+        assert!(
+            mes < 0.97 * photopic_veil,
+            "HPS mesopic veil {mes} must sit below the photopic value \
+             {photopic_veil}: photopic-as-mesopic regression"
+        );
+
+        // Order-of-magnitude pin against the documented Falchi formula
+        // 0.092e-3 * R^0.72 * 8.11 cd/m^2: mesopic weighting moves this
+        // by tens of percent, a units regression by three orders.
         let documented = 0.092e-3 * radiance_nw.powf(0.72) * 8.11;
         assert!(
-            (mes / documented - 1.0).abs() < 0.01,
-            "veil {mes} cd/m^2 must match the documented corrected \
-             formula {documented} (a 1000x regression fails this by \
-             three orders of magnitude)"
+            mes / documented > 0.3 && mes / documented < 1.5,
+            "veil {mes} cd/m^2 out of family with the documented \
+             formula {documented} (units regression)"
         );
 
         // Red share comes from the skyglow spectrum and stays a share.
         assert!(red > 0.0 && red < mes, "red {red} vs mes {mes}");
+    }
+
+    // ── Background-input uncertainty propagation ──
+    //
+    // Constants provenance (tests below pin the ARITHMETIC against
+    // them): RESULTS_CRITERION_SITES.md section 9. The measured margin
+    // slope is 0.29-0.44 dex/deg = 0.67-1.01 ln/deg (section 9.1); the
+    // Bortle ladder validated the TVI target-inflation arithmetic to
+    // 0.04-0.06 deg in the small-veil regime (section 9.3, ring
+    // reference 3.4e-4 cd/m^2 inferred from deep-night margin ratios);
+    // the aerosol bracket runs measured 13-17 deg per unit excess AOD
+    // (sections 9.4/9.5/9.6).
+
+    /// In the Weber-flat TVI regime (L >= 10 cd/m^2, constant contrast
+    /// threshold) the detection target is proportional to L_ref, so
+    /// with the veil dominating the reference the calibration term
+    /// must equal sigma_ln / |slope| EXACTLY - a closed-form pin of
+    /// the perturbation arithmetic. Hand value: 0.30 / 0.84 = 0.35714.
+    #[test]
+    fn skyglow_cal_term_exact_in_weber_flat_regime() {
+        let slope = 0.84; // measured central margin slope [ln/deg]
+        let (cal, duty) = skyglow_sigma_terms(1e-9, 100.0, slope, false);
+        assert!(
+            (cal - SKYGLOW_ATLAS_SIGMA_LN / slope).abs() < 1e-6,
+            "cal {cal} vs exact {}",
+            SKYGLOW_ATLAS_SIGMA_LN / slope
+        );
+        assert_eq!(duty, 0.0, "duty term must be off when not flagged");
+    }
+
+    /// The duty-cycle term against the section 9.3 Bortle-4 cell: ring
+    /// reference 3.4e-4 cd/m^2, veil 1.2e-3 cd/m^2, measured winter
+    /// shift 0.96-1.02 deg (predicted 0.96 by this same TVI
+    /// arithmetic, validated to 0.04-0.06 deg). The target inflation
+    /// through the TVI table must be ~0.43 dex, and at the slope that
+    /// realizes the measured 0.96 deg shift (0.985 ln / 0.96 deg =
+    /// 1.026 ln/deg = 0.445 dex/deg, the steep end of the measured
+    /// 0.29-0.44 dex/deg range - the margin curve steepens below
+    /// depression 12) the full on/off swing must reproduce it.
+    #[test]
+    fn skyglow_duty_term_matches_measured_bortle4_swing() {
+        let nat = 3.4e-4;
+        let veil = 1.2e-3;
+        let inflation_dex = libm::log10(khayt_target(nat + veil) / khayt_target(nat));
+        assert!(
+            (0.40..=0.46).contains(&inflation_dex),
+            "target inflation {inflation_dex} dex, expected ~0.43"
+        );
+        let slope = 1.026;
+        let (_, duty) = skyglow_sigma_terms(nat, veil, slope, true);
+        let full_swing = 2.0 * duty; // two-point sigma = half the swing
+        assert!(
+            (full_swing - 0.96).abs() < 0.05,
+            "on/off swing {full_swing} deg vs measured 0.96-1.02"
+        );
+    }
+
+    /// Aerosol term: the ln-lever over the measured central slope must
+    /// reproduce the measured ~16 deg per unit AOD, and a cliff slope
+    /// must shrink it (the measured Jun 22 immunity).
+    #[test]
+    fn aerosol_term_reproduces_measured_lever_and_cliff_immunity() {
+        // 13.5 * 0.05 / 0.84 = 0.8036 deg for a 0.05 AOD sigma.
+        let typical = aerosol_sigma_deg(0.05, 0.84);
+        assert!((typical - 0.8036).abs() < 1e-3, "typical {typical}");
+        // Same sigma on a cliff (|slope| 5 ln/deg): 6x smaller.
+        let cliff = aerosol_sigma_deg(0.05, -5.0);
+        assert!((cliff - 0.135).abs() < 1e-3, "cliff {cliff}");
+        assert_eq!(aerosol_sigma_deg(0.0, 0.84), 0.0);
+        // Climatology bracket constant: (0.12-0.05)/sqrt(12).
+        assert!((AOD_CLIMATOLOGY_SIGMA - 0.0202).abs() < 3e-4);
+    }
+
+    /// RSS fold: the total must be the root-sum-square of the
+    /// crossing's own sigma and the three background terms.
+    #[test]
+    fn background_terms_fold_by_rss() {
+        let bg = BackgroundSigma {
+            skyglow_cal_deg: 0.12,
+            skyglow_duty_deg: 0.0,
+            aerosol_deg: 0.16,
+        };
+        assert!((bg.total_deg() - 0.2).abs() < 1e-12);
+        let total = bg.fold_into(0.05);
+        assert!((total - (0.05f64 * 0.05 + 0.04).sqrt()).abs() < 1e-12);
+        // No background: fold is the identity.
+        assert_eq!(BackgroundSigma::default().fold_into(0.07), 0.07);
+    }
+
+    /// Input-sigma resolution ladder: explicit product sigma wins
+    /// (halved when the excess clamped to zero), then the CAMS
+    /// envelope on a measured custom aerosol, then the climatology
+    /// bracket for a guessed type, then nothing.
+    #[test]
+    fn aerosol_input_sigma_resolution_ladder() {
+        let base = PrayerTimeInput::default();
+        assert_eq!(aerosol_input_aod_sigma(&base), None);
+
+        let climatology = PrayerTimeInput {
+            aerosol_type: Some(AerosolType::ContinentalAverage),
+            ..base.clone()
+        };
+        assert_eq!(
+            aerosol_input_aod_sigma(&climatology),
+            Some(AOD_CLIMATOLOGY_SIGMA)
+        );
+
+        let measured = PrayerTimeInput {
+            custom_aerosol: Some(AerosolProperties {
+                aod_550: 0.09,
+                ..aerosol::default_properties(AerosolType::ContinentalAverage)
+            }),
+            ..base.clone()
+        };
+        let s = aerosol_input_aod_sigma(&measured).unwrap();
+        assert!((s - (0.03 + 0.2 * 0.09)).abs() < 1e-12, "envelope {s}");
+
+        let wired = PrayerTimeInput {
+            aod_sigma_550: Some(0.07),
+            ..measured.clone()
+        };
+        assert_eq!(aerosol_input_aod_sigma(&wired), Some(0.07));
+
+        // Measured-clean (excess clamped to zero, no aerosol input):
+        // only the upward half of the product error can act.
+        let clamped = PrayerTimeInput {
+            aod_sigma_550: Some(0.06),
+            ..base.clone()
+        };
+        assert_eq!(aerosol_input_aod_sigma(&clamped), Some(0.03));
+
+        // Near the baseline the clamp is partial: excess 0.01 with a
+        // 0.052 product sigma can excurse down by at most itself, so
+        // sigma_eff = (0.052 + 0.01) / 2 = 0.031.
+        let near_baseline = PrayerTimeInput {
+            custom_aerosol: Some(AerosolProperties {
+                aod_550: 0.01,
+                ..aerosol::default_properties(AerosolType::ContinentalAverage)
+            }),
+            aod_sigma_550: Some(0.052),
+            ..base
+        };
+        let s = aerosol_input_aod_sigma(&near_baseline).unwrap();
+        assert!((s - 0.031).abs() < 1e-12, "near-baseline sigma {s}");
+    }
+
+    /// The interim env-style override: a positive excess rides the
+    /// type carrier's optics; zero/negative clears every aerosol input
+    /// (measured cleaner than the calibration baseline).
+    #[test]
+    fn aod_override_scales_carrier_and_clears_on_clean() {
+        let base = PrayerTimeInput {
+            aerosol_type: Some(AerosolType::ContinentalClean),
+            ..PrayerTimeInput::default()
+        };
+        let over = apply_background_overrides(&base, Some(0.07), Some(0.05)).unwrap();
+        let a = over.custom_aerosol.expect("carrier expected");
+        assert!((a.aod_550 - 0.07).abs() < 1e-12);
+        // Carrier optics come from the declared type.
+        assert!(
+            (a.angstrom_exponent
+                - aerosol::default_properties(AerosolType::ContinentalClean).angstrom_exponent)
+                .abs()
+                < 1e-12
+        );
+        assert_eq!(over.aod_sigma_550, Some(0.05));
+
+        let clean = apply_background_overrides(&base, Some(0.0), Some(0.05)).unwrap();
+        assert!(clean.custom_aerosol.is_none());
+        assert!(clean.aerosol_type.is_none());
+        assert_eq!(clean.aod_sigma_550, Some(0.05));
+
+        // Nothing requested: no clone, caller keeps the original.
+        assert!(apply_background_overrides(&base, None, None).is_none());
+    }
+
+    /// End-to-end: an urban veil must WIDEN the reported khayt fajr
+    /// uncertainty relative to the identical pristine run, and the
+    /// background share must be visible in the new field - a
+    /// Birmingham-winter run honestly reports a larger +- than Mecca.
+    #[test]
+    fn skyglow_widens_reported_khayt_uncertainty() {
+        let base = PrayerTimeInput {
+            latitude: 21.4225,
+            longitude: 39.8262,
+            year: 2024,
+            month: 3,
+            day: 15,
+            timezone: 3.0,
+            sza_step: 1.0,
+            scattering_mode: ScatteringMode::Single,
+            ..PrayerTimeInput::default()
+        };
+        let veiled_in = PrayerTimeInput {
+            // Bortle-6-class city radiance (15 nW/cm^2/sr).
+            skyglow: Some(twilight_skyglow::quick_estimate(15.0, 0.5)),
+            ..base.clone()
+        };
+        let pristine = compute_prayer_times(&base);
+        let veiled = compute_prayer_times(&veiled_in);
+        let (ps, vs) = (
+            pristine.khayt.fajr_sigma_deg.expect("pristine sigma"),
+            veiled.khayt.fajr_sigma_deg.expect("veiled sigma"),
+        );
+        assert!(
+            pristine.khayt.fajr_background_sigma_deg.is_none(),
+            "pristine run must not claim a background term"
+        );
+        let bg = veiled
+            .khayt
+            .fajr_background_sigma_deg
+            .expect("veiled run must report its background share");
+        assert!(bg > 0.0, "background share {bg}");
+        assert!(
+            vs > ps,
+            "veil must widen the total sigma: {vs} vs pristine {ps}"
+        );
+        // The RSS contract between the reported pieces: total^2 >= bg^2.
+        assert!(vs * vs >= bg * bg - 1e-12);
     }
 
     // ── set_time_from_fractional_hour ──
@@ -3334,6 +4183,89 @@ mod khayt_terrain_tests {
     /// A ridge toward the dawn azimuth must delay the khayt Fajr: the
     /// observer's first visible sky sits above the ridge, where the dawn
     /// band brightens later.
+    /// Regression for the frozen-azimuth fan bug: the khayt fan placed
+    /// the sun at the SUNSET azimuth for both sides, so under a
+    /// georeferenced 3D cloud field the morning fan traced rays through
+    /// the western sky and an eastern cloud bank never dimmed the dawn
+    /// band. With per-side absolute azimuths, a deck covering the dawn
+    /// azimuths must delay khayt fajr relative to the same deck moved to
+    /// the sunset azimuths (which must leave fajr nearly clear-sky).
+    #[test]
+    fn eastern_cloud_bank_delays_khayt_fajr() {
+        use twilight_data::cloud::{default_properties, CloudType};
+        use twilight_data::cloud_field_builder::{field_from_layers, FieldGeometry};
+
+        let (lat, lon) = (21.4225, 39.8262);
+        let uniform = field_from_layers(
+            &[default_properties(CloudType::Stratus)],
+            FieldGeometry {
+                center_lat_deg: lat,
+                center_lon_deg: lon,
+                half_extent_km: 128.0,
+                res_km: 2.0,
+            },
+            "azimuth-regression",
+        );
+        // Halve the footprint by longitude relative to the observer:
+        // the eastern bank covers the dawn azimuths (morning sun ~65 deg
+        // at Mecca in June), the western bank the sunset azimuths.
+        let half = |keep_east: bool| {
+            let mut f = uniform.clone();
+            for iz in 0..f.nz {
+                for ilat in 0..f.nlat {
+                    for ilon in 0..f.nlon {
+                        let cell_lon = f.lon0_deg + (ilon as f64 + 0.5) * f.dlon_deg;
+                        let is_east = cell_lon > lon;
+                        if is_east != keep_east {
+                            f.sigma[(iz * f.nlat + ilat) * f.nlon + ilon] = 0.0;
+                        }
+                    }
+                }
+            }
+            f.derive();
+            f
+        };
+        let base = PrayerTimeInput {
+            latitude: lat,
+            longitude: lon,
+            year: 2026,
+            month: 6,
+            day: 13,
+            timezone: 3.0,
+            scattering_mode: crate::simulation::ScatteringMode::Single,
+            ..Default::default()
+        };
+        let east_in = PrayerTimeInput {
+            cloud_field: Some(half(true)),
+            ..base.clone()
+        };
+        let west_in = PrayerTimeInput {
+            cloud_field: Some(half(false)),
+            ..base
+        };
+        let out_east = compute_prayer_times(&east_in);
+        let out_west = compute_prayer_times(&west_in);
+        let fe = out_east.khayt.fajr_time.expect("east-bank khayt fajr");
+        let fw = out_west.khayt.fajr_time.expect("west-bank khayt fajr");
+        // Dimmer dawn band = detection at a shallower depression = later
+        // clock time. Pre-fix, the morning fan pointed WEST, inverting
+        // this ordering.
+        assert!(
+            fe > fw + 0.5 / 60.0,
+            "eastern deck must delay khayt fajr: east {fe:.4} h vs west {fw:.4} h"
+        );
+        // Evening is a DISAPPEARANCE event: dimming the western twilight
+        // glow drops it below detection EARLIER, so the western deck
+        // ADVANCES isha while the eastern deck leaves it nearly
+        // clear-sky (the mirror of the morning appearance logic).
+        let ie = out_east.khayt.isha_abyad_time.expect("east-bank isha");
+        let iw = out_west.khayt.isha_abyad_time.expect("west-bank isha");
+        assert!(
+            ie > iw + 0.5 / 60.0,
+            "western deck must ADVANCE khayt isha: west {iw:.4} h vs east {ie:.4} h"
+        );
+    }
+
     #[test]
     fn eastern_ridge_delays_khayt_fajr() {
         let mk = |angles: [f64; 360]| HorizonProfile {

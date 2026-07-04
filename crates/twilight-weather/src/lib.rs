@@ -17,6 +17,7 @@
 //! motivated but approximate. Real aerosol composition and cloud micro-
 //! physics are more complex than what a weather API can provide.
 
+pub mod aod;
 pub mod api;
 pub mod cache;
 pub mod cloud3d;
@@ -95,12 +96,29 @@ pub struct GasComposition {
 /// pass to `twilight_data::builder::build_full()`.
 #[derive(Debug, Clone)]
 pub struct AtmosphericParams {
-    /// Aerosol properties (None = clear sky, no aerosol)
+    /// Aerosol properties (None = clear sky, no aerosol). When present,
+    /// `aod_550` carries the EXCESS over the desert-calibration
+    /// baseline ([`aod::AOD_BASELINE_550`]), not the absolute column -
+    /// see [`mapping::map_aerosol`].
     pub aerosol: Option<AerosolProperties>,
     /// Cloud properties (None = clear sky, no cloud)
     pub cloud: Option<CloudProperties>,
     /// Gas composition overrides (None = use standard atmosphere defaults)
     pub gas_composition: Option<GasComposition>,
+    /// Absolute AOD550 as measured by the CAMS feed (None when the
+    /// value in `conditions.aod_550` was a documented fallback default
+    /// rather than a measurement - fallbacks are never dressed up as
+    /// measurements).
+    pub aod_550_measured: Option<f64>,
+    /// 1-sigma envelope uncertainty of the measured AOD550
+    /// ([`aod::aod_sigma_envelope`]); None when nothing was measured.
+    ///
+    /// CLI WIRING (one line, pending - twilight-cli is owned by another
+    /// work stream): copy this into `PrayerTimeInput::aod_sigma_550` in
+    /// `build_input`, next to where `w.aerosol` already flows into
+    /// `custom_aerosol`. Until then the interim switch is the env var
+    /// `TWILIGHT_AOD_SIGMA_550`, read by the pipeline.
+    pub aod_sigma_550: Option<f64>,
     /// Human-readable summary of what was detected
     pub description: String,
     /// The raw weather conditions used to derive these params
@@ -134,15 +152,31 @@ pub fn fetch_atmospheric_params_at(
     Ok(params_from_conditions(conditions))
 }
 
+/// True when `conditions.aod_550` is an actual feed measurement, not a
+/// documented missing-data substitution (api.rs records every
+/// substitution in `data_warnings`).
+fn aod_was_measured(conditions: &WeatherConditions) -> bool {
+    !conditions.data_warnings.iter().any(|w| {
+        w.starts_with("aerosol optical depth") || w.starts_with("air quality feed returned no data")
+    })
+}
+
 fn params_from_conditions(conditions: WeatherConditions) -> AtmosphericParams {
     let aerosol = mapping::map_aerosol(&conditions);
     let cloud = mapping::map_cloud(&conditions);
     let gas_composition = mapping::map_gas_composition(&conditions);
     let description = mapping::describe(&conditions, &aerosol, &cloud, &gas_composition);
+    // The measured-AOD provenance travels even when the aerosol is None
+    // (excess clamped at the baseline): the pipeline's uncertainty
+    // propagation still needs the product sigma for the one-sided term.
+    let aod_550_measured = aod_was_measured(&conditions).then_some(conditions.aod_550);
+    let aod_sigma_550 = aod_550_measured.map(aod::aod_sigma_envelope);
     AtmosphericParams {
         aerosol,
         cloud,
         gas_composition,
+        aod_550_measured,
+        aod_sigma_550,
         description,
         conditions,
     }
@@ -255,9 +289,11 @@ mod tests {
         let aerosol = mapping::map_aerosol(&c);
         assert!(aerosol.is_some(), "AOD 0.25 should produce aerosol");
         let props = aerosol.unwrap();
+        // Excess semantics: 0.25 measured minus the 0.10 calibration
+        // baseline (see mapping::map_aerosol and aod::AOD_BASELINE_550).
         assert!(
-            (props.aod_550 - 0.25).abs() < 0.01,
-            "Should use measured AOD, got {}",
+            (props.aod_550 - 0.15).abs() < 0.01,
+            "Should carry the measured excess, got {}",
             props.aod_550
         );
     }
@@ -275,8 +311,8 @@ mod tests {
             props.angstrom_exponent
         );
         assert!(
-            (props.aod_550 - 0.60).abs() < 0.01,
-            "Should use measured AOD"
+            (props.aod_550 - 0.50).abs() < 0.01,
+            "Should carry the measured excess (0.60 - 0.10 baseline)"
         );
     }
 
@@ -297,22 +333,51 @@ mod tests {
     }
 
     #[test]
-    fn aerosol_aod_uses_measured_value() {
-        // Whatever type is selected, the AOD should always be the measured value
-        for aod in &[0.06, 0.15, 0.30, 0.50] {
+    fn aerosol_aod_uses_measured_excess() {
+        // Whatever type is selected, the engine AOD is always the
+        // measured value minus the 0.10 calibration baseline.
+        for aod in &[0.15, 0.30, 0.50] {
             let mut c = make_hazy_conditions();
             c.aod_550 = *aod;
             c.dust_ug_m3 = 0.0;
-            let aerosol = mapping::map_aerosol(&c);
-            if let Some(props) = aerosol {
-                assert!(
-                    (props.aod_550 - aod).abs() < 0.01,
-                    "AOD should be {}, got {}",
-                    aod,
-                    props.aod_550
-                );
-            }
+            let props = mapping::map_aerosol(&c).expect("aerosol expected");
+            assert!(
+                (props.aod_550 - (aod - 0.10)).abs() < 0.01,
+                "engine AOD should be excess {}, got {}",
+                aod - 0.10,
+                props.aod_550
+            );
         }
+        // At/below the baseline: the calibration atmosphere already
+        // contains this much aerosol; no excess input is produced.
+        let mut c = make_hazy_conditions();
+        c.aod_550 = 0.06;
+        c.dust_ug_m3 = 0.0;
+        assert!(
+            mapping::map_aerosol(&c).is_none(),
+            "AOD below the calibration baseline must map to no aerosol"
+        );
+    }
+
+    #[test]
+    fn measured_aod_provenance_travels_in_params() {
+        // A measured value carries the absolute AOD and its envelope
+        // sigma even when the excess clamps to zero.
+        let mut c = make_clear_conditions();
+        c.aod_550 = 0.08;
+        let p = params_from_conditions(c);
+        assert!(p.aerosol.is_none(), "0.08 is below the 0.10 baseline");
+        assert_eq!(p.aod_550_measured, Some(0.08));
+        assert!((p.aod_sigma_550.unwrap() - (0.03 + 0.2 * 0.08)).abs() < 1e-12);
+
+        // A substituted default must NOT masquerade as a measurement.
+        let mut c = make_clear_conditions();
+        c.aod_550 = 0.15;
+        c.data_warnings
+            .push("aerosol optical depth missing; assuming 0.15".to_string());
+        let p = params_from_conditions(c);
+        assert!(p.aod_550_measured.is_none());
+        assert!(p.aod_sigma_550.is_none());
     }
 
     // ── Cloud mapping tests ──

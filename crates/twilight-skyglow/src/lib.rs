@@ -167,10 +167,18 @@ pub fn quick_estimate(radiance_nw: f64, led_fraction: f64) -> SkyglowResult {
     let (mut spectral, num_wl) = spectrum::mixed_spectrum(radiance_nw, led_fraction);
     let wl: Vec<f64> = (0..num_wl).map(|i| 380.0 + 10.0 * i as f64).collect();
     let phot = twilight_threshold::luminance::photopic_luminance(&wl, &spectral[..num_wl]);
-    if phot > 1e-30 {
+    if phot > 1e-30 && phot.is_finite() && zenith_lum.is_finite() && zenith_lum > 0.0 {
         let scale = (zenith_lum * 1e-3) / phot;
         for v in spectral.iter_mut().take(num_wl) {
             *v *= scale;
+        }
+    } else {
+        // Degenerate input (zero, negative, or non-finite radiance):
+        // ZERO the spectrum rather than passing the uncalibrated
+        // template through (which is ~2 orders bright, and negative
+        // input would inject a huge negative veil: review round 2).
+        for v in spectral.iter_mut().take(num_wl) {
+            *v = 0.0;
         }
     }
 
@@ -216,6 +224,23 @@ pub fn quick_estimate_at_angle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Degenerate radiance (zero, negative, NaN) must yield a ZERO
+    /// spectrum, never the uncalibrated template (review round 2).
+    #[test]
+    fn degenerate_radiance_zeroes_spectrum() {
+        for &r in &[0.0f64, -5.0, f64::NAN] {
+            let sg = quick_estimate(r, 0.3);
+            let max = sg.spectral_radiance[..sg.num_wavelengths]
+                .iter()
+                .cloned()
+                .fold(0.0f64, f64::max);
+            assert!(
+                max == 0.0,
+                "radiance {r}: spectrum must be zeroed, got max {max:e}"
+            );
+        }
+    }
 
     /// The spectral injection must sit on the same photometric rail as
     /// the Falchi zenith luminance: photopic(spectral) == zenith mcd

@@ -134,6 +134,20 @@ pub struct KhaytParams {
     pub celestial_red_fraction: f64,
 }
 
+/// Calibration-analysis knob: parse an override of the APPEARANCE edge
+/// factor from the `TWILIGHT_KHAYT_EDGE_APPEARANCE` environment
+/// variable (raw value passed in; `None`/invalid/non-positive falls
+/// through to `default`). Used by the edge-factor constraint sweep
+/// (tools/criterion_edge_factor.py, validation/RESULTS_EDGE_FACTOR.md)
+/// to trace a site's factor-to-depression response curve without a
+/// rebuild. NOT a user-facing parameter: production semantics are the
+/// calibrated default.
+fn edge_appearance_override(raw: Option<&str>, default: f64) -> f64 {
+    raw.and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(default)
+}
+
 impl Default for KhaytParams {
     fn default() -> Self {
         Self {
@@ -177,7 +191,16 @@ impl Default for KhaytParams {
             // is 17 deg, SQM twilight end 17.99+-0.16) calibrates ~4x.
             // Out-of-sample check: Padborg/UK June should land at
             // OpenFajr's summer 12.3-12.7 deg without retuning.
-            edge_factor_appearance: 45.0,
+            // TWILIGHT_KHAYT_EDGE_APPEARANCE overrides the 45.0 for
+            // the edge-factor calibration analysis (see
+            // edge_appearance_override above); production runs leave
+            // the variable unset.
+            edge_factor_appearance: edge_appearance_override(
+                std::env::var("TWILIGHT_KHAYT_EDGE_APPEARANCE")
+                    .ok()
+                    .as_deref(),
+                45.0,
+            ),
             edge_factor_disappearance: 4.0,
             spread_required: 5,
             celestial_red_fraction: 0.25,
@@ -1099,6 +1122,26 @@ mod tests {
     }
 
     #[test]
+    fn edge_appearance_env_override_is_picked_up() {
+        // Parse contract (pure, no process-global state).
+        assert_eq!(edge_appearance_override(Some("18.0"), 45.0), 18.0);
+        assert_eq!(edge_appearance_override(Some(" 60 "), 45.0), 60.0);
+        assert_eq!(edge_appearance_override(Some("junk"), 45.0), 45.0);
+        assert_eq!(edge_appearance_override(Some("-3"), 45.0), 45.0);
+        assert_eq!(edge_appearance_override(Some("inf"), 45.0), 45.0);
+        assert_eq!(edge_appearance_override(None, 45.0), 45.0);
+        // End-to-end: the env var reaches KhaytParams::default().
+        // Set/restore window kept minimal (env is process-global; the
+        // sibling tests construct defaults from parallel threads, and
+        // their assertions hold at any factor in [18, 45]).
+        std::env::set_var("TWILIGHT_KHAYT_EDGE_APPEARANCE", "18.0");
+        let picked = KhaytParams::default().edge_factor_appearance;
+        std::env::remove_var("TWILIGHT_KHAYT_EDGE_APPEARANCE");
+        assert_eq!(picked, 18.0);
+        assert_eq!(KhaytParams::default().edge_factor_appearance, 45.0);
+    }
+
+    #[test]
     fn featureless_sky_yields_nothing() {
         let szas: Vec<f64> = (0..20).map(|i| 96.0 + 0.5 * i as f64).collect();
         let s = detect(&flat(&szas, 2.2e-4, 2.2e-4), &KhaytParams::default());
@@ -1234,6 +1277,138 @@ mod tests {
             }
         }
         0.5 * (lo + hi)
+    }
+
+    /// Central (kadhib) refinement gate: production morning runs use
+    /// central: true with a refine-only-when-the-verdict-is-at-stake
+    /// condition; no other synthetic gate exercised that branch (review
+    /// round 2). Plants a central-only glow whose crossing sits ~0.5 deg
+    /// PAST the sadiq crossing and asserts (a) the kadhib fires, (b) the
+    /// refined kadhib recovers the analytic central-crossing truth to
+    /// REFINE_TARGET_BRACKET_DEG. A second scan with the central
+    /// crossing only ~0.05 deg past sadiq asserts the verdict gate does
+    /// NOT report a kadhib (the interval cannot fire), pinning the
+    /// conditional arithmetic against sign/operand regressions.
+    #[test]
+    fn refined_solver_recovers_central_kadhib_crossing() {
+        let params = KhaytParams::default().for_side(true);
+        // Base glow shared by ALL band patches (log-curved so the
+        // refinement does real work), plus a central-only brightness
+        // factor (1 + amp). Through the local ln-margin slope
+        // (~0.9/deg near the crossing) the central crossing lands
+        // ln(1 + amp) / 0.9 deg deeper than sadiq: amp picks the
+        // planted kadhib separation directly.
+        let mk_rows = move |sza: f64, amp: f64| -> (Vec<PatchLum>, Vec<PatchLum>) {
+            let base = 2.0e-2 * libm::exp(-((sza - 96.0) / 3.0) * ((sza - 96.0) / 3.0));
+            let band = (0..5)
+                .map(|i| {
+                    let g = if i == 2 { base * (1.0 + amp) } else { base };
+                    PatchLum {
+                        mesopic: FLOOR + g,
+                        red: 0.3 * (FLOOR + g),
+                        ..Default::default()
+                    }
+                })
+                .collect();
+            let refs = (0..2)
+                .map(|_| PatchLum {
+                    mesopic: FLOOR,
+                    red: 0.3 * FLOOR,
+                    ..Default::default()
+                })
+                .collect();
+            (band, refs)
+        };
+        let mk_scan = |amp: f64| -> KhaytScan {
+            let szas: Vec<f64> = (0..16).map(|i| 96.0 + i as f64).collect();
+            let rows: Vec<_> = szas.iter().map(|&s| mk_rows(s, amp)).collect();
+            KhaytScan {
+                szas,
+                band: rows.iter().map(|r| r.0.clone()).collect(),
+                refs: rows.iter().map(|r| r.1.clone()).collect(),
+            }
+        };
+
+        // Case A: amp 3 plants the central crossing ~ln(4)/0.9 = 1.5
+        // deg past sadiq: the kadhib must fire and refine.
+        let scan = mk_scan(3.0);
+        let night = night_baseline(&scan);
+        // Analytic central-crossing truth via the production event
+        // sample (central patch index 2 of the 5-patch fan).
+        let central_margin = |s: f64| -> f64 {
+            let (band, refs) = mk_rows(s, 3.0);
+            let p = FanPoint {
+                sza: s,
+                band,
+                refs,
+            };
+            event_sample(EventKind::Central, &p, &night, &params, 2).margin
+        };
+        let (mut lo, mut hi) = (96.0, 111.0);
+        assert!(central_margin(lo) >= 1.0 && central_margin(hi) < 1.0, "bracket");
+        for _ in 0..60 {
+            let mid = 0.5 * (lo + hi);
+            if central_margin(mid) >= 1.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let truth_c = 0.5 * (lo + hi);
+
+        let mut eval = |s: f64| Some(mk_rows(s, 3.0));
+        let eval_ref: &mut FanEval<'_> = &mut eval;
+        let sol = detect_refined(
+            &scan,
+            &params,
+            Some(eval_ref),
+            RefineEvents {
+                spread: true,
+                central: true,
+                ahmar: false,
+            },
+        );
+        let sadiq = sol.sadiq.expect("sadiq detected");
+        let kadhib = sol.kadhib.expect("planted central-only wedge must fire the kadhib");
+        assert!(
+            kadhib.sza_deg > sadiq.sza_deg + 0.2,
+            "kadhib {:.3} must sit past sadiq {:.3} + 0.2",
+            kadhib.sza_deg,
+            sadiq.sza_deg
+        );
+        assert!(
+            (kadhib.sza_deg - truth_c).abs() <= REFINE_TARGET_BRACKET_DEG,
+            "central: got {:.4} truth {:.4} (err {:.3}): the kadhib the user \
+             sees must be refined, not coarse-grid quantized",
+            kadhib.sza_deg,
+            truth_c,
+            (kadhib.sza_deg - truth_c).abs()
+        );
+
+        // Case B: amp 0.1 plants the central crossing ~ln(1.1)/0.9 =
+        // 0.11 deg past sadiq: inside the 0.2 deg distinctness gate, so
+        // no kadhib may be reported (pins the c > s + 0.2 arithmetic
+        // direction).
+        let scan_b = mk_scan(0.1);
+        let mut eval_b = |s: f64| Some(mk_rows(s, 0.1));
+        let eval_b_ref: &mut FanEval<'_> = &mut eval_b;
+        let sol_b = detect_refined(
+            &scan_b,
+            &params,
+            Some(eval_b_ref),
+            RefineEvents {
+                spread: true,
+                central: true,
+                ahmar: false,
+            },
+        );
+        assert!(sol_b.sadiq.is_some(), "sadiq still detected in case B");
+        assert!(
+            sol_b.kadhib.is_none(),
+            "a central crossing within 0.2 deg of sadiq must NOT report a \
+             kadhib (got {:?})",
+            sol_b.kadhib.map(|c| c.sza_deg)
+        );
     }
 
     #[test]
