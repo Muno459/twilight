@@ -52,114 +52,6 @@ fn cross_boundary(
     (boundary_pos + new_dir * 1e-3, new_dir)
 }
 
-/// Compute total optical depth from `pos` along `dir` to atmosphere exit.
-///
-/// Marches shell-by-shell with refraction, identical path geometry to
-/// `shadow_ray_transmittance` but in an arbitrary direction and returning
-/// the raw optical depth rather than exp(-tau).
-///
-/// COMBINED transport channel: the accumulated tau is the gas extinction
-/// PLUS the caller-provided per-shell cloud channel `cloud_ext` (constant
-/// per shell, so the sum stays exactly piecewise constant). The chains
-/// pass `&atm.cloud_extinction` (the gray 1D deck: the EXACT combined
-/// channel) on 1D/clear runs, and the per-shell FIELD MAJORANTS
-/// (`field_shell_majorants`) on 3D-field runs, where the scouted tau is
-/// the MAJORANT-combined optical depth that the truncated null-collision
-/// flight inverts (see the derivation at the scalar chain's
-/// `use_forced`). Clear-sky shells carry 0.0 either way, so clear-sky
-/// taus are bit-identical to the gas-only scout.
-///
-/// Early-exits when tau exceeds `FORCED_TAU_CUTOFF` (20.0). At that point
-/// `1 - exp(-20) = 0.999999998` in f64, so the forced-scattering weight
-/// is indistinguishable from 1.0 and the truncated exponential is
-/// indistinguishable from the regular exponential. This means photons
-/// deep in the atmosphere (where tau_max >> 20) pay only 1-3 shell ops
-/// instead of marching all 50 shells to TOA.
-///
-/// Returns `(tau_max, hit_ground)`. `hit_ground` is true if the ray
-/// terminates at the surface rather than exiting to space. When
-/// `hit_ground` is true, forced scattering should NOT be used (the
-/// photon will be handled by ground reflection in the bounce loop).
-fn scout_tau_to_boundary(
-    atm: &AtmosphereModel,
-    start_pos: Vec3,
-    start_dir: Vec3,
-    wavelength_idx: usize,
-    cloud_ext: &[f64; crate::atmosphere::MAX_SHELLS],
-) -> (f64, bool) {
-    let surface_radius = atm.surface_radius();
-    let num_shells = atm.num_shells;
-    let mut pos = start_pos;
-    let mut dir = start_dir;
-    let mut tau = 0.0;
-
-    let mut shell_idx = match atm.shell_index(pos.length()) {
-        Some(idx) => idx,
-        None => return (0.0, false),
-    };
-
-    for _ in 0..200 {
-        let shell = &atm.shells[shell_idx];
-        let optics = &atm.optics[shell_idx][wavelength_idx];
-
-        match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
-            Some((dist, is_outward)) => {
-                // Combined channel: gas + the per-shell cloud channel
-                // (1D deck or field majorant; 0.0 on clear shells, so
-                // clear-sky taus are bit-identical).
-                tau += (optics.extinction + cloud_ext[shell_idx]) * dist;
-
-                // Refract at boundary (same logic as shadow_ray_transmittance)
-                let boundary_pos = pos + dir * dist;
-                let n_from = atm.refractive_index[shell_idx];
-                let next_shell = if is_outward {
-                    shell_idx + 1
-                } else {
-                    shell_idx.wrapping_sub(1)
-                };
-                let n_to = if next_shell < num_shells {
-                    atm.refractive_index[next_shell]
-                } else {
-                    1.0
-                };
-                let (new_dir, crossed) = match refract_at_boundary(dir, boundary_pos, n_from, n_to)
-                {
-                    RefractResult::Refracted(d) => (d, true),
-                    RefractResult::TotalReflection(d) => (d, false),
-                };
-                dir = new_dir;
-                pos = boundary_pos + dir * 1e-3;
-
-                // Hit ground -- path terminates here
-                if !is_outward && pos.length() <= surface_radius + 1.0 {
-                    return (tau, true);
-                }
-
-                // Exited atmosphere
-                if crossed {
-                    if next_shell >= num_shells {
-                        return (tau, false);
-                    }
-                    shell_idx = next_shell;
-                }
-            }
-            None => return (tau, false),
-        }
-
-        // At tau > FORCED_TAU_CUTOFF (20.0), 1-exp(-20) = 0.999999998.
-        // The forced-scattering weight is indistinguishable from 1.0
-        // and the truncated exponential is the regular exponential.
-        // Early exit avoids pointless shell marching through dense
-        // lower atmosphere. No bias: weight correction is exact to
-        // f64 precision at this threshold.
-        if tau > FORCED_TAU_CUTOFF {
-            return (tau, false);
-        }
-    }
-
-    (tau, false)
-}
-
 /// Advance a photon along its ray until `tau_target` optical depth is consumed.
 ///
 /// Marches shell-by-shell with refraction, following the same path geometry
@@ -1612,6 +1504,21 @@ const LOS_IMP_H_EXTREME_M: f64 = 15_000.0;
 struct SplitParticleScalar {
     pos: Vec3,
     dir: Vec3,
+    weight: f64,
+    rng: McRng,
+}
+
+/// State of a single particle in the weight-window work stack (Stokes
+/// mode, the production polarized chain). Carries the full scatter
+/// context a resumed bounce needs: the normalized polarization state and
+/// the previous direction (the NEE Mueller geometry), plus the scalar
+/// importance weight the windows act on.
+#[derive(Clone, Copy)]
+struct SplitParticleStokes {
+    pos: Vec3,
+    dir: Vec3,
+    prev_dir: Vec3,
+    stokes: crate::scattering::StokesVector,
     weight: f64,
     rng: McRng,
 }
@@ -3150,18 +3057,9 @@ fn trace_secondary_chain(
     // approximation is sub-percent. (The previous code applied a Mueller
     // scatter for the WRONG geometry - sun->omega - then normalized it away.)
     // A cloud seed is depolarizing HG by the declared convention, so the
-    // unpolarized seed state is exact for it.
-    let mut stokes = StokesVector::unpolarized(1.0);
+    // unpolarized seed state is exact for it (carried by the stack seed
+    // particle below).
 
-    let mut pos = start_pos;
-    let mut current_dir = dir;
-    let mut prev_dir = sun_dir;
-    // NOTE: no `start_optics.ssa` factor here. The caller multiplies the
-    // chain average by beta_scat = extinction * ssa at the seed point, so
-    // applying SSA again here double-counted the seed-vertex albedo
-    // (invisible in Rayleigh tests where ssa = 1; underestimated MS for
-    // aerosol/cloud atmospheres).
-    let mut weight = w0;
     let mut total_stokes = StokesVector::unpolarized(0.0);
 
     // Upfront forced scattering at deep twilight (SZA >= 96).
@@ -3203,15 +3101,139 @@ fn trace_secondary_chain(
         ((sza_deg_local - ZENITH_SZA_START) / (ZENITH_SZA_FULL - ZENITH_SZA_START)).clamp(0.0, 1.0);
     let alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
 
+    // Weight-window population control, ported from the scalar chain
+    // (same constants, same importance: altitude scale height + CADIS
+    // lateral term; see the weight-window block above SplitParticleScalar).
+    // The production polarized chain previously ran a bare bounce loop, so
+    // every deep-twilight prayer scan paid the one-bright-chain tail this
+    // machinery exists to kill. Windows act on the scalar importance
+    // `weight`; the normalized Stokes state rides along in the particle.
+    let surface_radius = atm.surface_radius();
+    let h_ww = weight_window_h(sza_deg_local);
+    let alt_start = start_pos.length() - surface_radius;
+    let cos_sun_start = local_up.dot(sun_dir);
+    let ck = cadis_k(sza_deg_local);
+
+    // NOTE on w0 (unchanged from the pre-window chain): no
+    // `start_optics.ssa` factor at the seed. The caller multiplies the
+    // chain average by beta_scat = extinction * ssa at the seed point, so
+    // applying SSA again here double-counted the seed-vertex albedo.
+    let dummy_rng = McRng {
+        tau: 0,
+        dir: 0,
+        ctl: 0,
+    };
+    let mut stack = [SplitParticleStokes {
+        pos: Vec3::new(0.0, 0.0, 0.0),
+        dir: Vec3::new(0.0, 0.0, 1.0),
+        prev_dir: Vec3::new(0.0, 0.0, 1.0),
+        stokes: StokesVector::unpolarized(1.0),
+        weight: 0.0,
+        rng: dummy_rng,
+    }; MAX_SPLIT_PARTICLES];
+    let mut stack_len: usize = 1;
+    stack[0] = SplitParticleStokes {
+        pos: start_pos,
+        dir,
+        prev_dir: sun_dir,
+        stokes: StokesVector::unpolarized(1.0),
+        weight: w0,
+        rng: *rng,
+    };
+
+    // Process all particles: main first, then split copies (LIFO order).
+    while stack_len > 0 {
+        stack_len -= 1;
+        let mut pos = stack[stack_len].pos;
+        let mut current_dir = stack[stack_len].dir;
+        let mut prev_dir = stack[stack_len].prev_dir;
+        let mut stokes = stack[stack_len].stokes;
+        let mut weight = stack[stack_len].weight;
+        let mut local_rng = stack[stack_len].rng;
+
     for _scatter in 0..BOUNCE_SAFETY_LIMIT {
+        // --- Weight window population control ---
+        // Placed at the TOP of the bounce (skipping the seed vertex,
+        // which the scalar chain also leaves unchecked): between the end
+        // of one bounce and the start of the next nothing moves, so this
+        // is the same check the scalar chain runs after its direction
+        // update, and it uniformly covers the gas path and the
+        // cloud-collision path (which `continue`s past the loop tail).
+        if _scatter > 0 {
+            let alt = pos.length() - surface_radius;
+            let cos_sun_here = pos.normalize().dot(sun_dir);
+            let w_target =
+                weight_window_target(alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck);
+            let w_lower = w_target / WW_LOWER_RATIO;
+            let w_upper = w_target * WW_UPPER_RATIO;
+            let abs_w = weight.abs();
+
+            if abs_w < w_lower && w_target > 1e-30 {
+                // Russian roulette (unbiased: E[out] = p * w_target = |w|).
+                let p_survive = abs_w / w_target;
+                if xorshift_f64(&mut local_rng.ctl) < p_survive {
+                    weight = if weight >= 0.0 { w_target } else { -w_target };
+                } else {
+                    break; // chain killed by RR
+                }
+            } else if abs_w > w_upper && w_target > 1e-30 {
+                // Split into k copies of weight/k (unbiased: k * w/k = w).
+                let k_ideal = libm::round(abs_w / w_target) as usize;
+                let max_k = MAX_SPLIT_PARTICLES - stack_len + 1;
+                if max_k >= 2 {
+                    let k = k_ideal.clamp(2, max_k);
+                    weight /= k as f64;
+                    for copy_idx in 1..k {
+                        if stack_len < MAX_SPLIT_PARTICLES {
+                            let child_seed = splitmix64(
+                                local_rng.tau
+                                    ^ (copy_idx as u64).wrapping_mul(2654435761)
+                                    ^ (alt.to_bits() >> 32),
+                            );
+                            stack[stack_len] = SplitParticleStokes {
+                                pos,
+                                dir: current_dir,
+                                prev_dir,
+                                stokes,
+                                weight,
+                                rng: McRng::from_seed(child_seed),
+                            };
+                            stack_len += 1;
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Decide scatter mode for this bounce ---
+        // Fused scout + VSPG (ported from the scalar chain): one shell
+        // walk collects tau_max AND the altitude/SZA-importance segments
+        // that place forced collisions where the sun still shines. The
+        // windows above split exactly the high-weight trajectories this
+        // sampling creates; without it (plain truncated-exponential, the
+        // pre-port state) collisions land low in the dark and the
+        // measured deep-twilight CV did not improve.
         let mut forced_this_bounce = false;
         let mut tau_max = 0.0;
+        let mut vspg_segs = [VspgSegment {
+            tau_lo: 0.0,
+            tau_hi: 0.0,
+            importance: 1.0,
+        }; VSPG_MAX_SEGMENTS];
+        let mut n_vspg_segs = 0usize;
 
         if use_forced {
-            let (tm, hit_ground) =
-                scout_tau_to_boundary(atm, pos, current_dir, wavelength_idx, cloud_maj);
+            let (tm, hit_ground, ns) = scout_with_vspg_segments(
+                atm,
+                pos,
+                current_dir,
+                wavelength_idx,
+                sza_deg_local,
+                &mut vspg_segs,
+                cloud_maj,
+            );
             tau_max = tm;
+            n_vspg_segs = ns;
             // Force scatter only when path exits to space AND has moderate optical
             // depth. Ground-bound paths: analog (ground reflection). Dense paths
             // (tau >= 20): analog (equivalent, no scout overhead). Very thin paths
@@ -3239,8 +3261,11 @@ fn trace_secondary_chain(
             // attenuates through AND can collide in the cloud.
             let exp_neg_tau = libm::exp(-tau_max);
             weight *= 1.0 - exp_neg_tau;
-            let xi = xorshift_f64(&mut rng.tau);
-            let tau_s = -libm::log(1.0 - xi * (1.0 - exp_neg_tau) + 1e-30);
+            // VSPG: sample the collision location from the pre-collected
+            // importance segments (weight-corrected, unbiased).
+            let (tau_s, vspg_w) =
+                vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max, &mut local_rng.tau);
+            weight *= vspg_w;
             let (sp, sd, ss) =
                 advance_to_optical_depth(atm, pos, current_dir, tau_s, wavelength_idx, cloud_maj);
             pos = sp;
@@ -3263,7 +3288,7 @@ fn trace_secondary_chain(
                     &mut pos,
                     &mut current_dir,
                     &mut weight,
-                    &mut rng.tau,
+                    &mut local_rng.tau,
                 ) {
                     FieldVertex::Cloud { shell, g } => {
                         scatter_shell = shell;
@@ -3291,7 +3316,7 @@ fn trace_secondary_chain(
                 let sigma_c = atm.cloud_extinction[scatter_shell];
                 if sigma_c > 0.0 {
                     let sigma_gas = atm.optics[scatter_shell][wavelength_idx].extinction;
-                    if xorshift_f64(&mut rng.tau) < sigma_c / (sigma_c + sigma_gas) {
+                    if xorshift_f64(&mut local_rng.tau) < sigma_c / (sigma_c + sigma_gas) {
                         cloud_collision = true;
                         g_cloud_here = atm.cloud_g_scaled;
                     }
@@ -3303,7 +3328,7 @@ fn trace_secondary_chain(
             let mut scatter_found = false;
             let mut found_shell = 0usize;
             let mut tau_c_remaining =
-                -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
+                -libm::log(1.0 - xorshift_f64(&mut local_rng.tau) + 1e-30);
 
             for _ in 0..200 {
                 let r = pos.length();
@@ -3327,7 +3352,7 @@ fn trace_secondary_chain(
                 } else {
                     let cb = current_dir.dot(term_axis);
                     let sp = sigma * (1.0 - alpha_et * cb);
-                    let xi = xorshift_f64(&mut rng.tau);
+                    let xi = xorshift_f64(&mut local_rng.tau);
                     (-libm::log(1.0 - xi + 1e-30) / sp, sp, cb)
                 };
 
@@ -3397,10 +3422,10 @@ fn trace_secondary_chain(
                         let albedo = atm.surface_albedo[wavelength_idx];
                         weight *= albedo;
                         prev_dir = current_dir;
-                        current_dir = sample_hemisphere(normal, &mut rng.dir);
+                        current_dir = sample_hemisphere(normal, &mut local_rng.dir);
                         stokes = StokesVector::unpolarized(1.0);
                         tau_c_remaining =
-                            -libm::log(1.0 - xorshift_f64(&mut rng.tau) + 1e-30);
+                            -libm::log(1.0 - xorshift_f64(&mut local_rng.tau) + 1e-30);
                         continue;
                     }
                     continue;
@@ -3471,8 +3496,8 @@ fn trace_secondary_chain(
         // is a depolarizing HG: sample the lobe, reset polarization, and
         // continue (no Mueller update).
         if cloud_collision {
-            let cos_theta = sample_henyey_greenstein(xorshift_f64(&mut rng.dir), g_cloud_here);
-            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
+            let cos_theta = sample_henyey_greenstein(xorshift_f64(&mut local_rng.dir), g_cloud_here);
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
             let d = scatter_direction(current_dir, cos_theta, phi);
             prev_dir = current_dir;
             current_dir = d;
@@ -3480,12 +3505,12 @@ fn trace_secondary_chain(
             continue;
         }
 
-        let cos_theta = if xorshift_f64(&mut rng.dir) < optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(&mut rng.dir))
+        let cos_theta = if xorshift_f64(&mut local_rng.dir) < optics.rayleigh_fraction {
+            sample_rayleigh_analytic(xorshift_f64(&mut local_rng.dir))
         } else {
-            sample_henyey_greenstein(xorshift_f64(&mut rng.dir), optics.asymmetry)
+            sample_henyey_greenstein(xorshift_f64(&mut local_rng.dir), optics.asymmetry)
         };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
+        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
         let new_dir = scatter_direction(current_dir, cos_theta, phi);
 
         // Update Stokes through this gas scatter (fused, no matrices, no trig)
@@ -3511,16 +3536,21 @@ fn trace_secondary_chain(
         current_dir = new_dir;
     }
 
+    }
+
     total_stokes
 }
 
 /// Scalar-mode secondary MC chain (no Stokes, no Mueller matrices).
 ///
 /// Identical physics to `trace_secondary_chain` but tracks only scalar
-/// radiance weight. All RNG consumption is identical so direction sampling
-/// produces the same trajectories -- the only difference is that we evaluate
-/// scalar phase functions instead of Mueller/Stokes operations at each
-/// scatter event and NEE.
+/// radiance weight: scalar phase functions replace the Mueller/Stokes
+/// operations at each scatter event and NEE. (The historical claim of
+/// bit-identical RNG streams between the two chains no longer holds:
+/// this chain additionally runs VSPG segment sampling and Dwivedi
+/// direction MIS, and both chains now run weight-window population
+/// control whose split/roulette draws depend on their own weight
+/// trajectories.)
 ///
 /// This saves 3x `scatter_stokes_fast`, 3x `scattering_plane_cos_sin`,
 /// and multiple 4-component Stokes operations per bounce.
@@ -6549,6 +6579,31 @@ mod tests {
     // here for the diagnostic printlns in the field-forced gates.
     extern crate std;
 
+    /// Test shim for the retired plain scalar scout: since the Stokes
+    /// chain adopted the fused scout (weight-window port), the fused
+    /// `scout_with_vspg_segments` is THE production scout. These tests
+    /// only need `(tau_max, hit_ground)`, so route the old signature
+    /// through the fused walk (identical combined-tau accumulation and
+    /// FORCED_TAU_CUTOFF early exit by construction; the collected
+    /// segments are discarded; sza 0.0 keeps every VSPG importance at
+    /// 1.0).
+    fn scout_tau_to_boundary(
+        atm: &AtmosphereModel,
+        pos: Vec3,
+        dir: Vec3,
+        wavelength_idx: usize,
+        cloud_ext: &[f64; crate::atmosphere::MAX_SHELLS],
+    ) -> (f64, bool) {
+        let mut segs = [VspgSegment {
+            tau_lo: 0.0,
+            tau_hi: 0.0,
+            importance: 1.0,
+        }; VSPG_MAX_SEGMENTS];
+        let (tau, hit_ground, _) =
+            scout_with_vspg_segments(atm, pos, dir, wavelength_idx, 0.0, &mut segs, cloud_ext);
+        (tau, hit_ground)
+    }
+
     /// Regression: the geographic-to-ECEF round trip can land the observer
     /// radius one ulp below the surface (equator, lon 3.0: 9e-10 m low),
     /// where shell_index() is None; before the entry snap every photon died
@@ -9223,6 +9278,18 @@ mod tests {
             total <= 4096,
             "Scalar split stack too large: {} bytes",
             total
+        );
+    }
+
+    #[test]
+    fn split_stack_stokes_fits_in_stack() {
+        // MAX_SPLIT_PARTICLES * sizeof(SplitParticleStokes) should stay
+        // well under the thread stack budget (pos+dir+prev_dir+stokes+
+        // weight+rng ~ 136 bytes).
+        let total = MAX_SPLIT_PARTICLES * core::mem::size_of::<SplitParticleStokes>();
+        assert!(
+            total < 8 * 1024,
+            "Stokes split stack too large: {total} bytes"
         );
     }
 

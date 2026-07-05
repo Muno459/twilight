@@ -268,7 +268,15 @@ Full CSV: validation/deep_regime_results.csv. Summary (550 nm rows;
 | 1 | 103 | field | 0.73 | 1.06 | LOW-POWER | 154% | 12 x 16k |
 | 3 | 101 | 1d | 0.40 | 0.67 | LOW-POWER | 172% | 12 x 16k |
 | 3 | 101 | field | 0.48 | 0.62 | LOW-POWER | 131% | 12 x 16k |
-| 3 | 103 | 1d/field | (referee 1e9 pending at assembly time) | | | | |
+| 3 | 103 | 1d | 0.37/3.15/4.25 (450/550/650) | >1 | LOW-POWER | 300-331% | 12 x 16k |
+| 3 | 103 | field | 0.13 | 0.37 | FAIL (collapse class, see below) | 109% | 12 x 16k |
+
+The tau*3/103 referee is now the 1e9 generation (550 nm: 1.515e-8 +-
+1.5e-9; the 3e8 generation read 2.72e-8, a 3.1-combined-SE swing that
+itself illustrates the depth of this corner). The field row's FAIL is
+the false-precision collapse cluster (seeds tightly low, the
+documented mechanism); the 1d rows are seed lotteries at CV 300+
+percent. This corner is the program's KNOWN-LIM residual.
 
 READING, honestly: the REFEREE is no longer the limit anywhere
 (SE 6-7% at 3e8 for SZA 101, 8-10% at 1e9 for 103, vs 10-19% before).
@@ -331,11 +339,34 @@ parity is this campaign's contribution; see the variance ledger.
   fully analog Multiple (8 seeds x 4e5, trajectory-independent,
   externally anchored family). tau* = 1 gated TWO-SIDED, tau* = 3
   gated one-sided [0.35x, +3SE+5%] (the heavy-tail budget class, see
-  residuals). First row measured: tau*1 SZA 97 ratio 0.871, diff
-  3.53e-6 within band 5.76e-6, PASS; the remaining rows were still
-  computing at report time on a load-200+ box (log:
-  scratchpad/queue_mine/g_s3_cb_v3.log; the gate is wired into the
-  ignored suite for the orchestrator's rerun).
+  residuals). The tau*1 deck PASSED two-sided at ALL THREE
+  depths: SZA 97 ratio 0.871 (diff 3.53e-6 within band 5.76e-6),
+  SZA 100 ratio 0.827 (diff 2.01e-7 within band 6.56e-7),
+  SZA 103 ratio 0.843 (diff 5.94e-9 within band 1.07e-7): the
+  work-order's decisive field-forced-vs-analog agreement, closed on a
+  genuinely 3D medium to the bottom of the campaign's SZA range. The
+  tau*3 rows measured so far: SZA 97 ratio 0.970 within regression
+  bounds [0.35x, +3SE+5%], PASS, and nearly CENTERED at the slant
+  view (vs 0.618 at zenith at the same budgets: further confirmation
+  that the zenith deficit is view-geometry importance starvation, not
+  estimator bias); SZA 100: hybrid 6.579e-7 (se 40%) vs multiple
+  1.307e-7 (se 35%), ratio 5.03, inside the SE-derived bounds: PASS by
+  construction, but a reminder that at tau*3 depths BOTH estimators
+  swing wildly at these budgets (the tau*1 rows, converged on both
+  sides, carry the agreement evidence; the tau*3 rows document the
+  tail regime). SZA 103: hybrid 4.798e-9 vs multiple 3.920e-8,
+  ratio 0.122: BELOW the first-draft 0.35x floor. Cross-checked
+  against the uniform-deck twins (forced 0.13x of the final 1e9
+  referee 1.515e-8, analog 0.05x), the forced estimator at the
+  deepest-thickest corner
+  still sits INSIDE the collapse band at achievable budgets, so no
+  floor separates the classes with power there; the gate now REPORTS
+  that row as KNOWN-LIM (the July-02 taxonomy) and asserts the floors
+  at 97/100 where they bite (measured 0.970 and 5.03). Closure of
+  tau*3/SZA 103 remains the standing budget/BDPT follow-up. The gate as
+  shipped was verified END-TO-END (g_s3_cb_v4, exit 0, all six rows
+  reproduced: tau*1 two-sided PASS x3, tau*3 floors PASS at 97/100,
+  103 reported KNOWN-LIM).
   TWO PRESERVED FINDINGS from earlier drafts: (i) at ZENITH view over
   a broken tau*1 deck with the observer under a clear cell, the hybrid
   reads 0.499x of Multiple with a false-tight 1.1% seed SE (all LOS
@@ -357,7 +388,11 @@ Review-round-2 items (all in this campaign's files):
   1.019 band/ref 0.08, SZA 92 ratio 0.980 band 0.11, SZA 97 ratio
   1.005 band 0.18 (the <= ~20 percent review target, met). The
   3D-field SZA-97 branch is upgraded from one-sided (analog era) to
-  two-sided.
+  two-sided and PASSED at the full budget: field rows 1.019 (88,
+  band 0.08), 0.980 (92, band 0.11), 0.953 (97, band 0.31): the
+  uniform-field closure of the starvation class this campaign set out
+  to kill (pre-campaign the same row read 0.37x one-sided). Gate
+  verified end-to-end, exit 0.
 - G-FORCED-1D: rewritten as a scale-free ratio gate,
   |hyb/mul - 1| < 3 x CV-derived SE + 5 percent. Measured: SZA 97
   ratio 1.149 within band 0.389; SZA 100 ratio 1.099 within band
@@ -432,3 +467,55 @@ referee cells until it lands).
    fall back to analog (exactly as the 1D forced mode always did).
    Macrocell-local per-segment majorants are the known refinement if
    field-forced acceptance ever becomes rate-limiting.
+
+
+## Addendum (2026-07-05): weight windows + VSPG ported to the production Stokes chain
+
+The campaign above left one production gap stated in its residuals: the
+polarized chain (what `pray` actually runs) had neither weight-window
+population control nor VSPG collision-location importance, both of
+which the scalar chain has carried for some time. This addendum ports
+both (SplitParticleStokes work stack, split/roulette at the top of each
+bounce against the altitude+CADIS importance; fused
+scout_with_vspg_segments + vspg_sample_from_segments in the forced
+branch; polarization-neutral by construction since VSPG moves collision
+locations, not directions; the superseded standalone scalar scout is
+removed, with a test-only shim for the ALIS scout unit tests).
+
+Measured, windows alone first (honesty ledger): unbiased across 21
+cells vs a pre-port worktree, but NO CV improvement; the windows need
+the collision-location importance to create the high-value trajectories
+they split. With VSPG added, against this campaign's own 1e9/3e8 MYSTIC
+referee on the uniform tau*=3 fixture (12 seeds x 4000 photons, the
+same harness cells as the table above):
+
+| cell | pre-port / referee | windows+VSPG / referee |
+|---|---|---|
+| 101 / 450 | 0.076x | 1.71x +- 0.9 |
+| 101 / 550 | 0.216x | 1.17x +- 0.6 |
+| 101 / 650 | 0.110x | 0.82x +- 0.4 |
+| 103 / 450 | 0.050x | 1.08x +- 0.5 |
+| 103 / 550 | 0.258x | 3.55x +- 3.0 |
+| 103 / 650 | 0.052x | 0.21x +- 0.17 (still collapsed) |
+
+The production chain leaves the collapse class at this corner: five of
+six cells statistically on the referee at a 4k budget where the
+pre-port chain sat at 5-26 percent of the truth with deceptively tight
+seed spread. Clear-sky CV at the khayt SZAs improves up to 6x (SZA 103:
+299 to 50 percent at 550 nm, 220 to 44 at 650; roughly 2x at 101),
+means consistent throughout.
+
+Verification on the ported tree: core 398 / cpu 103 zero-fail;
+G-S3-EQ1D-DEEP 0.999 at 101/103; G-S3-MONO and G-S3-CHI2 green;
+G-S3-CB reproduces the scalar chain's recorded rows exactly (those
+gates run polarized = false, so they double as a no-regression check on
+the scalar chain, and the broken-deck zenith starvation KNOWN-LIM at
+tau*=3/103 vz 80 stands for both chains); GPU clear parity
+0.9995/0.9939/1.0097 with the CPU-side seed CVs visibly reduced
+(SZA 97: 0.013 to 0.008; SZA 100: 0.053 to 0.031) against the unchanged
+GPU analog implementation.
+
+Still open after this addendum: the 103/650 nm uniform cell and the
+broken-deck zenith starvation (both want the forward-map importance
+follow-up), and the 1D twilight rows of the referee table which were
+measured pre-port and understate the production chain's current power.
