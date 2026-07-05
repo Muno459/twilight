@@ -2657,6 +2657,35 @@ mod tests {
     /// produce the forced-vs-analog CV comparison.
     #[test]
     #[ignore = "variance-ledger harness; run explicitly, see RESULTS_DEEP_REGIME.md"]
+    /// Degree-of-polarization dump for the paper's polarization figure:
+    /// zenith view, clear sky, backward MC Stokes at three SZA.
+    /// `cargo test -p twilight-cpu --release dop_dump -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic dump, run explicitly"]
+    fn dop_dump() {
+        use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};
+        let atm = make_clear_sky_atm();
+        let (lat, lon) = (21.4225, 39.8262);
+        let obs = geographic_to_ecef(lat, lon, 0.0);
+        let view = solar_direction_ecef(0.001, 270.0, lat, lon); // zenith
+        println!("DOPCSV,sza,wl_nm,I,dop");
+        for sza in [88.0f64, 92.0, 96.0, 100.0] {
+            let sun = solar_direction_ecef(sza, 270.0, lat, lon);
+            let s = twilight_core::photon::mc_scatter_spectrum_polarized(
+                &atm, obs, view, sun, 4000, 0xC0FFEE, None,
+            );
+            for (w, sv) in s.iter().enumerate().take(atm.num_wavelengths) {
+                let i = sv.s[0];
+                let dop = if i > 1e-30 {
+                    (sv.s[1] * sv.s[1] + sv.s[2] * sv.s[2]).sqrt() / i
+                } else {
+                    0.0
+                };
+                println!("DOPCSV,{sza},{:.0},{i:e},{dop:.4}", atm.wavelengths_nm[w]);
+            }
+        }
+    }
+
     fn cv_ledger_field() {
         let getenv = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
         let which = getenv("CV_FIELD", "synthetic");

@@ -148,6 +148,37 @@ SITES = {
     # Fine scan for the decisive OpenFajr dates: near the June turnaround
     # the khayt crossing is cliff-shaped and quantizes to the 0.5 deg
     # grid; 0.25 deg halves that.
+    # The 23 OpenFajr panel dates not in the original 19-date sweep
+    # (completing all 42 published points; PDF Table 1).
+    "birmingham_rest": (52.44, -1.95, 150, [
+        "2015-01-19", "2015-02-06", "2015-02-18", "2015-02-23",
+        "2015-02-24", "2015-04-22", "2015-04-28", "2015-05-17",
+        "2015-05-20", "2015-05-23", "2015-06-04", "2015-06-06",
+        "2015-06-08", "2015-06-09", "2015-06-10", "2015-07-10",
+        "2015-07-21", "2015-08-28", "2015-09-07", "2015-09-26",
+        "2015-09-27", "2015-11-28", "2015-12-19",
+    ], []),
+    # Full winter subset under the MEASURED atlas veil (Lorenz 2024,
+    # 3.595 mcd inverted to VIIRS-equivalent radiance 162.55, sodium-era
+    # led fraction 0.15): the corrected counterpart of the winter rows.
+    "birmingham_veil_full": (52.44, -1.95, 150, [
+        "2015-01-11", "2015-01-19", "2015-01-24", "2015-02-06",
+        "2015-02-18", "2015-02-22", "2015-02-23", "2015-02-24",
+        "2015-02-27", "2015-11-13", "2015-11-28", "2015-12-10",
+        "2015-12-19", "2015-12-25",
+    ], ["--skyglow", "--radiance", "162.55", "--led-fraction", "0.15"]),
+    # The remaining 28 OpenFajr dates under the measured veil (the
+    # winter 14 are birmingham_veil_full): together every published
+    # panel date gets its apples-to-apples veiled run.
+    "birmingham_veil_rest": (52.44, -1.95, 150, [
+        "2015-04-20", "2015-04-22", "2015-04-27", "2015-04-28",
+        "2015-05-13", "2015-05-17", "2015-05-20", "2015-05-23",
+        "2015-05-27", "2015-06-04", "2015-06-06", "2015-06-07",
+        "2015-06-08", "2015-06-09", "2015-06-10", "2015-06-22",
+        "2015-06-30", "2015-07-06", "2015-07-10", "2015-07-18",
+        "2015-07-21", "2015-08-16", "2015-08-28", "2015-09-06",
+        "2015-09-07", "2015-09-23", "2015-09-26", "2015-09-27",
+    ], ["--skyglow", "--radiance", "162.55", "--led-fraction", "0.15"]),
     "birmingham_fine": (52.44, -1.95, 150, [
         "2015-04-20", "2015-06-22", "2015-06-30", "2015-09-06",
         "2015-12-25",

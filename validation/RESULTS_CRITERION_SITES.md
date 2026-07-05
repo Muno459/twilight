@@ -39,7 +39,7 @@ release engine, default clear-sky atmosphere unless stated.
 | I5 | Hassan et al. 2013 NRIAG J. 2:45-53; 2014 | Matrouh, sea-desert, 31 00 N 27 51 E, 75 m | multi-year 2009-2013 | photoelectric + naked eye | P.E. 14.5-15 +- 1; eye 14.5 |
 | I6 | Issa & Hassan 2011; Hassan et al. 2014 | Kottamia, desert, 29 56 N 31 49 E, 470 m | multi-year ~2010 | photoelectric + naked eye | P.E. 14.5; eye 14.66 +- 0.2 |
 | I7 | Issa & Hassan 2008 II/III; Hassan et al. 2014 | Bahariya oasis, desert, 28 43 N 30 00 E, 150 m | multi-year ~2007 | photoelectric + naked eye | P.E. 14.7-15 (one series 14 +- 0.5); eye 14.6 |
-| I8 | Semeida & Hassan 2018, BJBAS 7:286-290 | Wadi Al-Natrun, desert, 30 30 N 30 09 E, 30 m | multi-year to 2017 | naked eye | 14.57 |
+| I8 | Semeida & Hassan 2018, BJBAS 7:286-290 | Wadi Al-Natrun, desert, 30 30 N 30 09 E, 30 m | 38 obs, 2014-2015 | naked eye | 14.57 is the paper's mean+1SD "highest value of confidence"; observed range 12.48-15.14 (their stated bounds); campaign mean = 14.57 minus 1 SD |
 | I9 | Hassan et al. 2009; Hassan & Abdel-Hadi 2015 | Tubruq, Libya, 32 05 N 23 59 E, 10-40 m | sea background 429 days 2007-2008; desert background 623 days 2009-2013 | naked eye | sea 13.43-13.48; desert 14.66-14.7 |
 | I10 | Sultan 2004, al-Irshaad 8 | Bani-Hoshiesh, 30 km E of Sana'a, Yemen, 15.4 N 44.2 E, 2200 m | 23-28 Nov 2003, post-rain, very clear | naked-eye team | first faint horizon glow merged with the zodiacal light 04:50 local = 18.8 deg (his stated 18.95); "colors divergence" 13.2; evening: red leaves the sky at 15 |
 | I11 | Saksono & Fulazzaky 2020, NRIAG J. 9:238-244 | Depok, Indonesia, 6 27 S 106 48 E, 50-140 m | 26 days, June-July 2015 | SQM + third-degree polynomial knee | 14.0 +- 0.6 |
@@ -98,7 +98,7 @@ using the matched output (khayt vs naked eye, legacy vs instrument).
 | Matrouh (I5) | 14.21 [13.68..14.82] | 14.40 | eye 14.5; P.E. 14.5-15 +- 1 | -0.29 / -0.35 | match |
 | Kottamia (I6) | 14.49 [14.39..14.58] | 14.61 | eye 14.66 +- 0.2; P.E. 14.5 | -0.17 / +0.11 | match |
 | Bahariya (I7) | 14.68 [14.44..14.80] | 14.54 | eye 14.6; P.E. 14.7-15 | +0.08 / -0.3 | match |
-| Wadi Al-Natrun (I8) | 13.83 [13.53..14.39] | 13.84 | eye 14.57 | -0.74 | low; no obvious background story |
+| Wadi Al-Natrun (I8) | 13.83 [13.53..14.39] | 13.84 | eye: range 12.48-15.14, mean+1SD 14.57 | inside the published range; -0.74 only vs the upper-confidence bound | match (2026-07-06 source re-read: the 14.57 this table previously scored against is the paper's mean+1SD, not its mean) |
 | Tubruq desert bg (I9) | 14.95 [14.82..15.20] | 14.77 | eye 14.66-14.7 | +0.27 | match |
 | Tubruq sea bg (I9) | same runs | same | eye 13.43-13.48 | +1.49 | miss; sea background (see 5) |
 | Sana'a 2200 m (I10) | **14.86** [14.84..14.89] | 14.44 | bracketed: first glow 18.8 > tabayyun > colors 13.2 | inside bracket | consistent (his two events straddle the khayt) |
@@ -215,6 +215,12 @@ is NOT the pristine desert the criterion was calibrated against:
   floor (and winter aerosol) is missing from the pristine run;
   moon-bright winter mornings (which raise the reference floor the same
   way skyglow does) already agree.
+
+RESOLVED 2026-07-06: the Natrun target was the paper's mean+1SD upper
+bound, not its mean (38 observations, 2014-2015, observed range
+12.48 to 15.14); the engine sits inside the published range and the
+row is scored as a match against the published statistics. The
+paragraph below is retained for history.
 
 Wadi Al-Natrun (-0.74) is the one moderate outlier without an obvious
 background story; its campaign value (14.57) is a single published

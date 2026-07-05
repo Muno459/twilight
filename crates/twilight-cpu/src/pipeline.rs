@@ -2230,13 +2230,30 @@ fn run_adaptive_scan(
     };
 
     // Pass 1: coarse scan to locate threshold regions.
+    //
+    // Compressed-twilight refinement (measured on OpenFajr Jun 22,
+    // 52.4 N: 0.5 deg quantized the cliff crossing to 11.50 deg where
+    // 0.25 and 0.125 both give 11.90): when the night's maximum
+    // depression is within COMPRESSED_TWILIGHT_MARGIN_DEG of the scan
+    // window top, the whole margin curve lives on the turnaround
+    // cliff, so halve the coarse step (quarter it in the deepest
+    // compression). Cost is confined to high-latitude summer nights;
+    // everywhere else the step is untouched.
+    let compression = sza_upper - SCAN_FLOOR_SZA;
+    let eff_step = if compression < 13.0 {
+        (input.sza_step * 0.25).max(0.125)
+    } else if compression < 16.0 {
+        (input.sza_step * 0.5).max(0.25)
+    } else {
+        input.sza_step
+    };
     let coarse_t0 = std::time::Instant::now();
     let mut coarse_szas = Vec::new();
     {
         let mut sza = SCAN_FLOOR_SZA;
         while sza <= sza_upper + 1e-6 {
             coarse_szas.push(sza);
-            sza += input.sza_step;
+            sza += eff_step;
         }
     }
     if input.verbose {
@@ -2286,7 +2303,7 @@ fn run_adaptive_scan(
     // one coarse step plus one fine step so the fit window around the
     // refined crossing stays inside fine-scanned territory.
     let mut refine_regions: Vec<(f64, f64)> = Vec::new();
-    let margin = input.sza_step + FINE_STEP_DEG;
+    let margin = eff_step + FINE_STEP_DEG;
     for sza in [
         coarse_prayer.fajr_sza_deg,
         coarse_prayer.isha_abyad_sza_deg,

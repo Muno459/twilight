@@ -298,6 +298,28 @@ mod tests {
         atm
     }
 
+    /// Dump the map as CSV for external visualization (papers,
+    /// diagnostics). Run explicitly:
+    /// `cargo test -p twilight-core --release importance_map_dump -- --ignored --nocapture`
+    #[test]
+    #[ignore = "diagnostic dump, run explicitly"]
+    fn importance_map_dump() {
+        extern crate std;
+        let atm = test_atm();
+        let m = SolarImportanceMap::build(&atm, 1);
+        std::println!("IMAPCSV,alt_km,cos_sun,importance");
+        for ia in 0..ALT_BANDS {
+            let alt = (ia as f64 + 0.5) * 3.0;
+            for ic in 0..COS_BANDS {
+                let c = -0.5 + (ic as f64 + 0.5) * (1.0 / COS_BANDS as f64);
+                std::println!(
+                    "IMAPCSV,{alt},{c:.4},{:e}",
+                    m.data[ia * COS_BANDS + ic]
+                );
+            }
+        }
+    }
+
     #[test]
     fn map_builds_and_normalizes() {
         let atm = test_atm();
