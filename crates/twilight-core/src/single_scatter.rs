@@ -171,14 +171,8 @@ pub fn single_scatter_radiance(
 
     // Find where the line of sight exits the atmosphere
     let los_max = match ray_sphere_intersect(observer_pos, view_dir, toa_radius) {
-        Some(hit) => {
-            if hit.t_far > 0.0 {
-                hit.t_far
-            } else {
-                return 0.0;
-            }
-        }
-        None => return 0.0,
+        Some(hit) if hit.t_far > 0.0 => hit.t_far,
+        _ => return 0.0,
     };
 
     // Check if LOS hits the ground
