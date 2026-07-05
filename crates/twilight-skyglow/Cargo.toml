@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Light pollution skyglow model for twilight prayer times"
+description = "Artificial skyglow model: Lorenz atlas, VIIRS Black Marble, Garstang propagation, mesopic veil"
 
 [dependencies]
 ureq = "3"

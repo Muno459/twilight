@@ -3,7 +3,7 @@ name = "twilight-gpu"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Metal GPU compute backend for twilight MCRT"
+description = "Metal and portable wgpu (Vulkan/DX12/Metal) GPU backends for twilight MCRT"
 
 [features]
 default = []

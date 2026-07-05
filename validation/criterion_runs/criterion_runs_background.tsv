@@ -1,0 +1,83 @@
+site	date	khayt_fajr_dep	legacy_fajr_dep	khayt_isha_ahmar_dep	khayt_isha_abyad_dep	legacy_isha_ahmar_dep	legacy_isha_abyad_dep	khayt_fajr_time	false_dawn_from	extra
+assiut_aer_seasons	2013-01-15	12.92	13.51	13.5	15.02	12.26	12.37	05:48:21	05:46:01	--aerosol continental-average
+assiut_aer_seasons	2013-04-15	13.01	13.67	13.5	14.9	12.12	12.35	04:34:36	04:31:37	--aerosol continental-average
+assiut_aer_seasons	2013-10-15	13.1	13.14	14.56	14.18	11.51	11.97	04:59:34	04:55:43	--aerosol continental-average
+assiut_agri_clean	2013-01-15	14.06	14.13	14.5	15.93	12.72	12.99	05:42:59	05:40:37	--aerosol continental-clean
+assiut_agri_clean	2013-04-15	14.26	14.21	14.5	15.96	13.03	12.95	04:28:41	04:25:46	--aerosol continental-clean
+assiut_agri_clean	2013-10-15	14.14	13.92	15.26	14.97	12.17	12.57	04:54:52	04:50:38	--aerosol continental-clean
+assiut_glow	2013-01-15	7.28	10.42	10.32	10.02	10.92	9.03	06:15:07	06:14:05	--skyglow
+birmingham_aer_cavg	2015-01-11	11.99	13.16	13.5	15.55	12.57	12.83	06:50:56	06:48:11	--aerosol continental-average
+birmingham_aer_cavg	2015-01-24	13.17	13.62	13.5	15.17	12.34	12.61	06:33:11	06:29:56	--aerosol continental-average
+birmingham_aer_cavg	2015-02-22	12.91	13.63	13.5	15.21	12.61	12.62	05:50:03	05:47:14	--aerosol continental-average
+birmingham_aer_cavg	2015-02-27	12.94	13.81	14.5	14.32	11.95	12.3	05:39:36	05:36:28	--aerosol continental-average
+birmingham_aer_cavg	2015-06-07	11.5	13.13	12.5	12.5	12.64	12.48	02:50:37	02:43:44	--aerosol continental-average
+birmingham_aer_cavg	2015-06-22	11.5	13.46	11.5	11.5	12.44	12.31	02:41:55		--aerosol continental-average
+birmingham_aer_cavg	2015-06-30	11.66	12.44	12.5	12.5	11.02	11.52	02:44:57	02:37:51	--aerosol continental-average
+birmingham_aer_cavg	2015-11-13	12.95	13.53	13.5	15.65	12.73	13.13	05:59:36	05:55:34	--aerosol continental-average
+birmingham_aer_cavg	2015-12-10	13.4	13.62	13.5	15.71	12.68	12.87	06:31:41	06:28:31	--aerosol continental-average
+birmingham_aer_cavg	2015-12-25	11.69	12.24	14.02	13.11	11.52	11.69	06:53:52	06:52:13	--aerosol continental-average
+birmingham_aer_cclean	2015-01-11	13.17	13.64	14.5	16.62	13.28	13.57	06:42:43	06:40:24	--aerosol continental-clean
+birmingham_aer_cclean	2015-01-24	14.11	14.23	14.5	16.03	13.14	13.58	06:26:51	06:23:18	--aerosol continental-clean
+birmingham_aer_cclean	2015-02-22	14.01	14.66	14.5	16.46	13.25	13.19	05:42:51	05:39:16	--aerosol continental-clean
+birmingham_aer_cclean	2015-02-27	13.91	14.52	15.5	15.35	13.04	12.88	05:33:12	05:29:31	--aerosol continental-clean
+birmingham_aer_cclean	2015-06-22	11.5	13.35	11.5	11.5	13.24	12.77	02:41:55		--aerosol continental-clean
+birmingham_aer_cclean	2015-11-13	14.03	14.37	14.5	17.06	13.37	13.66	05:52:21	05:48:31	--aerosol continental-clean
+birmingham_aer_cclean	2015-12-10	14.1	14.14	14.5	16.19	13.36	13.64	06:26:46	06:25:06	--aerosol continental-clean
+birmingham_aer_cclean	2015-12-25	12.7	12.83	14.67	14.3	11.6	12.28	06:46:42	06:43:35	--aerosol continental-clean
+birmingham_atlas	2015-01-11	7.45	10.61	10.45	10.21	10.99	9.3	07:23:26	07:21:48	--skyglow
+birmingham_atlas	2015-01-24	7.45	10.61	10.44	10.21	10.97	9.29	07:12:44	07:11:11	--skyglow
+birmingham_atlas	2015-02-22	7.45	10.61	10.46	10.21	10.98	9.29	06:25:55	06:24:26	--skyglow
+birmingham_atlas	2015-02-27	7.45	10.61	10.45	10.21	10.95	9.29	06:15:35	06:14:07	--skyglow
+birmingham_atlas	2015-04-20	7.45	10.59	10.46	10.19	10.98	9.31	05:12:24	05:10:42	--skyglow
+birmingham_atlas	2015-06-22	7.4	10.65	10.14	9.9	10.98	9.29	03:39:28	03:36:56	--skyglow
+birmingham_atlas	2015-09-23	7.45	10.61	10.46	10.2	10.95	9.29	06:11:00	06:09:31	--skyglow
+birmingham_atlas	2015-11-13	7.45	10.63	10.44	10.21	10.98	9.29	06:37:15	06:35:41	--skyglow
+birmingham_atlas	2015-12-10	7.45	10.6	10.45	10.19	10.98	9.3	07:14:33	07:12:54	--skyglow
+birmingham_atlas	2015-12-25	7.44	10.56	10.45	10.18	10.82	9.29	07:24:57	07:23:17	--skyglow
+birmingham_atlas_fix	2015-01-11	12.83	14.16	14.97	14.84	13.5	13.74	06:45:06	06:43:11	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-01-24	12.83	14.77	14.96	14.83	13.2	13.64	06:35:28	06:33:09	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-02-22	12.83	14.82	15.02	14.88	13.21	13.82	05:50:34	05:48:30	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-02-27	12.81	14.56	15.02	14.81	12.81	13.47	05:40:26	05:38:20	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-04-20	12.86	14.83	14.94	14.89	13.63	13.73	04:29:24	04:26:38	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-04-27	12.84	14.59	14.83	14.9	12.91	13.55	04:10:20	04:07:07	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-05-13	12.86	14.61	14.82	14.9	13.77	13.81	03:26:15	03:22:17	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-05-27	12.8	14.27	14.5	14.5	13.1	13.4	02:51:05	02:45:54	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-06-07	12.24	13.93	12.5	12.5	13.43	13.41	02:38:11	02:33:30	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-06-22	11.5	13.46	11.5	11.5	13.09	12.95	02:41:55		--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-06-30	12.24	13.19	12.5	12.5	11.92	12.46	02:34:07	02:28:47	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-07-06	12.24	13.75	12.5	12.5	13.11	13.25	02:43:40	02:38:55	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-07-18	12.84	14.38	14.5	14.5	13.82	13.85	03:01:21	02:56:16	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-08-16	12.89	14.7	14.85	14.9	13.92	13.84	04:15:16	04:12:04	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-09-06	12.79	14.35	15.01	14.84	13.96	13.93	05:02:16	04:59:32	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-09-23	12.83	14.8	14.99	14.76	12.86	13.38	05:34:34	05:32:16	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-11-13	12.83	14.63	14.98	14.87	13.87	13.87	06:00:25	05:58:06	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-12-10	12.85	14.66	14.94	14.84	13.58	13.97	06:35:30	06:33:09	--skyglow --radiance 0.011086
+birmingham_atlas_fix	2015-12-25	12.76	13.22	14.54	14.65	11.92	12.66	06:46:17	06:44:26	--skyglow --radiance 0.011086
+birmingham_atlas_led0	2015-12-10	7.45	10.44	10.29	10.19	10.8	9.07	07:14:33	07:12:54	--skyglow --led-fraction 0
+birmingham_b4_fix	2015-01-24	13.96	14.77	16.19	16.48	13.2	13.66	06:27:51	06:24:31	--skyglow --radiance 1.363e-4
+birmingham_b4_fix	2015-06-22	11.5	13.47	11.5	11.5	13.09	12.95	02:41:55		--skyglow --radiance 1.363e-4
+birmingham_b4_fix	2015-12-10	13.97	14.67	15.5	16.4	13.59	13.98	06:27:41	06:24:24	--skyglow --radiance 1.363e-4
+birmingham_b5_fix	2015-01-24	13.68	14.77	16.05	15.93	13.2	13.66	06:29:45	06:26:46	--skyglow --radiance 4.088e-4
+birmingham_b5_fix	2015-06-22	11.5	13.47	11.5	11.5	13.09	12.95	02:41:55		--skyglow --radiance 4.088e-4
+birmingham_b5_fix	2015-12-10	13.71	14.67	16.42	15.97	13.59	13.98	06:29:29	06:26:32	--skyglow --radiance 4.088e-4
+birmingham_b6_fix	2015-01-24	13.56	14.77	15.68	15.69	13.2	13.66	06:30:34	06:28:36	--skyglow --radiance 1.0221e-3
+birmingham_b6_fix	2015-06-22	11.5	13.47	11.5	11.5	13.09	12.95	02:41:55		--skyglow --radiance 1.0221e-3
+birmingham_b6_fix	2015-12-10	13.6	14.67	15.69	15.71	13.59	13.98	06:30:16	06:28:19	--skyglow --radiance 1.0221e-3
+birmingham_veil_r08	2015-01-24	11.1	13.76	13.24	13.24	12.96	12.92	06:47:20	06:45:16	--skyglow --radiance 0.8
+birmingham_veil_r08	2015-06-22	10.72	13.34	11.5	11.5	12.98	12.58	02:55:04	02:50:51	--skyglow --radiance 0.8
+birmingham_veil_r08	2015-12-10	11.08	13.97	13.23	13.26	13.19	12.87	06:48:04	06:45:54	--skyglow --radiance 0.8
+birmingham_veil_r2	2015-01-24	10.62	13.51	12.88	12.89	12.86	12.45	06:50:36	06:48:32	--skyglow --radiance 2
+birmingham_veil_r2	2015-06-22	10.25	13.19	11.5	11.5	12.87	12.38	03:02:15	02:58:33	--skyglow --radiance 2
+birmingham_veil_r2	2015-12-10	10.6	13.4	12.96	12.91	12.97	12.44	06:51:30	06:49:20	--skyglow --radiance 2
+birmingham_veil_r6	2015-01-24	9.93	12.94	12.39	12.3	12.63	11.86	06:55:23	06:53:41	--skyglow --radiance 6
+birmingham_veil_r6	2015-06-22	9.61	12.83	11.5	11.5	12.59	12.06	03:11:27	03:08:06	--skyglow --radiance 6
+birmingham_veil_r6	2015-12-10	9.92	12.86	12.39	12.3	12.7	11.92	06:56:25	06:54:39	--skyglow --radiance 6
+tubruq_desert_alb	2010-01-15	14.82	14.5	14.5	17.72	13.4	13.86	06:14:44	06:08:57	--albedo 0.30
+tubruq_desert_alb	2010-04-15	14.82	14.72	15.5	16.68	13.51	13.7	04:46:35	04:44:18	--albedo 0.30
+tubruq_desert_alb	2010-07-15	15.19	14.67	15.5	16.88	13.91	13.93	04:08:09	04:04:04	--albedo 0.30
+tubruq_sea	2010-01-15	14.81	14.61	14.5	17.72	13.41	13.87	06:14:45	06:08:57	--albedo 0.06
+tubruq_sea	2010-04-15	14.83	14.63	15.5	16.69	13.52	13.63	04:46:32	04:44:17	--albedo 0.06
+tubruq_sea	2010-07-15	15.2	14.66	15.5	16.88	13.6	13.7	04:08:07	04:04:03	--albedo 0.06
+tubruq_sea_marine	2010-01-15	13.83	14.01	14.5	16.25	13.17	13.09	06:19:36	06:16:51	--albedo 0.06 --aerosol maritime-clean
+tubruq_sea_marine	2010-04-15	13.91	14.15	14.5	16.22	13.15	13.55	04:51:10	04:48:58	--albedo 0.06 --aerosol maritime-clean
+tubruq_sea_marine	2010-07-15	14.07	14.02	14.5	16.07	13.41	13.4	04:14:51	04:10:53	--albedo 0.06 --aerosol maritime-clean

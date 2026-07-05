@@ -1,0 +1,80 @@
+Twilight MCRT Prayer Time Calculator
+====================================
+Date:       2011-04-15
+Location:   31.0670°N, 32.8670°E
+Elevation:  20 m
+Timezone:   Africa/Cairo (UTC+02:00, IANA tzdb)
+Albedo:     0.15
+SZA step:   0.50°
+Atmosphere: US Standard 1976 (clear sky)
+Ephemeris:  NREL SPA
+Method:     Hybrid SS+MC (100 sec. rays/step) + CIE mesopic vision
+Polarize:   Stokes [I,Q,U,V]
+
+GPU:        Apple M2 Pro (Metal)
+Compute:    GPU (Metal; per-kernel CPU fallback)
+Computing...
+Done in 276893 ms (ephemeris: SPA (fallback), compute: GPU (Metal; per-kernel CPU fallback))
+
+Prayer Times (MCRT-derived):
+-----------------------------------------------------------------
+  Sunrise:              05:21:21
+  Sunset:               18:16:29
+
+  Celestial background: fajr-side 7.448e-4 cd/m^2, isha-side 8.482e-3 (dark-sky const 2.200e-4) - re-floating thresholds.
+  Fajr (khayt al-abyad): 04:17:23 ±0.1min  (SZA 103.99°, depression 13.99°)
+    └ white thread distinct from black + lateral spread (2:187, mustatir)
+    └ false dawn (al-fajr al-kadhib) visible from 04:10:05 - do not pray Fajr yet
+  Isha (shafaq ahmar):   19:30:44 ±<0.1min  (SZA 106.01°, depression 16.01°)
+    └ red band no longer distinct - Shafi'i/Maliki/Hanbali (primary)
+  Isha (shafaq abyad):   19:29:02 ±0.1min  (SZA 105.67°, depression 15.67°)
+    └ white band no longer distinct - Hanafi
+
+  Legacy absolute-threshold method (comparison):
+  Fajr (true dawn):     04:12:54 ±<0.1min  (SZA 104.89°, depression 14.89°)
+  Isha (al-abyad):      19:15:01 ±0.7min  (SZA 102.87°, depression 12.87°)
+    └ Hanafi school - white twilight disappears
+  Isha (al-ahmar):      19:11:49 ±0.7min  (SZA 102.23°, depression 12.23°)
+    └ Shafi'i/Maliki/Hanbali - red glow disappears
+-----------------------------------------------------------------
+
+Comparison with conventional fixed-angle methods:
+-----------------------------------------------------------------
+  Fajr 18° (MWL/ISNA)          03:57:13  (diff: +15.7 min)
+  Fajr 15° (Egypt)             04:12:22  (diff: +0.5 min)
+  Fajr 19.5° (Umm al-Qura)     03:49:33  (diff: +23.4 min)
+  Isha 17° (MWL)               19:35:45  (diff: -23.9 min)
+  Isha 17.5° (Egypt)           19:38:18  (diff: -26.5 min)
+  Isha 18° (ISNA)              19:40:51  (diff: -29.0 min)
+-----------------------------------------------------------------
+
+Notes:
+  - These times are computed from first-principles radiative transfer (MCRT).
+  - Current model: US Standard 1976 atmosphere, hybrid single+multi scatter.
+  - Order 1 is exact, orders 2+ are MC. Use --photons to adjust convergence.
+  - No aerosols or clouds. Use --aerosol/--cloud or --weather to add them.
+  - The 'depression' angle is the equivalent fixed angle that gives the same time.
+  - Differences from conventional times reflect atmospheric conditions vs fixed angles.
+khayt sza  93.00: spread   2.893e1 (+-0.0e0) central   3.180e1 ahmar   3.413e1
+khayt sza  95.00: spread   6.893e1 (+-0.0e0) central   7.822e1 ahmar   1.109e2
+khayt sza  97.00: spread   5.700e1 (+-0.0e0) central   6.749e1 ahmar   7.555e1
+khayt sza  99.00: spread   1.968e1 (+-0.0e0) central   2.435e1 ahmar   8.453e1
+khayt sza 101.00: spread   2.209e1 (+-0.0e0) central   2.852e1 ahmar   1.960e1
+khayt sza 103.00: spread   6.050e0 (+-0.0e0) central   8.502e0 ahmar   5.833e0
+khayt sza 105.00: spread  8.330e-1 (+-0.0e0) central   1.526e0 ahmar   1.230e0
+khayt sza 107.00: spread  7.476e-2 (+-0.0e0) central  1.419e-1 ahmar   0.000e0
+khayt sza 109.00: spread  6.118e-3 (+-0.0e0) central  3.230e-2 ahmar   0.000e0
+khayt sza 111.00: spread   0.000e0 (+-0.0e0) central   0.000e0 ahmar   0.000e0
+khayt sza  93.00: spread   3.254e2 (+-0.0e0) central   3.577e2 ahmar   3.838e2
+khayt sza  95.00: spread   7.741e2 (+-0.0e0) central   8.785e2 ahmar   1.244e3
+khayt sza  97.00: spread   6.348e2 (+-0.0e0) central   7.518e2 ahmar   8.367e2
+khayt sza  99.00: spread   2.153e2 (+-0.0e0) central   2.665e2 ahmar   8.048e2
+khayt sza 101.00: spread   1.723e2 (+-0.0e0) central   2.227e2 ahmar   1.526e2
+khayt sza 103.00: spread   2.806e1 (+-0.0e0) central   3.981e1 ahmar   2.559e1
+khayt sza 105.00: spread   1.790e0 (+-0.0e0) central   3.472e0 ahmar   2.726e0
+khayt sza 107.00: spread  1.615e-1 (+-0.0e0) central  4.463e-1 ahmar  2.053e-1
+khayt sza 109.00: spread  1.175e-2 (+-0.0e0) central  6.202e-2 ahmar  1.803e-1
+khayt sza 111.00: spread   0.000e0 (+-0.0e0) central   0.000e0 ahmar   0.000e0
+khayt resolution fajr_sadiq: sza 103.9949 deg, sigma 0.0282 deg (bracket half 0.0469 deg), ~0.14 min
+khayt resolution isha_ahmar: sza 106.0096 deg, sigma 0.0091 deg (bracket half 0.0156 deg), ~0.05 min
+khayt resolution isha_abyad: sza 105.6712 deg, sigma 0.0231 deg (bracket half 0.0000 deg), ~0.12 min

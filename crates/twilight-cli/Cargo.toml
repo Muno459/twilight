@@ -3,7 +3,7 @@ name = "twilight-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Command-line interface for twilight prayer time computation"
+description = "Command-line interface: twilight simulation and Quranic dawn/dusk (prayer time) computation"
 
 [features]
 default = ["gpu"]

@@ -4,13 +4,13 @@
 
 <p align="center">
   <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/rust-workspace-orange?style=flat-square" alt="rust"/></a>
-  <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/GPU-Metal-blueviolet?style=flat-square" alt="gpu"/></a>
-  <a href="#validation"><img src="https://img.shields.io/badge/validated-libRadtran%20%2B%20field%20campaigns-green?style=flat-square" alt="validation"/></a>
+  <a href="https://github.com/Muno459/twilight"><img src="https://img.shields.io/badge/GPU-Metal%20%2B%20wgpu%20(Vulkan)-blueviolet?style=flat-square" alt="gpu"/></a>
+  <a href="#validation"><img src="https://img.shields.io/badge/validated-libRadtran%20%2B%20SHDOM%20%2B%20field%20campaigns-green?style=flat-square" alt="validation"/></a>
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue?style=flat-square" alt="license"/></a>
 </p>
 
-<h3 align="center">A physically-based dawn and dusk calculator.</h3>
-<p align="center">Fajr and Isha computed the way the Quran defines them, not from a fixed angle.</p>
+<h3 align="center">A Monte Carlo radiative-transfer simulator of the twilight sky,<br/>with a validated model of human dawn and dusk visibility.</h3>
+<p align="center">Its flagship application: Fajr and Isha computed the way the Quran defines them, not from a fixed angle.</p>
 
 <br/>
 
@@ -18,29 +18,41 @@
 
 ## What this is
 
-Prayer apps compute Fajr with a fixed solar depression angle: MWL uses 18
-degrees, Egypt 15, Umm al-Qura uses offsets. They disagree because "when
-does dawn become visible?" is not a single number. It depends on the
-atmosphere, the clouds, the moon, the city lights, and the human eye.
+`twilight` is two layers, cleanly separated in the crate graph.
 
-The ayah describes something more specific than an angle: a band of light
-on the horizon becoming *distinct to you* from the night beside it. That is
-a visual detection event, and it can be computed.
+**The simulator** computes absolute spectral sky radiance through deep
+twilight: backward Monte Carlo transport through a 56-shell spherical
+refracting atmosphere to 150 km, at 41 wavelengths with full Stokes
+polarization, with measured 3D cloud fields, aerosols, five-species
+molecular absorption, and every celestial and artificial background light
+source. It is validated against DISORT, MYSTIC, and SHDOM (144/144 slab
+points, absolute scale to 1 to 2.5 percent, cloud decks refereed to solar
+zenith angle 103 with 1e9-photon references) and against measured twilight
+skies. The same engine answers general questions: twilight brightness
+decay, zodiacal light visibility, artificial skyglow, high-latitude
+persistent twilight.
 
-`twilight` simulates the night sky for your location and date, models a
-dark-adapted human observer watching the eastern horizon, and reports the
-moment the white thread of dawn becomes distinct and spreads, exactly as
-the verse and the sunnah describe it. It also reports the false dawn (the
-narrow "wolf's tail" that rises before the true dawn) and both Isha
-definitions (the disappearance of the red and the white twilight).
+**The application** models a dark-adapted human observer watching the
+horizon band, and reports the moment the white thread of dawn becomes
+distinct and spreads, exactly as the verse and the sunnah describe it,
+along with the false dawn (the narrow "wolf's tail" that rises before the
+true dawn) and both Isha definitions (the disappearance of the red and the
+white twilight). Prayer apps disagree because they reduce "when does dawn
+become visible?" to a fixed solar depression angle (MWL 18 degrees, Egypt
+15, Umm al-Qura offsets); the ayah describes a visual detection event, and
+a detection event can be computed.
 
 The sky it simulates is tonight's sky, not a textbook one: the forecast at
-the prayer hour, satellite-measured cloud cover and city light, the real
-moon from the JPL ephemeris, and an **AI 3D cloud reconstruction**: a
-neural network trained on spaceborne cloud radar rebuilds the actual
-three-dimensional cloud field over your head from the latest geostationary
-satellite scan, so the light transport sees clouds at their true heights
-and thicknesses, not a guessed average.
+the prayer hour, measured aerosol optical depth, satellite-measured cloud
+cover and city light, the real moon from the JPL ephemeris, and an **AI 3D
+cloud reconstruction**: a neural network trained on spaceborne cloud radar
+rebuilds the actual three-dimensional cloud field over your head from the
+latest geostationary satellite scan, so the light transport sees clouds at
+their true heights and thicknesses, not a guessed average. And because the
+inputs are measured, the output carries an honest uncertainty: every
+computed time is reported with a plus-minus band propagated from the Monte
+Carlo noise, the skyglow atlas calibration, the street-light duty cycle,
+and the aerosol product.
 
 ## Quick start
 
@@ -52,8 +64,8 @@ cargo build --release
 # the coordinates via the IANA database; --tz overrides if needed.
 ./target/release/twilight-cli pray --lat 21.4225 --lon 39.8262 --date 2026-06-13
 
-# Production: live weather at the prayer hour, satellite clouds, measured
-# skyglow, JPL ephemeris, multi-scatter transport
+# Production: live weather and aerosols at the prayer hour, satellite
+# clouds, measured skyglow, JPL ephemeris, multi-scatter transport
 ./target/release/twilight-cli pray --lat 54.82 --lon 9.36 --date 2026-06-13 \
   --weather --skyglow --de440 data/de440.bsp --scattering hybrid
 ```
@@ -61,7 +73,7 @@ cargo build --release
 Output (Mecca, clear sky):
 
 ```
-  Fajr (khayt al-abyad): 04:29:09  (SZA 104.85°, depression 14.85°)
+  Fajr (khayt al-abyad): 04:29:09 ±3.0min  (SZA 104.85°, depression 14.85°)
     └ white thread distinct from black + lateral spread (2:187, mustatir)
     └ false dawn (al-fajr al-kadhib) visible from 04:27:14 - do not pray Fajr yet
   Isha (shafaq ahmar):   20:15:48  (depression 15.50°)
@@ -77,7 +89,9 @@ printed below these for comparison.
 
 Two independent kinds of validation: the light transport is checked against
 reference radiative-transfer codes, and the visibility criterion is checked
-against published human dawn-observation campaigns.
+against published human dawn-observation campaigns. The full program lives
+in `validation/` (one RESULTS document per campaign, each stating its
+reproduction command).
 
 **Criterion vs field campaigns** (clear sky, calibrated once at Mecca):
 
@@ -91,17 +105,29 @@ against published human dawn-observation campaigns.
 The Birmingham row matters most: the seasonal "summer relaxation" that UK
 scholars apply as a hand-rule (14.5° in winter, about 12.5° in summer)
 emerges from the physics across 31 degrees of latitude with no additional
-tuning.
+tuning. Across the full 16-campaign sweep the median absolute residual is
+0.3° of depression.
 
-**Transport vs libRadtran** (Rayleigh, shape-normalized; details in `validation/RESULTS.md`):
+The criterion's one calibrated constant has itself been stress-tested:
+inverting each desert campaign independently for its own implied value
+gives a cluster with geometric mean 41.6 and spread of only a factor 1.31
+(n = 8 sites, 25.8 to 32.1° N), with the production value inside the
+one-standard-error band and no latitude trend (r = +0.07). The constant is
+not a fit artifact; it is the invariant that eight independent observation
+programs agree on to within their own observational noise
+(`validation/RESULTS_EDGE_FACTOR.md`).
+
+**Transport vs reference codes** (details in `validation/RESULTS*.md`):
 
 | Reference | Regime | Agreement |
 |---|---|---|
-| DISORT (pseudospherical, 16 streams) | SZA 60 to 90° | **2.6 to 3.5 % median** |
+| DISORT (pseudospherical, 16 streams) | SZA 60 to 90° | **2.6 to 3.5 % median** (shape) |
 | DISORT, absolute scale (no normalization) | SZA 60 to 85° | **ratio 0.975 to 0.993** |
-| MYSTIC (spherical Monte Carlo) | SZA 95° | **+6.5 % / +2.9 %** (450/650 nm) |
-| MYSTIC backward, 1e8 photons | SZA 96 to 100° | **1 to 14 %**; past 102° the public referee itself no longer converges |
+| MYSTIC (spherical Monte Carlo) | SZA 95 to 100° | **1 to 14 %**, backward mode, 1e8 photons |
 | DISORT + MYSTIC, cloud slab (same delta-scaled HG problem) | tau* 1 / 3 / 10, SZA 30 to 60° | **144 of 144 points within 3 % + 2 SE**, both MC estimators |
+| SHDOM, true-3D cloud cube | checkerboard + broken deck | **64/64 + 48/48 points in band** |
+| MYSTIC ultra-deep, cloud decks at twilight | tau* 1 and 3, SZA 101 to 103, 3e8 to **1e9 photons** | tau* 1 rows statistically consistent (PASS); tau* 3 rows honestly LOW-POWER (heavy-tail, documented) |
+| Measured twilight skies (Patat, Koomen) | zenith decay into deep twilight | **1.2 to 5.5 %** per-magnitude decay error |
 
 ## Live data
 
@@ -110,11 +136,12 @@ fallbacks:
 
 | Quantity | Source | Cadence |
 |---|---|---|
-| Weather, aerosols, cloud cover at the prayer hour | Open-Meteo forecast + CAMS air quality | hourly forecast |
+| Weather, cloud cover at the prayer hour | Open-Meteo forecast | hourly forecast |
+| Aerosol optical depth (as excess over a measured baseline) | CAMS via Open-Meteo air quality, with per-value input sigma | hourly, archive since 2022-07 |
 | Cloud optical thickness and top height | NASA GIBS, MODIS; sampled at the observer and 50 to 300 km along the sun azimuth, where the twilight light path actually crosses the cloud field | daily |
 | Cloud water path and particle size (phase typing, gap filling) | NASA GIBS, MODIS microphysics | daily |
 | 3D ice-cloud vertical profile | cloud3d model on GOES-19/18 (anonymous S3) or Meteosat-9 SEVIRI (EUMETSAT Data Store) | 10 to 15 min scans |
-| Artificial skyglow | Lorenz 2024 propagated atlas, cross-checked by live VIIRS Black Marble nighttime lights | atlas + daily |
+| Artificial skyglow | Lorenz 2024 propagated atlas, cross-checked by live VIIRS Black Marble nighttime lights; veil applied in mesopic photometry from the source spectrum (HPS vs LED) | atlas + daily |
 | Solar activity (airglow driver) | NOAA SWPC F10.7 radio flux | daily measured |
 | Sun and Moon | JPL DE440 ephemeris (exact lunar parallax, true phase angle, real distance); NREL SPA fallback | static file |
 | Zodiacal light | Leinert 1998 Table 16, the measured grid, embedded and regenerable | embedded |
@@ -153,7 +180,9 @@ collapses it into vertical layers at their measured heights, and rescales
 the total amplitude to the MODIS-measured optical thickness when one is
 available: structure from the AI reconstruction, amplitude from direct
 measurement. SEVIRI is the instrument the model was trained on; GOES uses
-the eleven nearest-wavelength channels.
+the eleven nearest-wavelength channels. With `--cloud-field` the transport
+path-traces the georeferenced voxel volume directly (explicit in-cloud
+scattering on CPU and GPU alike).
 
 ### More options
 
@@ -162,7 +191,7 @@ twilight-cli pray ... --terrain               # Copernicus DEM horizon masking
 twilight-cli pray ... --bortle 7              # manual skyglow (or --radiance)
 twilight-cli pray ... --aerosol urban --cloud thin-cirrus
 twilight-cli pray ... --photons 500           # more MC rays per LOS step
-twilight-cli pray ... --cpu                   # skip the Metal GPU
+twilight-cli pray ... --cpu                   # skip the GPU
 twilight-cli pray ... --fast                  # scalar mode, skip polarization
 twilight-cli mcrt  --lat 21.42 --lon 39.83 --sza-start 90 --sza-end 108
 twilight-cli solar --lat 21.42 --lon 39.83 --date 2026-06-15 --tz 3 --de440 data/de440.bsp
@@ -196,67 +225,93 @@ multiply both patches (absolute radiometric scale, uniform cloud cover,
 uniform skyglow) largely cancel in the ratio. It also needs no special
 handling at high latitudes: the test is already relative to tonight's sky,
 so brightness-based times exist wherever the sky physically brightens
-(Padborg at 54.8° N in June: Fajr 02:55 inside persistent twilight).
+(Padborg at 54.8° N in June: Fajr 02:55 inside persistent twilight,
+confirmed by direct observation).
 
 One calibration layer is stated openly. Laboratory psychophysics predicts
 the eye should already see the dawn's photometric excess at depression 17
 to 18°; every field campaign shows it does not, because the dawn at that
 depth is a borderless gradient spread over tens of degrees (photometers
 detect it, people do not). The factor bridging that gap is calibrated once
-against the Mecca campaign cluster and then held fixed worldwide. The
-Birmingham row in the validation table is the test of that choice.
+against the Mecca campaign cluster and then held fixed worldwide. Three
+independent attacks on that constant (per-site inversion across eight
+desert campaigns, a decomposition from the published psychophysics
+literature, and a zodiacal-light cross-prediction it was never tuned on)
+are documented in `validation/RESULTS_EDGE_FACTOR.md`; the Birmingham row
+in the validation table remains the cleanest out-of-sample test.
 
 Set `TWILIGHT_KHAYT_DEBUG=1` to dump the per-azimuth contrast-margin curves
-of any run.
+of any run, including the per-crossing uncertainty split (Monte Carlo,
+skyglow calibration, street-light duty cycle, aerosol input).
 
 ### The transport
 
 The sky itself is computed by backward Monte Carlo radiative transfer
 through a 56-shell spherical atmosphere reaching 150 km: Rayleigh
 scattering, five-species molecular absorption (O3, NO2, O2, H2O, O4 CIA
-from HITRAN/Serdyuchenko data), OPAC-style aerosols, delta-Eddington cloud
-transport, full Stokes polarization, and Snell refraction at shell
-boundaries, at 41 wavelengths from 380 to 780 nm.
+from HITRAN/Serdyuchenko data), OPAC-style aerosols, measured 3D cloud
+fields traversed by exact DDA voxel marching (with a gray combined channel
+and per-shell majorants for forced flights), full Stokes polarization, and
+Snell refraction at shell boundaries, at 41 wavelengths from 380 to 780 nm.
 
 First-order scattering is evaluated as an exact deterministic integral.
 The entire Monte Carlo budget goes to the multiple-scattering field, which
 is all that exists at Fajr depth, where the line of sight lies fully inside
 Earth's shadow. The estimator stack (next-event estimation, one-sample-MIS
-seeding, forced collisions, exponential transform, Dwivedi sampling, weight
-windows, splitting, bidirectional subpaths, hero-wavelength spectral MIS)
-is exactly unbiased and held to that standard by an adversarial audit
-process and regression-gated CPU/GPU parity tests.
+seeding, forced collisions via truncated null-collision delta tracking,
+VSPG collision-location importance, exponential transform, Dwivedi
+directional MIS, weight windows with splitting, a forward-informed
+importance map, bidirectional subpaths, hero-wavelength spectral MIS) is
+exactly unbiased and held to that standard by an adversarial audit process,
+bit-identity harnesses across refactors, and regression-gated parity tests
+between four independent implementations (CPU scalar, CPU polarized, Metal,
+WGSL).
 
 A full computed day runs about 430 million photon chains: roughly 520 sky
 patches (depression scan × view fan × independent seeds), each tracing
 20,000 chains per wavelength across 41 wavelengths, with every scattering
 event firing a refracted shadow ray toward the sun. On an Apple-Silicon
-GPU (Metal) this takes minutes.
+GPU this takes minutes; the same WGSL kernels run on any Vulkan, DX12, or
+Metal adapter through the portable wgpu backend (headless Linux/NVIDIA
+included).
 
 ## Architecture
 
+The workspace boundary is the simulator/application boundary:
+
 ```
-crates/
-  twilight-core       MC transport kernel (#![no_std])
+crates/                              THE SIMULATOR
+  twilight-core       MC transport kernel (#![no_std], forbid(unsafe));
+                      photon chains, 3D cloud DDA, importance machinery
   twilight-data       atmosphere builder: USSA-76 + thermosphere to 150 km,
                       prebaked cross-sections, aerosols, cloud optics
   twilight-solar      NREL SPA, pure-Rust JPL DE440 SPK reader, lunar
                       ephemeris, earth rotation
+  twilight-gpu        Metal + portable wgpu (Vulkan/DX12/Metal) ports of
+                      the full estimator, parity-gated against the CPU
   twilight-threshold  CIE mesopic/scotopic luminance, contrast thresholds,
-                      night-sky background from measured tables, crossing fits
-  twilight-cpu        pipeline: K-seed scans, the khayt fan, crossing to time
-  twilight-gpu        Metal port of the full estimator, parity-gated
-  twilight-weather    Open-Meteo, GIBS satellite layers, cloud3d, F10.7
+                      night-sky background from measured tables
+
+                                     THE APPLICATION
+  twilight-cpu        pipeline: K-seed scans, the khayt fan, crossings,
+                      uncertainty propagation
+  twilight-weather    Open-Meteo, CAMS aerosols, GIBS satellite, cloud3d
   twilight-skyglow    Lorenz atlas, VIIRS Black Marble, Garstang model
   twilight-terrain    Copernicus DEM horizon profiles
   twilight-ffi        C FFI (minimal)
   twilight-cli        the twilight-cli binary
+
 tools/
-  validate_libradtran.py   DISORT/MYSTIC cross-validation harness
+  validate_libradtran.py   DISORT/MYSTIC cross-validation harness (all tiers)
+  criterion_edge_factor.py the edge-factor attack program
   cloud3d_profile.py       GOES to cloud3d 3D profiles (+ 3D renders)
   cloud3d_seviri.py        Meteosat SEVIRI to cloud3d (EUMETSAT Data Store)
   gen_*.py                 every embedded data table is regenerable from source
 ```
+
+See `docs/ARCHITECTURE.md` for the layer contract and
+`validation/README.md` for the map from every results table to the command
+that regenerates it.
 
 ## Limitations
 
@@ -268,26 +323,24 @@ established local calendars. Known limits, stated plainly:
   ships with the engine (`twilight-cli sqm predict|compare` and the
   campaign protocol in docs/SQM_CAMPAIGN.md); what remains is a meter on a
   roof and clear nights.
-- **3D cloud transport runs on the CPU.** With `--cloud-field`, light is
-  path-traced through the measured voxel volume (explicit in-cloud
-  scattering, validated against DISORT/MYSTIC on cloud slabs); the GPU
-  currently accelerates clear-sky and single-scatter work only, so a
-  cloudy multi-scatter run takes tens of minutes, not seconds.
-- **Under a thick deck at depressions past ~7°, the production (hybrid)
-  estimator converges one-sidedly from below** at default ray budgets
-  (about 0.4x at optical depth 10; the independent analog estimator
-  matches MYSTIC there). Real broken fields are far thinner; the
-  combined-channel sampler that removes this is tracked work.
-- **No external 3D spherical twilight referee exists.** The cloud
-  transport is externally checked on plane-parallel slabs at daytime sun
-  and the clear-sky spherical transport to SZA ~100; the combined
-  regime (3D clouds at twilight geometry) is checked by internal
-  cross-estimator gates and, ultimately, the SQM field campaign.
-- **External transport validation reaches SZA ~98-100** (the absolute
-  radiometric scale is proven to 1-2.5% at SZA 60-85; MYSTIC backward-mode
-  agreement extends to ~100°), while the events live at 99 to 108°. The
-  khayt criterion is a ratio and cancels most residual scale risk; deeper
-  reference comparison is compute-limited on the reference side.
+- **The deepest thick-cloud cells remain statistically weak.** Under a
+  tau* = 3 deck at solar zenith angle 101 to 103 the 550 nm chain variance
+  is heavy-tailed: the estimator agrees with the 1e9-photon MYSTIC referee
+  where it has power (650 nm now sits on the referee after the directional
+  MIS port) but several 550 nm cells remain LOW-POWER at affordable seed
+  budgets. Campaign-scale seeds or sun-side bidirectional transport would
+  close them; the gate taxonomy in `validation/RESULTS_DEEP_REGIME.md`
+  tracks exactly which cells are proven and which are pending.
+- **Zenith views over broken decks starve the importance sampler** (a
+  documented residual with a false-tight error signature; slant views,
+  which the khayt band uses, are unaffected).
+- **GPU chains carry the guiding stack but not population control.**
+  Weight-window splitting is CPU-only (thread-divergence redesign pending),
+  so the CPU path remains the variance reference in the deepest cells.
+- **Sea-horizon sites carry a documented open offset** (Tubruq): a 1D
+  aerosol column cannot represent the directional marine boundary layer
+  along the dawn path; the maritime aerosol type remains the honest input
+  for sea horizons.
 - **Shafaq al-ahmar** rests on the weakest observational dataset (no
   color-resolved modern campaign exists); the evening calibration leans on
   instrumental rather than panel data.
@@ -299,6 +352,10 @@ established local calendars. Known limits, stated plainly:
 export LIBRADTRAN_DIR=~/tools-build/libRadtran-2.0.6
 python3 tools/validate_libradtran.py --tier 1a --shape-only
 python3 tools/validate_libradtran.py --tier 1b --shape-only
+python3 tools/validate_libradtran.py --tier deep     # 3e8 to 1e9 photon referee
+
+# Edge-factor attack program (per-site inversion, zodiacal ladder)
+python3 tools/criterion_edge_factor.py --analyze
 
 # Field-campaign checks
 ./target/release/twilight-cli pray --lat 21.4225 --lon 39.8262 --date 2026-06-13 \
@@ -306,10 +363,19 @@ python3 tools/validate_libradtran.py --tier 1b --shape-only
 ./target/release/twilight-cli pray --lat 52.44 --lon=-1.93 --date 2026-06-13 \
   --de440 data/de440.bsp --scattering hybrid   # Birmingham June: 12.50
 
-# Full test suite (including the Metal GPU parity gates)
+# Full test suite (both GPU backends and their parity gates)
 cargo test --workspace --release
-cargo test -p twilight-gpu --release --features metal
+cargo test -p twilight-gpu --release --features "metal wgpu"
 ```
+
+Every table in `validation/RESULTS*.md` states the exact command and gate
+that produced it; `validation/README.md` is the index.
+
+## Citing
+
+If you use this simulator in academic work, please cite it via the
+repository's `CITATION.cff` (GitHub renders a "Cite this repository"
+button). A methods and validation paper is in preparation.
 
 ## License
 

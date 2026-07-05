@@ -1,0 +1,1 @@
+{"nz": 4, "ny": 16, "nx": 16, "top_m": 4000.0, "lat0_deg": -0.07186489399928135, "lon0_deg": -0.07186489399928135, "dlat_deg": 0.008983111749910169, "dlon_deg": 0.008983111749910169, "units": "g/m3", "vertical_order": "top_down", "row_order": "north_to_south", "time_utc": "2026-07-02T16:45:32Z", "source": "g3-deck 16km synthetic (validate_shdom)"}

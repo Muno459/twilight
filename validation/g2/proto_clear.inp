@@ -1,0 +1,17 @@
+data_files_path /Users/mostafamahdi/tools-build/libRadtran-2.0.6/data/
+atmosphere_file /Users/mostafamahdi/tools-build/libRadtran-2.0.6/data/atmmod/afglus.dat
+source solar solar_tsis_tw.dat per_nm
+albedo 0.15
+wavelength 550 550
+mol_abs_param crs
+no_absorption mol
+rte_solver disort
+number_of_streams 32
+pseudospherical
+sza 60.0
+phi0 0.0
+umu -1.0
+phi 0.0
+zout 0.0
+output_user lambda uu
+quiet

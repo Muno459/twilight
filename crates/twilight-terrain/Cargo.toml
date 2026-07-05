@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Terrain masking for twilight prayer times. Copernicus GLO-30 + national LiDAR."
+description = "Terrain horizon profiles: Copernicus GLO-30 DEM + national LiDAR"
 
 [dependencies]
 tiff = { version = "0.11", default-features = false, features = ["deflate"] }
