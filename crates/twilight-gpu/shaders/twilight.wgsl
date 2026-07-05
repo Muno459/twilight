@@ -113,7 +113,7 @@ const CLOUD_MAX_SUBSTEPS: u32 = 64u;
 const ATM_HEADER_MAGIC: u32 = 0u;
 const ATM_HEADER_VERSION: u32 = 1u;
 const BUFFER_MAGIC: u32 = 0x544C5754u; // "TWLT"
-const BUFFER_VERSION: u32 = 4u;
+const BUFFER_VERSION: u32 = 5u;
 const HEADER_SENTINEL: f32 = -1.0;
 const ATM_NUM_SHELLS: u32 = 2u;
 const ATM_NUM_WAVELENGTHS: u32 = 3u;
@@ -142,6 +142,35 @@ const TERMINATOR_MAX_SHARE: f32 = 0.5;
 const TERMINATOR_N_MAX: f32 = 8.0;
 const TERMINATOR_TILT_MIN_DEG: f32 = 20.0;
 const TERMINATOR_TILT_MAX_DEG: f32 = 60.0;
+
+// ── Deep-twilight guiding stack (port of the CPU secondary chains; see the
+// MSL twin for the full derivation comments) ────────────────────────────────
+//
+// GPU DIFFERENCE, documented honestly: the CPU keeps
+// VSPG_MAX_SEGMENTS = 128 (a full 64-shell double crossing plus reflection
+// headroom); per-thread GPU storage is register/stack-limited, so the GPU
+// cap is 64 segments = MAX_SHELLS. A full one-way crossing is captured
+// exactly; only reflection-multiplied walks overflow, and overflow uses the
+// SAME tile-to-tau_max rule as the CPU (extend the LAST segment across the
+// overflow tau at neutral importance 1.0): the segment set keeps tiling
+// [0, tau_max], so the estimator stays exactly unbiased with merely coarser
+// importance on the tail.
+const VSPG_GPU_MAX_SEGMENTS: u32 = 64u;
+const VSPG_BOOST_START_M: f32 = 15000.0;
+const VSPG_BOOST_FULL_M: f32 = 70000.0;
+const VSPG_MAX_IMPORTANCE: f32 = 50.0;
+const VSPG_SZA_START: f32 = 93.0;
+const VSPG_SZA_FULL: f32 = 106.0;
+
+// Dwivedi horizontal direction MIS (CPU constants).
+const DWIVEDI_BETA_MAX: f32 = 3.0;
+const DWIVEDI_SZA_CENTER: f32 = 103.0;
+const DWIVEDI_SZA_WIDTH: f32 = 2.0;
+const DWIVEDI_FRAC_MAX: f32 = 0.35;
+
+// Iteration backstop for the field-forced truncated null-collision loop
+// (CPU FIELD_NULL_EVENT_LIMIT; Poisson(20) tail, kill = weight zero).
+const FIELD_NULL_EVENT_LIMIT: u32 = 512u;
 
 const FLT_MAX_F32: f32 = 3.4028235e38;
 // Stand-in for the MSL INFINITY free path (see header notes).
@@ -784,6 +813,10 @@ const FIELD_NTLON: u32 = 7u;
 const FIELD_G_STAR_PRESENT: u32 = 8u;
 const FIELD_BG_PRESENT: u32 = 9u;
 const FIELD_MACRO_PRESENT: u32 = 10u;
+// v5: per-transport-shell cloud majorant array (host-computed via
+// Cloud3DField::band_max_sigma over each shell band; the field-forced
+// mode's majorant-combined channel). Present flag + start offset.
+const FIELD_SHELL_MAJ_PRESENT: u32 = 11u;
 const FIELD_Z0_M: u32 = 12u;
 const FIELD_DZ_M: u32 = 13u;
 const FIELD_LAT0_DEG: u32 = 14u;
@@ -791,6 +824,7 @@ const FIELD_LON0_DEG: u32 = 15u;
 const FIELD_DLAT_DEG: u32 = 16u;
 const FIELD_DLON_DEG: u32 = 17u;
 const FIELD_G_DEFAULT: u32 = 18u;
+const FIELD_SHELL_MAJ_OFFSET: u32 = 19u;
 const FIELD_SIGMA_OFFSET: u32 = 20u;
 const FIELD_G_STAR_OFFSET: u32 = 21u;
 const FIELD_MACRO_OFFSET: u32 = 22u;
@@ -828,6 +862,20 @@ fn field_array_offset(slot: u32) -> u32 {
 
 fn field_z_top_m() -> f32 {
     return fld[FIELD_Z0_M] + fld[FIELD_DZ_M] * f32(field_uint(FIELD_NZ));
+}
+
+// True when the v5 per-shell majorant array is packed (the gate for the
+// field-forced mode; hosts that packed without an atmosphere leave it off
+// and field runs stay analog).
+fn field_has_shell_majorants() -> bool {
+    return field_uint(FIELD_SHELL_MAJ_PRESENT) == 1u;
+}
+
+// Per-transport-shell cloud-extinction majorant (v5): bounds the field's
+// sigma_at pointwise over shell `shell_idx`'s radial band. Only valid when
+// field_has_shell_majorants().
+fn field_shell_majorant(shell_idx: u32) -> f32 {
+    return fld[field_array_offset(FIELD_SHELL_MAJ_OFFSET) + shell_idx];
 }
 
 // Returns true and writes (iz, ilat, ilon) when inside the footprint.
@@ -1607,9 +1655,16 @@ struct SecondarySetup {
     n_zenith: f32,
     m_term: f32,
     alpha_et: f32,
-    // Forced-collision gate: (sza >= ZENITH_SZA_START_DEG) && !field_present
-    // (composes exactly with the shell-constant 1D deck via the combined
-    // scout/advance channel; a 3D field stays analog: see twilight.metal).
+    // Chain-local solar zenith angle [deg]: drives the VSPG importance and
+    // the Dwivedi MIS ramps (port of the CPU sza_deg_local).
+    sza_deg: f32,
+    // Forced-collision gate: (sza >= ZENITH_SZA_START_DEG) && (!field_present
+    // || field majorants packed). The 1D deck composes exactly via the
+    // combined scout/advance channel; a 3D field composes via the
+    // majorant-combined channel + truncated null-collision classification
+    // (port of the CPU field_forced_classify; see twilight.metal for the
+    // full derivation comments). Fields packed without majorants keep the
+    // analog fallback.
     use_forced: u32,
     forced_tau_min: f32,
     cloud_channel: u32,
@@ -1647,7 +1702,89 @@ fn terminator_axis(up: vec3<f32>, sun_dir: vec3<f32>, tilt_rad: f32) -> vec3<f32
 }
 
 // ============================================================================
-// Forced scattering scout: combined (gas + gray 1D cloud) tau to boundary
+// Deep-twilight guiding helpers (port of the CPU photon.rs guiding stack;
+// semantically twinned with the MSL helpers, see twilight.metal)
+// ============================================================================
+
+// Sigmoid for smooth SZA ramps (CPU sigmoid).
+fn guide_sigmoid(x: f32) -> f32 {
+    return 1.0 / (1.0 + exp(-x));
+}
+
+// SZA-adaptive Dwivedi sampling fraction (CPU dwivedi_frac).
+fn dwivedi_frac(sza_deg: f32) -> f32 {
+    return DWIVEDI_FRAC_MAX * guide_sigmoid((sza_deg - DWIVEDI_SZA_CENTER) / DWIVEDI_SZA_WIDTH);
+}
+
+// SZA-adaptive Dwivedi concentration parameter (CPU dwivedi_beta).
+fn dwivedi_beta(sza_deg: f32) -> f32 {
+    return DWIVEDI_BETA_MAX * guide_sigmoid((sza_deg - DWIVEDI_SZA_CENTER) / DWIVEDI_SZA_WIDTH);
+}
+
+// Dwivedi PDF in sr^-1 for cos_z = dir . local_up (CPU dwivedi_pdf).
+fn dwivedi_pdf(cos_z: f32, beta: f32) -> f32 {
+    if (beta < 1e-6) {
+        return INV_4PI;
+    }
+    let abs_cz = clamp(abs(cos_z), 0.0, 1.0);
+    return beta * exp(-beta * abs_cz) / (4.0 * PI * (1.0 - exp(-beta)));
+}
+
+// Sample the Dwivedi distribution (CPU dwivedi_sample): CDF inversion of
+// |cos_z|, random sign (symmetric about the horizontal plane), uniform phi.
+struct DwivediSample {
+    cos_z: f32,
+    phi: f32,
+}
+
+fn dwivedi_sample(xi1: f32, xi2: f32, xi_sign: f32, beta: f32) -> DwivediSample {
+    let phi = 2.0 * PI * xi2;
+    if (beta < 1e-6) {
+        return DwivediSample(2.0 * xi1 - 1.0, phi);
+    }
+    let one_minus_exp_neg_beta = 1.0 - exp(-beta);
+    let abs_cz = clamp(-log(1.0 - xi1 * one_minus_exp_neg_beta) / beta, 0.0, 1.0);
+    var cos_z = -abs_cz;
+    if (xi_sign < 0.5) {
+        cos_z = abs_cz;
+    }
+    return DwivediSample(cos_z, phi);
+}
+
+// Altitude/SZA-dependent VSPG importance (CPU vspg_importance): >= 1,
+// ramping quadratically in altitude from 1.0 at 15 km to an SZA-dependent
+// max (up to 50x) at 70 km.
+fn vspg_importance(alt_m: f32, sza_deg: f32) -> f32 {
+    if (alt_m <= VSPG_BOOST_START_M) {
+        return 1.0;
+    }
+    let sza_t = clamp((sza_deg - VSPG_SZA_START) / (VSPG_SZA_FULL - VSPG_SZA_START), 0.0, 1.0);
+    let alt_t = clamp((alt_m - VSPG_BOOST_START_M) / (VSPG_BOOST_FULL_M - VSPG_BOOST_START_M),
+                      0.0, 1.0);
+    let max_imp = 1.0 + (VSPG_MAX_IMPORTANCE - 1.0) * sza_t;
+    return 1.0 + (max_imp - 1.0) * alt_t * alt_t;
+}
+
+// Per-shell VSPG segment (CPU VspgSegment).
+struct VspgSegment {
+    tau_lo: f32,
+    tau_hi: f32,
+    importance: f32,
+}
+
+// Per-shell cloud channel of the forced-flight scout/advance walk: the gray
+// 1D deck (exact) without a field, the per-shell field MAJORANT with one
+// (field runs carry all-zero atm cloud_extinction, so the two never mix).
+fn chain_shell_cloud_ext(use_field_maj: bool, shell_idx: u32) -> f32 {
+    if (use_field_maj) {
+        return field_shell_majorant(shell_idx);
+    }
+    return read_cloud_extinction(shell_idx);
+}
+
+// ============================================================================
+// Forced scattering scout, fused with VSPG segment collection: combined
+// (gas + per-shell cloud channel) tau to boundary
 // ============================================================================
 
 struct ScoutResult {
@@ -1655,12 +1792,20 @@ struct ScoutResult {
     hit_ground: bool,
 }
 
-fn scout_tau_to_boundary(start_pos: vec3<f32>, start_dir: vec3<f32>, wl_idx: u32) -> ScoutResult {
+// Fused scout + VSPG segment collection (port of the CPU
+// scout_with_vspg_segments; see the MSL twin for the overflow-rule
+// derivation). Writes the per-shell segments and their count through the
+// function-space pointers.
+fn scout_with_vspg_segments(use_field_maj: bool, start_pos: vec3<f32>,
+                            start_dir: vec3<f32>, wl_idx: u32, sza_deg: f32,
+                            segments: ptr<function, array<VspgSegment, 64>>,
+                            num_seg: ptr<function, u32>) -> ScoutResult {
     let ns = atm_num_shells();
     let surface_radius = atm[ATM_SHELLS_START];
     var pos = start_pos;
     var dir = start_dir;
     var tau = 0.0;
+    *num_seg = 0u;
 
     let sidx = shell_index_binary(length(pos));
     if (sidx < 0) {
@@ -1672,6 +1817,7 @@ fn scout_tau_to_boundary(start_pos: vec3<f32>, start_dir: vec3<f32>, wl_idx: u32
         let shell_base = ATM_SHELLS_START + us * ATM_SHELL_STRIDE;
         let r_inner = atm[shell_base];
         let r_outer = atm[shell_base + 1u];
+        let alt_mid = atm[shell_base + 2u];
         let extinction = atm[ATM_OPTICS_START + (us * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
 
         let bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
@@ -1679,8 +1825,25 @@ fn scout_tau_to_boundary(start_pos: vec3<f32>, start_dir: vec3<f32>, wl_idx: u32
             return ScoutResult(tau, false);
         }
 
-        // COMBINED transport channel: gas + gray 1D shell cloud extinction.
-        tau += (extinction + read_cloud_extinction(us)) * bnd.dist;
+        // COMBINED transport channel: gas + the per-shell cloud channel
+        // (gray 1D shell deck, or the field MAJORANT in field-forced mode).
+        let tau_shell = (extinction + chain_shell_cloud_ext(use_field_maj, us)) * bnd.dist;
+        let tau_end = tau + tau_shell;
+
+        // Collect the VSPG segment when the shell carries nonzero tau.
+        if (*num_seg < VSPG_GPU_MAX_SEGMENTS && tau_shell > 1e-30) {
+            (*segments)[*num_seg] = VspgSegment(tau, tau_end, vspg_importance(alt_mid, sza_deg));
+            *num_seg = *num_seg + 1u;
+        } else if (tau_shell > 1e-30) {
+            // Segment-buffer OVERFLOW: extend the LAST segment across the
+            // overflow tau at neutral importance so the set keeps tiling
+            // [0, tau_max] (the CPU overflow rule; unbiased, coarser
+            // importance on the tail).
+            (*segments)[VSPG_GPU_MAX_SEGMENTS - 1u].tau_hi = tau_end;
+            (*segments)[VSPG_GPU_MAX_SEGMENTS - 1u].importance = 1.0;
+        }
+
+        tau = tau_end;
 
         var boundary_pos = pos + dir * bnd.dist;
         let target_r = select(r_inner, r_outer, bnd.is_outward);
@@ -1719,6 +1882,67 @@ fn scout_tau_to_boundary(start_pos: vec3<f32>, start_dir: vec3<f32>, wl_idx: u32
 }
 
 // ============================================================================
+// VSPG forced-flight sampler (port of the CPU vspg_sample_from_segments;
+// see the MSL twin for the derivation comments). Returns (tau_s,
+// weight_correction = I_avg / I_j); falls back to the plain truncated
+// exponential (weight 1, ONE rng draw like the CPU fallback) when no
+// segments exist or all probabilities vanish.
+// ============================================================================
+
+struct VspgSample {
+    tau_s: f32,
+    weight: f32,
+}
+
+fn vspg_sample_from_segments(segments: ptr<function, array<VspgSegment, 64>>,
+                             num_seg: u32, tau_max: f32,
+                             rng: ptr<function, vec2<u32>>) -> VspgSample {
+    if (num_seg == 0u) {
+        let xi = rng_next_f32(rng);
+        let one_minus_exp = 1.0 - exp(-tau_max);
+        return VspgSample(-log(1.0 - xi * one_minus_exp + 1e-30), 1.0);
+    }
+
+    var p_sum = 0.0;
+    var q_sum = 0.0;
+    for (var i = 0u; i < num_seg; i++) {
+        let p_i = exp(-(*segments)[i].tau_lo) - exp(-(*segments)[i].tau_hi);
+        p_sum += p_i;
+        q_sum += (*segments)[i].importance * p_i;
+    }
+
+    if (q_sum < 1e-30) {
+        let xi = rng_next_f32(rng);
+        let one_minus_exp = 1.0 - exp(-tau_max);
+        return VspgSample(-log(1.0 - xi * one_minus_exp + 1e-30), 1.0);
+    }
+
+    // CDF inversion: select segment j. Re-accumulates the SAME running sums
+    // as the pass above (identical order, identical f32 values): the CPU's
+    // q_cdf scan without the per-thread cdf array.
+    let xi_segment = rng_next_f32(rng) * q_sum;
+    var j = 0u;
+    var q_run = (*segments)[0].importance
+              * (exp(-(*segments)[0].tau_lo) - exp(-(*segments)[0].tau_hi));
+    while (j + 1u < num_seg && q_run < xi_segment) {
+        j++;
+        q_run += (*segments)[j].importance
+               * (exp(-(*segments)[j].tau_lo) - exp(-(*segments)[j].tau_hi));
+    }
+
+    // Within segment j: conditional truncated exponential, clamped for
+    // numerical safety.
+    let p_j = exp(-(*segments)[j].tau_lo) - exp(-(*segments)[j].tau_hi);
+    let xi_within = rng_next_f32(rng);
+    var tau_s = -log(exp(-(*segments)[j].tau_lo) - xi_within * p_j + 1e-30);
+    tau_s = clamp(tau_s, (*segments)[j].tau_lo, (*segments)[j].tau_hi);
+
+    // Weight correction I_avg / I_j with I_avg = q_sum / p_sum.
+    let i_avg = q_sum / p_sum;
+    return VspgSample(tau_s, i_avg / (*segments)[j].importance);
+}
+
+// ============================================================================
 // Forced scattering: advance along a ray to a target COMBINED optical depth
 // ============================================================================
 
@@ -1728,7 +1952,8 @@ struct AdvanceResult {
     shell_idx: u32,
 }
 
-fn advance_to_optical_depth(start_pos: vec3<f32>, start_dir: vec3<f32>,
+fn advance_to_optical_depth(use_field_maj: bool, start_pos: vec3<f32>,
+                            start_dir: vec3<f32>,
                             tau_target: f32, wl_idx: u32) -> AdvanceResult {
     let ns = atm_num_shells();
     let surface_radius = atm[ATM_SHELLS_START];
@@ -1746,10 +1971,11 @@ fn advance_to_optical_depth(start_pos: vec3<f32>, start_dir: vec3<f32>,
         let r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
         let r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1u];
         let optics_idx = us * MAX_WAVELENGTHS + wl_idx;
-        // Combined per-shell extinction (gas + gray 1D cloud), matching the
+        // Combined per-shell extinction (gas + gray 1D cloud, or gas + the
+        // per-shell field MAJORANT in field-forced mode), matching the
         // combined scout.
         let sigma_comb = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE]
-            + read_cloud_extinction(us);
+            + chain_shell_cloud_ext(use_field_maj, us);
 
         let bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
         if (!bnd.found) {
@@ -1873,13 +2099,26 @@ fn trace_secondary_chain(field_present: bool, start_pos: vec3<f32>,
     var total_U = kahan_new();
     var total_V = kahan_new();
 
+    // Deep-twilight guiding parameters (port of the CPU chains; see the
+    // MSL twin). The field-forced (majorant-combined) channel is active
+    // exactly when the kernel enabled forced mode under a field.
+    let d_frac = dwivedi_frac(setup.sza_deg);
+    let d_beta = dwivedi_beta(setup.sza_deg);
+    let use_field_maj = field_present && (setup.use_forced != 0u);
+
     for (var scatter_iter = 0u; scatter_iter < setup.max_bounces; scatter_iter++) {
         // --- Decide scatter mode for this bounce ---
+        // Fused scout + VSPG: one shell walk collects tau_max AND the
+        // altitude/SZA-importance segments for the forced-flight sampler.
         var forced_this_bounce = false;
         var tau_max = 0.0;
+        var vspg_segs: array<VspgSegment, 64>;
+        var n_vspg_segs = 0u;
 
         if (setup.use_forced != 0u) {
-            let scout = scout_tau_to_boundary(pos, current_dir, wl_idx);
+            let scout = scout_with_vspg_segments(
+                use_field_maj, pos, current_dir, wl_idx, setup.sza_deg,
+                &vspg_segs, &n_vspg_segs);
             tau_max = scout.tau;
             // Force scatter only when the path exits to space and tau is in
             // the useful range (see twilight.metal for the rationale).
@@ -1895,30 +2134,94 @@ fn trace_secondary_chain(field_present: bool, start_pos: vec3<f32>,
         var g_cloud_here = 0.0;
 
         if (forced_this_bounce) {
-            // Upfront forced scattering (unbiased); tau_max is the COMBINED
-            // (gas + gray 1D cloud) optical depth.
+            // Upfront forced scattering (unbiased); tau_max is the
+            // (majorant-)COMBINED optical depth (gas + gray 1D deck, or
+            // gas + per-shell field majorant).
             let exp_neg_tau = exp(-tau_max);
             weight *= (1.0 - exp_neg_tau);
             if (weight < 1e-30) {
                 break;
             }
-            let xi = rng_next_f32(rng);
-            let tau_s = -log1p_f32(-xi * (1.0 - exp_neg_tau));
-            let adv = advance_to_optical_depth(pos, current_dir, tau_s, wl_idx);
+            // VSPG: sample the collision location from the pre-collected
+            // importance segments (weight-corrected, unbiased; replaces
+            // the plain truncated-exponential draw).
+            let vs = vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max, rng);
+            let tau_s = vs.tau_s;
+            weight *= vs.weight;
+            let adv = advance_to_optical_depth(use_field_maj, pos, current_dir, tau_s, wl_idx);
             pos = adv.pos;
             current_dir = adv.dir;
             scatter_shell = adv.shell_idx;
 
-            // Vertex type from the exact extinction conditional at the
-            // collision shell; draw taken ONLY when the shell carries cloud.
-            let sigma_c_f = read_cloud_extinction(scatter_shell);
-            if (sigma_c_f > 0.0) {
-                let sigma_gas_f = atm[ATM_OPTICS_START
-                    + (scatter_shell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
-                if (rng_next_f32(rng) < sigma_c_f / (sigma_c_f + sigma_gas_f)) {
-                    cloud_collision = true;
-                    // Forced mode is 1D-only: the gray deck's delta-scaled g.
-                    g_cloud_here = atm[ATM_CLOUD_G_SCALED];
+            if (use_field_maj) {
+                // FIELD: classify the majorant collision (real cloud / real
+                // gas / null); nulls re-draw within the remaining truncated
+                // budget. Port of the CPU field_forced_classify (see
+                // twilight.metal for the derivation and the f32 kill
+                // threshold note). The classification uniform is drawn ONLY
+                // in shells with a positive cloud majorant.
+                var consumed = tau_s;
+                var fshell = adv.shell_idx;
+                var resolved = false;
+                for (var ev = 0u; ev < FIELD_NULL_EVENT_LIMIT; ev++) {
+                    let c_maj = field_shell_majorant(fshell);
+                    if (c_maj <= 0.0) { // real gas with probability 1
+                        resolved = true;
+                        break;
+                    }
+                    let sigma_gas_m = atm[ATM_OPTICS_START
+                        + (fshell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
+                    let sigma_m = sigma_gas_m + c_maj;
+                    let sigma_c_here = field_sigma_at(pos);
+                    let xi_cls = rng_next_f32(rng) * sigma_m;
+                    if (xi_cls < sigma_c_here) {
+                        cloud_collision = true;
+                        g_cloud_here = field_g_at(pos);
+                        resolved = true;
+                        break;
+                    }
+                    if (xi_cls < sigma_c_here + sigma_gas_m) {
+                        resolved = true;
+                        break;
+                    }
+                    // NULL: continue the truncated flight in the remaining
+                    // budget; kill on an fp-exhausted budget (f32 threshold,
+                    // see the MSL twin).
+                    let t_rem = tau_max - consumed;
+                    if (t_rem <= 1e-6) {
+                        break; // killed below
+                    }
+                    let e_rem = exp(-t_rem);
+                    weight *= (1.0 - e_rem);
+                    let xi2 = rng_next_f32(rng);
+                    let d_tau = -log(1.0 - xi2 * (1.0 - e_rem) + 1e-30);
+                    let nadv = advance_to_optical_depth(
+                        use_field_maj, pos, current_dir, d_tau, wl_idx);
+                    pos = nadv.pos;
+                    current_dir = nadv.dir;
+                    fshell = nadv.shell_idx;
+                    consumed += d_tau;
+                }
+                scatter_shell = fshell;
+                if (!resolved) {
+                    // Backstop kill (fp-exhausted budget or the null-event
+                    // limit): terminate the particle with weight zero.
+                    weight = 0.0;
+                    break;
+                }
+            } else {
+                // 1D deck: vertex type from the exact extinction conditional
+                // at the collision shell; draw taken ONLY when the shell
+                // carries cloud.
+                let sigma_c_f = read_cloud_extinction(scatter_shell);
+                if (sigma_c_f > 0.0) {
+                    let sigma_gas_f = atm[ATM_OPTICS_START
+                        + (scatter_shell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
+                    if (rng_next_f32(rng) < sigma_c_f / (sigma_c_f + sigma_gas_f)) {
+                        cloud_collision = true;
+                        // The gray deck's delta-scaled asymmetry.
+                        g_cloud_here = atm[ATM_CLOUD_G_SCALED];
+                    }
                 }
             }
         } else {
@@ -2169,16 +2472,72 @@ fn trace_secondary_chain(field_present: bool, start_pos: vec3<f32>,
             continue;
         }
 
-        // Sample new direction (gas vertex).
+        // Sample new direction (gas vertex): Dwivedi/phase MIS mixture at
+        // deep twilight (port of the CPU chains' MIS block; the balance-
+        // heuristic weight corrects the SCALAR intensity, the Stokes update
+        // below uses the actual sampled angle). Below the 0.02 activation:
+        // the pure-phase path, draw-for-draw identical to history.
         var cos_theta: f32;
-        if (rng_next_f32(rng) < op.rayleigh_fraction) {
-            cos_theta = sample_rayleigh_analytic(rng_next_f32(rng));
+        var new_dir: vec3<f32>;
+        let mis_active = d_frac >= 0.02;
+        if (mis_active) {
+            let local_up_here = normalize(pos);
+            let alpha_p_mis = 1.0 - d_frac;
+            let xi_branch = rng_next_f32(rng);
+            if (xi_branch < d_frac) {
+                // Dwivedi branch: horizontal-biased escape sampling in the
+                // local (up, east, north) frame.
+                let xi1 = rng_next_f32(rng);
+                let xi2 = rng_next_f32(rng);
+                let xi_sign = rng_next_f32(rng);
+                let dw = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
+                let sin_z = sqrt(max(1.0 - dw.cos_z * dw.cos_z, 0.0));
+                var arbitrary = vec3<f32>(1.0, 0.0, 0.0);
+                if (abs(local_up_here.y) < 0.9) {
+                    arbitrary = vec3<f32>(0.0, 1.0, 0.0);
+                }
+                let east = normalize(cross(local_up_here, arbitrary));
+                let north = cross(local_up_here, east);
+                let d = normalize(local_up_here * dw.cos_z
+                                  + east * (sin_z * cos(dw.phi))
+                                  + north * (sin_z * sin(dw.phi)));
+                cos_theta = clamp(dot(current_dir, d), -1.0, 1.0);
+                let p_phase = mixed_phase(cos_theta, op) * INV_4PI;
+                let p_dw = dwivedi_pdf(dw.cos_z, d_beta);
+                let mis_denom = alpha_p_mis * p_phase + d_frac * p_dw;
+                if (mis_denom > 1e-30) {
+                    weight *= p_phase / mis_denom;
+                }
+                new_dir = d;
+            } else {
+                // Phase branch (within MIS).
+                if (rng_next_f32(rng) < op.rayleigh_fraction) {
+                    cos_theta = sample_rayleigh_analytic(rng_next_f32(rng));
+                } else {
+                    cos_theta = sample_henyey_greenstein(rng_next_f32(rng), op.asymmetry);
+                }
+                cos_theta = clamp(cos_theta, -1.0, 1.0);
+                let phi = 2.0 * PI * rng_next_f32(rng);
+                new_dir = scatter_direction(current_dir, cos_theta, phi);
+                let p_phase = mixed_phase(cos_theta, op) * INV_4PI;
+                let cos_z_dw = dot(new_dir, local_up_here);
+                let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
+                let mis_denom = alpha_p_mis * p_phase + d_frac * p_dw;
+                if (mis_denom > 1e-30) {
+                    weight *= p_phase / mis_denom;
+                }
+            }
         } else {
-            cos_theta = sample_henyey_greenstein(rng_next_f32(rng), op.asymmetry);
+            // Pure phase function: no Dwivedi, no MIS overhead.
+            if (rng_next_f32(rng) < op.rayleigh_fraction) {
+                cos_theta = sample_rayleigh_analytic(rng_next_f32(rng));
+            } else {
+                cos_theta = sample_henyey_greenstein(rng_next_f32(rng), op.asymmetry);
+            }
+            cos_theta = clamp(cos_theta, -1.0, 1.0);
+            let phi = 2.0 * PI * rng_next_f32(rng);
+            new_dir = scatter_direction(current_dir, cos_theta, phi);
         }
-        cos_theta = clamp(cos_theta, -1.0, 1.0);
-        let phi = 2.0 * PI * rng_next_f32(rng);
-        let new_dir = scatter_direction(current_dir, cos_theta, phi);
         if (!is_finite_f32(new_dir.x) || (length(new_dir) < 1e-10)) {
             break;
         }
@@ -2937,9 +3296,16 @@ fn hybrid_scatter_v2(@builtin(workgroup_id) tg_pos: vec3<u32>,
                     setup.n_zenith = bp.n_zenith;
                     setup.m_term = bp.m_term;
                     setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
-                    // Forced mode: on at deep twilight, off under a 3D field.
+                    setup.sza_deg = sza_deg;
+                    // Forced mode: on at deep twilight. The 1D deck composes
+                    // via the exact combined channel; a 3D field composes
+                    // via the majorant-combined channel + truncated null-
+                    // collision classification, which needs the v5
+                    // per-shell majorants. A field packed without them
+                    // keeps the analog fallback.
                     setup.use_forced = 0u;
-                    if (sza_deg >= ZENITH_SZA_START_DEG && !field_present) {
+                    if (sza_deg >= ZENITH_SZA_START_DEG
+                        && (!field_present || field_has_shell_majorants())) {
                         setup.use_forced = 1u;
                     }
                     // The CPU forced_tau_min_for_sza sigmoid.

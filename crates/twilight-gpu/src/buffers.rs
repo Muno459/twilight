@@ -31,7 +31,15 @@ pub const BUFFER_MAGIC: u32 = 0x544C_5754;
 ///     geometry. The version bump forces a re-pack so a stale v3 host
 ///     paired with a v4 shader (or vice versa) trips the header gate
 ///     loudly instead of silently running the wrong transport.
-pub const BUFFER_VERSION: u32 = 4;
+/// v5: field-forced mode on GPU. The packed cloud field buffer gains an
+///     optional per-TRANSPORT-SHELL cloud-extinction majorant array
+///     (`MAX_SHELLS` f32, host-computed via `Cloud3DField::band_max_sigma`
+///     over each shell's radial band, the same derivation as the CPU
+///     `field_shell_majorants`). Header slots 11 and 19 (previously
+///     reserved, packed as 0.0) now carry the present-flag and the array
+///     start offset. The version bump forces a re-pack so a v4 field
+///     buffer (no majorants) can never feed a v5 kernel's majorant reads.
+pub const BUFFER_VERSION: u32 = 5;
 
 /// Maximum number of light pollution sources in a single dispatch.
 pub const MAX_LIGHT_SOURCES: usize = 2048;
@@ -284,7 +292,9 @@ pub mod field_offsets {
     pub const G_STAR_PRESENT: usize = 8;
     pub const BG_PRESENT: usize = 9;
     pub const MACRO_PRESENT: usize = 10;
-    // slot 11 reserved
+    /// v5: 1.0 when the per-transport-shell cloud majorant array is packed
+    /// (the GPU field-forced gate; 0.0 keeps field runs analog).
+    pub const SHELL_MAJ_PRESENT: usize = 11;
     // Geometry (f32): grid spacings and origins.
     pub const Z0_M: usize = 12;
     pub const DZ_M: usize = 13;
@@ -293,7 +303,10 @@ pub mod field_offsets {
     pub const DLAT_DEG: usize = 16;
     pub const DLON_DEG: usize = 17;
     pub const G_DEFAULT: usize = 18;
-    // slot 19 reserved
+    /// v5: start offset (f32 index, u32 bits) of the per-shell cloud
+    /// majorant array (`MAX_SHELLS` f32). Valid only when
+    /// `SHELL_MAJ_PRESENT` is 1.0.
+    pub const SHELL_MAJ_OFFSET: usize = 19;
     // Array start offsets (f32 index into the data buffer).
     pub const SIGMA_OFFSET: usize = 20;
     pub const G_STAR_OFFSET: usize = 21;
@@ -315,8 +328,28 @@ pub struct PackedCloudField {
 }
 
 impl PackedCloudField {
-    /// Pack a [`twilight_core::cloud_field::Cloud3DField`] view.
+    /// Pack a [`twilight_core::cloud_field::Cloud3DField`] view WITHOUT
+    /// per-shell majorants. GPU kernels then keep field runs analog
+    /// (forced mode stays gated off, the pre-v5 behavior). Production
+    /// backends should pass the transport-shell bands to
+    /// [`Self::pack_with_majorants`] instead.
     pub fn pack(field: &twilight_core::cloud_field::Cloud3DField) -> Self {
+        Self::pack_with_majorants(field, &[])
+    }
+
+    /// Pack a field view plus per-TRANSPORT-SHELL cloud majorants (v5).
+    ///
+    /// `shell_bands[i] = (r_inner, r_outer)` of atmosphere shell `i`
+    /// (absolute ECEF radii, the same bands the CPU `field_shell_majorants`
+    /// walks). `maj[i] = field.band_max_sigma(r_inner, r_outer)` bounds
+    /// `sigma_at` pointwise over every position in the band, so the GPU
+    /// field-forced mode's majorant-combined channel dominates the true
+    /// extinction everywhere (nulls, never bias). Empty `shell_bands`
+    /// packs no majorant array and leaves the field analog on GPU.
+    pub fn pack_with_majorants(
+        field: &twilight_core::cloud_field::Cloud3DField,
+        shell_bands: &[(f64, f64)],
+    ) -> Self {
         use field_offsets as fo;
 
         let nz = field.nz;
@@ -330,12 +363,14 @@ impl PackedCloudField {
         let g_star_len = field.g_star.len();
         let macro_len = field.macrocell_max.len();
         let bg_len = field.background_column.len();
+        let maj_len = if shell_bands.is_empty() { 0 } else { MAX_SHELLS };
 
         let sigma_off = fo::HEADER_LEN;
         let g_star_off = sigma_off + sigma_len;
         let macro_off = g_star_off + g_star_len;
         let bg_off = macro_off + macro_len;
-        let total = bg_off + bg_len;
+        let maj_off = bg_off + bg_len;
+        let total = maj_off + maj_len;
 
         let mut data = vec![0.0f32; total.max(fo::HEADER_LEN)];
 
@@ -350,6 +385,7 @@ impl PackedCloudField {
         data[fo::G_STAR_PRESENT] = if g_star_len > 0 { 1.0 } else { 0.0 };
         data[fo::BG_PRESENT] = if bg_len > 0 { 1.0 } else { 0.0 };
         data[fo::MACRO_PRESENT] = if macro_len > 0 { 1.0 } else { 0.0 };
+        data[fo::SHELL_MAJ_PRESENT] = if maj_len > 0 { 1.0 } else { 0.0 };
         data[fo::Z0_M] = field.z0_m as f32;
         data[fo::DZ_M] = field.dz_m as f32;
         data[fo::LAT0_DEG] = field.lat0_deg as f32;
@@ -357,6 +393,7 @@ impl PackedCloudField {
         data[fo::DLAT_DEG] = field.dlat_deg as f32;
         data[fo::DLON_DEG] = field.dlon_deg as f32;
         data[fo::G_DEFAULT] = field.g_default as f32;
+        data[fo::SHELL_MAJ_OFFSET] = f32::from_bits(maj_off as u32);
         data[fo::SIGMA_OFFSET] = f32::from_bits(sigma_off as u32);
         data[fo::G_STAR_OFFSET] = f32::from_bits(g_star_off as u32);
         data[fo::MACRO_OFFSET] = f32::from_bits(macro_off as u32);
@@ -366,6 +403,19 @@ impl PackedCloudField {
         data[g_star_off..g_star_off + g_star_len].copy_from_slice(field.g_star);
         data[macro_off..macro_off + macro_len].copy_from_slice(field.macrocell_max);
         data[bg_off..bg_off + bg_len].copy_from_slice(field.background_column);
+
+        // Per-shell majorants: f64 band max, rounded UP to the next f32 so
+        // the f32 majorant still dominates every f32 sigma_at (the packed
+        // voxel data is f32 already, so the plain cast is exact for the
+        // dominating voxel; next_up guards the background/f64 join).
+        for (i, &(r_inner, r_outer)) in shell_bands.iter().take(maj_len).enumerate() {
+            let m = field.band_max_sigma(r_inner, r_outer);
+            let mut m32 = m as f32;
+            if (m32 as f64) < m {
+                m32 = f32::from_bits(m32.to_bits() + 1);
+            }
+            data[maj_off + i] = m32;
+        }
 
         PackedCloudField { data }
     }
@@ -1221,6 +1271,107 @@ mod tests {
             BUFFER_VERSION,
             "shader BUFFER_VERSION disagrees with buffers.rs",
         );
+
+        // Cloud-field header slots (v5 adds the shell-majorant pair).
+        let field_expected: &[(&str, usize)] = &[
+            ("FIELD_G_STAR_PRESENT", field_offsets::G_STAR_PRESENT),
+            ("FIELD_BG_PRESENT", field_offsets::BG_PRESENT),
+            ("FIELD_MACRO_PRESENT", field_offsets::MACRO_PRESENT),
+            ("FIELD_SHELL_MAJ_PRESENT", field_offsets::SHELL_MAJ_PRESENT),
+            ("FIELD_SHELL_MAJ_OFFSET", field_offsets::SHELL_MAJ_OFFSET),
+            ("FIELD_SIGMA_OFFSET", field_offsets::SIGMA_OFFSET),
+            ("FIELD_G_STAR_OFFSET", field_offsets::G_STAR_OFFSET),
+            ("FIELD_MACRO_OFFSET", field_offsets::MACRO_OFFSET),
+            ("FIELD_BG_OFFSET", field_offsets::BG_OFFSET),
+        ];
+        for &(name, rust_value) in field_expected {
+            let shader_value = shader_uint_const(src, name) as usize;
+            assert_eq!(
+                shader_value, rust_value,
+                "shader {} = {} disagrees with buffers.rs field_offsets value {}",
+                name, shader_value, rust_value,
+            );
+        }
+    }
+
+    // ── PackedCloudField (v5 shell majorants) ───────────────────────────
+
+    fn make_test_field_arrays() -> (Vec<f32>, Vec<f32>) {
+        // 2 z levels (1..3 km), 3x3 voxels; level 0 carries the max.
+        let mut sigma = vec![0.0f32; 2 * 3 * 3];
+        sigma[4] = 3e-4; // level 0 center voxel
+        sigma[9 + 4] = 1e-4; // level 1 center voxel
+        let bg = vec![5e-5f32; 2];
+        (sigma, bg)
+    }
+
+    fn make_test_field<'a>(
+        sigma: &'a [f32],
+        bg: &'a [f32],
+    ) -> twilight_core::cloud_field::Cloud3DField<'a> {
+        twilight_core::cloud_field::Cloud3DField {
+            sigma,
+            g_star: &[],
+            background_column: bg,
+            macrocell_max: &[],
+            tile: 1,
+            nz: 2,
+            nlat: 3,
+            nlon: 3,
+            z0_m: 1000.0,
+            dz_m: 1000.0,
+            lat0_deg: 0.0,
+            lon0_deg: 0.0,
+            dlat_deg: 0.02,
+            dlon_deg: 0.02,
+            g_default: 0.5,
+        }
+    }
+
+    #[test]
+    fn packed_field_without_majorants_flags_absent() {
+        let (sigma, bg) = make_test_field_arrays();
+        let field = make_test_field(&sigma, &bg);
+        let packed = PackedCloudField::pack(&field);
+        assert_eq!(packed.data[field_offsets::SHELL_MAJ_PRESENT], 0.0);
+        // No majorant array appended: buffer ends after background column.
+        let bg_off = packed.data[field_offsets::BG_OFFSET].to_bits() as usize;
+        assert_eq!(packed.data.len(), bg_off + bg.len());
+    }
+
+    #[test]
+    fn packed_field_majorants_match_band_max_sigma() {
+        let (sigma, bg) = make_test_field_arrays();
+        let field = make_test_field(&sigma, &bg);
+        let earth_r = twilight_core::atmosphere::EARTH_RADIUS_M;
+        // Three transport-shell bands: below the grid, straddling level 0,
+        // and above the grid top.
+        let bands = [
+            (earth_r, earth_r + 900.0),
+            (earth_r + 900.0, earth_r + 1800.0),
+            (earth_r + 3200.0, earth_r + 10_000.0),
+        ];
+        let packed = PackedCloudField::pack_with_majorants(&field, &bands);
+        assert_eq!(packed.data[field_offsets::SHELL_MAJ_PRESENT], 1.0);
+        let maj_off = packed.data[field_offsets::SHELL_MAJ_OFFSET].to_bits() as usize;
+        assert_eq!(packed.data.len(), maj_off + MAX_SHELLS);
+        for (i, &(r_lo, r_hi)) in bands.iter().enumerate() {
+            let want = field.band_max_sigma(r_lo, r_hi);
+            let got = packed.data[maj_off + i] as f64;
+            assert!(
+                got >= want && (got - want) <= want * 1e-6 + 1e-30,
+                "majorant[{}] = {:e} must dominate band_max_sigma {:e} tightly",
+                i,
+                got,
+                want,
+            );
+        }
+        // Unused shells stay zero.
+        assert_eq!(packed.data[maj_off + bands.len()], 0.0);
+        // Band 0 misses the grid entirely.
+        assert_eq!(packed.data[maj_off], 0.0);
+        // Band 1 sees level 0: max(voxel 3e-4, bg 5e-5).
+        assert!((packed.data[maj_off + 1] - 3e-4).abs() < 1e-9);
     }
 
     #[test]

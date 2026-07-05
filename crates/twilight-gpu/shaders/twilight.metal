@@ -100,7 +100,7 @@ constant uint CLOUD_MAX_SUBSTEPS = 64;
 constant uint ATM_HEADER_MAGIC          = 0;
 constant uint ATM_HEADER_VERSION        = 1;
 constant uint BUFFER_MAGIC              = 0x544C5754u; // "TWLT"
-constant uint BUFFER_VERSION            = 4u;
+constant uint BUFFER_VERSION            = 5u;
 // Written to output[0] when the header gate fails. Radiance and per-photon
 // weights are never negative, so the host detects this unambiguously.
 constant float HEADER_SENTINEL          = -1.0f;
@@ -129,9 +129,10 @@ constant float BOUNDARY_NUDGE_M = 2.0f;
 // Below this, chains scatter naturally and rarely escape.
 constant float ZENITH_SZA_START_DEG = 96.0f;
 
-// Early-exit threshold for scout_tau_to_boundary.
-// At tau > 20, 1-exp(-20) = 0.999999998 in f32. The forced-scattering
-// weight is indistinguishable from 1.0 and we fall back to analog scatter.
+// Early-exit threshold for the forced-scattering scout
+// (scout_with_vspg_segments). At tau > 20, 1-exp(-20) = 0.999999998 in f32.
+// The forced-scattering weight is indistinguishable from 1.0 and we fall
+// back to analog scatter.
 constant float FORCED_TAU_CUTOFF = 20.0f;
 
 // Maximum directional bias for the exponential transform.
@@ -158,6 +159,53 @@ constant float TERMINATOR_N_MAX = 8.0f;
 // Tilt angle (degrees) of terminator axis from zenith at SZA_START / SZA_FULL.
 constant float TERMINATOR_TILT_MIN_DEG = 20.0f;
 constant float TERMINATOR_TILT_MAX_DEG = 60.0f;
+
+// ── Deep-twilight guiding stack (port of the CPU secondary chains) ─────────
+//
+// VSPG (vertical-shell-probability guiding): importance-weights the forced
+// collision location across the scout's per-shell tau segments so deep-
+// twilight chains scatter high (stratosphere/mesosphere) where NEE toward
+// the sun still sees light. Exactly unbiased: the weight correction
+// I_avg / I_j compensates the biased segment selection (CPU photon.rs,
+// scout_with_vspg_segments / vspg_sample_from_segments).
+//
+// GPU DIFFERENCE, documented honestly: the CPU keeps
+// VSPG_MAX_SEGMENTS = 128 (a full 64-shell double crossing plus
+// reflection headroom). Per-thread GPU storage is register/stack-limited
+// (64-thread groups, ~2-4 KB stack per thread), so the GPU cap is 64
+// segments = MAX_SHELLS: a full one-way crossing is captured exactly and
+// only reflection-multiplied walks overflow. Overflow uses the SAME
+// tile-to-tau_max rule as the CPU (extend the LAST segment across the
+// overflow tau at neutral importance 1.0): the segment set keeps tiling
+// [0, tau_max], p_sum telescopes to 1 - e^{-tau_max}, and the estimator
+// stays exactly unbiased with merely coarser importance on the tail.
+// (No overflow diagnostic counter on GPU; the CPU atomic is
+// observability-only.)
+constant uint VSPG_GPU_MAX_SEGMENTS = 64;
+// Altitude ramp of the VSPG importance (CPU constants, photon.rs).
+constant float VSPG_BOOST_START_M = 15000.0f;
+constant float VSPG_BOOST_FULL_M  = 70000.0f;
+constant float VSPG_MAX_IMPORTANCE = 50.0f;
+// SZA ramp of the VSPG importance.
+constant float VSPG_SZA_START = 93.0f;
+constant float VSPG_SZA_FULL  = 106.0f;
+
+// Dwivedi-type horizontal direction MIS (CPU constants, photon.rs): at
+// deep twilight chains must travel ~1500 km laterally; the Dwivedi lobe
+// p(cos_z) ~ exp(-beta |cos_z|) concentrates direction samples near the
+// local horizontal plane, mixed with the phase function via one-sample
+// balance-heuristic MIS (exactly unbiased).
+constant float DWIVEDI_BETA_MAX   = 3.0f;
+constant float DWIVEDI_SZA_CENTER = 103.0f;
+constant float DWIVEDI_SZA_WIDTH  = 2.0f;
+constant float DWIVEDI_FRAC_MAX   = 0.35f;
+
+// Iteration backstop for the field-forced truncated null-collision loop
+// (CPU FIELD_NULL_EVENT_LIMIT): the expected null count per forced flight
+// is bounded by the majorant-excess tau < FORCED_TAU_CUTOFF = 20, so
+// P(> 512 events) is a Poisson(20) tail; a chain hitting the limit is
+// killed with weight zero (expectation loss far below f32 resolution).
+constant uint FIELD_NULL_EVENT_LIMIT = 512;
 
 // ============================================================================
 // Buffer accessor helpers
@@ -273,6 +321,10 @@ constant uint FIELD_NTLON          = 7u;
 constant uint FIELD_G_STAR_PRESENT = 8u;
 constant uint FIELD_BG_PRESENT     = 9u;
 constant uint FIELD_MACRO_PRESENT  = 10u;
+// v5: per-transport-shell cloud majorant array (host-computed via
+// Cloud3DField::band_max_sigma over each shell band; the field-forced
+// mode's majorant-combined channel). Present flag + start offset.
+constant uint FIELD_SHELL_MAJ_PRESENT = 11u;
 constant uint FIELD_Z0_M           = 12u;
 constant uint FIELD_DZ_M           = 13u;
 constant uint FIELD_LAT0_DEG       = 14u;
@@ -280,6 +332,7 @@ constant uint FIELD_LON0_DEG       = 15u;
 constant uint FIELD_DLAT_DEG       = 16u;
 constant uint FIELD_DLON_DEG       = 17u;
 constant uint FIELD_G_DEFAULT      = 18u;
+constant uint FIELD_SHELL_MAJ_OFFSET = 19u;
 constant uint FIELD_SIGMA_OFFSET   = 20u;
 constant uint FIELD_G_STAR_OFFSET  = 21u;
 constant uint FIELD_MACRO_OFFSET   = 22u;
@@ -312,6 +365,20 @@ inline uint field_array_offset(device const float* fld, uint slot) {
 
 inline float field_z_top_m(device const float* fld) {
     return fld[FIELD_Z0_M] + fld[FIELD_DZ_M] * float(field_uint(fld, FIELD_NZ));
+}
+
+// True when the v5 per-shell majorant array is packed (the gate for the
+// field-forced mode; hosts that packed without an atmosphere leave it off
+// and field runs stay analog).
+inline bool field_has_shell_majorants(device const float* fld) {
+    return field_uint(fld, FIELD_SHELL_MAJ_PRESENT) == 1u;
+}
+
+// Per-transport-shell cloud-extinction majorant (v5): bounds the field's
+// sigma_at pointwise over shell `shell_idx`'s radial band. Only valid when
+// field_has_shell_majorants().
+inline float field_shell_majorant(device const float* fld, uint shell_idx) {
+    return fld[field_array_offset(fld, FIELD_SHELL_MAJ_OFFSET) + shell_idx];
 }
 
 // Returns true and writes (iz, ilat, ilon) when inside the footprint.
@@ -1680,16 +1747,24 @@ struct SecondarySetup {
     float n_zenith;
     float m_term;
     float alpha_et;
+    // Chain-local solar zenith angle [deg]: drives the VSPG importance and
+    // the Dwivedi MIS ramps (port of the CPU sza_deg_local).
+    float sza_deg;
     // Forced-collision gate, computed by the caller as
-    // (sza >= ZENITH_SZA_START_DEG) && !field_present. Forced mode composes
-    // EXACTLY with the shell-constant 1D gray cloud deck (combined transport
-    // channel: scout/advance accumulate gas + cloud tau, both piecewise
-    // constant per shell, so the truncated inversion stays exact and the
-    // vertex type is drawn from the extinction conditional at the collision
-    // shell; port of the CPU combined-channel forced mode, ac673c7). A 3D
-    // FIELD's per-segment cloud extinction is NOT shell-constant, so forced
-    // mode stays OFF there (analog delta tracking is unbiased), mirroring
-    // the CPU `use_forced && field.is_none()` gate.
+    // (sza >= ZENITH_SZA_START_DEG) && (!field_present || field majorants
+    // packed). Forced mode composes EXACTLY with the shell-constant 1D gray
+    // cloud deck (combined transport channel: scout/advance accumulate
+    // gas + cloud tau, both piecewise constant per shell, so the truncated
+    // inversion stays exact and the vertex type is drawn from the extinction
+    // conditional at the collision shell; port of the CPU combined-channel
+    // forced mode, ac673c7). A 3D FIELD's sigma_c(x) is NOT shell-constant,
+    // so forced mode there folds the MAJORANT-combined channel
+    // sigma_m = sigma_gas + c_maj(shell) (exactly piecewise constant) and
+    // classifies the collision by truncated null-collision delta tracking
+    // (real cloud / real gas / null; port of the CPU field_forced_classify;
+    // derivation and telescoping proof at the CPU scalar chain's
+    // use_forced block). Fields packed WITHOUT majorants (pre-v5 hosts /
+    // no uploaded atmosphere) keep the analog fallback.
     uint use_forced;
     // SZA-adaptive forced-scatter tau floor (port of the CPU
     // forced_tau_min_for_sza sigmoid: 0.05 at SZA <= 100, 0.02 at >= 104).
@@ -1736,6 +1811,77 @@ inline float3 terminator_axis(float3 up, float3 sun_dir, float tilt_rad) {
     float cos_t;
     float sin_t = sincos(tilt_rad, cos_t);
     return normalize(cos_t * up + sin_t * sun_horiz);
+}
+
+// ============================================================================
+// Deep-twilight guiding helpers (port of the CPU photon.rs guiding stack)
+// ============================================================================
+
+// Sigmoid for smooth SZA ramps (CPU sigmoid).
+inline float guide_sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+// SZA-adaptive Dwivedi sampling fraction (CPU dwivedi_frac).
+inline float dwivedi_frac(float sza_deg) {
+    return DWIVEDI_FRAC_MAX * guide_sigmoid((sza_deg - DWIVEDI_SZA_CENTER) / DWIVEDI_SZA_WIDTH);
+}
+
+// SZA-adaptive Dwivedi concentration parameter (CPU dwivedi_beta).
+inline float dwivedi_beta(float sza_deg) {
+    return DWIVEDI_BETA_MAX * guide_sigmoid((sza_deg - DWIVEDI_SZA_CENTER) / DWIVEDI_SZA_WIDTH);
+}
+
+// Dwivedi PDF in sr^-1 for cos_z = dir . local_up (CPU dwivedi_pdf):
+//   p(cos_z) = beta * exp(-beta |cos_z|) / (4 pi (1 - exp(-beta))),
+// 1/(4 pi) when beta < 1e-6 (effectively uniform).
+inline float dwivedi_pdf(float cos_z, float beta) {
+    if (beta < 1e-6f) return INV_4PI;
+    float abs_cz = clamp(fabs(cos_z), 0.0f, 1.0f);
+    return beta * exp(-beta * abs_cz) / (4.0f * PI * (1.0f - exp(-beta)));
+}
+
+// Sample the Dwivedi distribution (CPU dwivedi_sample): CDF inversion of
+// |cos_z|, random sign (symmetric about the horizontal plane), uniform phi.
+struct DwivediSample { float cos_z; float phi; };
+inline DwivediSample dwivedi_sample(float xi1, float xi2, float xi_sign, float beta) {
+    float phi = 2.0f * PI * xi2;
+    if (beta < 1e-6f) {
+        return DwivediSample{2.0f * xi1 - 1.0f, phi};
+    }
+    float one_minus_exp_neg_beta = 1.0f - exp(-beta);
+    float abs_cz = clamp(-log(1.0f - xi1 * one_minus_exp_neg_beta) / beta, 0.0f, 1.0f);
+    float cos_z = (xi_sign < 0.5f) ? abs_cz : -abs_cz;
+    return DwivediSample{cos_z, phi};
+}
+
+// Altitude/SZA-dependent VSPG importance (CPU vspg_importance): >= 1,
+// ramping quadratically in altitude from 1.0 at 15 km to an SZA-dependent
+// max (up to 50x) at 70 km.
+inline float vspg_importance(float alt_m, float sza_deg) {
+    if (alt_m <= VSPG_BOOST_START_M) return 1.0f;
+    float sza_t = clamp((sza_deg - VSPG_SZA_START) / (VSPG_SZA_FULL - VSPG_SZA_START), 0.0f, 1.0f);
+    float alt_t = clamp((alt_m - VSPG_BOOST_START_M) / (VSPG_BOOST_FULL_M - VSPG_BOOST_START_M),
+                        0.0f, 1.0f);
+    float max_imp = 1.0f + (VSPG_MAX_IMPORTANCE - 1.0f) * sza_t;
+    return 1.0f + (max_imp - 1.0f) * alt_t * alt_t;
+}
+
+// Per-shell VSPG segment: the combined tau range a shell contributes to the
+// scout walk plus its precomputed importance (CPU VspgSegment).
+struct VspgSegment {
+    float tau_lo;
+    float tau_hi;
+    float importance;
+};
+
+// Per-shell cloud channel of the forced-flight scout/advance walk: the gray
+// 1D deck (exact) without a field, the per-shell field MAJORANT with one
+// (field runs carry all-zero atm.cloud_extinction, so the two never mix).
+inline float chain_shell_cloud_ext(device const float* atm, device const float* fld,
+                                   bool use_field_maj, uint shell_idx) {
+    return use_field_maj ? field_shell_majorant(fld, shell_idx)
+                         : read_cloud_extinction(atm, shell_idx);
 }
 
 
@@ -2044,10 +2190,14 @@ kernel void mcrt_trace_photon(
 }
 
 // ============================================================================
-// Forced scattering scout: compute tau_max to atmosphere boundary
+// Forced scattering scout, fused with VSPG segment collection (port of the
+// CPU scout_with_vspg_segments)
 //
-// Marches shell-by-shell with refraction. Early-exits at tau > FORCED_TAU_CUTOFF
-// (20.0) since the weight correction is indistinguishable from 1.0 at that point.
+// Marches shell-by-shell with refraction, accumulating the COMBINED
+// (gas + per-shell cloud channel) optical depth to the boundary AND
+// collecting the per-shell VSPG segments the forced-flight sampler inverts.
+// Early-exits at tau > FORCED_TAU_CUTOFF (20.0) since the weight correction
+// is indistinguishable from 1.0 at that point (segments are then unused).
 // Returns (tau_max, hit_ground). When hit_ground is true, forced scattering
 // should NOT be used -- the analog loop handles ground reflection.
 // ============================================================================
@@ -2057,13 +2207,17 @@ struct ScoutResult {
     bool  hit_ground;
 };
 
-ScoutResult scout_tau_to_boundary(device const float* atm, float3 start_pos,
-                                   float3 start_dir, uint wl_idx) {
+ScoutResult scout_with_vspg_segments(device const float* atm, device const float* fld,
+                                     bool use_field_maj, float3 start_pos,
+                                     float3 start_dir, uint wl_idx, float sza_deg,
+                                     thread VspgSegment* segments,
+                                     thread uint &num_seg) {
     uint ns = atm_num_shells(atm);
     float surface_radius = atm[ATM_SHELLS_START];
     float3 pos = start_pos;
     float3 dir = start_dir;
     float tau = 0.0f;
+    num_seg = 0;
 
     int sidx = shell_index_binary(atm, length(pos));
     if (sidx < 0) return ScoutResult{0.0f, false};
@@ -2073,18 +2227,40 @@ ScoutResult scout_tau_to_boundary(device const float* atm, float3 start_pos,
         uint shell_base = ATM_SHELLS_START + us * ATM_SHELL_STRIDE;
         float r_inner = atm[shell_base];
         float r_outer = atm[shell_base + 1];
+        float alt_mid = atm[shell_base + 2];
         float extinction = atm[ATM_OPTICS_START + (us * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
 
         ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
         if (!bnd.found) return ScoutResult{tau, false};
 
-        // COMBINED transport channel (port of the CPU scout_tau_to_boundary,
-        // ac673c7): gas extinction PLUS the gray 1D shell cloud extinction,
-        // both piecewise constant per shell so the sum stays exactly
-        // piecewise constant. Clear-sky shells add 0.0 (bit-identical to the
-        // gas-only scout). A 3D field is never scouted (forced mode is
-        // 1D-only; field runs carry all-zero cloud_extinction).
-        tau += (extinction + read_cloud_extinction(atm, us)) * bnd.dist;
+        // COMBINED transport channel (port of the CPU scout, ac673c7): gas
+        // extinction PLUS the per-shell cloud channel -- the gray 1D shell
+        // deck exactly, or the per-shell FIELD MAJORANT in field-forced mode
+        // (chain_shell_cloud_ext) -- both piecewise constant per shell so
+        // the sum stays exactly piecewise constant. Clear-sky shells add 0.0
+        // (bit-identical to the gas-only scout).
+        float tau_shell = (extinction + chain_shell_cloud_ext(atm, fld, use_field_maj, us))
+                        * bnd.dist;
+        float tau_end = tau + tau_shell;
+
+        // Collect the VSPG segment when the shell carries nonzero tau.
+        if (num_seg < VSPG_GPU_MAX_SEGMENTS && tau_shell > 1e-30f) {
+            segments[num_seg] = VspgSegment{tau, tau_end, vspg_importance(alt_mid, sza_deg)};
+            num_seg++;
+        } else if (tau_shell > 1e-30f) {
+            // Segment-buffer OVERFLOW. The sampler normalizes by p_sum over
+            // the SEGMENTS, so dropped tau would over-weight every head
+            // collision and never sample the tail. Extend the LAST segment
+            // across the overflow tau at neutral importance instead (any
+            // positive importance is unbiased; only the TILING of
+            // [0, tau_max] matters): p_sum then telescopes to
+            // 1 - e^{-tau_max} exactly (CPU overflow rule; see the
+            // VSPG_GPU_MAX_SEGMENTS comment for the reduced GPU cap).
+            segments[VSPG_GPU_MAX_SEGMENTS - 1].tau_hi = tau_end;
+            segments[VSPG_GPU_MAX_SEGMENTS - 1].importance = 1.0f;
+        }
+
+        tau = tau_end;
 
         float3 boundary_pos = pos + dir * bnd.dist;
         float target_r = bnd.is_outward ? r_outer : r_inner;
@@ -2114,6 +2290,72 @@ ScoutResult scout_tau_to_boundary(device const float* atm, float3 start_pos,
 }
 
 // ============================================================================
+// VSPG forced-flight sampler (port of the CPU vspg_sample_from_segments)
+//
+// CDF-inverts the importance-weighted per-segment scatter probabilities
+// q_i = I_i * (e^{-tau_lo_i} - e^{-tau_hi_i}) collected by the scout, then
+// samples tau within the chosen segment from the conditional truncated
+// exponential. Returns (tau_s, weight_correction = I_avg / I_j): exactly
+// unbiased for ANY positive importances over a tiling of [0, tau_max].
+// Falls back to the plain truncated exponential (weight 1) when no
+// segments exist or all probabilities vanish, consuming ONE rng draw like
+// the CPU fallback.
+// ============================================================================
+
+struct VspgSample {
+    float tau_s;
+    float weight;
+};
+
+VspgSample vspg_sample_from_segments(thread const VspgSegment* segments, uint num_seg,
+                                     float tau_max, thread ulong &rng) {
+    if (num_seg == 0) {
+        float xi = xorshift_f32(rng);
+        float one_minus_exp = 1.0f - exp(-tau_max);
+        return VspgSample{-log(1.0f - xi * one_minus_exp + 1e-30f), 1.0f};
+    }
+
+    float p_sum = 0.0f;
+    float q_sum = 0.0f;
+    for (uint i = 0; i < num_seg; i++) {
+        float p_i = exp(-segments[i].tau_lo) - exp(-segments[i].tau_hi);
+        p_sum += p_i;
+        q_sum += segments[i].importance * p_i;
+    }
+
+    if (q_sum < 1e-30f) {
+        float xi = xorshift_f32(rng);
+        float one_minus_exp = 1.0f - exp(-tau_max);
+        return VspgSample{-log(1.0f - xi * one_minus_exp + 1e-30f), 1.0f};
+    }
+
+    // CDF inversion: select segment j. Re-accumulates the SAME running sums
+    // as the pass above (identical order, identical f32 values), so this is
+    // the CPU's q_cdf scan without the per-thread cdf array.
+    float xi_segment = xorshift_f32(rng) * q_sum;
+    uint j = 0;
+    float q_run = segments[0].importance
+                * (exp(-segments[0].tau_lo) - exp(-segments[0].tau_hi));
+    while (j + 1 < num_seg && q_run < xi_segment) {
+        j++;
+        q_run += segments[j].importance
+               * (exp(-segments[j].tau_lo) - exp(-segments[j].tau_hi));
+    }
+
+    // Within segment j: conditional truncated exponential,
+    // tau = -ln(e^{-tau_lo} - xi * p_j), clamped for numerical safety.
+    float p_j = exp(-segments[j].tau_lo) - exp(-segments[j].tau_hi);
+    float xi_within = xorshift_f32(rng);
+    float tau_s = -log(exp(-segments[j].tau_lo) - xi_within * p_j + 1e-30f);
+    tau_s = clamp(tau_s, segments[j].tau_lo, segments[j].tau_hi);
+
+    // Weight correction I_avg / I_j with I_avg = q_sum / p_sum: exactly
+    // compensates the biased segment selection.
+    float i_avg = q_sum / p_sum;
+    return VspgSample{tau_s, i_avg / segments[j].importance};
+}
+
+// ============================================================================
 // Forced scattering helper: advance along a ray to a target optical depth
 //
 // Marches shell-by-shell with refraction, consuming tau_target of optical
@@ -2127,7 +2369,8 @@ struct AdvanceResult {
     uint   shell_idx;
 };
 
-AdvanceResult advance_to_optical_depth(device const float* atm, float3 start_pos,
+AdvanceResult advance_to_optical_depth(device const float* atm, device const float* fld,
+                                        bool use_field_maj, float3 start_pos,
                                         float3 start_dir, float tau_target,
                                         uint wl_idx) {
     uint ns = atm_num_shells(atm);
@@ -2144,12 +2387,13 @@ AdvanceResult advance_to_optical_depth(device const float* atm, float3 start_pos
         float r_inner = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE];
         float r_outer = atm[ATM_SHELLS_START + us * ATM_SHELL_STRIDE + 1];
         uint optics_idx = us * MAX_WAVELENGTHS + wl_idx;
-        // Combined per-shell extinction (gas + gray 1D cloud), matching the
+        // Combined per-shell extinction (gas + gray 1D cloud, or gas + the
+        // per-shell field MAJORANT in field-forced mode), matching the
         // combined scout so a forced flight sampled from the combined tau
         // inverts to the exact combined collision point (CPU
         // advance_to_optical_depth, ac673c7). Clear shells add 0.0.
         float sigma_comb = atm[ATM_OPTICS_START + optics_idx * ATM_OPTICS_STRIDE]
-                         + read_cloud_extinction(atm, us);
+                         + chain_shell_cloud_ext(atm, fld, use_field_maj, us);
 
         ShellBoundary bnd = next_shell_boundary(pos, dir, r_inner, r_outer);
         if (!bnd.found) return AdvanceResult{pos, dir, us};
@@ -2283,16 +2527,30 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
 
     KahanAccum total_I, total_Q, total_U, total_V;
 
+    // Deep-twilight guiding parameters (port of the CPU chains): the
+    // Dwivedi MIS ramps with the chain's SZA; below the 0.02 activation
+    // the pure-phase path consumes identical RNG draws, so shallow streams
+    // keep their structure. The field-forced (majorant-combined) channel
+    // is active exactly when the kernel enabled forced mode under a field
+    // (majorants guaranteed packed then; see SecondarySetup.use_forced).
+    float d_frac = dwivedi_frac(setup.sza_deg);
+    float d_beta = dwivedi_beta(setup.sza_deg);
+    bool use_field_maj = field_present && (setup.use_forced != 0u);
+
     for (uint scatter_iter = 0; scatter_iter < setup.max_bounces; scatter_iter++) {
         // --- Decide scatter mode for this bounce ---
+        // Fused scout + VSPG (port of the CPU chains): one shell walk
+        // collects tau_max AND the altitude/SZA-importance segments that
+        // place forced collisions where the sun still shines.
         bool forced_this_bounce = false;
         float tau_max = 0.0f;
+        VspgSegment vspg_segs[VSPG_GPU_MAX_SEGMENTS];
+        uint n_vspg_segs = 0;
 
-        // setup.use_forced already encodes the field gate (forced mode is
-        // disabled only under a 3D field; the shell-constant 1D deck folds
-        // into the combined scout/advance channel, see SecondarySetup).
         if (setup.use_forced != 0u) {
-            ScoutResult scout = scout_tau_to_boundary(atm, pos, current_dir, wl_idx);
+            ScoutResult scout = scout_with_vspg_segments(
+                atm, fld, use_field_maj, pos, current_dir, wl_idx,
+                setup.sza_deg, vspg_segs, n_vspg_segs);
             tau_max = scout.tau;
             // Force scatter only when path exits to space, optical depth is
             // within the useful range, and tau >= forced_tau_min. Without the
@@ -2314,37 +2572,101 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
 
         if (forced_this_bounce) {
             // Upfront forced scattering (unbiased): no analog walk, no
-            // double-counting. tau_max is the COMBINED (gas + gray 1D cloud)
-            // optical depth, so under a deck the weight is the combined
+            // double-counting. tau_max is the (majorant-)COMBINED optical
+            // depth (gas + gray 1D deck, or gas + per-shell field
+            // majorant), so the weight is the (majorant-)combined
             // collision probability and the flight attenuates through AND
-            // can collide in the cloud.
+            // can collide in the cloud channel.
             float exp_neg_tau = exp(-tau_max);
             weight *= (1.0f - exp_neg_tau);
             if (weight < 1e-30f) break;
-            float xi = xorshift_f32(rng);
-            float tau_s = -metal_log1p(-xi * (1.0f - exp_neg_tau));
-            AdvanceResult adv = advance_to_optical_depth(atm, pos, current_dir, tau_s, wl_idx);
+            // VSPG: sample the collision location from the pre-collected
+            // importance segments (weight-corrected, unbiased; replaces
+            // the plain truncated-exponential draw).
+            VspgSample vs = vspg_sample_from_segments(vspg_segs, n_vspg_segs, tau_max, rng);
+            float tau_s = vs.tau_s;
+            weight *= vs.weight;
+            AdvanceResult adv = advance_to_optical_depth(
+                atm, fld, use_field_maj, pos, current_dir, tau_s, wl_idx);
             pos = adv.pos;
             current_dir = adv.dir;
             scatter_shell = adv.shell_idx;
 
-            // Vertex type from the exact extinction conditional at the
-            // collision shell: cloud with p = sigma_c / (sigma_c + sigma_gas)
-            // (the same first-arrival law the analog race realizes). The
-            // type probabilities cancel the per-type extinction factors
-            // exactly, so no weight correction; a gas vertex carries the
-            // gas SSA below, a cloud vertex is pure scattering. The draw is
-            // taken ONLY when the collision shell carries cloud, so
-            // clear-sky RNG streams keep their structure (CPU ac673c7).
-            float sigma_c_f = read_cloud_extinction(atm, scatter_shell);
-            if (sigma_c_f > 0.0f) {
-                float sigma_gas_f = atm[ATM_OPTICS_START
-                    + (scatter_shell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
-                if (xorshift_f32(rng) < sigma_c_f / (sigma_c_f + sigma_gas_f)) {
-                    cloud_collision = true;
-                    // Forced mode is 1D-only (no field here): the gray
-                    // deck's delta-scaled asymmetry.
-                    g_cloud_here = atm[ATM_CLOUD_G_SCALED];
+            if (use_field_maj) {
+                // FIELD: classify the majorant collision (real cloud /
+                // real gas / null); nulls re-draw within the remaining
+                // truncated budget. Port of the CPU field_forced_classify
+                // (derivation and telescoping proof at the CPU scalar
+                // chain's use_forced block). The classification uniform is
+                // drawn ONLY in shells with a positive cloud majorant
+                // (a majorant-clear shell is real gas with probability 1).
+                float consumed = tau_s;
+                uint fshell = adv.shell_idx;
+                bool resolved = false;
+                for (uint ev = 0; ev < FIELD_NULL_EVENT_LIMIT; ev++) {
+                    float c_maj = field_shell_majorant(fld, fshell);
+                    if (c_maj <= 0.0f) { resolved = true; break; } // real gas
+                    float sigma_gas_m = atm[ATM_OPTICS_START
+                        + (fshell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
+                    float sigma_m = sigma_gas_m + c_maj;
+                    float sigma_c_here = field_sigma_at(fld, pos);
+                    float xi_cls = xorshift_f32(rng) * sigma_m;
+                    if (xi_cls < sigma_c_here) {
+                        cloud_collision = true;
+                        g_cloud_here = field_g_at(fld, pos);
+                        resolved = true;
+                        break;
+                    }
+                    if (xi_cls < sigma_c_here + sigma_gas_m) { resolved = true; break; }
+                    // NULL: continue the truncated flight in the remaining
+                    // budget. Kill on an fp-exhausted budget: the correct
+                    // continuation would carry weight * (1 - e^{-t_rem});
+                    // the CPU threshold is 1e-12 (f64), below f32
+                    // resolution near tau_max, so the f32 port kills at
+                    // 1e-6 (expectation loss <= weight * 1e-6, far below
+                    // the f32 MC noise floor -- the same acceptance class
+                    // as FORCED_TAU_CUTOFF, where f32 rounds 1 - e^{-20}
+                    // to exactly 1).
+                    float t_rem = tau_max - consumed;
+                    if (t_rem <= 1e-6f) break; // killed below
+                    float e_rem = exp(-t_rem);
+                    weight *= (1.0f - e_rem);
+                    float xi2 = xorshift_f32(rng);
+                    float d_tau = -log(1.0f - xi2 * (1.0f - e_rem) + 1e-30f);
+                    AdvanceResult nadv = advance_to_optical_depth(
+                        atm, fld, use_field_maj, pos, current_dir, d_tau, wl_idx);
+                    pos = nadv.pos;
+                    current_dir = nadv.dir;
+                    fshell = nadv.shell_idx;
+                    consumed += d_tau;
+                }
+                scatter_shell = fshell;
+                if (!resolved) {
+                    // Backstop kill (fp-exhausted budget or the null-event
+                    // limit): terminate the particle with weight zero.
+                    weight = 0.0f;
+                    break;
+                }
+            } else {
+                // 1D deck: vertex type from the exact extinction
+                // conditional at the collision shell: cloud with
+                // p = sigma_c / (sigma_c + sigma_gas) (the same
+                // first-arrival law the analog race realizes). The type
+                // probabilities cancel the per-type extinction factors
+                // exactly, so no weight correction; a gas vertex carries
+                // the gas SSA below, a cloud vertex is pure scattering.
+                // The draw is taken ONLY when the collision shell carries
+                // cloud, so clear-sky RNG streams keep their structure
+                // (CPU ac673c7).
+                float sigma_c_f = read_cloud_extinction(atm, scatter_shell);
+                if (sigma_c_f > 0.0f) {
+                    float sigma_gas_f = atm[ATM_OPTICS_START
+                        + (scatter_shell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
+                    if (xorshift_f32(rng) < sigma_c_f / (sigma_c_f + sigma_gas_f)) {
+                        cloud_collision = true;
+                        // The gray deck's delta-scaled asymmetry.
+                        g_cloud_here = atm[ATM_CLOUD_G_SCALED];
+                    }
                 }
             }
         } else {
@@ -2568,15 +2890,72 @@ float4 trace_secondary_chain(device const float* atm, device const float* fld,
             continue;
         }
 
-        // Sample new direction (gas vertex)
-        float cos_theta = clamp(
-            (xorshift_f32(rng) < op.rayleigh_fraction)
-                ? sample_rayleigh_analytic(xorshift_f32(rng))
-                : sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry),
-            -1.0f, 1.0f);
-        float phi = 2.0f * PI * xorshift_f32(rng);
-        float3 new_dir = scatter_direction(current_dir, cos_theta, phi);
-        // Guard: if scatter_direction returned zero/NaN, bail
+        // Sample new direction (gas vertex): Dwivedi/phase MIS mixture at
+        // deep twilight (port of the CPU chains' MIS block, identical
+        // arithmetic; the balance-heuristic weight corrects the SCALAR
+        // intensity, and the Stokes update below uses the actual sampled
+        // angle, so the polarization treatment is unchanged). Below the
+        // 0.02 activation: the pure-phase path, draw-for-draw identical
+        // to history.
+        float cos_theta;
+        float3 new_dir;
+        bool mis_active = d_frac >= 0.02f;
+        if (mis_active) {
+            float3 local_up_here = normalize(pos);
+            float alpha_p_mis = 1.0f - d_frac;
+            float xi_branch = xorshift_f32(rng);
+            if (xi_branch < d_frac) {
+                // Dwivedi branch: horizontal-biased escape sampling in the
+                // local (up, east, north) frame.
+                float xi1 = xorshift_f32(rng);
+                float xi2 = xorshift_f32(rng);
+                float xi_sign = xorshift_f32(rng);
+                DwivediSample dw = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
+                float sin_z = sqrt(max(1.0f - dw.cos_z * dw.cos_z, 0.0f));
+                float3 arbitrary = (fabs(local_up_here.y) < 0.9f)
+                    ? float3(0.0f, 1.0f, 0.0f)
+                    : float3(1.0f, 0.0f, 0.0f);
+                float3 east = normalize(cross(local_up_here, arbitrary));
+                float3 north = cross(local_up_here, east);
+                float3 d = normalize(local_up_here * dw.cos_z
+                                     + east * (sin_z * cos(dw.phi))
+                                     + north * (sin_z * sin(dw.phi)));
+                cos_theta = clamp(dot(current_dir, d), -1.0f, 1.0f);
+                float p_phase = mixed_phase(cos_theta, op) * INV_4PI;
+                float p_dw = dwivedi_pdf(dw.cos_z, d_beta);
+                float mis_denom = alpha_p_mis * p_phase + d_frac * p_dw;
+                if (mis_denom > 1e-30f) {
+                    weight *= p_phase / mis_denom;
+                }
+                new_dir = d;
+            } else {
+                // Phase branch (within MIS).
+                cos_theta = clamp(
+                    (xorshift_f32(rng) < op.rayleigh_fraction)
+                        ? sample_rayleigh_analytic(xorshift_f32(rng))
+                        : sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry),
+                    -1.0f, 1.0f);
+                float phi = 2.0f * PI * xorshift_f32(rng);
+                new_dir = scatter_direction(current_dir, cos_theta, phi);
+                float p_phase = mixed_phase(cos_theta, op) * INV_4PI;
+                float cos_z_dw = dot(new_dir, local_up_here);
+                float p_dw = dwivedi_pdf(cos_z_dw, d_beta);
+                float mis_denom = alpha_p_mis * p_phase + d_frac * p_dw;
+                if (mis_denom > 1e-30f) {
+                    weight *= p_phase / mis_denom;
+                }
+            }
+        } else {
+            // Pure phase function: no Dwivedi, no MIS overhead.
+            cos_theta = clamp(
+                (xorshift_f32(rng) < op.rayleigh_fraction)
+                    ? sample_rayleigh_analytic(xorshift_f32(rng))
+                    : sample_henyey_greenstein(xorshift_f32(rng), op.asymmetry),
+                -1.0f, 1.0f);
+            float phi = 2.0f * PI * xorshift_f32(rng);
+            new_dir = scatter_direction(current_dir, cos_theta, phi);
+        }
+        // Guard: if the sampled direction is zero/NaN, bail
         if (!isfinite(new_dir.x) || (length(new_dir) < 1e-10f)) break;
 
         // Update Stokes state through this scatter event
@@ -3072,10 +3451,16 @@ kernel void hybrid_scatter_v2(
                 setup.n_zenith = bp.n_zenith;
                 setup.m_term = bp.m_term;
                 setup.alpha_et = EXP_TRANSFORM_ALPHA_MAX * sza_t_et;
-                // Forced mode: on at deep twilight, off only under a 3D
-                // field (the 1D deck composes via the combined channel).
+                setup.sza_deg = sza_deg;
+                // Forced mode: on at deep twilight. The 1D deck composes
+                // via the exact combined channel; a 3D field composes via
+                // the majorant-combined channel + truncated null-collision
+                // classification, which needs the v5 per-shell majorants.
+                // A field packed without them (no uploaded atmosphere)
+                // keeps the analog fallback.
+                bool forced_ok = !field_present || field_has_shell_majorants(fld);
                 setup.use_forced =
-                    (sza_deg >= ZENITH_SZA_START_DEG && !field_present) ? 1u : 0u;
+                    (sza_deg >= ZENITH_SZA_START_DEG && forced_ok) ? 1u : 0u;
                 // The CPU forced_tau_min_for_sza sigmoid:
                 // 0.05 - 0.03 * sigmoid(sza - 102).
                 setup.forced_tau_min =

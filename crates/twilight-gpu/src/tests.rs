@@ -1732,8 +1732,9 @@ mod layer4_metal {
         assert!(tau[0] <= tau[1] + 1e-9 && tau[1] <= tau[2] + 1e-9, "{tau:?}");
     }
 
-    /// G-VERSION: a v3 field buffer must trip the field header gate on the
-    /// device-side probe (the v3-into-v4 rejection described in the plan).
+    /// G-VERSION: a stale-version field buffer must trip the field header
+    /// gate on the device-side probe (the old-into-current rejection
+    /// described in the plan; v4 buffers lack the v5 shell majorants).
     #[test]
     fn metal_field_version_gate_fails_loudly() {
         let Some(mut gpu) = try_metal_concrete() else { return };
@@ -1741,25 +1742,25 @@ mod layer4_metal {
         let view = owned.view();
         gpu.upload_field(Some(&view)).unwrap();
 
-        // A valid v4 field dispatches fine (no sentinel).
+        // A valid current-version field dispatches fine (no sentinel).
         let p0 = ecef_point(50.0, 4.0, 0.0);
         let up = normalize3(p0);
         let rays = vec![[p0[0], p0[1], p0[2], 10_000.0, up[0], up[1], up[2]]];
         let ok = gpu.field_tau_probe(&rays).unwrap();
         assert!(ok[0] >= 0.0, "valid field probe returned {}", ok[0]);
 
-        // Stamp the OLD version (v3) into the field header: the probe must
+        // Stamp an OLD version (v3) into the field header: the probe must
         // refuse it via the HEADER_SENTINEL path.
         gpu.set_field_version_word(3);
         let bad = gpu.field_tau_probe(&rays).unwrap();
         assert_eq!(
             bad[0].to_bits(),
             (-1.0f64).to_bits(),
-            "v3 field buffer must trip the v4 field header gate (got {})",
+            "stale field buffer must trip the field header gate (got {})",
             bad[0]
         );
 
-        // Re-upload restores a valid v4 header.
+        // Re-upload restores a valid current-version header.
         gpu.upload_field(Some(&view)).unwrap();
         let ok2 = gpu.field_tau_probe(&rays).unwrap();
         assert!(ok2[0] >= 0.0);
@@ -1891,8 +1892,10 @@ mod layer4_metal {
 
     /// G-MC-PARITY-3 (b): the real Padborg field, GPU vs CPU hybrid+field,
     /// straddling the forced-collision threshold (SZA 95 analog-eligible,
-    /// 97 and 100 above ZENITH_SZA_START; under a FIELD both backends stay
-    /// analog, pinning the use_forced-off-under-field gating parity).
+    /// 97 and 100 above ZENITH_SZA_START; under a FIELD both backends now
+    /// run the majorant-combined forced mode with VSPG collision guiding
+    /// and the truncated null-collision classification, pinning the
+    /// field-forced gating parity end to end).
     ///
     /// Heavy: the CPU reference walks the full-resolution field DDA on every
     /// NEE for 8 seeds x 64 wavelengths x 100 rays at three SZAs (this IS
@@ -4256,6 +4259,22 @@ fn wgsl_offsets_match_buffers_rs() {
     assert_eq!(grab("ATM_SHELL_STRIDE") as usize, o::SHELL_STRIDE);
     assert_eq!(grab("ATM_OPTICS_START") as usize, o::OPTICS_START);
     assert_eq!(grab("ATM_OPTICS_STRIDE") as usize, o::OPTICS_STRIDE);
+
+    // Buffer version: a WGSL shader compiled against a different packing
+    // version must never pass the header gate silently.
+    assert_eq!(grab("BUFFER_VERSION"), crate::buffers::BUFFER_VERSION);
+
+    // Cloud-field header slots (v5 adds the shell-majorant pair).
+    use crate::buffers::field_offsets as f;
+    assert_eq!(grab("FIELD_G_STAR_PRESENT") as usize, f::G_STAR_PRESENT);
+    assert_eq!(grab("FIELD_BG_PRESENT") as usize, f::BG_PRESENT);
+    assert_eq!(grab("FIELD_MACRO_PRESENT") as usize, f::MACRO_PRESENT);
+    assert_eq!(grab("FIELD_SHELL_MAJ_PRESENT") as usize, f::SHELL_MAJ_PRESENT);
+    assert_eq!(grab("FIELD_SHELL_MAJ_OFFSET") as usize, f::SHELL_MAJ_OFFSET);
+    assert_eq!(grab("FIELD_SIGMA_OFFSET") as usize, f::SIGMA_OFFSET);
+    assert_eq!(grab("FIELD_G_STAR_OFFSET") as usize, f::G_STAR_OFFSET);
+    assert_eq!(grab("FIELD_MACRO_OFFSET") as usize, f::MACRO_OFFSET);
+    assert_eq!(grab("FIELD_BG_OFFSET") as usize, f::BG_OFFSET);
 }
 
 // ── Layer 4w: wgpu backend (portable WGSL translation) ──────────────────

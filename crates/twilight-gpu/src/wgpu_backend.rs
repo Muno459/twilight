@@ -70,6 +70,12 @@ pub struct WgpuBackend {
     buf_atm: Option<wgpu::Buffer>,
     buf_field: Option<wgpu::Buffer>,
     num_wavelengths: u32,
+    /// Transport-shell radial bands (r_inner, r_outer) of the uploaded
+    /// atmosphere: `upload_field` computes the per-shell field majorants
+    /// (GPU field-forced mode) over these bands. Upload the atmosphere
+    /// BEFORE the field (the trait lifecycle order); a field uploaded
+    /// with no atmosphere packs no majorants and stays analog.
+    shell_bands: Vec<(f64, f64)>,
     info: GpuDeviceInfo,
 }
 
@@ -190,6 +196,7 @@ pub(crate) fn init_concrete(_config: &GpuConfig) -> Result<WgpuBackend, GpuError
         buf_atm: None,
         buf_field: None,
         num_wavelengths: 0,
+        shell_bands: Vec::new(),
         info,
     })
 }
@@ -360,6 +367,11 @@ impl GpuBackend for WgpuBackend {
     ) -> Result<(), GpuError> {
         let packed = PackedAtmosphere::pack(atm);
         self.num_wavelengths = atm.num_wavelengths as u32;
+        self.shell_bands = atm.shells
+            [..atm.num_shells.min(twilight_core::atmosphere::MAX_SHELLS)]
+            .iter()
+            .map(|s| (s.r_inner, s.r_outer))
+            .collect();
         self.buf_atm = Some(self.storage_from_f32(&packed.data, "atm"));
         Ok(())
     }
@@ -374,7 +386,10 @@ impl GpuBackend for WgpuBackend {
                 Ok(())
             }
             Some(f) => {
-                let packed = PackedCloudField::pack(f);
+                // v5: per-shell field majorants over the uploaded shell
+                // bands (GPU field-forced mode; the CPU
+                // field_shell_majorants derivation).
+                let packed = PackedCloudField::pack_with_majorants(f, &self.shell_bands);
                 self.buf_field = Some(self.storage_from_f32(&packed.data, "field"));
                 Ok(())
             }

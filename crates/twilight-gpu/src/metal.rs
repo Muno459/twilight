@@ -95,6 +95,12 @@ pub struct MetalBackend {
     // watchdog batch, mirroring the field case. Set at upload, never
     // adjusted at run time (adaptive batching regressed twice, measured).
     has_cloud_1d: bool,
+    // Transport-shell radial bands (r_inner, r_outer) of the uploaded
+    // atmosphere: the per-shell field majorants (GPU field-forced mode)
+    // are computed over these bands at upload_field time. Upload the
+    // atmosphere BEFORE the field (the trait lifecycle order); a field
+    // uploaded with no atmosphere packs no majorants and stays analog.
+    shell_bands: Vec<(f64, f64)>,
 }
 
 // Safety: Metal objects (device, queue, pipeline states, shared buffers) are
@@ -180,6 +186,7 @@ pub(crate) fn init_backend(config: &GpuConfig) -> Result<MetalBackend, GpuError>
         config: config.clone(),
         num_wavelengths: 0,
         has_cloud_1d: false,
+        shell_bands: Vec::new(),
     })
 }
 
@@ -200,6 +207,11 @@ impl GpuBackend for MetalBackend {
             [..atm.num_shells.min(twilight_core::atmosphere::MAX_SHELLS)]
             .iter()
             .any(|&c| c > 0.0);
+        self.shell_bands = atm.shells
+            [..atm.num_shells.min(twilight_core::atmosphere::MAX_SHELLS)]
+            .iter()
+            .map(|s| (s.r_inner, s.r_outer))
+            .collect();
         self.buf_atm = Some(create_buffer_from_f32(&self.device, &packed.data)?);
         Ok(())
     }
@@ -214,7 +226,11 @@ impl GpuBackend for MetalBackend {
                 Ok(())
             }
             Some(f) => {
-                let packed = crate::buffers::PackedCloudField::pack(f);
+                // v5: per-shell field majorants over the uploaded shell
+                // bands (the GPU field-forced mode's majorant-combined
+                // channel; the CPU field_shell_majorants derivation).
+                let packed =
+                    crate::buffers::PackedCloudField::pack_with_majorants(f, &self.shell_bands);
                 self.buf_field = Some(create_buffer_from_f32(&self.device, &packed.data)?);
                 Ok(())
             }
