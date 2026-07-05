@@ -1332,6 +1332,12 @@ const WW_UPPER_RATIO: f64 = 2.0;
 /// bounces still contribute (SZA 100-104).
 const WW_LOWER_RATIO: f64 = 10.0;
 
+/// Observer-SZA gate for building the forward-informed importance map:
+/// cos(96 deg), matching ZENITH_SZA_START (forced mode). Above this
+/// (shallower), the chains keep the dormant-window heuristic and their
+/// historical RNG streams bit-identically.
+const FIM_COS_GATE: f64 = -0.104_528_463_267_653_47;
+
 /// Maximum number of concurrent split particles in the work stack.
 ///
 /// Caps the maximum split count per weight-window event. Stack memory per
@@ -2640,6 +2646,17 @@ pub fn hybrid_scatter_radiance(
     let toa_radius = atm.toa_radius();
     let surface_radius = atm.surface_radius();
 
+    // Forward-informed importance map for the chain weight windows,
+    // built once per call (sub-ms) and only in the deep regime
+    // (observer SZA >= 96, the forced-mode gate), so every shallower
+    // surface keeps its historical streams bit-identical. The map is
+    // SZA-independent by construction; the gate is purely a cost and
+    // stream-stability choice.
+    let cos_sza_obs = observer_pos.normalize().dot(sun_dir);
+    let fim_store = (cos_sza_obs < FIM_COS_GATE)
+        .then(|| crate::importance::SolarImportanceMap::build(atm, wavelength_idx));
+    let fim = fim_store.as_ref();
+
     // Find LOS extent
     let los_max = match ray_sphere_intersect(observer_pos, view_dir, toa_radius) {
         Some(hit) if hit.t_far > 0.0 => hit.t_far,
@@ -2880,6 +2897,7 @@ pub fn hybrid_scatter_radiance(
                         field,
                         chain_cloud,
                         cloud_maj,
+                        fim,
                     );
                     mc_stokes = mc_stokes.add(&chain_stokes);
                 }
@@ -2905,6 +2923,7 @@ pub fn hybrid_scatter_radiance(
                         field,
                         chain_cloud,
                         cloud_maj,
+                        fim,
                     );
                 }
                 let inv_rays = 1.0 / rays_this_sub as f64;
@@ -2966,6 +2985,9 @@ fn trace_secondary_chain(
     // channel), the per-shell field majorants with one (see the scalar
     // chain's use_forced derivation).
     cloud_maj: &[f64; crate::atmosphere::MAX_SHELLS],
+    // Forward-informed importance for the weight windows (None: the
+    // altitude+CADIS heuristic; see crate::importance).
+    fim: Option<&crate::importance::SolarImportanceMap>,
 ) -> crate::scattering::StokesVector {
     use crate::scattering::{scatter_stokes_fast, scattering_plane_cos_sin, StokesVector};
     use crate::single_scatter::shadow_ray_transmittance;
@@ -3092,6 +3114,14 @@ fn trace_secondary_chain(
     // null-collision delta tracking: see the derivation and telescoping
     // proof at the scalar chain's use_forced block.
     let use_forced = sza_deg_local >= ZENITH_SZA_START;
+    // Dwivedi horizontal-bias directional MIS (ported from the scalar
+    // chain, review of the 103/650 collapse: population control cannot
+    // recover paths the direction sampler never generates). Ramps in
+    // with SZA exactly like the scalar chain; below the 0.02 activation
+    // the pure-phase path consumes identical RNG draws, so shallow
+    // streams stay bit-identical.
+    let d_frac = dwivedi_frac(sza_deg_local);
+    let d_beta = dwivedi_beta(sza_deg_local);
 
     // Exponential transform bias parameter.
     // Ramps from 0 (SZA < 96) to EXP_TRANSFORM_ALPHA_MAX (SZA >= 106).
@@ -3162,8 +3192,15 @@ fn trace_secondary_chain(
         if _scatter > 0 {
             let alt = pos.length() - surface_radius;
             let cos_sun_here = pos.normalize().dot(sun_dir);
-            let w_target =
-                weight_window_target(alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck);
+            // Importance: the forward-informed solar map when present
+            // (deterministic adjoint proxy, crate::importance), else
+            // the historical altitude+CADIS heuristic.
+            let w_target = match fim {
+                Some(m) => m.window_target(alt, cos_sun_here, alt_start, cos_sun_start),
+                None => {
+                    weight_window_target(alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck)
+                }
+            };
             let w_lower = w_target / WW_LOWER_RATIO;
             let w_upper = w_target * WW_UPPER_RATIO;
             let abs_w = weight.abs();
@@ -3505,13 +3542,73 @@ fn trace_secondary_chain(
             continue;
         }
 
-        let cos_theta = if xorshift_f64(&mut local_rng.dir) < optics.rayleigh_fraction {
-            sample_rayleigh_analytic(xorshift_f64(&mut local_rng.dir))
+        // Gas direction sampling: Dwivedi/phase MIS mixture at deep
+        // twilight (identical arithmetic to the scalar chain; the
+        // balance-heuristic weight corrects the SCALAR intensity, and
+        // the Mueller update below uses the actual sampled angle, so
+        // the polarization treatment is unchanged). Below activation:
+        // the pure-phase path, draw-for-draw identical to history.
+        let alpha_d = d_frac;
+        let mis_active = alpha_d >= 0.02;
+        let (new_dir, cos_theta) = if mis_active {
+            let local_up_here = pos.normalize();
+            let alpha_p_mis = 1.0 - alpha_d;
+            let xi_branch = xorshift_f64(&mut local_rng.dir);
+            if xi_branch < alpha_d {
+                // Dwivedi branch: horizontal-biased escape sampling.
+                let xi1 = xorshift_f64(&mut local_rng.dir);
+                let xi2 = xorshift_f64(&mut local_rng.dir);
+                let xi_sign = xorshift_f64(&mut local_rng.dir);
+                let (cos_z, phi_dw) = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
+                let sin_z = libm::sqrt((1.0 - cos_z * cos_z).max(0.0));
+                let east = {
+                    let arbitrary = if libm::fabs(local_up_here.y) < 0.9 {
+                        Vec3::new(0.0, 1.0, 0.0)
+                    } else {
+                        Vec3::new(1.0, 0.0, 0.0)
+                    };
+                    local_up_here.cross(arbitrary).normalize()
+                };
+                let north = local_up_here.cross(east);
+                let d = (local_up_here.scale(cos_z)
+                    + east.scale(sin_z * libm::cos(phi_dw))
+                    + north.scale(sin_z * libm::sin(phi_dw)))
+                .normalize();
+                let cos_t = current_dir.dot(d);
+                let p_phase = scalar_phase_value(cos_t, optics) * INV_4PI;
+                let p_dw = dwivedi_pdf(cos_z, d_beta);
+                let mis_denom = alpha_p_mis * p_phase + alpha_d * p_dw;
+                if mis_denom > 1e-30 {
+                    weight *= p_phase / mis_denom;
+                }
+                (d, cos_t)
+            } else {
+                // Phase branch (within MIS).
+                let ct = if xorshift_f64(&mut local_rng.dir) < optics.rayleigh_fraction {
+                    sample_rayleigh_analytic(xorshift_f64(&mut local_rng.dir))
+                } else {
+                    sample_henyey_greenstein(xorshift_f64(&mut local_rng.dir), optics.asymmetry)
+                };
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
+                let d = scatter_direction(current_dir, ct, phi);
+                let p_phase = scalar_phase_value(ct, optics) * INV_4PI;
+                let cos_z_dw = d.dot(local_up_here);
+                let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
+                let mis_denom = alpha_p_mis * p_phase + alpha_d * p_dw;
+                if mis_denom > 1e-30 {
+                    weight *= p_phase / mis_denom;
+                }
+                (d, ct)
+            }
         } else {
-            sample_henyey_greenstein(xorshift_f64(&mut local_rng.dir), optics.asymmetry)
+            let ct = if xorshift_f64(&mut local_rng.dir) < optics.rayleigh_fraction {
+                sample_rayleigh_analytic(xorshift_f64(&mut local_rng.dir))
+            } else {
+                sample_henyey_greenstein(xorshift_f64(&mut local_rng.dir), optics.asymmetry)
+            };
+            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
+            (scatter_direction(current_dir, ct, phi), ct)
         };
-        let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut local_rng.dir);
-        let new_dir = scatter_direction(current_dir, cos_theta, phi);
 
         // Update Stokes through this gas scatter (fused, no matrices, no trig)
         let (cs, ss) = scattering_plane_cos_sin(prev_dir, current_dir, new_dir);
@@ -3588,6 +3685,9 @@ fn trace_secondary_chain_scalar(
     // `&atm.cloud_extinction` without a field (the exact 1D combined
     // channel), the per-shell field majorants with one (see use_forced).
     cloud_maj: &[f64; crate::atmosphere::MAX_SHELLS],
+    // Forward-informed importance for the weight windows (None: the
+    // altitude+CADIS heuristic; see crate::importance).
+    fim: Option<&crate::importance::SolarImportanceMap>,
 ) -> f64 {
     use crate::single_scatter::shadow_ray_transmittance;
 
@@ -4181,8 +4281,15 @@ fn trace_secondary_chain_scalar(
             // --- Weight window population control ---
             let alt = pos.length() - surface_radius;
             let cos_sun_here = pos.normalize().dot(sun_dir);
-            let w_target =
-                weight_window_target(alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck);
+            // Importance: the forward-informed solar map when present
+            // (deterministic adjoint proxy, crate::importance), else
+            // the historical altitude+CADIS heuristic.
+            let w_target = match fim {
+                Some(m) => m.window_target(alt, cos_sun_here, alt_start, cos_sun_start),
+                None => {
+                    weight_window_target(alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck)
+                }
+            };
             let w_lower = w_target / WW_LOWER_RATIO;
             let w_upper = w_target * WW_UPPER_RATIO;
             let abs_w = weight.abs();
@@ -4693,6 +4800,9 @@ fn trace_secondary_chain_alis(
     field: Option<&Cloud3DField>,
     // Per-run channel flag + per-step cloud seed mixture (see ChainCloud).
     cloud: ChainCloud,
+    // Forward-informed importance for the weight windows (None: the
+    // altitude+CADIS heuristic; see crate::importance).
+    fim: Option<&crate::importance::SolarImportanceMap>,
 ) -> ([f64; 64], bool) {
     use crate::single_scatter::shadow_ray_transmittance_spectrum;
 
@@ -5465,8 +5575,15 @@ fn trace_secondary_chain_alis(
             // --- Weight window population control ---
             let alt = pos.length() - surface_radius;
             let cos_sun_here = pos.normalize().dot(sun_dir);
-            let w_target =
-                weight_window_target(alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck);
+            // Importance: the forward-informed solar map when present
+            // (deterministic adjoint proxy, crate::importance), else
+            // the historical altitude+CADIS heuristic.
+            let w_target = match fim {
+                Some(m) => m.window_target(alt, cos_sun_here, alt_start, cos_sun_start),
+                None => {
+                    weight_window_target(alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck)
+                }
+            };
             let w_lower = w_target / WW_LOWER_RATIO;
             let w_upper = w_target * WW_UPPER_RATIO;
             let abs_hw = hero_weight.abs();
@@ -5548,6 +5665,15 @@ pub fn hybrid_scatter_radiance_alis(
     let toa_radius = atm.toa_radius();
     let surface_radius = atm.surface_radius();
     let mut radiance = [0.0f64; 64];
+
+    // Forward-informed importance map (see hybrid_scatter_radiance):
+    // ALIS rotates its hero per subpath, so the map uses the mid-grid
+    // wavelength (importance quality only); deep-gated so shallow
+    // surfaces keep bit-identical streams.
+    let cos_sza_obs = observer_pos.normalize().dot(sun_dir);
+    let fim_store = (cos_sza_obs < FIM_COS_GATE)
+        .then(|| crate::importance::SolarImportanceMap::build(atm, num_wl / 2));
+    let fim = fim_store.as_ref();
 
     // Find LOS extent.
     let los_max = match ray_sphere_intersect(observer_pos, view_dir, toa_radius) {
@@ -5957,6 +6083,7 @@ pub fn hybrid_scatter_radiance_alis(
                     guide_ref,
                     field,
                     chain_cloud,
+                    fim,
                 );
 
                 if beta_cloud > 0.0 {
@@ -7236,6 +7363,7 @@ mod tests {
                 field,
                 ChainCloud::CLEAR,
                 cloud_maj,
+                None,
             );
             assert!(v.is_finite() && v >= 0.0, "chain {ray} returned {v}");
             sum += v;
@@ -9348,6 +9476,7 @@ mod tests {
                 None,
                 ChainCloud::CLEAR,
                 &atm.cloud_extinction,
+                None,
             );
         }
         let mean = total / n as f64;
@@ -9399,6 +9528,7 @@ mod tests {
                 None,
                 ChainCloud::CLEAR,
                 &atm.cloud_extinction,
+                None,
             );
             assert!(
                 val >= 0.0,
@@ -9453,6 +9583,7 @@ mod tests {
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
                 None,
                 ChainCloud::CLEAR,
+                None,
             );
             for w in 0..num_wl {
                 assert!(
@@ -9884,6 +10015,7 @@ mod tests {
                 None,
                 ChainCloud::CLEAR,
                 &atm.cloud_extinction,
+                None,
             );
             assert!(
                 result >= 0.0 && result.is_finite(),
@@ -9932,6 +10064,7 @@ mod tests {
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
                 None,
                 ChainCloud::CLEAR,
+                None,
             );
             for w in 0..num_wl {
                 assert!(

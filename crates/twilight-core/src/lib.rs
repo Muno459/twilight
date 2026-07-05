@@ -15,6 +15,7 @@ pub mod gas_absorption;
 #[allow(clippy::approx_constant, clippy::large_const_arrays)]
 pub mod gas_absorption_data;
 pub mod geometry;
+pub mod importance;
 pub mod path_guide;
 pub mod photon;
 pub mod scattering;
