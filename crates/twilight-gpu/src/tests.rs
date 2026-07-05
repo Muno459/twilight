@@ -600,7 +600,7 @@ fn run_hybrid_sanity(backend: &mut dyn crate::GpuBackend, label: &str) -> usize 
 
 // ── Metal backend integration tests ─────────────────────────────────────
 
-#[cfg(any(feature = "metal", feature = "wgpu"))]
+#[cfg(any(all(feature = "metal", target_os = "macos"), feature = "wgpu"))]
 mod field_fixtures {
     // Checkerboard field + ray fan shared by the Metal and wgpu DDA
     // parity gates (pure twilight-data/core constructions).
@@ -841,7 +841,7 @@ mod field_fixtures {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 mod layer4_metal {
     use super::*;
     use super::field_fixtures::*;
@@ -2081,7 +2081,7 @@ const CROSS_BACKEND_RTOL: f64 = 1e-4;
 fn init_all_backends() -> Vec<(crate::BackendKind, Box<dyn crate::GpuBackend>)> {
     let mut backends = Vec::new();
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         let config = crate::GpuConfig {
             preferred_backend: Some(crate::BackendKind::Metal),
@@ -2167,7 +2167,7 @@ fn cross_backend_single_scatter_parity() {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 #[test]
 fn metal_hybrid_split_dispatch_boundaries_match_cpu_statistics() {
     use twilight_core::geometry::{geographic_to_ecef, solar_direction_ecef};

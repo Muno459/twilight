@@ -19,7 +19,16 @@ twilight-data = { workspace = true }
 twilight-threshold = { workspace = true }
 twilight-skyglow = { workspace = true }
 
-# Metal backend
+# wgpu backend (portable: Vulkan / DX12 / Metal / GL)
+wgpu = { version = "28", optional = true }
+pollster = { version = "0.4", optional = true }
+bytemuck = { version = "1", optional = true }
+
+# Metal backend: Apple-only bindings live under a target table so the
+# `metal` feature is a safe no-op on other platforms (a Linux workspace
+# check with the feature enabled must not try to compile objc2, which
+# has a hard compile_error off Apple targets).
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true, features = ["NSError", "NSString"] }
 objc2-metal = { version = "0.3", optional = true, features = [
@@ -28,11 +37,6 @@ objc2-metal = { version = "0.3", optional = true, features = [
     "MTLArgument", "MTLCommandEncoder", "MTLTypes",
 ] }
 block2 = { version = "0.6", optional = true }
-
-# wgpu backend (portable: Vulkan / DX12 / Metal / GL)
-wgpu = { version = "28", optional = true }
-pollster = { version = "0.4", optional = true }
-bytemuck = { version = "1", optional = true }
 
 [dev-dependencies]
 twilight-cpu = { workspace = true }

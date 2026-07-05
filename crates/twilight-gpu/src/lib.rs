@@ -35,7 +35,7 @@
 
 pub mod buffers;
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 pub mod metal;
 
 #[cfg(feature = "wgpu")]
@@ -372,7 +372,7 @@ pub fn detect_backends() -> Vec<BackendKind> {
     let mut available = Vec::new();
 
     // Metal: check if feature is compiled (always works on macOS/iOS)
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", target_os = "macos"))]
     {
         if probe_metal() {
             available.push(BackendKind::Metal);
@@ -439,7 +439,7 @@ pub fn try_init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     };
 
     match kind {
-        #[cfg(feature = "metal")]
+        #[cfg(all(feature = "metal", target_os = "macos"))]
         BackendKind::Metal => init_metal(config),
         #[cfg(feature = "wgpu")]
         BackendKind::Wgpu => init_wgpu(config),
@@ -450,12 +450,12 @@ pub fn try_init(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
 
 // ── Probe / init (lightweight device checks) ────────────────────────────
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn probe_metal() -> bool {
     metal::probe()
 }
 
-#[cfg(feature = "metal")]
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn init_metal(config: &GpuConfig) -> Result<Box<dyn GpuBackend>, GpuError> {
     metal::init(config)
 }
