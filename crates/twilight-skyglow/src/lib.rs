@@ -22,10 +22,14 @@
 //! radiance in nW/cm^2/sr) remains as the override and offline fallback.
 //! There is still no ground-source photon tracer.
 //!
-//! A Garstang (1986)-style single-scatter integration exists in [`garstang`]
-//! but is NOT currently wired into the prayer-time pipeline; the pipeline
-//! uses the simpler zenith-luminance estimate from [`spectrum`]. Wiring the
-//! Garstang propagation in (and validating its magnitudes) is an open task.
+//! A Garstang (1986)-style single-scatter integration lives in [`garstang`].
+//! Its ABSOLUTE magnitudes are still not what the pipeline consumes (the
+//! amplitude rail stays on the Falchi/atlas calibration via [`spectrum`]),
+//! but its slant-LOS generalization ([`garstang::slant_brightness`]) now
+//! supplies the AZIMUTHAL STRUCTURE of the khayt veil through
+//! [`DirectionalSkyglow`] / [`directional_veils`]: per-patch veils whose
+//! all-azimuth mean is pinned to the isotropic atlas value (structure from
+//! Garstang+VIIRS, amplitude from the atlas rail).
 //!
 //! # Spectral Model
 //!
@@ -142,6 +146,139 @@ impl RadianceSource for ConstantRadiance {
     fn name(&self) -> &str {
         "Constant (user-provided)"
     }
+}
+
+/// Azimuthally-resolved artificial skyglow: VIIRS-binned ground light
+/// sources plus the Garstang integration parameters, carried by callers
+/// (the prayer pipeline, the CLI) that want per-direction veils instead
+/// of one isotropic value.
+///
+/// # NORMALIZATION DECISION (read before touching the amplitudes)
+///
+/// The Garstang slant integral supplies only the azimuthal STRUCTURE of
+/// the veil; the absolute AMPLITUDE stays on the validated Falchi/atlas
+/// photometric rail that `quick_estimate` and the khayt veil already
+/// use. Concretely, [`DirectionalSkyglow::azimuth_ratios`] normalizes
+/// the slant brightnesses so their ALL-AZIMUTH AVERAGE at the patch
+/// elevation is exactly 1.0, and a per-patch veil is
+/// `(isotropic veil at that elevation) x ratio`. The atlas-equivalent
+/// isotropic mean of the directional veils therefore matches the old
+/// isotropic path BY CONSTRUCTION:
+///
+///   structure from Garstang + VIIRS, amplitude from the atlas rail.
+///
+/// This keeps the absolute calibration anchored to the validated atlas
+/// (no tuned constant enters), while an observer south of a city
+/// correctly sees a brighter northern sky and a darker southern dawn
+/// horizon.
+#[derive(Debug, Clone)]
+pub struct DirectionalSkyglow {
+    /// Binned ground sources (distance/azimuth from the observer).
+    pub sources: Vec<garstang::LightSource>,
+    /// Garstang integration parameters (observer elevation, AOD, ...).
+    pub config: garstang::GarstangConfig,
+}
+
+/// Azimuth samples of the all-azimuth normalization mean (5-degree
+/// steps; the source binning itself is 10-degree at its finest).
+const MEAN_AZ_SAMPLES: usize = 72;
+
+impl DirectionalSkyglow {
+    /// Bin a radiance grid around the observer into ground sources.
+    ///
+    /// Returns `None` when the source yields no usable light bins
+    /// (missing tile, all-dark, nodata) so the caller can fall back to
+    /// the isotropic path LOUDLY instead of propagating a silent guess.
+    pub fn from_radiance_source(
+        source: &dyn RadianceSource,
+        observer_lat: f64,
+        observer_lon: f64,
+        config: garstang::GarstangConfig,
+        radius_km: f64,
+    ) -> Option<Self> {
+        let sources = garstang::bin_sources(source, observer_lat, observer_lon, radius_km);
+        if sources.is_empty() {
+            return None;
+        }
+        Some(DirectionalSkyglow { sources, config })
+    }
+
+    /// Slant brightness at each requested azimuth, DIVIDED by the
+    /// all-azimuth mean slant brightness at the same elevation (the
+    /// normalization that pins the amplitude to the atlas rail; see the
+    /// type-level docs). Returns `None` when the structure is
+    /// undefined (no sources, or a degenerate zero/non-finite mean) so
+    /// callers fall back to the isotropic veil.
+    pub fn azimuth_ratios(&self, azimuths_deg: &[f64], elevation_deg: f64) -> Option<Vec<f64>> {
+        if self.sources.is_empty() {
+            return None;
+        }
+        let mean = (0..MEAN_AZ_SAMPLES)
+            .map(|i| {
+                garstang::slant_brightness(
+                    &self.sources,
+                    &self.config,
+                    i as f64 * 360.0 / MEAN_AZ_SAMPLES as f64,
+                    elevation_deg,
+                )
+            })
+            .sum::<f64>()
+            / MEAN_AZ_SAMPLES as f64;
+        if !mean.is_finite() || mean <= 0.0 {
+            return None;
+        }
+        Some(
+            azimuths_deg
+                .iter()
+                .map(|&az| {
+                    garstang::slant_brightness(&self.sources, &self.config, az, elevation_deg)
+                        / mean
+                })
+                .collect(),
+        )
+    }
+}
+
+/// Per-patch artificial veils `(mesopic cd/m^2, red-band cd/m^2)` at the
+/// given absolute azimuths and patch elevation, on the SAME photometric
+/// rail as [`quick_estimate`]: the spectrum is calibrated to the Falchi
+/// zenith luminance, its mesopic/red bands are lifted by the Duriscoe
+/// elevation factor (exactly the isotropic khayt veil), and each patch
+/// is then scaled by the normalized Garstang slant ratio - so the
+/// all-azimuth average of these veils equals the isotropic veil (see
+/// [`DirectionalSkyglow`] for the normalization decision).
+///
+/// `radiance_nw`/`led_fraction` must be the SAME values the isotropic
+/// path was fed (the observer's VIIRS radiance and lighting mix).
+///
+/// Returns `None` when the directional structure is undefined (no
+/// sources / degenerate mean): callers MUST fall back to the isotropic
+/// path and say so, not guess.
+pub fn directional_veils(
+    directional: &DirectionalSkyglow,
+    radiance_nw: f64,
+    led_fraction: f64,
+    patch_azimuths_deg: &[f64],
+    patch_elevation_deg: f64,
+) -> Option<Vec<(f64, f64)>> {
+    let ratios = directional.azimuth_ratios(patch_azimuths_deg, patch_elevation_deg)?;
+    let sg = quick_estimate(radiance_nw, led_fraction);
+    let n = sg.num_wavelengths.min(sg.spectral_radiance.len());
+    let wl: Vec<f64> = (0..n).map(|i| 380.0 + 10.0 * i as f64).collect();
+    let mes = twilight_threshold::luminance::mesopic_luminance(&wl, &sg.spectral_radiance[..n]);
+    let red = twilight_threshold::luminance::red_band_luminance(&wl, &sg.spectral_radiance[..n]);
+    let lift = angular::enhancement_factor(patch_elevation_deg);
+    if mes <= 1e-30 {
+        // Degenerate spectrum (zero/negative radiance): zero veil
+        // everywhere, same convention as the isotropic khayt veil.
+        return Some(vec![(0.0, 0.0); patch_azimuths_deg.len()]);
+    }
+    Some(
+        ratios
+            .iter()
+            .map(|r| (mes * lift * r, red * lift * r))
+            .collect(),
+    )
 }
 
 /// Compute the zenith artificial sky brightness from a single radiance value
@@ -307,6 +444,64 @@ mod tests {
             result.directional_luminance,
             zenith.zenith_luminance
         );
+    }
+
+    /// The all-azimuth average of the directional veils must equal the
+    /// isotropic veil (spectrum mesopic x elevation lift) EXACTLY (up
+    /// to FP roundoff): this is the normalization contract that keeps
+    /// the amplitude on the atlas rail while the slant integral only
+    /// contributes structure.
+    #[test]
+    fn directional_veils_average_to_isotropic() {
+        let d = DirectionalSkyglow {
+            sources: vec![garstang::LightSource {
+                distance_m: 6_400.0, // OpenFajr-like: city 4 miles away
+                azimuth_deg: 0.0,
+                upward_flux: 5e6,
+            }],
+            config: garstang::GarstangConfig::default(),
+        };
+        let elev = 3.0;
+        let (radiance, led) = (162.55, 0.15);
+        // Probe on the same uniform grid the normalization mean uses.
+        let azs: Vec<f64> = (0..MEAN_AZ_SAMPLES)
+            .map(|i| i as f64 * 360.0 / MEAN_AZ_SAMPLES as f64)
+            .collect();
+        let veils = directional_veils(&d, radiance, led, &azs, elev).expect("structure");
+        let mean_mes = veils.iter().map(|v| v.0).sum::<f64>() / veils.len() as f64;
+
+        let sg = quick_estimate(radiance, led);
+        let wl: Vec<f64> = (0..sg.num_wavelengths).map(|i| 380.0 + 10.0 * i as f64).collect();
+        let iso_mes = twilight_threshold::luminance::mesopic_luminance(
+            &wl,
+            &sg.spectral_radiance[..sg.num_wavelengths],
+        ) * angular::enhancement_factor(elev);
+        assert!(
+            (mean_mes - iso_mes).abs() / iso_mes < 1e-9,
+            "all-azimuth mean {mean_mes:e} must equal the isotropic veil {iso_mes:e}"
+        );
+        // And the structure is real: toward the city beats away from it.
+        assert!(
+            veils[0].0 > veils[MEAN_AZ_SAMPLES / 2].0,
+            "veil toward the city ({:e}) must exceed the anti-city veil ({:e})",
+            veils[0].0,
+            veils[MEAN_AZ_SAMPLES / 2].0
+        );
+    }
+
+    /// No usable sources -> None (loud fallback at the caller), never a
+    /// silent isotropic guess dressed up as directional data.
+    #[test]
+    fn directional_from_dark_source_is_none() {
+        let dark = ConstantRadiance { radiance: 0.0 };
+        let d = DirectionalSkyglow::from_radiance_source(
+            &dark,
+            52.44,
+            -1.95,
+            garstang::GarstangConfig::default(),
+            200.0,
+        );
+        assert!(d.is_none(), "all-dark grid must yield no directional model");
     }
 
     #[test]

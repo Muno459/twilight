@@ -39,6 +39,11 @@ const TAU_AEROSOL_550_DEFAULT: f64 = 0.15;
 /// Mean Earth radius (m) for curvature correction.
 const EARTH_RADIUS: f64 = 6_371_000.0;
 
+/// Henyey-Greenstein asymmetry parameter for the aerosol phase function
+/// (g = 0.7, typical continental aerosol; shared by the zenith and slant
+/// integrals so both describe the same atmosphere).
+const MIE_G: f64 = 0.7;
+
 /// A binned ground-level light source for the Garstang integration.
 #[derive(Debug, Clone)]
 pub struct LightSource {
@@ -148,6 +153,127 @@ pub fn directional_brightness(
     zenith * factor
 }
 
+/// Compute the artificial sky brightness along an arbitrary slant line
+/// of sight (azimuth + elevation), resolving the AZIMUTHAL structure of
+/// the skyglow that `directional_brightness` (zenith x elevation factor)
+/// cannot see: an observer south of a city has a bright northern sky
+/// and a darker southern one at the same elevation.
+///
+/// This is the proper slant-LOS generalization of the zenith integral:
+/// the LOS is marched from the observer, the point at arc length `s`
+/// sitting at altitude `observer_elevation + s*sin(e)` and horizontal
+/// offset `s*cos(e)` toward `azimuth_deg`. At each LOS point every
+/// source contributes scattered light through the SAME emission,
+/// scattering-coefficient, phase-function and extinction pieces the
+/// zenith integral uses (shared helpers below), with the true 3D
+/// source-to-point geometry and the true scattering angle between the
+/// incoming ray and the LOS direction; the result is attenuated to the
+/// observer along the slant and integrated.
+///
+/// Quadrature: the SAME altitude grid as the zenith integral
+/// (`altitude_steps` cells of the vertical span up to `max_altitude`),
+/// mapped onto the slant via `ds = dh / sin(e)`; at elevation 90 the
+/// integrand reduces term-by-term to `single_source_zenith`, which is
+/// the `slant_equals_zenith_at_90` unit gate.
+///
+/// Flat-earth geometry throughout, like the zenith integral; the
+/// elevation is clamped to >= 1 degree (same clamp philosophy as
+/// `angular::enhancement_factor`) so the 1/sin(e) path terms stay
+/// bounded at the horizon.
+///
+/// # Arguments
+/// * `sources` - Binned light sources (distance/azimuth FROM THE
+///   OBSERVER, ground level)
+/// * `config` - Integration parameters (same meaning as for
+///   [`zenith_brightness`])
+/// * `azimuth_deg` - LOS azimuth (degrees, 0=N, 90=E)
+/// * `elevation_deg` - LOS elevation above the horizon (degrees)
+///
+/// # Returns
+/// Artificial sky brightness in W/m^2/sr at the configured wavelength.
+pub fn slant_brightness(
+    sources: &[LightSource],
+    config: &GarstangConfig,
+    azimuth_deg: f64,
+    elevation_deg: f64,
+) -> f64 {
+    if sources.is_empty() {
+        return 0.0;
+    }
+
+    let wl = config.wavelength_nm;
+    let rayleigh_tau = rayleigh_optical_depth(wl);
+    let aerosol_tau = config.aod_550 * (550.0 / wl).powf(1.3); // Angstrom exponent ~1.3
+
+    let elev = elevation_deg.clamp(1.0, 90.0);
+    let sin_e = elev.to_radians().sin();
+    let cos_e = elev.to_radians().cos();
+    // LOS horizontal unit vector, east/north components (az 0=N, 90=E).
+    let ux = azimuth_deg.to_radians().sin();
+    let uy = azimuth_deg.to_radians().cos();
+    let z_obs = config.observer_elevation;
+
+    let n_steps = config.altitude_steps;
+    let dh = config.max_altitude / n_steps as f64;
+    let ds = dh / sin_e; // arc length per altitude cell along the slant
+    let effective_up = config.uplight_fraction + config.ground_reflectance * 0.5;
+
+    let mut integral = 0.0;
+    for step in 0..n_steps {
+        let h = (step as f64 + 0.5) * dh; // absolute altitude of the LOS point
+        if h < z_obs {
+            continue; // same below-observer skip as the zenith integral
+        }
+        // LOS point: arc length from the observer, horizontal offset.
+        let s = (h - z_obs) / sin_e;
+        let px = s * cos_e * ux; // east of observer [m]
+        let py = s * cos_e * uy; // north of observer [m]
+
+        let (sigma_total, f_rayleigh) = scattering_at(h, rayleigh_tau, aerosol_tau);
+
+        // Extinction from the LOS point back to the observer along the
+        // slant: for the exponential atmosphere on a straight flat-earth
+        // path this is exactly the vertical optical depth / sin(e)
+        // (substitute z = z_obs + s'*sin(e) in the path integral).
+        let tau_los = optical_depth_vertical(z_obs, h, rayleigh_tau, aerosol_tau) / sin_e;
+
+        for source in sources {
+            let d = source.distance_m;
+            if d < 1.0 {
+                continue; // degenerate, matches the zenith integral
+            }
+            // Source position on the ground (east/north of the observer).
+            let sx = d * source.azimuth_deg.to_radians().sin();
+            let sy = d * source.azimuth_deg.to_radians().cos();
+            // 3D geometry from the source to the LOS point.
+            let dx = px - sx;
+            let dy = py - sy;
+            let d_horiz = (dx * dx + dy * dy).sqrt();
+            let r = (d_horiz * d_horiz + h * h).sqrt();
+            if r < 1.0 {
+                continue;
+            }
+            // Scattering angle between the incoming ray (source -> LOS
+            // point, direction (dx,dy,h)/r) and the outgoing ray toward
+            // the observer (-LOS direction).
+            let cos_theta = -(dx * cos_e * ux + dy * cos_e * uy + h * sin_e) / r;
+            let theta = cos_theta.clamp(-1.0, 1.0).acos();
+            let p_average = mixed_phase(theta, f_rayleigh);
+
+            // Extinction from the source up to the LOS point (slant
+            // path from the ground, same helper as the zenith integral).
+            let tau_in = optical_depth_slant(0.0, h, d_horiz, rayleigh_tau, aerosol_tau);
+            let extinction = (-tau_in - tau_los).exp();
+
+            let source_intensity = source.upward_flux * effective_up;
+            integral +=
+                source_intensity / (4.0 * PI * r * r) * sigma_total * p_average * extinction * ds;
+        }
+    }
+
+    integral
+}
+
 /// Compute the contribution of a single source to zenith brightness.
 ///
 /// This performs the altitude integration along the observer's zenith LOS:
@@ -211,26 +337,10 @@ fn single_source_zenith(
         //   scattering angle = PI - atan2(d, h)
         let theta_scatter = PI - (d / h).atan(); // scattering angle
 
-        // Rayleigh scattering coefficient at this altitude
-        let n_rayleigh = rayleigh_tau / H_RAYLEIGH * (-h / H_RAYLEIGH).exp();
-
-        // Aerosol scattering coefficient at this altitude
-        let n_aerosol = aerosol_tau / H_AEROSOL * (-h / H_AEROSOL).exp();
-
-        // Total scattering coefficient (per meter)
-        let sigma_total = n_rayleigh + n_aerosol;
-
-        // Phase functions
-        let p_rayleigh = rayleigh_phase(theta_scatter);
-        let p_mie = henyey_greenstein_phase(theta_scatter, 0.7); // g=0.7 typical aerosol
-
-        // Weighted average phase function
-        let f_rayleigh = if sigma_total > 0.0 {
-            n_rayleigh / sigma_total
-        } else {
-            0.5
-        };
-        let p_average = f_rayleigh * p_rayleigh + (1.0 - f_rayleigh) * p_mie;
+        // Scattering coefficient and Rayleigh/Mie-weighted phase
+        // function (shared with the slant integral).
+        let (sigma_total, f_rayleigh) = scattering_at(h, rayleigh_tau, aerosol_tau);
+        let p_average = mixed_phase(theta_scatter, f_rayleigh);
 
         // Optical depth from source to scattering point (slant path)
         // tau_slant = tau_vertical * (1 / sin(chi)) for the molecular part,
@@ -264,6 +374,29 @@ fn single_source_zenith(
     }
 
     integral
+}
+
+/// Scattering medium at absolute altitude `h` [m]: the total scattering
+/// coefficient [1/m] and the Rayleigh fraction of it. Shared by the
+/// zenith and slant integrals (identical arithmetic to the historical
+/// inline expressions of `single_source_zenith`).
+fn scattering_at(h: f64, rayleigh_tau: f64, aerosol_tau: f64) -> (f64, f64) {
+    let n_rayleigh = rayleigh_tau / H_RAYLEIGH * (-h / H_RAYLEIGH).exp();
+    let n_aerosol = aerosol_tau / H_AEROSOL * (-h / H_AEROSOL).exp();
+    let sigma_total = n_rayleigh + n_aerosol;
+    let f_rayleigh = if sigma_total > 0.0 {
+        n_rayleigh / sigma_total
+    } else {
+        0.5
+    };
+    (sigma_total, f_rayleigh)
+}
+
+/// Rayleigh/Mie-weighted average phase function at scattering angle
+/// `theta`, with the Rayleigh share `f_rayleigh` of the local
+/// scattering coefficient. Shared by the zenith and slant integrals.
+fn mixed_phase(theta: f64, f_rayleigh: f64) -> f64 {
+    f_rayleigh * rayleigh_phase(theta) + (1.0 - f_rayleigh) * henyey_greenstein_phase(theta, MIE_G)
 }
 
 /// Rayleigh phase function.
@@ -740,6 +873,112 @@ mod tests {
             "Vertical path should match: slant={}, vert={}",
             tau,
             tau_v
+        );
+    }
+
+    // ── slant_brightness limit gates ──
+
+    /// Gate (a): at elevation 90 the slant integral must reduce to the
+    /// zenith integral within quadrature tolerance, for any source set
+    /// and any LOS azimuth (at the zenith the azimuth is degenerate).
+    #[test]
+    fn slant_equals_zenith_at_90() {
+        let sources = vec![
+            LightSource {
+                distance_m: 8_000.0,
+                azimuth_deg: 10.0,
+                upward_flux: 2e6,
+            },
+            LightSource {
+                distance_m: 35_000.0,
+                azimuth_deg: 145.0,
+                upward_flux: 8e6,
+            },
+            LightSource {
+                distance_m: 120_000.0,
+                azimuth_deg: 260.0,
+                upward_flux: 4e7,
+            },
+        ];
+        let config = GarstangConfig {
+            observer_elevation: 150.0,
+            ..GarstangConfig::default()
+        };
+        let zen = zenith_brightness(&sources, &config);
+        for az in [0.0, 77.0, 213.0] {
+            let slant = slant_brightness(&sources, &config, az, 90.0);
+            assert!(
+                (slant - zen).abs() / zen < 1e-9,
+                "slant at e=90 (az {}) must equal zenith: slant={:e}, zenith={:e}",
+                az,
+                slant,
+                zen
+            );
+        }
+    }
+
+    /// Gate (b): a single strong source at azimuth 0 must produce a
+    /// monotonically decreasing brightness at a fixed low elevation as
+    /// the LOS azimuth rotates from 0 (toward the source) to 180 (away).
+    #[test]
+    fn slant_monotone_away_from_source() {
+        let source = LightSource {
+            distance_m: 10_000.0,
+            azimuth_deg: 0.0,
+            upward_flux: 1e7,
+        };
+        let config = GarstangConfig::default();
+        let mut prev = f64::INFINITY;
+        for az_i in 0..=12 {
+            let az = az_i as f64 * 15.0;
+            let b = slant_brightness(std::slice::from_ref(&source), &config, az, 10.0);
+            assert!(b > 0.0, "brightness must stay positive at az {}", az);
+            assert!(
+                b < prev,
+                "brightness must decrease rotating away from the source: \
+                 az {} gave {:e}, previous azimuth gave {:e}",
+                az,
+                b,
+                prev
+            );
+            prev = b;
+        }
+    }
+
+    /// Gate (c): for a ring of equal sources (azimuthally symmetric
+    /// city glow) the azimuth-averaged slant result at a low elevation
+    /// must sit within a factor ~2 of the OLD isotropic path
+    /// (zenith x enhancement_factor(elev)). This documents that the
+    /// slant integral and the Duriscoe elevation lift describe the same
+    /// physics at the same amplitude; the slant integral only ADDS the
+    /// azimuthal structure the old path could not see.
+    #[test]
+    fn slant_ring_average_matches_isotropic_within_factor_2() {
+        let n_ring = 36;
+        let sources: Vec<LightSource> = (0..n_ring)
+            .map(|i| LightSource {
+                distance_m: 15_000.0,
+                azimuth_deg: i as f64 * 360.0 / n_ring as f64,
+                upward_flux: 1e6,
+            })
+            .collect();
+        let config = GarstangConfig::default();
+        let elev = 10.0;
+        let n_az = 24;
+        let mean_slant: f64 = (0..n_az)
+            .map(|i| slant_brightness(&sources, &config, i as f64 * 360.0 / n_az as f64, elev))
+            .sum::<f64>()
+            / n_az as f64;
+        let isotropic =
+            zenith_brightness(&sources, &config) * crate::angular::enhancement_factor(elev);
+        let ratio = mean_slant / isotropic;
+        assert!(
+            (0.5..=2.0).contains(&ratio),
+            "ring-averaged slant vs zenith x enhancement should agree within ~2x: \
+             slant_avg={:e}, isotropic={:e}, ratio={:.3}",
+            mean_slant,
+            isotropic,
+            ratio
         );
     }
 

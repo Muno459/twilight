@@ -2660,6 +2660,24 @@ mod tests {
     /// Degree-of-polarization dump for the paper's polarization figure:
     /// zenith view, clear sky, backward MC Stokes at three SZA.
     /// `cargo test -p twilight-cpu --release dop_dump -- --ignored --nocapture`
+    /// Importance-map dump on the REAL clear-sky atmosphere (the paper
+    /// figure; the toy Rayleigh test atmosphere is too transparent to
+    /// show the corridor structure).
+    #[test]
+    #[ignore = "diagnostic dump, run explicitly"]
+    fn imap_dump_real() {
+        let atm = make_clear_sky_atm();
+        let m = twilight_core::importance::SolarImportanceMap::build(&atm, wl_index(&atm, 450.0));
+        println!("IMAPCSV,alt_km,cos_sun,importance");
+        for ia in 0..twilight_core::importance::ALT_BANDS {
+            let alt = (ia as f64 + 0.5) * 3.0;
+            for ic in 0..twilight_core::importance::COS_BANDS {
+                let c = -0.5 + (ic as f64 + 0.5) / twilight_core::importance::COS_BANDS as f64;
+                println!("IMAPCSV,{alt},{c:.4},{:e}", m.lookup(alt * 1000.0, c));
+            }
+        }
+    }
+
     #[test]
     #[ignore = "diagnostic dump, run explicitly"]
     fn dop_dump() {
@@ -2669,10 +2687,10 @@ mod tests {
         let obs = geographic_to_ecef(lat, lon, 0.0);
         let view = solar_direction_ecef(0.001, 270.0, lat, lon); // zenith
         println!("DOPCSV,sza,wl_nm,I,dop");
-        for sza in [88.0f64, 92.0, 96.0, 100.0] {
+        for sza in [85.0f64, 90.0, 94.0, 97.0] {
             let sun = solar_direction_ecef(sza, 270.0, lat, lon);
             let s = twilight_core::photon::mc_scatter_spectrum_polarized(
-                &atm, obs, view, sun, 4000, 0xC0FFEE, None,
+                &atm, obs, view, sun, 40000, 0xC0FFEE, None,
             );
             for (w, sv) in s.iter().enumerate().take(atm.num_wavelengths) {
                 let i = sv.s[0];

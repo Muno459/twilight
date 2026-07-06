@@ -370,6 +370,16 @@ struct PrayArgs {
     /// Default 0.5 (typical mixed modern city).
     #[arg(long, default_value = "0.5")]
     led_fraction: f64,
+    /// Azimuthally-resolved skyglow veil for the khayt criterion:
+    /// fetch the VIIRS Black Marble grid around the site, bin it into
+    /// ground light sources, and give every khayt fan patch its own
+    /// Garstang slant veil at its real azimuth (an observer south of a
+    /// city sees a darker eastern dawn horizon than its bright northern
+    /// sky). STRUCTURE only: the amplitude stays on the atlas/Falchi
+    /// rail of --skyglow (which this flag requires). Falls back loudly
+    /// to the isotropic veil when no VIIRS grid is available.
+    #[arg(long, requires = "skyglow")]
+    skyglow_directional: bool,
     /// Force CPU-only computation (skip GPU)
     #[arg(long)]
     cpu: bool,
@@ -1734,6 +1744,104 @@ fn resolve_skyglow(args: &PrayArgs, year: i32, month: i32, day: i32) -> Option<S
     Some(result)
 }
 
+/// Azimuthally-resolved skyglow (--skyglow-directional): VIIRS Black
+/// Marble grid around the site -> binned ground sources for the khayt
+/// Garstang slant veils. STRUCTURE only; the veil amplitude stays on
+/// the --skyglow atlas/Falchi rail (`radiance_nw` must be the SAME
+/// value the isotropic path resolved). Returns None LOUDLY when no
+/// usable grid exists; the pipeline then keeps the isotropic veil.
+///
+/// The GapFilled Black Marble layers reach back only about a year, so
+/// the grid is opened near TODAY even for historical run dates: a
+/// city's lighting GEOMETRY is essentially time-invariant, and only
+/// the geometry is consumed here.
+fn resolve_directional_skyglow(
+    args: &PrayArgs,
+    radiance_nw: f64,
+    dawn_azimuth_deg: Option<f64>,
+) -> Option<twilight_skyglow::DirectionalSkyglow> {
+    let cache = Path::new(&args.dem_dir)
+        .parent()
+        .map(|p| p.join("skyglow"))
+        .unwrap_or_else(|| PathBuf::from("data/skyglow"));
+    let (ty, tm, td) = current_utc_date();
+    let grid = match twilight_skyglow::dnb::DnbGrid::open(
+        &cache,
+        args.lat,
+        args.lon,
+        (ty, tm as u32, td as u32),
+    ) {
+        Some(g) => g,
+        None => {
+            eprintln!(
+                "Warning: --skyglow-directional: no VIIRS Black Marble grid for this site \
+                 (last 21 nights, both sensors); keeping the ISOTROPIC veil."
+            );
+            return None;
+        }
+    };
+    let config = twilight_skyglow::garstang::GarstangConfig {
+        observer_elevation: args.elevation,
+        ..Default::default()
+    };
+    let directional = match twilight_skyglow::DirectionalSkyglow::from_radiance_source(
+        &grid, args.lat, args.lon, config, 200.0,
+    ) {
+        Some(d) => d,
+        None => {
+            eprintln!(
+                "Warning: --skyglow-directional: VIIRS grid {} shows no light sources \
+                 within 200 km; keeping the ISOTROPIC veil.",
+                grid.date
+            );
+            return None;
+        }
+    };
+
+    // One-line summary at the khayt patch elevation (3 deg above the
+    // horizon): veil toward the dawn azimuth vs toward the brightest
+    // (city) azimuth vs the isotropic value the old path applies
+    // everywhere (also the exact all-azimuth mean of the directional
+    // veils, by the normalization contract).
+    let elev = 3.0;
+    let azs: Vec<f64> = (0..72).map(|i| i as f64 * 5.0).collect();
+    if let Some(veils) =
+        twilight_skyglow::directional_veils(&directional, radiance_nw, args.led_fraction, &azs, elev)
+    {
+        let iso_mes = veils.iter().map(|v| v.0).sum::<f64>() / veils.len() as f64;
+        let (city_az, city_mes) = veils
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (azs[i], v.0))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((0.0, 0.0));
+        let dawn_txt = match dawn_azimuth_deg.and_then(|az| {
+            twilight_skyglow::directional_veils(
+                &directional,
+                radiance_nw,
+                args.led_fraction,
+                &[az],
+                elev,
+            )
+            .map(|v| (az, v[0].0))
+        }) {
+            Some((az, v)) => format!("dawn az {:.0} deg {:.4}", az, v),
+            None => "dawn az n/a".to_string(),
+        };
+        println!(
+            "Skyglow dir: {} vs city az {:.0} deg {:.4} vs isotropic {:.4} cd/m^2 \
+             (mesopic, 3 deg elev; VIIRS {}, {} source bins)",
+            dawn_txt,
+            city_az,
+            city_mes,
+            iso_mes,
+            grid.date,
+            directional.sources.len()
+        );
+    }
+    Some(directional)
+}
+
 /// Assemble the pipeline input from the resolved pieces. Weather-derived
 /// properties travel in the custom_* slots; manual flags go through the
 /// type-based path.
@@ -1747,6 +1855,7 @@ fn build_input(
     cloud_field: Option<twilight_data::cloud_field_builder::OwnedCloudField>,
     horizon_profile: Option<HorizonProfile>,
     skyglow: Option<SkyglowResult>,
+    directional_skyglow: Option<twilight_skyglow::DirectionalSkyglow>,
     solar_f107: Option<f64>,
 ) -> PrayerTimeInput {
     let (year, month, day) = date;
@@ -1786,6 +1895,7 @@ fn build_input(
         photons_per_wavelength: args.photons,
         horizon_profile,
         skyglow,
+        directional_skyglow,
         o3_column_du: o3_du,
         no2_surface_density: no2_density,
         polarized: !args.fast,
@@ -2125,6 +2235,32 @@ fn cmd_pray(args: PrayArgs) {
 
     let skyglow_result = resolve_skyglow(&args, year, month, day);
 
+    let directional_skyglow = if args.skyglow_directional {
+        match &skyglow_result {
+            Some(sg) => {
+                // Dawn azimuth (SPA sunrise) for the summary line only;
+                // the pipeline places patches at the real per-side sun
+                // azimuths internally.
+                let dawn_az = spa::solar_position(&SpaInput {
+                    hour: 12,
+                    ..utc_spa.clone()
+                })
+                .ok()
+                .and_then(|o| sun_azimuth_at(&utc_spa, o.sunrise.rem_euclid(24.0)));
+                resolve_directional_skyglow(&args, sg.integrated_radiance, dawn_az)
+            }
+            None => {
+                eprintln!(
+                    "Warning: --skyglow-directional needs a resolved --skyglow amplitude; \
+                     ignoring."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // Measured solar activity for the airglow background. F10.7 is a real
     // daily-measured quantity (Penticton/NOAA SWPC) - only fetched when the
     // run is already online (weather mode); offline runs keep the mid-cycle
@@ -2163,6 +2299,7 @@ fn cmd_pray(args: PrayArgs) {
         cloud_field,
         horizon_profile,
         skyglow_result,
+        directional_skyglow,
         solar_f107,
     );
 

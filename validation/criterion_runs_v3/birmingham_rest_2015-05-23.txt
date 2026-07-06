@@ -1,0 +1,56 @@
+Twilight MCRT Prayer Time Calculator
+====================================
+Date:       2015-05-23
+Location:   52.4400°N, -1.9500°E
+Elevation:  150 m
+Timezone:   Europe/London (UTC+01:00, IANA tzdb)
+Albedo:     0.15
+SZA step:   0.50°
+Atmosphere: US Standard 1976 (clear sky)
+Ephemeris:  NREL SPA
+Method:     Hybrid SS+MC (100 sec. rays/step) + CIE mesopic vision
+Polarize:   Stokes [I,Q,U,V]
+
+GPU:        Apple M2 Pro (Metal)
+Compute:    GPU (Metal; per-kernel CPU fallback)
+Computing...
+Done in 226564 ms (ephemeris: SPA (fallback), compute: GPU (Metal; per-kernel CPU fallback))
+
+Prayer Times (MCRT-derived):
+-----------------------------------------------------------------
+  Sunrise:              05:01:22
+  Sunset:               21:08:33
+
+  Celestial background: fajr-side 7.038e-4 cd/m^2, isha-side 1.137e-3 (dark-sky const 2.200e-4) - re-floating thresholds.
+  Fajr (khayt al-abyad): 02:42:58 ±27.4min  (SZA 103.99°, depression 13.99°)
+    └ white thread distinct from black + lateral spread (2:187, mustatir)
+  Isha (shafaq ahmar):   23:45:58 ±6.4min  (SZA 104.93°, depression 14.93°)
+    └ red band no longer distinct - Shafi'i/Maliki/Hanbali (primary)
+  Isha (shafaq abyad):   23:41:27 ±40.5min  (SZA 104.70°, depression 14.70°)
+    └ white band no longer distinct - Hanafi
+
+  Legacy absolute-threshold method (comparison):
+  Fajr (true dawn):     02:26:40 ±2.4min  (SZA 104.91°, depression 14.91°)
+  Isha (al-abyad):      23:26:15 ±1.0min  (SZA 103.84°, depression 13.84°)
+    └ Hanafi school - white twilight disappears
+  Isha (al-ahmar):      23:21:14 ±0.5min  (SZA 103.53°, depression 13.53°)
+    └ Shafi'i/Maliki/Hanbali - red glow disappears
+-----------------------------------------------------------------
+
+Comparison with conventional fixed-angle methods:
+-----------------------------------------------------------------
+  Fajr 18° (MWL/ISNA)          N/A  (diff: ---)
+  Fajr 15° (Egypt)             02:24:58  (diff: +1.7 min)
+  Fajr 19.5° (Umm al-Qura)     N/A  (diff: ---)
+  Isha 17° (MWL)               N/A  (diff: ---)
+  Isha 17.5° (Egypt)           N/A  (diff: ---)
+  Isha 18° (ISNA)              N/A  (diff: ---)
+-----------------------------------------------------------------
+
+Notes:
+  - These times are computed from first-principles radiative transfer (MCRT).
+  - Current model: US Standard 1976 atmosphere, hybrid single+multi scatter.
+  - Order 1 is exact, orders 2+ are MC. Use --photons to adjust convergence.
+  - No aerosols or clouds. Use --aerosol/--cloud or --weather to add them.
+  - The 'depression' angle is the equivalent fixed angle that gives the same time.
+  - Differences from conventional times reflect atmospheric conditions vs fixed angles.

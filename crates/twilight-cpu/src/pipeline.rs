@@ -108,6 +108,16 @@ pub struct PrayerTimeInput {
     /// radiance is added to the MCRT-computed natural twilight radiance before
     /// threshold analysis, shifting Fajr/Isha times.
     pub skyglow: Option<SkyglowResult>,
+    /// Azimuthally-resolved artificial skyglow: VIIRS-binned ground
+    /// sources + Garstang integration config. Only consulted by the
+    /// khayt fan and only when `skyglow` is also set: each fan patch
+    /// then gets its own veil, scaled by the normalized Garstang slant
+    /// ratio at the patch's absolute azimuth - STRUCTURE from
+    /// Garstang+VIIRS, AMPLITUDE still from `skyglow`'s atlas rail
+    /// (see [`twilight_skyglow::DirectionalSkyglow`] for the
+    /// normalization contract). None keeps the historical isotropic
+    /// shared-pair veil path byte-identical.
+    pub directional_skyglow: Option<twilight_skyglow::DirectionalSkyglow>,
     /// Override total column O3 (Dobson Units). When set, the standard
     /// atmosphere O3 profile is scaled to match this total column.
     /// Typical range: 220-450 DU.
@@ -163,6 +173,7 @@ impl Default for PrayerTimeInput {
             photons_per_wavelength: 10_000,
             horizon_profile: None,
             skyglow: None,
+            directional_skyglow: None,
             o3_column_du: None,
             no2_surface_density: None,
             polarized: true,
@@ -1643,27 +1654,73 @@ fn khayt_pass(
         (band_mcrt.clone(), ref_mcrt.clone(), band_z_m.clone(), ref_z_m.clone())
     };
 
-    // ── Skyglow: identical additive veil on every patch of the low ring
+    // ── Skyglow: additive veil on every patch of the low ring.
+    // Without directional data the veil is IDENTICAL on every patch
     // (azimuthal structure of city glow is unknown from the atlas; an
     // equal veil still raises adaptation and suppresses contrast, which
-    // is its physically dominant effect on detection).
+    // is its physically dominant effect on detection). With
+    // `input.directional_skyglow` present, every patch keeps the same
+    // side amplitude rail but is scaled by the normalized Garstang
+    // slant ratio at its own ABSOLUTE azimuth (side sun azimuth +
+    // patch offset): structure from Garstang+VIIRS, amplitude from the
+    // atlas rail (the all-azimuth mean of the ratios is 1 by
+    // construction, so the isotropic calibration is untouched; see
+    // twilight_skyglow::DirectionalSkyglow). This is what lets an
+    // observer south of a city see a darker eastern dawn horizon than
+    // its bright northern sky (the OpenFajr Birmingham geometry).
     // The veil's angular lift depends on the patch elevation, and
     // terrain RAISES patches (band_z drops below params.band_zenith_deg):
     // a valley urban site must not keep the 3-degree-ring lift on
     // patches that actually sit at 10 degrees (review round 2). One
-    // veil per side at that side's mean band zenith; the per-patch
-    // spread within a side is second order in the lift curve.
-    let side_veil = |band_z: &[f64]| -> (f64, f64) {
-        match &input.skyglow {
-            Some(sg) => {
-                let mean_z = if band_z.is_empty() {
-                    params.band_zenith_deg
-                } else {
-                    band_z.iter().sum::<f64>() / band_z.len() as f64
-                };
-                khayt_skyglow_veil(sg, mean_z)
+    // amplitude per side at that side's mean band zenith; the
+    // per-patch spread within a side is second order in the lift curve.
+    struct SideVeils {
+        /// (mesopic, red) veil per band patch, in band_offsets_deg order.
+        band: Vec<(f64, f64)>,
+        /// (mesopic, red) veil per reference patch, in ref_offsets_deg order.
+        refs: Vec<(f64, f64)>,
+    }
+    let side_veil = |band_z: &[f64], sun_az: Option<f64>| -> SideVeils {
+        let nb = params.band_offsets_deg.len();
+        let nr = params.ref_offsets_deg.len();
+        let iso = |pair: (f64, f64)| SideVeils {
+            band: vec![pair; nb],
+            refs: vec![pair; nr],
+        };
+        let sg = match &input.skyglow {
+            Some(sg) => sg,
+            None => return iso((0.0, 0.0)),
+        };
+        let mean_z = if band_z.is_empty() {
+            params.band_zenith_deg
+        } else {
+            band_z.iter().sum::<f64>() / band_z.len() as f64
+        };
+        let base = khayt_skyglow_veil(sg, mean_z);
+        // Directional structure needs the side's real sun azimuth to
+        // place the patches on the compass; without it (or without
+        // directional data, or with a degenerate slant mean) fall back
+        // to the historical isotropic pair - byte-identical arithmetic.
+        let ratios = match (&input.directional_skyglow, sun_az) {
+            (Some(d), Some(az0)) => {
+                let azs: Vec<f64> = params
+                    .band_offsets_deg
+                    .iter()
+                    .chain(params.ref_offsets_deg.iter())
+                    .map(|o| az0 + o)
+                    .collect();
+                d.azimuth_ratios(&azs, 90.0 - mean_z)
             }
-            None => (0.0, 0.0),
+            _ => None,
+        };
+        match ratios {
+            Some(r) => SideVeils {
+                band: (0..nb).map(|j| (base.0 * r[j], base.1 * r[j])).collect(),
+                refs: (0..nr)
+                    .map(|j| (base.0 * r[nb + j], base.1 * r[nb + j]))
+                    .collect(),
+            },
+            None => iso(base),
         }
     };
 
@@ -1750,14 +1807,14 @@ fn khayt_pass(
     let assemble = |anchors: &[(f64, Vec<f64>, Vec<f64>)],
                     bm: &[Vec<DirSample>],
                     rm: &[Vec<DirSample>],
-                    veil: (f64, f64)|
+                    veils: &SideVeils|
      -> KhaytScan {
         let band = szas
             .iter()
             .enumerate()
             .map(|(i, &sza)| {
                 (0..params.band_offsets_deg.len())
-                    .map(|j| patch_from(&bm[j][i], interp(anchors, sza, j, false), veil))
+                    .map(|j| patch_from(&bm[j][i], interp(anchors, sza, j, false), veils.band[j]))
                     .collect()
             })
             .collect();
@@ -1766,7 +1823,7 @@ fn khayt_pass(
             .enumerate()
             .map(|(i, &sza)| {
                 (0..params.ref_offsets_deg.len())
-                    .map(|j| patch_from(&rm[j][i], interp(anchors, sza, j, true), veil))
+                    .map(|j| patch_from(&rm[j][i], interp(anchors, sza, j, true), veils.refs[j]))
                     .collect()
             })
             .collect();
@@ -1809,30 +1866,30 @@ fn khayt_pass(
     let compose = |anchors: &[(f64, Vec<f64>, Vec<f64>)],
                    rows: &[DirSample],
                    sza: f64,
-                   veil: (f64, f64)|
+                   veils: &SideVeils|
      -> (Vec<PatchLum>, Vec<PatchLum>) {
         let nb = params.band_offsets_deg.len();
         let band = (0..nb)
-            .map(|j| patch_from(&rows[j], interp(anchors, sza, j, false), veil))
+            .map(|j| patch_from(&rows[j], interp(anchors, sza, j, false), veils.band[j]))
             .collect();
         let refs = (0..params.ref_offsets_deg.len())
-            .map(|j| patch_from(&rows[nb + j], interp(anchors, sza, j, true), veil))
+            .map(|j| patch_from(&rows[nb + j], interp(anchors, sza, j, true), veils.refs[j]))
             .collect();
         (band, refs)
     };
     let evening_key: u8 = if sides_split { 1 } else { 0 };
     let az_abs_m = if field_asymmetric { sun_az_morning } else { None };
     let az_abs_e = if field_asymmetric { sun_az_evening } else { None };
-    let veil_m = side_veil(&band_z_m);
-    let veil_e = side_veil(&band_z_e);
+    let veil_m = side_veil(&band_z_m, sun_az_morning);
+    let veil_e = side_veil(&band_z_e, sun_az_evening);
 
     let mut eval_m = |sza: f64| -> Option<(Vec<PatchLum>, Vec<PatchLum>)> {
         let rows = fan_rows(0, az_abs_m, &band_z_m, &ref_z_m, sza);
-        Some(compose(&morning_anchors, &rows, sza, veil_m))
+        Some(compose(&morning_anchors, &rows, sza, &veil_m))
     };
     let eval_m_dyn: &mut FanEval<'_> = &mut eval_m;
     let morning = detect_refined(
-        &assemble(&morning_anchors, &band_mcrt, &ref_mcrt, veil_m),
+        &assemble(&morning_anchors, &band_mcrt, &ref_mcrt, &veil_m),
         &params.for_side(true),
         Some(eval_m_dyn),
         RefineEvents {
@@ -1843,11 +1900,11 @@ fn khayt_pass(
     );
     let mut eval_e = |sza: f64| -> Option<(Vec<PatchLum>, Vec<PatchLum>)> {
         let rows = fan_rows(evening_key, az_abs_e, &band_z_e, &ref_z_e, sza);
-        Some(compose(&evening_anchors, &rows, sza, veil_e))
+        Some(compose(&evening_anchors, &rows, sza, &veil_e))
     };
     let eval_e_dyn: &mut FanEval<'_> = &mut eval_e;
     let evening = detect_refined(
-        &assemble(&evening_anchors, &band_mcrt_e, &ref_mcrt_e, veil_e),
+        &assemble(&evening_anchors, &band_mcrt_e, &ref_mcrt_e, &veil_e),
         &params.for_side(false),
         Some(eval_e_dyn),
         RefineEvents {
@@ -1906,11 +1963,22 @@ fn khayt_pass(
                           red: bool|
      -> BackgroundSigma {
         let (rm, anchors, side_v) = if morning_side {
-            (&ref_mcrt, &morning_anchors, veil_m)
+            (&ref_mcrt, &morning_anchors, &veil_m)
         } else {
-            (&ref_mcrt_e, &evening_anchors, veil_e)
+            (&ref_mcrt_e, &evening_anchors, &veil_e)
         };
-        let veil = if red { side_v.1 } else { side_v.0 };
+        // The veil term of the background sigma acts on the REFERENCE
+        // ring: mean veil over the reference patches. In the isotropic
+        // path all entries are identical and the 2-patch mean of equal
+        // values is exact in IEEE, so no-directional outputs stay
+        // bit-identical to the historical shared-pair arithmetic.
+        let nr = side_v.refs.len().max(1);
+        let veil = side_v
+            .refs
+            .iter()
+            .map(|v| if red { v.1 } else { v.0 })
+            .sum::<f64>()
+            / nr as f64;
         let natural = natural_ref_level(rm, anchors, c.sza_deg, red);
         // AUTO duty-cycle: bimodal veil where street light DOMINATES
         // the reference (see skyglow_duty_cycle_env for the override).

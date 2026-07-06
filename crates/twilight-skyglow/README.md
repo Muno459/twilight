@@ -4,11 +4,16 @@ Light pollution skyglow model. Estimates how artificial lighting adds to the nat
 
 ## Status
 
-The Garstang-style RT integration in `garstang` is implemented but NOT yet
-wired into the prayer-time pipeline, and its absolute magnitudes have not
-been validated against published skyglow measurements. The pipeline currently
-uses the simpler zenith-luminance estimate (`quick_estimate_at_angle`). Treat
-skyglow output as indicative, not calibrated.
+The Garstang-style RT integration in `garstang` now feeds the prayer-time
+pipeline in ONE specific role: `slant_brightness` (the slant-LOS
+generalization of the zenith integral) supplies the AZIMUTHAL STRUCTURE of
+the khayt skyglow veil through `DirectionalSkyglow` / `directional_veils`,
+with per-patch veils normalized so their all-azimuth mean equals the
+isotropic atlas-rail value (structure from Garstang+VIIRS, amplitude from
+the Falchi/atlas calibration). Its ABSOLUTE magnitudes remain unvalidated
+against published skyglow measurements and are never consumed directly;
+the amplitude rail stays on the zenith-luminance estimate
+(`quick_estimate_at_angle`).
 
 ## Approach
 
@@ -18,7 +23,7 @@ The spectral dimension matters: LED streetlights (strong blue peak at 450nm) sca
 
 ## Modules
 
-**`garstang`**. Core RT computation. `zenith_brightness` integrates scattered radiance from a set of ground light sources at given distances and fluxes. Rayleigh and Mie scattering with wavelength-dependent optical depth profiles. `bin_sources` aggregates distributed radiance (e.g. from VIIRS satellite data) into discrete source bins by distance and azimuth. Slant optical depth computation through the aerosol and molecular layers.
+**`garstang`**. Core RT computation. `zenith_brightness` integrates scattered radiance from a set of ground light sources at given distances and fluxes; `slant_brightness` generalizes the same integral to an arbitrary azimuth/elevation line of sight (unit-gated to reduce to the zenith integral at elevation 90). Rayleigh and Mie scattering with wavelength-dependent optical depth profiles. `bin_sources` aggregates distributed radiance (e.g. from VIIRS satellite data) into discrete source bins by distance and azimuth. Slant optical depth computation through the aerosol and molecular layers.
 
 **`spectrum`**. Spectral lamp profiles. LED emission at 3000K, 4000K, and 5000K color temperatures (blue peak + phosphor broadband). HPS emission (narrow 589nm sodium line + broadband). Mixed spectra with configurable LED fraction. Blue-light fraction and Rayleigh scattering effectiveness metrics for each lamp type.
 
@@ -30,7 +35,9 @@ The spectral dimension matters: LED streetlights (strong blue peak at 450nm) sca
 
 The main entry point is `quick_estimate_at_angle`, which takes a VIIRS-equivalent radiance, LED fraction, and elevation angle, and returns a `SkyglowResult` with spectral radiance, Bortle class, zenith brightness, and blue-light fraction.
 
-The CLI exposes this via `--bortle <class>` or `--skyglow` (with `--radiance` for direct VIIRS input).
+For azimuthally-resolved veils, `dnb::DnbGrid` serves a whole VIIRS Black Marble night grid as a `RadianceSource`, `DirectionalSkyglow::from_radiance_source` bins it into ground sources around the observer, and `directional_veils` returns per-azimuth (mesopic, red) veils on the same photometric rail as the isotropic path.
+
+The CLI exposes this via `--bortle <class>` or `--skyglow` (with `--radiance` for direct VIIRS input), plus `--skyglow-directional` for the per-patch khayt veils.
 
 ## Tests
 

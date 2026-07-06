@@ -79,15 +79,20 @@ fn fetch_tile(url: &str) -> Result<Vec<u8>, SkyglowError> {
     })
 }
 
-/// Fetch one tile (disk-cached) and return the palette index at the pixel.
-fn index_at(
+/// A decoded paletted tile: raw palette indices, row-major.
+struct TileIndices {
+    idx: Vec<u8>,
+    width: usize,
+}
+
+/// Fetch one tile (disk-cached) and decode its raw palette indices.
+fn load_tile(
     cache_dir: &Path,
     layer: &str,
     date: &str,
-    lat: f64,
-    lon: f64,
-) -> Option<u8> {
-    let (row, col, py, px) = tile_for(lat, lon);
+    row: u32,
+    col: u32,
+) -> Option<TileIndices> {
     let path = cache_dir.join(format!("dnb_{layer}_{date}_{row}_{col}.png"));
     let bytes = if path.exists() {
         std::fs::read(&path).ok()?
@@ -111,8 +116,21 @@ fn index_at(
     }
     let mut buf = vec![0u8; reader.output_buffer_size()];
     let info = reader.next_frame(&mut buf).ok()?;
-    let w = info.width as usize;
-    buf.get((py as usize) * w + px as usize).copied()
+    let width = info.width as usize;
+    Some(TileIndices { idx: buf, width })
+}
+
+/// Fetch one tile (disk-cached) and return the palette index at the pixel.
+fn index_at(
+    cache_dir: &Path,
+    layer: &str,
+    date: &str,
+    lat: f64,
+    lon: f64,
+) -> Option<u8> {
+    let (row, col, py, px) = tile_for(lat, lon);
+    let tile = load_tile(cache_dir, layer, date, row, col)?;
+    tile.idx.get((py as usize) * tile.width + px as usize).copied()
 }
 
 /// Radiance [nW/(cm^2 sr)] at a point on a given date, or None for
@@ -219,6 +237,100 @@ pub fn epoch_ratio(
     }
     let ratio = (now.radiance_nw / epoch.radiance_nw).clamp(0.5, 2.0);
     Some((ratio, now, epoch.radiance_nw))
+}
+
+/// A whole VIIRS Black Marble radiance GRID for one night, served as a
+/// [`crate::RadianceSource`] so [`crate::garstang::bin_sources`] can
+/// build the azimuthally-resolved ground-source list around an
+/// observer. Decoded tiles are held in memory (the per-point
+/// [`measure`] path re-decodes a PNG per query, which is fine for one
+/// pixel and hopeless for thousands of bins).
+///
+/// The GapFilled Black Marble layers only reach back about a year, so
+/// the grid is opened near TODAY regardless of the run date: the
+/// azimuthal structure of a city's lighting is essentially
+/// time-invariant, and the directional model only consumes STRUCTURE
+/// (the amplitude stays on the atlas rail; see
+/// [`crate::DirectionalSkyglow`]).
+pub struct DnbGrid {
+    cache_dir: std::path::PathBuf,
+    layer: &'static str,
+    /// ISO date whose grid is being served.
+    pub date: String,
+    /// Decoded tiles by (row, col); `None` caches a failed fetch so a
+    /// missing tile is not re-requested for every bin.
+    tiles: std::cell::RefCell<TileMap>,
+}
+
+/// Decoded-tile cache: (row, col) -> decoded tile, or `None` for a
+/// tile that failed to fetch/decode (negative cache).
+type TileMap = std::collections::HashMap<(u32, u32), Option<std::rc::Rc<TileIndices>>>;
+
+impl DnbGrid {
+    /// Open the most recent night (walking back up to 21 days from
+    /// `today`, preferring NOAA-20 like [`measure`]) whose tile at the
+    /// observer decodes and carries actual data. Returns `None` when no
+    /// such night exists - the caller must fall back to the isotropic
+    /// path loudly, not guess.
+    pub fn open(cache_dir: &Path, lat: f64, lon: f64, today: (i32, u32, u32)) -> Option<DnbGrid> {
+        let (row, col, _, _) = tile_for(lat, lon);
+        for layer in LAYERS {
+            for back in 1..22 {
+                let date = iso(date_minus(today, back));
+                if let Some(tile) = load_tile(cache_dir, layer, &date, row, col) {
+                    // Real data, not an all-nodata placeholder tile.
+                    let valid = tile.idx.iter().filter(|&&i| i != 0).count();
+                    if valid >= 100 {
+                        let grid = DnbGrid {
+                            cache_dir: cache_dir.to_path_buf(),
+                            layer,
+                            date,
+                            tiles: std::cell::RefCell::new(std::collections::HashMap::new()),
+                        };
+                        grid.tiles
+                            .borrow_mut()
+                            .insert((row, col), Some(std::rc::Rc::new(tile)));
+                        return Some(grid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn tile(&self, row: u32, col: u32) -> Option<std::rc::Rc<TileIndices>> {
+        if let Some(cached) = self.tiles.borrow().get(&(row, col)) {
+            return cached.clone();
+        }
+        let loaded =
+            load_tile(&self.cache_dir, self.layer, &self.date, row, col).map(std::rc::Rc::new);
+        self.tiles.borrow_mut().insert((row, col), loaded.clone());
+        loaded
+    }
+}
+
+impl crate::RadianceSource for DnbGrid {
+    fn radiance_at(&self, lat: f64, lon: f64) -> Option<f64> {
+        let (row, col, py, px) = tile_for(lat, lon);
+        let tile = self.tile(row, col)?;
+        let idx = *tile.idx.get((py as usize) * tile.width + px as usize)? as usize;
+        let v = *DNB_RADIANCE_LUT.get(idx)?;
+        if v < 0.0 {
+            None // nodata
+        } else {
+            Some(v)
+        }
+    }
+
+    fn resolution_m(&self) -> f64 {
+        // Level-7 epsg4326 "500m" grid: 2.25 deg / 512 px ~ 490 m at the
+        // equator.
+        490.0
+    }
+
+    fn name(&self) -> &str {
+        "VIIRS Black Marble grid (GIBS DNB)"
+    }
 }
 
 #[cfg(test)]

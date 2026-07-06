@@ -1,0 +1,62 @@
+Twilight MCRT Prayer Time Calculator
+====================================
+Date:       2015-08-16
+Location:   52.4400°N, -1.9500°E
+Elevation:  150 m
+Timezone:   Europe/London (UTC+01:00, IANA tzdb)
+Albedo:     0.15
+SZA step:   0.50°
+Atmosphere: US Standard 1976 (clear sky)
+Ephemeris:  NREL SPA
+Method:     Hybrid SS+MC (100 sec. rays/step) + CIE mesopic vision
+Polarize:   Stokes [I,Q,U,V]
+Skyglow:    Bortle 7, zenith 3.59 mcd/m^2, LED fraction 15%
+  Estimated prayer time shift: ~15 minutes
+
+GPU:        Apple M2 Pro (Metal)
+Compute:    GPU (Metal; per-kernel CPU fallback)
+Computing...
+Done in 229860 ms (ephemeris: SPA (fallback), compute: GPU (Metal; per-kernel CPU fallback))
+
+Prayer Times (MCRT-derived):
+-----------------------------------------------------------------
+  Sunrise:              05:51:31
+  Sunset:               20:31:37
+
+  Light pollution: Bortle 7 (~15 min shift)
+  Celestial background: fajr-side 9.920e-4 cd/m^2, isha-side 8.860e-4 (dark-sky const 2.200e-4) - re-floating thresholds.
+  Fajr (khayt al-abyad): 04:24:36 ±7.3min  (SZA 101.86°, depression 11.86°)
+    └ white thread distinct from black + lateral spread (2:187, mustatir)
+    └ false dawn (al-fajr al-kadhib) visible from 04:22:07 - do not pray Fajr yet
+  Isha (shafaq ahmar):   22:18:01 ±14.4min  (SZA 104.07°, depression 14.07°)
+    └ red band no longer distinct - Shafi'i/Maliki/Hanbali (primary)
+  Isha (shafaq abyad):   22:21:03 ±10.9min  (SZA 104.38°, depression 14.38°)
+    └ white band no longer distinct - Hanafi
+
+  Legacy absolute-threshold method (comparison):
+  Fajr (true dawn):     04:06:20 ±6.0min  (SZA 103.84°, depression 13.84°)
+    └ high-latitude mode: sky never reaches full darkness; this is the
+      TVI-detectable onset of dawn brightening above tonight's sky floor
+  Isha (al-abyad):      22:06:54 ±3.6min  (SZA 102.87°, depression 12.87°)
+    └ Hanafi school - white twilight disappears
+  Isha (al-ahmar):      22:10:20 ±7.4min  (SZA 103.24°, depression 13.24°)
+    └ Shafi'i/Maliki/Hanbali - red glow disappears
+-----------------------------------------------------------------
+
+Comparison with conventional fixed-angle methods:
+-----------------------------------------------------------------
+  Fajr 18° (MWL/ISNA)          03:22:18  (diff: +44.0 min)
+  Fajr 15° (Egypt)             03:55:00  (diff: +11.3 min)
+  Fajr 19.5° (Umm al-Qura)     03:03:07  (diff: +63.2 min)
+  Isha 17° (MWL)               22:47:48  (diff: -37.5 min)
+  Isha 17.5° (Egypt)           22:53:21  (diff: -43.0 min)
+  Isha 18° (ISNA)              22:59:05  (diff: -48.8 min)
+-----------------------------------------------------------------
+
+Notes:
+  - These times are computed from first-principles radiative transfer (MCRT).
+  - Current model: US Standard 1976 atmosphere, hybrid single+multi scatter.
+  - Order 1 is exact, orders 2+ are MC. Use --photons to adjust convergence.
+  - No aerosols or clouds. Use --aerosol/--cloud or --weather to add them.
+  - The 'depression' angle is the equivalent fixed angle that gives the same time.
+  - Differences from conventional times reflect atmospheric conditions vs fixed angles.
