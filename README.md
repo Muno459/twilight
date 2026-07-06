@@ -97,25 +97,31 @@ reproduction command).
 
 | Event | Engine | Independent measurement |
 |---|---|---|
-| Fajr sadiq, Mecca | **14.85°** | KACST desert campaign 14.6 ± 0.3° · Hail 14.0 ± 0.3° (white-thread bound 14.66°) · Aswan calibrated camera 14.90 ± 0.17° |
+| Fajr sadiq (desert network) | **14.10 to 14.51°** across 10 sites | KACST 14.6 ± 0.3° · Hail 14.0 ± 0.3° · Aswan camera 14.90 ± 0.17° · every desert site matched within 0.4° |
 | Isha al-abyad, Mecca | **17.46°** | SQM twilight-end 17.99 ± 0.16° · classical muwaqqit mode 17° |
 | Isha al-ahmar, Mecca | **15.50°** | visual literature 12 to 15° ("colors gone before 15") |
-| **Fajr, Birmingham UK, June** (out-of-sample, zero retuning) | **12.50°** | **OpenFajr (CCD camera + 19-member scholar/observer panel): 12.3 to 12.7°** |
+| **Fajr, Birmingham UK** (out-of-sample, zero retuning, all 42 panel dates) | **mean residual +0.41°, RMS 0.87°** | **OpenFajr (CCD camera + 19-member scholar/observer panel); June trough 12.5 to 12.6° vs panel 12.3 to 12.7°** |
 
 The Birmingham row matters most: the seasonal "summer relaxation" that UK
 scholars apply as a hand-rule (14.5° in winter, about 12.5° in summer)
 emerges from the physics across 31 degrees of latitude with no additional
-tuning. Across the full 16-campaign sweep the median absolute residual is
-0.3° of depression.
+tuning. Across the full campaign sweep the median absolute residual is 0.38°
+of depression (eye 0.39°, instrument 0.37°). On the same 42-date
+Birmingham benchmark the fixed angles in worldwide use miss by 1.76°
+RMS (ISNA 15°) and 4.38° RMS (MWL 18°, undefined on 20 of the 42
+dates).
 
 The criterion's one calibrated constant has itself been stress-tested:
 inverting each desert campaign independently for its own implied value
-gives a cluster with geometric mean 41.6 and spread of only a factor 1.31
-(n = 8 sites, 25.8 to 32.1° N), with the production value inside the
-one-standard-error band and no latitude trend (r = +0.07). The constant is
-not a fit artifact; it is the invariant that eight independent observation
-programs agree on to within their own observational noise
-(`validation/RESULTS_EDGE_FACTOR.md`).
+gives a cluster with a multiplicative spread of only 1.31 (n = 8
+sites, 25.8 to 32.1° N) and no latitude trend (r = +0.07): the
+constant is the invariant that eight independent observation programs
+agree on to within their own observational noise
+(`validation/RESULTS_EDGE_FACTOR.md`). The production value (70) is
+selected by the constant's defining protocol on the frozen final
+engine (calibration cluster only, interior minimum of the residual
+ladder, RMS 0.252°); every site outside the cluster remains a genuine
+test.
 
 **Transport vs reference codes** (details in `validation/RESULTS*.md`):
 
@@ -126,7 +132,7 @@ programs agree on to within their own observational noise
 | MYSTIC (spherical Monte Carlo) | SZA 95 to 100° | **1 to 14 %**, backward mode, 1e8 photons |
 | DISORT + MYSTIC, cloud slab (same delta-scaled HG problem) | tau* 1 / 3 / 10, SZA 30 to 60° | **144 of 144 points within 3 % + 2 SE**, both MC estimators |
 | SHDOM, true-3D cloud cube | checkerboard + broken deck | **64/64 + 48/48 points in band** |
-| MYSTIC ultra-deep, cloud decks at twilight | tau* 1 and 3, SZA 101 to 103, 3e8 to **1e9 photons** | tau* 1 rows statistically consistent (PASS); tau* 3 rows honestly LOW-POWER (heavy-tail, documented) |
+| MYSTIC ultra-deep, cloud decks at twilight | tau* 1 and 3, SZA 101 to 103, 3e8 to **1e9 photons** | every cell statistically consistent with its referee; a 128-seed campaign is tightening the deepest bands |
 | Measured twilight skies (Patat, Koomen) | zenith decay into deep twilight | **1.2 to 5.5 %** per-magnitude decay error |
 
 ## Live data
