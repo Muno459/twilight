@@ -168,6 +168,23 @@ const DWIVEDI_SZA_CENTER: f32 = 103.0;
 const DWIVEDI_SZA_WIDTH: f32 = 2.0;
 const DWIVEDI_FRAC_MAX: f32 = 0.35;
 
+// Weight-window population control (CPU constants; see twilight.metal for
+// the full derivation notes): split above w_target * WW_UPPER_RATIO,
+// Russian roulette below w_target / WW_LOWER_RATIO, with w_target from
+// the altitude scale height H_ww(sza) and the CADIS lateral ramp.
+const WW_H_MIN_M: f32 = 12000.0;
+const WW_H_MAX_M: f32 = 1000000.0;
+const WW_SZA_CENTER: f32 = 100.0;
+const WW_SZA_WIDTH: f32 = 1.0;
+const WW_UPPER_RATIO: f32 = 2.0;
+const WW_LOWER_RATIO: f32 = 10.0;
+const CADIS_K_MAX: f32 = 12.0;
+const CADIS_SZA_CENTER: f32 = 100.0;
+const CADIS_SZA_WIDTH: f32 = 3.5;
+// Per-thread work-stack capacity for split copies (the CPU uses 24; see
+// the MSL twin for the register / thread-stack budget note).
+const WW_GPU_STACK: u32 = 4u;
+
 // Iteration backstop for the field-forced truncated null-collision loop
 // (CPU FIELD_NULL_EVENT_LIMIT; Poisson(20) tail, kill = weight zero).
 const FIELD_NULL_EVENT_LIMIT: u32 = 512u;
@@ -1751,6 +1768,48 @@ fn dwivedi_sample(xi1: f32, xi2: f32, xi_sign: f32, beta: f32) -> DwivediSample 
     return DwivediSample(cos_z, phi);
 }
 
+// ── Weight-window helpers (port of the CPU photon.rs weight windows;
+// twinned with the MSL helpers, see twilight.metal for the notes) ──
+
+// SZA-adaptive weight-window scale height [m] (CPU weight_window_h):
+// log-space interpolation H = H_MIN^t * H_MAX^(1-t).
+fn weight_window_h(sza_deg: f32) -> f32 {
+    let t = guide_sigmoid((sza_deg - WW_SZA_CENTER) / WW_SZA_WIDTH);
+    let ln_h = t * log(WW_H_MIN_M) + (1.0 - t) * log(WW_H_MAX_M);
+    return exp(ln_h);
+}
+
+// SZA-adaptive CADIS lateral-importance strength (CPU cadis_k).
+fn cadis_k(sza_deg: f32) -> f32 {
+    return CADIS_K_MAX * guide_sigmoid((sza_deg - CADIS_SZA_CENTER) / CADIS_SZA_WIDTH);
+}
+
+// Weight-window target at the current position (CPU weight_window_target):
+// w_target = 1 / (I_alt * I_lat); chains moving away from the sun keep
+// I_lat = 1 (no extra RR penalty).
+fn weight_window_target(alt_m: f32, alt_start_m: f32, h_ww: f32,
+                        cos_sun_current: f32, cos_sun_start: f32,
+                        ck: f32) -> f32 {
+    let i_alt = exp((alt_m - alt_start_m) / h_ww);
+    let delta_cos = cos_sun_current - cos_sun_start;
+    var i_lat = 1.0;
+    if (ck > 0.0 && delta_cos > 0.0) {
+        i_lat = exp(ck * delta_cos);
+    }
+    return 1.0 / (i_alt * i_lat);
+}
+
+// Split-particle state for the weight-window work stack (port of the CPU
+// SplitParticleStokes; see the MSL twin).
+struct SplitParticle {
+    pos: vec3<f32>,
+    dir: vec3<f32>,
+    prev_dir: vec3<f32>,
+    stokes: vec4<f32>,
+    weight: f32,
+    rng: vec2<u32>,
+}
+
 // Altitude/SZA-dependent VSPG importance (CPU vspg_importance): >= 1,
 // ramping quadratically in altitude from 1.0 at 15 km to an SZA-dependent
 // max (up to 50x) at 70 km.
@@ -2086,14 +2145,6 @@ fn trace_secondary_chain(field_present: bool, start_pos: vec3<f32>,
         w0 = phase_seed * INV_4PI / q_seed;
     }
 
-    // Seed polarization: unpolarized (same approximation as the CPU chain).
-    var stokes = vec4<f32>(1.0, 0.0, 0.0, 0.0);
-
-    var pos = start_pos;
-    var current_dir = dir;
-    var prev_dir = sun_dir; // direction before current propagation segment
-    var weight = w0;
-
     var total_I = kahan_new();
     var total_Q = kahan_new();
     var total_U = kahan_new();
@@ -2106,469 +2157,563 @@ fn trace_secondary_chain(field_present: bool, start_pos: vec3<f32>,
     let d_beta = dwivedi_beta(setup.sza_deg);
     let use_field_maj = field_present && (setup.use_forced != 0u);
 
-    for (var scatter_iter = 0u; scatter_iter < setup.max_bounces; scatter_iter++) {
-        // --- Decide scatter mode for this bounce ---
-        // Fused scout + VSPG: one shell walk collects tau_max AND the
-        // altitude/SZA-importance segments for the forced-flight sampler.
-        var forced_this_bounce = false;
-        var tau_max = 0.0;
-        var vspg_segs: array<VspgSegment, 64>;
-        var n_vspg_segs = 0u;
+    // ── Weight-window population control (port of the CPU Stokes chain;
+    // see the MSL twin for the activation-gate and stream-discipline
+    // rationale) ──
+    let ww_active = setup.sza_deg >= ZENITH_SZA_START_DEG;
+    let h_ww = weight_window_h(setup.sza_deg);
+    let alt_start = length(start_pos) - surface_radius;
+    let cos_sun_start = dot(setup.local_up, sun_dir);
+    let ck = cadis_k(setup.sza_deg);
 
-        if (setup.use_forced != 0u) {
-            let scout = scout_with_vspg_segments(
-                use_field_maj, pos, current_dir, wl_idx, setup.sza_deg,
-                &vspg_segs, &n_vspg_segs);
-            tau_max = scout.tau;
-            // Force scatter only when the path exits to space and tau is in
-            // the useful range (see twilight.metal for the rationale).
-            forced_this_bounce = !scout.hit_ground
-                && tau_max >= setup.forced_tau_min
-                && tau_max < FORCED_TAU_CUTOFF;
-        }
+    // Work stack, main particle first (split copies are pushed by the
+    // window block inside the bounce loop). Seed polarization: unpolarized
+    // (same approximation as the CPU chain); no start_optics.ssa factor
+    // on w0 (the host-side integrator's beta_scat already carries it).
+    var stack: array<SplitParticle, WW_GPU_STACK>;
+    stack[0] = SplitParticle(start_pos, dir, sun_dir,
+                             vec4<f32>(1.0, 0.0, 0.0, 0.0), w0, *rng);
+    var stack_len = 1u;
+    var main_processed = false;
 
-        var scatter_shell = 0u;
-        // Gray cloud channel: a cloud collision is a distinct vertex type
-        // (pure depolarizing HG scatter, no SSA, no weight change).
-        var cloud_collision = false;
-        var g_cloud_here = 0.0;
+    // Process all particles: main first, then split copies (LIFO order).
+    while (stack_len > 0u) {
+        stack_len -= 1u;
+        let is_main = !main_processed;
+        main_processed = true;
+        var pos = stack[stack_len].pos;
+        var current_dir = stack[stack_len].dir;
+        // Direction before the current propagation segment (the NEE
+        // Mueller geometry resumes exactly where the parent split).
+        var prev_dir = stack[stack_len].prev_dir;
+        var stokes = stack[stack_len].stokes;
+        var weight = stack[stack_len].weight;
+        // The MAIN particle continues the caller's stream (written back
+        // after its walk); split copies run their own derived streams.
+        var cur_rng = stack[stack_len].rng;
 
-        if (forced_this_bounce) {
-            // Upfront forced scattering (unbiased); tau_max is the
-            // (majorant-)COMBINED optical depth (gas + gray 1D deck, or
-            // gas + per-shell field majorant).
-            let exp_neg_tau = exp(-tau_max);
-            weight *= (1.0 - exp_neg_tau);
-            if (weight < 1e-30) {
-                break;
-            }
-            // VSPG: sample the collision location from the pre-collected
-            // importance segments (weight-corrected, unbiased; replaces
-            // the plain truncated-exponential draw).
-            let vs = vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max, rng);
-            let tau_s = vs.tau_s;
-            weight *= vs.weight;
-            let adv = advance_to_optical_depth(use_field_maj, pos, current_dir, tau_s, wl_idx);
-            pos = adv.pos;
-            current_dir = adv.dir;
-            scatter_shell = adv.shell_idx;
-
-            if (use_field_maj) {
-                // FIELD: classify the majorant collision (real cloud / real
-                // gas / null); nulls re-draw within the remaining truncated
-                // budget. Port of the CPU field_forced_classify (see
-                // twilight.metal for the derivation and the f32 kill
-                // threshold note). The classification uniform is drawn ONLY
-                // in shells with a positive cloud majorant.
-                var consumed = tau_s;
-                var fshell = adv.shell_idx;
-                var resolved = false;
-                for (var ev = 0u; ev < FIELD_NULL_EVENT_LIMIT; ev++) {
-                    let c_maj = field_shell_majorant(fshell);
-                    if (c_maj <= 0.0) { // real gas with probability 1
-                        resolved = true;
-                        break;
-                    }
-                    let sigma_gas_m = atm[ATM_OPTICS_START
-                        + (fshell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
-                    let sigma_m = sigma_gas_m + c_maj;
-                    let sigma_c_here = field_sigma_at(pos);
-                    let xi_cls = rng_next_f32(rng) * sigma_m;
-                    if (xi_cls < sigma_c_here) {
-                        cloud_collision = true;
-                        g_cloud_here = field_g_at(pos);
-                        resolved = true;
-                        break;
-                    }
-                    if (xi_cls < sigma_c_here + sigma_gas_m) {
-                        resolved = true;
-                        break;
-                    }
-                    // NULL: continue the truncated flight in the remaining
-                    // budget; kill on an fp-exhausted budget (f32 threshold,
-                    // see the MSL twin).
-                    let t_rem = tau_max - consumed;
-                    if (t_rem <= 1e-6) {
-                        break; // killed below
-                    }
-                    let e_rem = exp(-t_rem);
-                    weight *= (1.0 - e_rem);
-                    let xi2 = rng_next_f32(rng);
-                    let d_tau = -log(1.0 - xi2 * (1.0 - e_rem) + 1e-30);
-                    let nadv = advance_to_optical_depth(
-                        use_field_maj, pos, current_dir, d_tau, wl_idx);
-                    pos = nadv.pos;
-                    current_dir = nadv.dir;
-                    fshell = nadv.shell_idx;
-                    consumed += d_tau;
-                }
-                scatter_shell = fshell;
-                if (!resolved) {
-                    // Backstop kill (fp-exhausted budget or the null-event
-                    // limit): terminate the particle with weight zero.
-                    weight = 0.0;
-                    break;
-                }
-            } else {
-                // 1D deck: vertex type from the exact extinction conditional
-                // at the collision shell; draw taken ONLY when the shell
-                // carries cloud.
-                let sigma_c_f = read_cloud_extinction(scatter_shell);
-                if (sigma_c_f > 0.0) {
-                    let sigma_gas_f = atm[ATM_OPTICS_START
-                        + (scatter_shell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
-                    if (rng_next_f32(rng) < sigma_c_f / (sigma_c_f + sigma_gas_f)) {
-                        cloud_collision = true;
-                        // The gray deck's delta-scaled asymmetry.
-                        g_cloud_here = atm[ATM_CLOUD_G_SCALED];
-                    }
-                }
-            }
-        } else {
-            // Analog scatter WITH the gray cloud channel (decomposition
-            // tracking): the gas channel keeps the exponential transform, a
-            // separate gray cloud Poisson process races over each segment.
-            // Cloud budget drawn ONCE per free flight from the SAME stream.
-            var scatter_found = false;
-            var found_shell = 0u;
-            var tau_c_remaining = -log(1.0 - rng_next_f32(rng) + 1e-30);
-
-            for (var walk_i = 0u; walk_i < 200u; walk_i++) {
-                let r = length(pos);
-                let sidx = shell_index_binary(r);
-                if (sidx < 0) {
-                    break;
-                }
-
-                let us = u32(sidx);
-                let sh = read_shell(us);
-                let op = read_optics(us, wl_idx);
-
-                let bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
-                if (!bnd.found) {
-                    break;
-                }
-
-                // Gas free path (exponential transform on the gas channel);
-                // clear air walks to the boundary (no gas tau draw).
-                let sigma = op.extinction;
-                var cos_bias = 0.0;
-                var sigma_prime = sigma;
-                var free_path = FREE_PATH_INF;
-                if (sigma >= 1e-20) {
-                    cos_bias = dot(current_dir, setup.term_axis_dir);
-                    sigma_prime = sigma * (1.0 - setup.alpha_et * cos_bias);
-                    if (sigma_prime <= 0.0) {
-                        sigma_prime = sigma;
-                    }
-                    let xi = rng_next_f32(rng);
-                    free_path = -log(1.0 - xi + 1e-30) / sigma_prime;
-                }
-
-                // Race the gray cloud channel over the segment up to the gas
-                // event (gas scatter at free_path or boundary crossing).
-                let gas_cap = min(free_path, bnd.dist);
-                var cloud_dist = -1.0;
-                var tau_pass = 0.0;
-                if (field_present) {
-                    cloud_dist = field_advance_to_tau(pos, current_dir, gas_cap, tau_c_remaining);
-                } else {
-                    let sigma_c = read_cloud_extinction(us);
-                    if (sigma_c > 0.0) {
-                        let dist_c = tau_c_remaining / sigma_c;
-                        if (dist_c <= gas_cap) {
-                            cloud_dist = dist_c;
-                        } else {
-                            tau_pass = sigma_c * gas_cap;
-                        }
-                    }
-                }
-                if (cloud_dist >= 0.0) {
-                    // Cloud wins. ET gas weight correction for the distance
-                    // actually travelled (gray cloud ratio = 1).
-                    if (setup.alpha_et > 0.0 && sigma >= 1e-20) {
-                        let et_arg = -setup.alpha_et * sigma * cos_bias * cloud_dist;
-                        if (abs(et_arg) < 80.0) {
-                            weight *= exp(et_arg);
-                        } else {
-                            weight = 0.0;
-                        }
-                    }
-                    if (!is_finite_f32(weight)) {
-                        break;
-                    }
-                    pos = pos + current_dir * cloud_dist;
-                    if (field_present) {
-                        g_cloud_here = field_g_at(pos);
+        for (var scatter_iter = 0u; scatter_iter < setup.max_bounces; scatter_iter++) {
+            // --- Weight window population control (port of the CPU
+            // Stokes chain block; see the MSL twin for the placement and
+            // stream-discipline notes) ---
+            if (ww_active && scatter_iter > 0u) {
+                let alt = length(pos) - surface_radius;
+                let cos_sun_here = dot(normalize(pos), sun_dir);
+                let w_target = weight_window_target(
+                    alt, alt_start, h_ww, cos_sun_here, cos_sun_start, ck);
+                let w_lower = w_target / WW_LOWER_RATIO;
+                let w_upper = w_target * WW_UPPER_RATIO;
+                let abs_w = abs(weight);
+                if (abs_w < w_lower && w_target > 1e-30) {
+                    // Russian roulette (unbiased: E[out] = p * w_target =
+                    // |w|); the survival draw is consumed ONLY when the
+                    // window actually fires.
+                    let p_survive = abs_w / w_target;
+                    if (rng_next_f32(&cur_rng) < p_survive) {
+                        weight = select(-w_target, w_target, weight >= 0.0);
                     } else {
-                        g_cloud_here = atm[ATM_CLOUD_G_SCALED];
+                        break; // chain killed by RR
                     }
-                    found_shell = us;
-                    scatter_found = true;
-                    cloud_collision = true;
-                    break;
-                } else {
-                    // No cloud collision in this segment: consume its tau.
-                    if (field_present) {
-                        tau_pass = field_tau_along(pos, current_dir, gas_cap);
-                    }
-                    tau_c_remaining -= tau_pass;
-                }
-
-                if (free_path >= bnd.dist) {
-                    if (setup.alpha_et > 0.0 && sigma >= 1e-20) {
-                        let et_arg = -setup.alpha_et * sigma * cos_bias * bnd.dist;
-                        if (abs(et_arg) < 80.0) {
-                            weight *= exp(et_arg);
-                        } else {
-                            weight = 0.0;
-                        }
-                    }
-                    if (!is_finite_f32(weight)) {
-                        break;
-                    }
-
-                    var boundary_pos = pos + current_dir * bnd.dist;
-                    boundary_pos = snap_to_radius(
-                        boundary_pos, select(sh.r_inner, sh.r_outer, bnd.is_outward));
-
-                    // Ground reflection.
-                    if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
-                        let normal = normalize(boundary_pos);
-                        // Snap the bounce point ABOVE the surface (see the
-                        // MSL comment: the CPU 1 mm ledge vanishes in f32).
-                        let ground_pos = normal * (surface_radius + BOUNDARY_NUDGE_M);
-                        let cos_sun_ground = dot(sun_dir, normal);
-                        if (cos_sun_ground > 0.0) {
-                            let t_sun_gb = shadow_ray_transmittance_chain(
-                                field_present, setup.cloud_channel != 0u,
-                                ground_pos, sun_dir, wl_idx);
-                            if (t_sun_gb > 1e-30) {
-                                let albedo_nee = read_albedo(wl_idx);
-                                let nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
-                                if (is_finite_f32(nee_gb)) {
-                                    kahan_add(&total_I, nee_gb);
-                                }
+                } else if (abs_w > w_upper && w_target > 1e-30) {
+                    // Split into k copies of weight/k (unbiased:
+                    // k * (w/k) = w), k capped to the remaining stack
+                    // slots exactly like the CPU caps against its 24.
+                    let k_ideal = round_half_up(abs_w / w_target);
+                    let max_k = WW_GPU_STACK - stack_len + 1u;
+                    if (max_k >= 2u) {
+                        let k = u32(clamp(k_ideal, 2.0, f32(max_k)));
+                        weight /= f32(k);
+                        for (var copy_idx = 1u; copy_idx < k; copy_idx++) {
+                            if (stack_len < WW_GPU_STACK) {
+                                // Independent child stream (the CPU child
+                                // derivation; 0x9E3779B1 = 2654435761, and
+                                // the second splitmix64 | 1 mirrors
+                                // McRng::from_seed's first stream).
+                                let child_seed = splitmix64(
+                                    cur_rng
+                                    ^ u64_mul(vec2<u32>(copy_idx, 0u),
+                                              vec2<u32>(0x9E3779B1u, 0u))
+                                    ^ vec2<u32>(bitcast<u32>(alt), 0u));
+                                stack[stack_len] = SplitParticle(
+                                    pos, current_dir, prev_dir, stokes,
+                                    weight,
+                                    splitmix64(child_seed) | vec2<u32>(1u, 0u));
+                                stack_len += 1u;
                             }
                         }
-                        let albedo = read_albedo(wl_idx);
-                        weight *= albedo;
-                        if (!is_finite_f32(weight) || abs(weight) < 1e-30) {
+                    }
+                }
+            }
+
+            // --- Decide scatter mode for this bounce ---
+            // Fused scout + VSPG: one shell walk collects tau_max AND the
+            // altitude/SZA-importance segments for the forced-flight sampler.
+            var forced_this_bounce = false;
+            var tau_max = 0.0;
+            var vspg_segs: array<VspgSegment, 64>;
+            var n_vspg_segs = 0u;
+
+            if (setup.use_forced != 0u) {
+                let scout = scout_with_vspg_segments(
+                    use_field_maj, pos, current_dir, wl_idx, setup.sza_deg,
+                    &vspg_segs, &n_vspg_segs);
+                tau_max = scout.tau;
+                // Force scatter only when the path exits to space and tau is in
+                // the useful range (see twilight.metal for the rationale).
+                forced_this_bounce = !scout.hit_ground
+                    && tau_max >= setup.forced_tau_min
+                    && tau_max < FORCED_TAU_CUTOFF;
+            }
+
+            var scatter_shell = 0u;
+            // Gray cloud channel: a cloud collision is a distinct vertex type
+            // (pure depolarizing HG scatter, no SSA, no weight change).
+            var cloud_collision = false;
+            var g_cloud_here = 0.0;
+
+            if (forced_this_bounce) {
+                // Upfront forced scattering (unbiased); tau_max is the
+                // (majorant-)COMBINED optical depth (gas + gray 1D deck, or
+                // gas + per-shell field majorant).
+                let exp_neg_tau = exp(-tau_max);
+                weight *= (1.0 - exp_neg_tau);
+                if (weight < 1e-30) {
+                    break;
+                }
+                // VSPG: sample the collision location from the pre-collected
+                // importance segments (weight-corrected, unbiased; replaces
+                // the plain truncated-exponential draw).
+                let vs = vspg_sample_from_segments(&vspg_segs, n_vspg_segs, tau_max, &cur_rng);
+                let tau_s = vs.tau_s;
+                weight *= vs.weight;
+                let adv = advance_to_optical_depth(use_field_maj, pos, current_dir, tau_s, wl_idx);
+                pos = adv.pos;
+                current_dir = adv.dir;
+                scatter_shell = adv.shell_idx;
+
+                if (use_field_maj) {
+                    // FIELD: classify the majorant collision (real cloud / real
+                    // gas / null); nulls re-draw within the remaining truncated
+                    // budget. Port of the CPU field_forced_classify (see
+                    // twilight.metal for the derivation and the f32 kill
+                    // threshold note). The classification uniform is drawn ONLY
+                    // in shells with a positive cloud majorant.
+                    var consumed = tau_s;
+                    var fshell = adv.shell_idx;
+                    var resolved = false;
+                    for (var ev = 0u; ev < FIELD_NULL_EVENT_LIMIT; ev++) {
+                        let c_maj = field_shell_majorant(fshell);
+                        if (c_maj <= 0.0) { // real gas with probability 1
+                            resolved = true;
                             break;
                         }
-                        prev_dir = current_dir;
-                        current_dir = sample_hemisphere(normal, rng);
-                        pos = ground_pos;
-                        stokes = vec4<f32>(1.0, 0.0, 0.0, 0.0);
-                        // New free flight: redraw the cloud budget.
-                        tau_c_remaining = -log(1.0 - rng_next_f32(rng) + 1e-30);
+                        let sigma_gas_m = atm[ATM_OPTICS_START
+                            + (fshell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
+                        let sigma_m = sigma_gas_m + c_maj;
+                        let sigma_c_here = field_sigma_at(pos);
+                        let xi_cls = rng_next_f32(&cur_rng) * sigma_m;
+                        if (xi_cls < sigma_c_here) {
+                            cloud_collision = true;
+                            g_cloud_here = field_g_at(pos);
+                            resolved = true;
+                            break;
+                        }
+                        if (xi_cls < sigma_c_here + sigma_gas_m) {
+                            resolved = true;
+                            break;
+                        }
+                        // NULL: continue the truncated flight in the remaining
+                        // budget; kill on an fp-exhausted budget (f32 threshold,
+                        // see the MSL twin).
+                        let t_rem = tau_max - consumed;
+                        if (t_rem <= 1e-6) {
+                            break; // killed below
+                        }
+                        let e_rem = exp(-t_rem);
+                        weight *= (1.0 - e_rem);
+                        let xi2 = rng_next_f32(&cur_rng);
+                        let d_tau = -log(1.0 - xi2 * (1.0 - e_rem) + 1e-30);
+                        let nadv = advance_to_optical_depth(
+                            use_field_maj, pos, current_dir, d_tau, wl_idx);
+                        pos = nadv.pos;
+                        current_dir = nadv.dir;
+                        fshell = nadv.shell_idx;
+                        consumed += d_tau;
+                    }
+                    scatter_shell = fshell;
+                    if (!resolved) {
+                        // Backstop kill (fp-exhausted budget or the null-event
+                        // limit): terminate the particle with weight zero.
+                        weight = 0.0;
+                        break;
+                    }
+                } else {
+                    // 1D deck: vertex type from the exact extinction conditional
+                    // at the collision shell; draw taken ONLY when the shell
+                    // carries cloud.
+                    let sigma_c_f = read_cloud_extinction(scatter_shell);
+                    if (sigma_c_f > 0.0) {
+                        let sigma_gas_f = atm[ATM_OPTICS_START
+                            + (scatter_shell * MAX_WAVELENGTHS + wl_idx) * ATM_OPTICS_STRIDE];
+                        if (rng_next_f32(&cur_rng) < sigma_c_f / (sigma_c_f + sigma_gas_f)) {
+                            cloud_collision = true;
+                            // The gray deck's delta-scaled asymmetry.
+                            g_cloud_here = atm[ATM_CLOUD_G_SCALED];
+                        }
+                    }
+                }
+            } else {
+                // Analog scatter WITH the gray cloud channel (decomposition
+                // tracking): the gas channel keeps the exponential transform, a
+                // separate gray cloud Poisson process races over each segment.
+                // Cloud budget drawn ONCE per free flight from the SAME stream.
+                var scatter_found = false;
+                var found_shell = 0u;
+                var tau_c_remaining = -log(1.0 - rng_next_f32(&cur_rng) + 1e-30);
+
+                for (var walk_i = 0u; walk_i < 200u; walk_i++) {
+                    let r = length(pos);
+                    let sidx = shell_index_binary(r);
+                    if (sidx < 0) {
+                        break;
+                    }
+
+                    let us = u32(sidx);
+                    let sh = read_shell(us);
+                    let op = read_optics(us, wl_idx);
+
+                    let bnd = next_shell_boundary(pos, current_dir, sh.r_inner, sh.r_outer);
+                    if (!bnd.found) {
+                        break;
+                    }
+
+                    // Gas free path (exponential transform on the gas channel);
+                    // clear air walks to the boundary (no gas tau draw).
+                    let sigma = op.extinction;
+                    var cos_bias = 0.0;
+                    var sigma_prime = sigma;
+                    var free_path = FREE_PATH_INF;
+                    if (sigma >= 1e-20) {
+                        cos_bias = dot(current_dir, setup.term_axis_dir);
+                        sigma_prime = sigma * (1.0 - setup.alpha_et * cos_bias);
+                        if (sigma_prime <= 0.0) {
+                            sigma_prime = sigma;
+                        }
+                        let xi = rng_next_f32(&cur_rng);
+                        free_path = -log(1.0 - xi + 1e-30) / sigma_prime;
+                    }
+
+                    // Race the gray cloud channel over the segment up to the gas
+                    // event (gas scatter at free_path or boundary crossing).
+                    let gas_cap = min(free_path, bnd.dist);
+                    var cloud_dist = -1.0;
+                    var tau_pass = 0.0;
+                    if (field_present) {
+                        cloud_dist = field_advance_to_tau(pos, current_dir, gas_cap, tau_c_remaining);
+                    } else {
+                        let sigma_c = read_cloud_extinction(us);
+                        if (sigma_c > 0.0) {
+                            let dist_c = tau_c_remaining / sigma_c;
+                            if (dist_c <= gas_cap) {
+                                cloud_dist = dist_c;
+                            } else {
+                                tau_pass = sigma_c * gas_cap;
+                            }
+                        }
+                    }
+                    if (cloud_dist >= 0.0) {
+                        // Cloud wins. ET gas weight correction for the distance
+                        // actually travelled (gray cloud ratio = 1).
+                        if (setup.alpha_et > 0.0 && sigma >= 1e-20) {
+                            let et_arg = -setup.alpha_et * sigma * cos_bias * cloud_dist;
+                            if (abs(et_arg) < 80.0) {
+                                weight *= exp(et_arg);
+                            } else {
+                                weight = 0.0;
+                            }
+                        }
+                        if (!is_finite_f32(weight)) {
+                            break;
+                        }
+                        pos = pos + current_dir * cloud_dist;
+                        if (field_present) {
+                            g_cloud_here = field_g_at(pos);
+                        } else {
+                            g_cloud_here = atm[ATM_CLOUD_G_SCALED];
+                        }
+                        found_shell = us;
+                        scatter_found = true;
+                        cloud_collision = true;
+                        break;
+                    } else {
+                        // No cloud collision in this segment: consume its tau.
+                        if (field_present) {
+                            tau_pass = field_tau_along(pos, current_dir, gas_cap);
+                        }
+                        tau_c_remaining -= tau_pass;
+                    }
+
+                    if (free_path >= bnd.dist) {
+                        if (setup.alpha_et > 0.0 && sigma >= 1e-20) {
+                            let et_arg = -setup.alpha_et * sigma * cos_bias * bnd.dist;
+                            if (abs(et_arg) < 80.0) {
+                                weight *= exp(et_arg);
+                            } else {
+                                weight = 0.0;
+                            }
+                        }
+                        if (!is_finite_f32(weight)) {
+                            break;
+                        }
+
+                        var boundary_pos = pos + current_dir * bnd.dist;
+                        boundary_pos = snap_to_radius(
+                            boundary_pos, select(sh.r_inner, sh.r_outer, bnd.is_outward));
+
+                        // Ground reflection.
+                        if (!bnd.is_outward && length(boundary_pos) <= surface_radius + BOUNDARY_NUDGE_M) {
+                            let normal = normalize(boundary_pos);
+                            // Snap the bounce point ABOVE the surface (see the
+                            // MSL comment: the CPU 1 mm ledge vanishes in f32).
+                            let ground_pos = normal * (surface_radius + BOUNDARY_NUDGE_M);
+                            let cos_sun_ground = dot(sun_dir, normal);
+                            if (cos_sun_ground > 0.0) {
+                                let t_sun_gb = shadow_ray_transmittance_chain(
+                                    field_present, setup.cloud_channel != 0u,
+                                    ground_pos, sun_dir, wl_idx);
+                                if (t_sun_gb > 1e-30) {
+                                    let albedo_nee = read_albedo(wl_idx);
+                                    let nee_gb = weight * albedo_nee * t_sun_gb * cos_sun_ground / PI;
+                                    if (is_finite_f32(nee_gb)) {
+                                        kahan_add(&total_I, nee_gb);
+                                    }
+                                }
+                            }
+                            let albedo = read_albedo(wl_idx);
+                            weight *= albedo;
+                            if (!is_finite_f32(weight) || abs(weight) < 1e-30) {
+                                break;
+                            }
+                            prev_dir = current_dir;
+                            current_dir = sample_hemisphere(normal, &cur_rng);
+                            pos = ground_pos;
+                            stokes = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+                            // New free flight: redraw the cloud budget.
+                            tau_c_remaining = -log(1.0 - rng_next_f32(&cur_rng) + 1e-30);
+                            continue;
+                        }
+
+                        // Refract and cross into the next shell; the cloud
+                        // budget carries over undiminished.
+                        let n_from = read_refractive_index(us);
+                        let next_s = select(us - 1u, us + 1u, bnd.is_outward);
+                        var n_to = 1.0;
+                        if (next_s < atm_num_shells()) {
+                            n_to = read_refractive_index(next_s);
+                        }
+                        current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
+                        pos = radial_nudge(boundary_pos, bnd.is_outward);
                         continue;
                     }
 
-                    // Refract and cross into the next shell; the cloud
-                    // budget carries over undiminished.
-                    let n_from = read_refractive_index(us);
-                    let next_s = select(us - 1u, us + 1u, bnd.is_outward);
-                    var n_to = 1.0;
-                    if (next_s < atm_num_shells()) {
-                        n_to = read_refractive_index(next_s);
+                    // Gas scatter within this shell.
+                    if (setup.alpha_et > 0.0 && sigma >= 1e-20) {
+                        let et_arg = -setup.alpha_et * sigma * cos_bias * free_path;
+                        if (abs(et_arg) < 80.0) {
+                            weight *= (sigma / sigma_prime) * exp(et_arg);
+                        } else {
+                            weight = 0.0;
+                        }
                     }
-                    current_dir = refract_at_boundary(current_dir, boundary_pos, n_from, n_to);
-                    pos = radial_nudge(boundary_pos, bnd.is_outward);
-                    continue;
-                }
-
-                // Gas scatter within this shell.
-                if (setup.alpha_et > 0.0 && sigma >= 1e-20) {
-                    let et_arg = -setup.alpha_et * sigma * cos_bias * free_path;
-                    if (abs(et_arg) < 80.0) {
-                        weight *= (sigma / sigma_prime) * exp(et_arg);
-                    } else {
-                        weight = 0.0;
+                    if (!is_finite_f32(weight)) {
+                        break;
                     }
-                }
-                if (!is_finite_f32(weight)) {
+                    pos = pos + current_dir * free_path;
+                    found_shell = us;
+                    scatter_found = true;
                     break;
                 }
-                pos = pos + current_dir * free_path;
-                found_shell = us;
-                scatter_found = true;
-                break;
+
+                if (!scatter_found) {
+                    break;
+                }
+                scatter_shell = found_shell;
             }
 
-            if (!scatter_found) {
-                break;
+            let op = read_optics(scatter_shell, wl_idx);
+
+            // SSA: a cloud collision is pure scattering (no SSA factor).
+            if (!cloud_collision) {
+                weight *= op.ssa;
             }
-            scatter_shell = found_shell;
-        }
 
-        let op = read_optics(scatter_shell, wl_idx);
-
-        // SSA: a cloud collision is pure scattering (no SSA factor).
-        if (!cloud_collision) {
-            weight *= op.ssa;
-        }
-
-        // NEE. A cloud vertex is a depolarizing HG (phase on I, output
-        // unpolarized); a gas vertex applies the Mueller matrix to the
-        // photon's actual Stokes state.
-        if (is_finite_f32(weight) && abs(weight) > 1e-30) {
-            let t_sun_sec = shadow_ray_transmittance_chain(
-                field_present, setup.cloud_channel != 0u, pos, sun_dir, wl_idx);
-            if (t_sun_sec > 1e-30) {
-                let cos_angle_nee = clamp(dot(sun_dir, current_dir), -1.0, 1.0);
-                var nee_stokes: vec4<f32>;
-                if (cloud_collision) {
-                    let p = henyey_greenstein_phase(cos_angle_nee, g_cloud_here);
-                    nee_stokes = vec4<f32>(stokes.x * p, 0.0, 0.0, 0.0);
-                } else {
-                    var A_nee = 0.0;
-                    var B_nee = 0.0;
-                    var C_nee = 0.0;
-                    stokes_ABC(cos_angle_nee, op, &A_nee, &B_nee, &C_nee);
-                    var cos2phi_nee = 0.0;
-                    var sin2phi_nee = 0.0;
-                    scattering_plane_rotation(prev_dir, current_dir, -sun_dir,
-                                              &cos2phi_nee, &sin2phi_nee);
-                    if (!is_finite_f32(cos2phi_nee)) {
-                        cos2phi_nee = 1.0;
-                        sin2phi_nee = 0.0;
+            // NEE. A cloud vertex is a depolarizing HG (phase on I, output
+            // unpolarized); a gas vertex applies the Mueller matrix to the
+            // photon's actual Stokes state.
+            if (is_finite_f32(weight) && abs(weight) > 1e-30) {
+                let t_sun_sec = shadow_ray_transmittance_chain(
+                    field_present, setup.cloud_channel != 0u, pos, sun_dir, wl_idx);
+                if (t_sun_sec > 1e-30) {
+                    let cos_angle_nee = clamp(dot(sun_dir, current_dir), -1.0, 1.0);
+                    var nee_stokes: vec4<f32>;
+                    if (cloud_collision) {
+                        let p = henyey_greenstein_phase(cos_angle_nee, g_cloud_here);
+                        nee_stokes = vec4<f32>(stokes.x * p, 0.0, 0.0, 0.0);
+                    } else {
+                        var A_nee = 0.0;
+                        var B_nee = 0.0;
+                        var C_nee = 0.0;
+                        stokes_ABC(cos_angle_nee, op, &A_nee, &B_nee, &C_nee);
+                        var cos2phi_nee = 0.0;
+                        var sin2phi_nee = 0.0;
+                        scattering_plane_rotation(prev_dir, current_dir, -sun_dir,
+                                                  &cos2phi_nee, &sin2phi_nee);
+                        if (!is_finite_f32(cos2phi_nee)) {
+                            cos2phi_nee = 1.0;
+                            sin2phi_nee = 0.0;
+                        }
+                        nee_stokes = scatter_stokes(A_nee, B_nee, C_nee,
+                                                    cos2phi_nee, sin2phi_nee, stokes);
                     }
-                    nee_stokes = scatter_stokes(A_nee, B_nee, C_nee,
-                                                cos2phi_nee, sin2phi_nee, stokes);
-                }
 
-                let scale = weight * t_sun_sec / (4.0 * PI);
-                if (is_finite_f32(scale)) {
-                    let nee_I = scale * nee_stokes.x;
-                    if (is_finite_f32(nee_I)) { kahan_add(&total_I, nee_I); }
-                    let nee_Q = scale * nee_stokes.y;
-                    if (is_finite_f32(nee_Q)) { kahan_add(&total_Q, nee_Q); }
-                    let nee_U = scale * nee_stokes.z;
-                    if (is_finite_f32(nee_U)) { kahan_add(&total_U, nee_U); }
-                    let nee_V = scale * nee_stokes.w;
-                    if (is_finite_f32(nee_V)) { kahan_add(&total_V, nee_V); }
+                    let scale = weight * t_sun_sec / (4.0 * PI);
+                    if (is_finite_f32(scale)) {
+                        let nee_I = scale * nee_stokes.x;
+                        if (is_finite_f32(nee_I)) { kahan_add(&total_I, nee_I); }
+                        let nee_Q = scale * nee_stokes.y;
+                        if (is_finite_f32(nee_Q)) { kahan_add(&total_Q, nee_Q); }
+                        let nee_U = scale * nee_stokes.z;
+                        if (is_finite_f32(nee_U)) { kahan_add(&total_U, nee_U); }
+                        let nee_V = scale * nee_stokes.w;
+                        if (is_finite_f32(nee_V)) { kahan_add(&total_V, nee_V); }
+                    }
                 }
             }
-        }
 
-        if (!is_finite_f32(weight) || abs(weight) < 1e-30) {
-            break;
-        }
-
-        // Sample the new direction. A cloud vertex scatters from the gray
-        // HG lobe and resets polarization; a gas vertex samples the
-        // Rayleigh/HG mixture and updates Stokes.
-        if (cloud_collision) {
-            let ct_cloud = sample_henyey_greenstein(rng_next_f32(rng), g_cloud_here);
-            let phi_cloud = 2.0 * PI * rng_next_f32(rng);
-            let d_cloud = scatter_direction(current_dir, ct_cloud, phi_cloud);
-            if (!is_finite_f32(d_cloud.x) || (length(d_cloud) < 1e-10)) {
+            if (!is_finite_f32(weight) || abs(weight) < 1e-30) {
                 break;
             }
-            prev_dir = current_dir;
-            current_dir = d_cloud;
-            stokes = vec4<f32>(1.0, 0.0, 0.0, 0.0);
-            continue;
-        }
 
-        // Sample new direction (gas vertex): Dwivedi/phase MIS mixture at
-        // deep twilight (port of the CPU chains' MIS block; the balance-
-        // heuristic weight corrects the SCALAR intensity, the Stokes update
-        // below uses the actual sampled angle). Below the 0.02 activation:
-        // the pure-phase path, draw-for-draw identical to history.
-        var cos_theta: f32;
-        var new_dir: vec3<f32>;
-        let mis_active = d_frac >= 0.02;
-        if (mis_active) {
-            let local_up_here = normalize(pos);
-            let alpha_p_mis = 1.0 - d_frac;
-            let xi_branch = rng_next_f32(rng);
-            if (xi_branch < d_frac) {
-                // Dwivedi branch: horizontal-biased escape sampling in the
-                // local (up, east, north) frame.
-                let xi1 = rng_next_f32(rng);
-                let xi2 = rng_next_f32(rng);
-                let xi_sign = rng_next_f32(rng);
-                let dw = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
-                let sin_z = sqrt(max(1.0 - dw.cos_z * dw.cos_z, 0.0));
-                var arbitrary = vec3<f32>(1.0, 0.0, 0.0);
-                if (abs(local_up_here.y) < 0.9) {
-                    arbitrary = vec3<f32>(0.0, 1.0, 0.0);
+            // Sample the new direction. A cloud vertex scatters from the gray
+            // HG lobe and resets polarization; a gas vertex samples the
+            // Rayleigh/HG mixture and updates Stokes.
+            if (cloud_collision) {
+                let ct_cloud = sample_henyey_greenstein(rng_next_f32(&cur_rng), g_cloud_here);
+                let phi_cloud = 2.0 * PI * rng_next_f32(&cur_rng);
+                let d_cloud = scatter_direction(current_dir, ct_cloud, phi_cloud);
+                if (!is_finite_f32(d_cloud.x) || (length(d_cloud) < 1e-10)) {
+                    break;
                 }
-                let east = normalize(cross(local_up_here, arbitrary));
-                let north = cross(local_up_here, east);
-                let d = normalize(local_up_here * dw.cos_z
-                                  + east * (sin_z * cos(dw.phi))
-                                  + north * (sin_z * sin(dw.phi)));
-                cos_theta = clamp(dot(current_dir, d), -1.0, 1.0);
-                let p_phase = mixed_phase(cos_theta, op) * INV_4PI;
-                let p_dw = dwivedi_pdf(dw.cos_z, d_beta);
-                let mis_denom = alpha_p_mis * p_phase + d_frac * p_dw;
-                if (mis_denom > 1e-30) {
-                    weight *= p_phase / mis_denom;
-                }
-                new_dir = d;
-            } else {
-                // Phase branch (within MIS).
-                if (rng_next_f32(rng) < op.rayleigh_fraction) {
-                    cos_theta = sample_rayleigh_analytic(rng_next_f32(rng));
+                prev_dir = current_dir;
+                current_dir = d_cloud;
+                stokes = vec4<f32>(1.0, 0.0, 0.0, 0.0);
+                continue;
+            }
+
+            // Sample new direction (gas vertex): Dwivedi/phase MIS mixture at
+            // deep twilight (port of the CPU chains' MIS block; the balance-
+            // heuristic weight corrects the SCALAR intensity, the Stokes update
+            // below uses the actual sampled angle). Below the 0.02 activation:
+            // the pure-phase path, draw-for-draw identical to history.
+            var cos_theta: f32;
+            var new_dir: vec3<f32>;
+            let mis_active = d_frac >= 0.02;
+            if (mis_active) {
+                let local_up_here = normalize(pos);
+                let alpha_p_mis = 1.0 - d_frac;
+                let xi_branch = rng_next_f32(&cur_rng);
+                if (xi_branch < d_frac) {
+                    // Dwivedi branch: horizontal-biased escape sampling in the
+                    // local (up, east, north) frame.
+                    let xi1 = rng_next_f32(&cur_rng);
+                    let xi2 = rng_next_f32(&cur_rng);
+                    let xi_sign = rng_next_f32(&cur_rng);
+                    let dw = dwivedi_sample(xi1, xi2, xi_sign, d_beta);
+                    let sin_z = sqrt(max(1.0 - dw.cos_z * dw.cos_z, 0.0));
+                    var arbitrary = vec3<f32>(1.0, 0.0, 0.0);
+                    if (abs(local_up_here.y) < 0.9) {
+                        arbitrary = vec3<f32>(0.0, 1.0, 0.0);
+                    }
+                    let east = normalize(cross(local_up_here, arbitrary));
+                    let north = cross(local_up_here, east);
+                    let d = normalize(local_up_here * dw.cos_z
+                                      + east * (sin_z * cos(dw.phi))
+                                      + north * (sin_z * sin(dw.phi)));
+                    cos_theta = clamp(dot(current_dir, d), -1.0, 1.0);
+                    let p_phase = mixed_phase(cos_theta, op) * INV_4PI;
+                    let p_dw = dwivedi_pdf(dw.cos_z, d_beta);
+                    let mis_denom = alpha_p_mis * p_phase + d_frac * p_dw;
+                    if (mis_denom > 1e-30) {
+                        weight *= p_phase / mis_denom;
+                    }
+                    new_dir = d;
                 } else {
-                    cos_theta = sample_henyey_greenstein(rng_next_f32(rng), op.asymmetry);
+                    // Phase branch (within MIS).
+                    if (rng_next_f32(&cur_rng) < op.rayleigh_fraction) {
+                        cos_theta = sample_rayleigh_analytic(rng_next_f32(&cur_rng));
+                    } else {
+                        cos_theta = sample_henyey_greenstein(rng_next_f32(&cur_rng), op.asymmetry);
+                    }
+                    cos_theta = clamp(cos_theta, -1.0, 1.0);
+                    let phi = 2.0 * PI * rng_next_f32(&cur_rng);
+                    new_dir = scatter_direction(current_dir, cos_theta, phi);
+                    let p_phase = mixed_phase(cos_theta, op) * INV_4PI;
+                    let cos_z_dw = dot(new_dir, local_up_here);
+                    let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
+                    let mis_denom = alpha_p_mis * p_phase + d_frac * p_dw;
+                    if (mis_denom > 1e-30) {
+                        weight *= p_phase / mis_denom;
+                    }
+                }
+            } else {
+                // Pure phase function: no Dwivedi, no MIS overhead.
+                if (rng_next_f32(&cur_rng) < op.rayleigh_fraction) {
+                    cos_theta = sample_rayleigh_analytic(rng_next_f32(&cur_rng));
+                } else {
+                    cos_theta = sample_henyey_greenstein(rng_next_f32(&cur_rng), op.asymmetry);
                 }
                 cos_theta = clamp(cos_theta, -1.0, 1.0);
-                let phi = 2.0 * PI * rng_next_f32(rng);
+                let phi = 2.0 * PI * rng_next_f32(&cur_rng);
                 new_dir = scatter_direction(current_dir, cos_theta, phi);
-                let p_phase = mixed_phase(cos_theta, op) * INV_4PI;
-                let cos_z_dw = dot(new_dir, local_up_here);
-                let p_dw = dwivedi_pdf(cos_z_dw, d_beta);
-                let mis_denom = alpha_p_mis * p_phase + d_frac * p_dw;
-                if (mis_denom > 1e-30) {
-                    weight *= p_phase / mis_denom;
-                }
             }
-        } else {
-            // Pure phase function: no Dwivedi, no MIS overhead.
-            if (rng_next_f32(rng) < op.rayleigh_fraction) {
-                cos_theta = sample_rayleigh_analytic(rng_next_f32(rng));
+            if (!is_finite_f32(new_dir.x) || (length(new_dir) < 1e-10)) {
+                break;
+            }
+
+            // Update Stokes state through this scatter event.
+            var A_s = 0.0;
+            var B_s = 0.0;
+            var C_s = 0.0;
+            stokes_ABC(cos_theta, op, &A_s, &B_s, &C_s);
+            var cos2phi_s = 0.0;
+            var sin2phi_s = 0.0;
+            scattering_plane_rotation(prev_dir, current_dir, new_dir, &cos2phi_s, &sin2phi_s);
+            if (!is_finite_f32(cos2phi_s)) {
+                cos2phi_s = 1.0;
+                sin2phi_s = 0.0;
+            }
+            stokes = scatter_stokes(A_s, B_s, C_s, cos2phi_s, sin2phi_s, stokes);
+
+            // Normalize by I (importance weighting -- keeps stokes.x = 1).
+            if (is_finite_f32(stokes.x) && stokes.x > 1e-30) {
+                let inv_I = 1.0 / stokes.x;
+                stokes *= inv_I;
+                if (!is_finite_f32(stokes.y)) { stokes.y = 0.0; }
+                if (!is_finite_f32(stokes.z)) { stokes.z = 0.0; }
+                if (!is_finite_f32(stokes.w)) { stokes.w = 0.0; }
             } else {
-                cos_theta = sample_henyey_greenstein(rng_next_f32(rng), op.asymmetry);
+                stokes = vec4<f32>(1.0, 0.0, 0.0, 0.0);
             }
-            cos_theta = clamp(cos_theta, -1.0, 1.0);
-            let phi = 2.0 * PI * rng_next_f32(rng);
-            new_dir = scatter_direction(current_dir, cos_theta, phi);
-        }
-        if (!is_finite_f32(new_dir.x) || (length(new_dir) < 1e-10)) {
-            break;
+
+            prev_dir = current_dir;
+            current_dir = new_dir;
         }
 
-        // Update Stokes state through this scatter event.
-        var A_s = 0.0;
-        var B_s = 0.0;
-        var C_s = 0.0;
-        stokes_ABC(cos_theta, op, &A_s, &B_s, &C_s);
-        var cos2phi_s = 0.0;
-        var sin2phi_s = 0.0;
-        scattering_plane_rotation(prev_dir, current_dir, new_dir, &cos2phi_s, &sin2phi_s);
-        if (!is_finite_f32(cos2phi_s)) {
-            cos2phi_s = 1.0;
-            sin2phi_s = 0.0;
+        if (is_main) {
+            // Hand the main walk's final stream state back to the caller:
+            // bit-identical to the pre-window chain when no window fired.
+            *rng = cur_rng;
         }
-        stokes = scatter_stokes(A_s, B_s, C_s, cos2phi_s, sin2phi_s, stokes);
-
-        // Normalize by I (importance weighting -- keeps stokes.x = 1).
-        if (is_finite_f32(stokes.x) && stokes.x > 1e-30) {
-            let inv_I = 1.0 / stokes.x;
-            stokes *= inv_I;
-            if (!is_finite_f32(stokes.y)) { stokes.y = 0.0; }
-            if (!is_finite_f32(stokes.z)) { stokes.z = 0.0; }
-            if (!is_finite_f32(stokes.w)) { stokes.w = 0.0; }
-        } else {
-            stokes = vec4<f32>(1.0, 0.0, 0.0, 0.0);
-        }
-
-        prev_dir = current_dir;
-        current_dir = new_dir;
     }
 
     var result = vec4<f32>(kahan_result(total_I), kahan_result(total_Q),

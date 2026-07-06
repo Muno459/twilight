@@ -334,9 +334,14 @@ established local calendars. Known limits, stated plainly:
 - **Zenith views over broken decks starve the importance sampler** (a
   documented residual with a false-tight error signature; slant views,
   which the khayt band uses, are unaffected).
-- **GPU chains carry the guiding stack but not population control.**
-  Weight-window splitting is CPU-only (thread-divergence redesign pending),
-  so the CPU path remains the variance reference in the deepest cells.
+- **GPU population control runs on a capped split stack.** The hybrid
+  chain kernels carry the CPU's weight windows (splitting + Russian
+  roulette on the altitude + CADIS importance) with a 4-slot per-thread
+  stack against the CPU's 24, accepting the thread divergence (measured:
+  no wall-clock cost; deep-field calls got faster from the RR kills).
+  The GPU uses the heuristic window target only; the CPU keeps the
+  forward-informed importance map and the full stack, so it remains the
+  variance reference in the deepest cells.
 - **Sea-horizon sites carry a documented open offset** (Tubruq): a 1D
   aerosol column cannot represent the directional marine boundary layer
   along the dawn path; the maritime aerosol type remains the honest input

@@ -723,6 +723,47 @@ mod field_fixtures {
         }
     }
 
+    /// Dormant-regime bit-dump diagnostic: per-seed GPU chain totals of
+    /// the clear parity fixture as exact f64 bit patterns. Run it before
+    /// and after a shader change that must leave a regime untouched (the
+    /// weight-window port pinned its SZA-95 dormancy this way): dormant
+    /// rows must be IDENTICAL bits across the change, live rows may move
+    /// within their parity bands. Same geometry, seeds, and ray budget as
+    /// run_cloudy_mc_parity's clear gates.
+    pub fn dump_clear_seed_bits(gpu: &mut dyn crate::GpuBackend, label: &str) {
+        let atm = twilight_data::builder::build_clear_sky(
+            twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+            0.15,
+        );
+        gpu.upload_atmosphere(&atm).unwrap();
+        gpu.upload_field(None).unwrap();
+        let (lat, lon) = (54.83, 9.36);
+        let solar_azimuth = 270.0;
+        let obs_pos = twilight_core::geometry::geographic_to_ecef(lat, lon, 0.0);
+        let view = twilight_core::geometry::solar_direction_ecef(85.0, solar_azimuth, lat, lon);
+        let obs_arr = [obs_pos.x, obs_pos.y, obs_pos.z];
+        let view_arr = [view.x, view.y, view.z];
+        let num_wl = atm.num_wavelengths;
+        for sza_deg in [95.0f64, 97.0, 100.0] {
+            let sun =
+                twilight_core::geometry::solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+            let sun_arr = [sun.x, sun.y, sun.z];
+            for seed_idx in 0..8u64 {
+                let seed = seed_idx
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(sza_deg.to_bits());
+                let r = gpu
+                    .hybrid_scatter(obs_arr, view_arr, sun_arr, 100, seed)
+                    .unwrap();
+                let total: f64 = r.radiance[..num_wl].iter().sum();
+                eprintln!(
+                    "WW-DUMP [{label}] sza={sza_deg} seed={seed_idx} bits={:016x} total={total:.17e}",
+                    total.to_bits()
+                );
+            }
+        }
+    }
+
     pub const CB_NZ: usize = 4;
     pub const CB_N: usize = 27;
     pub const CB_TILE: usize = 8;
@@ -1890,6 +1931,70 @@ mod layer4_metal {
         run_cloudy_mc_parity(&mut gpu, &atm, Some(&view), "uniform", lat, lon, 85.0, 100, 16, cases);
     }
 
+    /// GPU-only side of the uniform-field parity fixture: per-seed GPU
+    /// broadband totals and per-call wall-clock on the exact
+    /// metal_field_mc_parity_uniform geometry and seeds. The CPU reference
+    /// of that gate is seed-deterministic and unchanged by GPU-side work,
+    /// so a before/after pair of these dumps plus ONE full gate run gives
+    /// before AND after GPU/CPU ratios without paying the heavy CPU field
+    /// reference twice (the weight-window port was verified this way).
+    #[test]
+    #[ignore = "GPU-only uniform-field dump; run explicitly"]
+    fn metal_ww_uniform_gpu_dump() {
+        use crate::GpuBackend;
+        let Some(mut gpu) = try_metal_concrete() else { return };
+        let atm = twilight_data::builder::build_clear_sky(
+            twilight_data::atmosphere_profiles::AtmosphereType::UsStandard,
+            0.15,
+        );
+        let owned = uniform_owned_field(2e-5);
+        let fld = owned.view();
+        gpu.upload_atmosphere(&atm).unwrap();
+        gpu.upload_field(Some(&fld)).unwrap();
+        let lat = owned.lat0_deg + owned.dlat_deg * (owned.nlat as f64) * 0.5;
+        let lon = owned.lon0_deg + owned.dlon_deg * (owned.nlon as f64) * 0.5;
+        let solar_azimuth = 270.0;
+        let obs_pos = twilight_core::geometry::geographic_to_ecef(lat, lon, 0.0);
+        let view = twilight_core::geometry::solar_direction_ecef(85.0, solar_azimuth, lat, lon);
+        let num_wl = atm.num_wavelengths;
+        for sza_deg in [95.0f64, 97.0, 100.0] {
+            let sun =
+                twilight_core::geometry::solar_direction_ecef(sza_deg, solar_azimuth, lat, lon);
+            let mut totals = Vec::new();
+            for seed_idx in 0..16u64 {
+                let seed = seed_idx
+                    .wrapping_mul(2862933555777941757)
+                    .wrapping_add(sza_deg.to_bits());
+                let t0 = std::time::Instant::now();
+                let r = gpu
+                    .hybrid_scatter(
+                        [obs_pos.x, obs_pos.y, obs_pos.z],
+                        [view.x, view.y, view.z],
+                        [sun.x, sun.y, sun.z],
+                        100,
+                        seed,
+                    )
+                    .unwrap();
+                let dt = t0.elapsed().as_secs_f64();
+                let total: f64 = r.radiance[..num_wl].iter().sum();
+                totals.push(total);
+                eprintln!(
+                    "WW-UNIFORM-GPU sza={sza_deg} seed={seed_idx} total={total:.10e} wall={dt:.2}s"
+                );
+            }
+            let mean = totals.iter().sum::<f64>() / totals.len() as f64;
+            let cv = if mean.abs() > 1e-300 {
+                (totals.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
+                    / (totals.len() - 1) as f64)
+                    .sqrt()
+                    / mean.abs()
+            } else {
+                0.0
+            };
+            eprintln!("WW-UNIFORM-GPU-SUMMARY sza={sza_deg} gpu_mean={mean:.6e} gpu_cv={cv:.4}");
+        }
+    }
+
     /// G-MC-PARITY-3 (b): the real Padborg field, GPU vs CPU hybrid+field,
     /// straddling the forced-collision threshold (SZA 95 analog-eligible,
     /// 97 and 100 above ZENITH_SZA_START; under a FIELD both backends now
@@ -2029,6 +2134,15 @@ mod layer4_metal {
         let cases: &[(f64, f64, f64)] =
             &[(95.0, 0.94, 1.06), (97.0, 0.88, 1.12), (100.0, 0.65, 1.35)];
         run_cloudy_mc_parity(&mut gpu, &atm, None, "clear", 54.83, 9.36, 85.0, 100, 8, cases);
+    }
+
+    /// TEMPORARY diagnostic (weight-window port): Metal per-seed bit dump
+    /// of the clear fixture; see dump_clear_seed_bits.
+    #[test]
+    #[ignore = "diagnostic dump for the weight-window port; run explicitly"]
+    fn metal_ww_seed_bit_dump() {
+        let Some(mut gpu) = try_metal_concrete() else { return };
+        dump_clear_seed_bits(&mut gpu, "metal");
     }
 
     /// G-PERF probe: wall-clock of one GPU hybrid_scatter call on the REAL
@@ -4277,6 +4391,116 @@ fn wgsl_offsets_match_buffers_rs() {
     assert_eq!(grab("FIELD_BG_OFFSET") as usize, f::BG_OFFSET);
 }
 
+// ── Weight-window constant twinning ─────────────────────────────────────
+// The GPU weight windows (split + Russian roulette in the hybrid chain
+// kernels) hard-code the CPU photon.rs weight-window constants in BOTH
+// shader languages. There is no codegen tying the three together (the CPU
+// constants are private to twilight-core), so this parse test pins the
+// MSL and the WGSL values numerically to the CPU values quoted from the
+// photon.rs weight-window block, exactly like the offset-parse tests pin
+// the buffer layout.
+#[test]
+fn ww_constants_twinned_and_pinned() {
+    let msl = include_str!("../shaders/twilight.metal");
+    let wgsl = include_str!("../shaders/twilight.wgsl");
+
+    let msl_float = |name: &str| -> f64 {
+        for line in msl.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("constant float ") else {
+                continue;
+            };
+            let Some((lhs, rhs)) = rest.split_once('=') else {
+                continue;
+            };
+            if lhs.trim() != name {
+                continue;
+            }
+            let value = rhs.split(';').next().unwrap().trim().trim_end_matches('f');
+            return value
+                .parse()
+                .unwrap_or_else(|e| panic!("bad MSL literal for {name} ({value:?}): {e}"));
+        }
+        panic!("constant float {name} not found in twilight.metal");
+    };
+    let msl_uint = |name: &str| -> u32 {
+        for line in msl.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("constant uint ") else {
+                continue;
+            };
+            let Some((lhs, rhs)) = rest.split_once('=') else {
+                continue;
+            };
+            if lhs.trim() != name {
+                continue;
+            }
+            let value = rhs.split(';').next().unwrap().trim().trim_end_matches('u');
+            return value
+                .parse()
+                .unwrap_or_else(|e| panic!("bad MSL literal for {name} ({value:?}): {e}"));
+        }
+        panic!("constant uint {name} not found in twilight.metal");
+    };
+    let wgsl_float = |name: &str| -> f64 {
+        let pat = format!("const {name}: f32 = ");
+        let i = wgsl
+            .find(&pat)
+            .unwrap_or_else(|| panic!("{name} not in twilight.wgsl"));
+        let rest = &wgsl[i + pat.len()..];
+        let end = rest.find(';').unwrap();
+        rest[..end].trim().parse().unwrap()
+    };
+    let wgsl_uint = |name: &str| -> u32 {
+        let pat = format!("const {name}: u32 = ");
+        let i = wgsl
+            .find(&pat)
+            .unwrap_or_else(|| panic!("{name} not in twilight.wgsl"));
+        let rest = &wgsl[i + pat.len()..];
+        let end = rest.find('u').unwrap();
+        rest[..end].trim().parse().unwrap()
+    };
+
+    // (name, CPU value): WW_* from the photon.rs weight-window constants,
+    // CADIS_* from the photon.rs CADIS block.
+    let expected: &[(&str, f64)] = &[
+        ("WW_H_MIN_M", 12_000.0),
+        ("WW_H_MAX_M", 1_000_000.0),
+        ("WW_SZA_CENTER", 100.0),
+        ("WW_SZA_WIDTH", 1.0),
+        ("WW_UPPER_RATIO", 2.0),
+        ("WW_LOWER_RATIO", 10.0),
+        ("CADIS_K_MAX", 12.0),
+        ("CADIS_SZA_CENTER", 100.0),
+        ("CADIS_SZA_WIDTH", 3.5),
+    ];
+    for &(name, cpu_value) in expected {
+        assert_eq!(
+            msl_float(name),
+            cpu_value,
+            "MSL {name} disagrees with the CPU photon.rs value"
+        );
+        assert_eq!(
+            wgsl_float(name),
+            cpu_value,
+            "WGSL {name} disagrees with the CPU photon.rs value"
+        );
+    }
+
+    // Work-stack capacity: a GPU budget choice (the CPU uses 24), but the
+    // two shader languages must agree, and the capped-split arithmetic
+    // (max_k = STACK - stack_len + 1) needs at least 2 slots to ever
+    // split.
+    let msl_stack = msl_uint("WW_GPU_STACK");
+    let wgsl_stack = wgsl_uint("WW_GPU_STACK");
+    assert_eq!(
+        msl_stack, wgsl_stack,
+        "WW_GPU_STACK differs between the twinned shaders"
+    );
+    assert!(
+        (2..=24).contains(&msl_stack),
+        "WW_GPU_STACK = {msl_stack} outside the sane 2..=24 range"
+    );
+}
+
 // ── Layer 4w: wgpu backend (portable WGSL translation) ──────────────────
 #[cfg(feature = "wgpu")]
 mod layer4_wgpu {
@@ -4349,6 +4573,16 @@ mod layer4_wgpu {
                 8,
                 cases,
             );
+        }
+    }
+
+    /// TEMPORARY diagnostic (weight-window port): wgpu per-seed bit dump
+    /// of the clear fixture; see dump_clear_seed_bits.
+    #[test]
+    #[ignore = "diagnostic dump for the weight-window port; run explicitly"]
+    fn wgpu_ww_seed_bit_dump() {
+        if let Some(mut gpu) = try_wgpu() {
+            super::field_fixtures::dump_clear_seed_bits(gpu.as_mut(), "wgpu");
         }
     }
 
