@@ -191,15 +191,23 @@ impl Default for KhaytParams {
             // is 17 deg, SQM twilight end 17.99+-0.16) calibrates ~4x.
             // Out-of-sample check: Padborg/UK June should land at
             // OpenFajr's summer 12.3-12.7 deg without retuning.
-            // TWILIGHT_KHAYT_EDGE_APPEARANCE overrides the 45.0 for
-            // the edge-factor calibration analysis (see
-            // edge_appearance_override above); production runs leave
-            // the variable unset.
+            // RECALIBRATED 2026-07-06 on the final engine by the
+            // constant's defining protocol: the calibration cluster
+            // (Riyadh KACST, Hail, Aswan) rerun across an extended
+            // factor ladder (40..80); the interior minimum of the
+            // weighted cluster residual selects 70 (RMS 0.252 deg;
+            // the curve rises on both sides: 0.264 at 65, 0.319 at
+            // 75). Full record: validation/criterion_runs/
+            // edge_factor_v2/RECAL_SUMMARY.json; the historical 45
+            // belongs to the pre-hyperaccuracy transport frame.
+            // TWILIGHT_KHAYT_EDGE_APPEARANCE overrides the default
+            // for calibration analyses; production runs leave the
+            // variable unset.
             edge_factor_appearance: edge_appearance_override(
                 std::env::var("TWILIGHT_KHAYT_EDGE_APPEARANCE")
                     .ok()
                     .as_deref(),
-                45.0,
+                70.0,
             ),
             edge_factor_disappearance: 4.0,
             spread_required: 5,
@@ -1138,7 +1146,7 @@ mod tests {
         let picked = KhaytParams::default().edge_factor_appearance;
         std::env::remove_var("TWILIGHT_KHAYT_EDGE_APPEARANCE");
         assert_eq!(picked, 18.0);
-        assert_eq!(KhaytParams::default().edge_factor_appearance, 45.0);
+        assert_eq!(KhaytParams::default().edge_factor_appearance, 70.0);
     }
 
     #[test]
