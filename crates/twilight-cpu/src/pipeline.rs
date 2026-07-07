@@ -803,9 +803,13 @@ fn gpu_route_to_cpu_reason(
         // dispatches survive the interactive macOS watchdog only as 100
         // step-windows with inter-buffer yields, measured ~3x SLOWER than
         // the CPU scan (~32 s vs ~11 s per 100-ray call). Perf routing,
-        // not correctness routing: flip when running headless or on a
-        // non-watchdog backend.
-        return Some("3D cloud field active (GPU parity-validated but watchdog-throttled; CPU scan is faster)");
+        // not correctness routing: TWILIGHT_GPU_FIELD=1 flips it for
+        // headless or non-watchdog backends, where the GPU field path
+        // (full-size dispatches) is the fast one.
+        if std::env::var("TWILIGHT_GPU_FIELD").as_deref() == Ok("1") {
+            return None;
+        }
+        return Some("3D cloud field active (GPU parity-validated but watchdog-throttled; CPU scan is faster; TWILIGHT_GPU_FIELD=1 overrides)");
     }
     let shell_cloud = atm.cloud_extinction.iter().any(|&e| e > 0.0);
     if shell_cloud
