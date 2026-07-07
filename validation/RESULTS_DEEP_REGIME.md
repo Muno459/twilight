@@ -519,3 +519,29 @@ Still open after this addendum: the 103/650 nm uniform cell and the
 broken-deck zenith starvation (both want the forward-map importance
 follow-up), and the 1D twilight rows of the referee table which were
 measured pre-port and understate the production chain's current power.
+
+## Addendum (2026-07-07): the broken-deck zenith starvation residual closes
+
+A lateral-escape seed lobe (fourth component of the chain seed
+mixture: azimuthally isotropic Dwivedi lobe, share 0.35, folded into
+the one-sample balance-heuristic MIS weight so the estimator stays
+exactly unbiased; active only for cloud-coupled seeds under
+HETEROGENEOUS fields at SZA >= 96, per-run broken-field flag) was
+implemented against residual 3. Measured on the checkerboard fixture
+at zenith view: SZA 100 mean recovery +14.4 percent with seed CV
+halved (17.8 to 8.9 percent); the restored vz-0 gate row passes
+two-sided (0.962) and separates from the recorded 0.5x regression
+class by roughly 10x. Bit-identity: 1066/1066 rows unchanged on every
+other surface (heterogeneity gate keeps uniform fields and 1D decks
+bit-exact); eq1d-deep ratio 1.000 at SZA 101/103.
+
+An honest correction to the historical record rode along: the
+recorded 0.499x figure compared against a draft-era Multiple
+reference that HALVED between the 2026-07-04 draft tree and the
+final engine (the recalibration-era commits moved absolute scales);
+on the final tree the SZA-97 deficit is 0.95 to 0.96 and the
+material starvation lives at SZA >= 100, which is where the lobe
+acts. The zenith Multiple reference above SZA 100 over broken decks
+remains noise-limited at affordable budgets (CV 124 to 265 percent),
+so the class is refereed by the gate row and the mean-recovery
+measurement rather than by analog parity.

@@ -2884,46 +2884,145 @@ mod tests {
     ///   July-02 campaign rows), not asserted; its closure is the
     ///   standing budget/BDPT follow-up.
     ///
-    /// VIEW GEOMETRY (finding, 2026-07-04): the gate looks at vz 80
-    /// (the g_s2 convention), NOT the zenith. A zenith LOS over a
-    /// checkerboard threads a SINGLE cell column; with the observer
-    /// under a CLEAR cell every LOS seed is gas-only (beta_seed = 0)
-    /// and the chain direction lobes (sun-phase, zenith, terminator)
-    /// rarely sample the down-and-sideways directions that couple to
-    /// the off-axis cloud cells, so the cloud-mediated class becomes an
-    /// unsampled heavy tail: measured tau*1/SZA 97 zenith hybrid
-    /// 3.764e-6 with a FALSE-TIGHT 1.1% seed SE vs analog Multiple
-    /// 7.543e-6 (0.499x). Unbiasedness at that geometry is pinned by
-    /// the flight-law/majorant-invariance/eq1d gates; the deficit is
-    /// importance-sampling starvation at achievable budgets, recorded
-    /// as a production residual (zenith view over a BROKEN deck) in
-    /// RESULTS_DEEP_REGIME.md. The slant view couples the LOS to both
-    /// cell types and is the honest agreement geometry; cells are 8 km
-    /// so the slant LOS crosses cell boundaries inside the deck.
+    /// VIEW GEOMETRY (finding, 2026-07-04; row restored 2026-07-06):
+    /// the tau-ladder rows look at vz 80 (the g_s2 convention). A
+    /// zenith LOS over a checkerboard threads a SINGLE cell column;
+    /// with the observer under a CLEAR cell every LOS seed is gas-only
+    /// (beta_seed = 0) and the chain direction lobes (sun-phase,
+    /// zenith, terminator) rarely sample the down-and-sideways
+    /// directions that couple to the off-axis cloud cells, so the
+    /// cloud-mediated class becomes an unsampled heavy tail: the
+    /// 2026-07-04 draft measured tau*1/SZA 97 zenith hybrid 3.764e-6
+    /// with a FALSE-TIGHT 1.1% seed SE vs analog Multiple 7.543e-6
+    /// (0.499x), recorded as production residual 3 in
+    /// RESULTS_DEEP_REGIME.md. Unbiasedness at that geometry is pinned
+    /// by the flight-law/majorant-invariance/eq1d gates; the deficit
+    /// was importance-sampling starvation at achievable budgets. The
+    /// slant view couples the LOS to both cell types and remains the
+    /// agreement geometry for the tau ladder. The zenith view is now
+    /// ALSO gated (two-sided) by the dedicated zenith-starvation row
+    /// at the bottom of this test: the per-wavelength chains carry a
+    /// lateral-escape seed lobe (photon.rs, LATERAL_ESCAPE_SHARE,
+    /// active only over broken fields at deep SZA for cloud-coupled
+    /// seeds), and on the current tree the converged Multiple
+    /// reference sits at 0.95-0.96x parity with the hybrid there (see
+    /// the row's comment for the full measured history, including the
+    /// halving of the draft-era Multiple reference by the
+    /// post-addendum recalibration commits).
+    /// The G-S3-CB checkerboard medium: the deep deck carved into
+    /// `cell` x `cell`-voxel (4*cell km) cells alternating with clear
+    /// cells, clear background beyond the footprint (the checkerboard
+    /// is the medium under test; a half-mean background would blur it).
+    /// The gate carves cell = 2 (8 km); the zenith probe also runs
+    /// cell = 4 (16 km, the 2026-07-04 draft tile size the starvation
+    /// finding was recorded on).
+    fn checkerboard_field(
+        tau_star: f64,
+        cell: usize,
+    ) -> (
+        AtmosphereModel,
+        twilight_data::cloud_field_builder::OwnedCloudField,
+    ) {
+        let (atm, mut owned) = deep_field(tau_star);
+        let (nz, nlat, nlon) = (owned.nz, owned.nlat, owned.nlon);
+        for iz in 0..nz {
+            for ilat in 0..nlat {
+                for ilon in 0..nlon {
+                    if (ilat / cell + ilon / cell) % 2 == 1 {
+                        owned.sigma[(iz * nlat + ilat) * nlon + ilon] = 0.0;
+                    }
+                }
+            }
+        }
+        for b in owned.background_column.iter_mut() {
+            *b = 0.0;
+        }
+        owned.derive();
+        (atm, owned)
+    }
+
+    /// Center coordinates of the CLEAR checkerboard cell nearest the
+    /// field center: the zenith-starvation geometry (residual 3 in
+    /// RESULTS_DEEP_REGIME.md), a vertical LOS threading a single clear
+    /// column with cloud walls 2*cell km away on every side. The carve
+    /// clears cell (ic, jc) = (ilat/cell, ilon/cell) when ic + jc is
+    /// odd; the central cell is even (cloudy), so step one cell east.
+    fn clear_cell_center(
+        owned: &twilight_data::cloud_field_builder::OwnedCloudField,
+        cell: usize,
+    ) -> (f64, f64) {
+        let (ic, mut jc) = (owned.nlat / (2 * cell), owned.nlon / (2 * cell));
+        if (ic + jc) % 2 == 0 {
+            jc += 1;
+        }
+        let half = 0.5 * cell as f64;
+        let lat = owned.lat0_deg + ((cell * ic) as f64 + half) * owned.dlat_deg;
+        let lon = owned.lon0_deg + ((cell * jc) as f64 + half) * owned.dlon_deg;
+        (lat, lon)
+    }
+
+    /// Zenith-starvation probe (diagnosis harness for residual 3 of
+    /// RESULTS_DEEP_REGIME.md): the G-S3-CB checkerboard with the
+    /// observer at the center of a CLEAR cell, zenith view, hybrid
+    /// scalar chain vs analog Multiple at matched geometry. Env knobs:
+    /// PROBE_TAU (1), PROBE_SZA (97), PROBE_VZ (0), PROBE_SEEDS (8),
+    /// PROBE_PHOTONS_H (8000), PROBE_PHOTONS_M (100000), PROBE_CELL
+    /// (2 voxels = 8 km; 4 = the 16 km draft tiles). Prints one
+    /// PROBECSV line; asserts nothing (diagnosis only).
+    #[test]
+    #[ignore = "g_s3_cb zenith starvation probe; env-driven diagnosis harness"]
+    fn g_s3_cb_zenith_probe() {
+        let getenv = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let tau_star: f64 = getenv("PROBE_TAU", "1").parse().unwrap();
+        let sza: f64 = getenv("PROBE_SZA", "97").parse().unwrap();
+        let vz: f64 = getenv("PROBE_VZ", "0").parse().unwrap();
+        let seeds: u64 = getenv("PROBE_SEEDS", "8").parse().unwrap();
+        let ph: usize = getenv("PROBE_PHOTONS_H", "8000").parse().unwrap();
+        let pm: usize = getenv("PROBE_PHOTONS_M", "100000").parse().unwrap();
+        let cell: usize = getenv("PROBE_CELL", "2").parse().unwrap();
+
+        let (atm, owned) = checkerboard_field(tau_star, cell);
+        let (lat, lon) = clear_cell_center(&owned, cell);
+        let view = owned.view();
+        // The probe geometry premise: the observer column must be clear
+        // (in-deck altitude, 1.5 km) with cloud in the neighbor cell.
+        let obs = twilight_core::geometry::geographic_to_ecef(lat, lon, 0.0);
+        let up = obs.normalize();
+        assert_eq!(
+            view.sigma_at(obs + up * 1500.0),
+            0.0,
+            "probe observer column is not clear"
+        );
+        let hybrid = SimulationConfig {
+            view_zenith: vz,
+            latitude: lat,
+            longitude: lon,
+            ..deep_config(ph, false)
+        };
+        let multiple = SimulationConfig {
+            scattering_mode: ScatteringMode::Multiple,
+            photons_per_wavelength: pm,
+            ..hybrid.clone()
+        };
+        let w550 = wl_index(&atm, 550.0);
+        let (m_h, se_h) = perwl_mean_se(&atm, &hybrid, sza, Some(&view), w550, seeds, false);
+        let (m_m, se_m) = perwl_mean_se(&atm, &multiple, sza, Some(&view), w550, seeds, true);
+        let cv = |m: f64, se: f64| 100.0 * se * (seeds as f64).sqrt() / m;
+        println!(
+            "PROBECSV,tau*{tau_star},sza{sza},vz{vz},cell{cell},hybrid,{m_h:.4e},se,{se_h:.2e},\
+             cv%,{:.1},multiple,{m_m:.4e},se,{se_m:.2e},cv%,{:.1},ratio,{:.3}",
+            cv(m_h, se_h),
+            cv(m_m, se_m),
+            m_h / m_m
+        );
+    }
+
     #[test]
     #[ignore = "g_s3_cb: heavy MC (hours); the decisive field-forced gate"]
     fn g_s3_field_forced_matches_multiple_checkerboard() {
         let mut failures = Vec::new();
         for (tau_star, two_sided) in [(1.0, true), (3.0, false)] {
-            let (atm, mut owned) = deep_field(tau_star);
-            // Carve the checkerboard: 2x2-voxel (8 km) cells.
-            let (nz, nlat, nlon) = (owned.nz, owned.nlat, owned.nlon);
-            for iz in 0..nz {
-                for ilat in 0..nlat {
-                    for ilon in 0..nlon {
-                        if (ilat / 2 + ilon / 2) % 2 == 1 {
-                            owned.sigma[(iz * nlat + ilat) * nlon + ilon] = 0.0;
-                        }
-                    }
-                }
-            }
-            // Background: clear beyond the footprint (the checkerboard
-            // is the medium under test; a half-mean background would
-            // blur it).
-            for b in owned.background_column.iter_mut() {
-                *b = 0.0;
-            }
-            owned.derive();
+            let (atm, owned) = checkerboard_field(tau_star, 2);
             let view = owned.view();
 
             let hybrid = SimulationConfig {
@@ -2988,6 +3087,68 @@ mod tests {
                 }
             }
         }
+
+        // ── ZENITH-STARVATION ROW (residual 3, restored 2026-07-06) ──
+        // tau* = 1, SZA 97, VIEW ZENITH 0, observer at the center of a
+        // CLEAR 16 km cell (the 2026-07-04 draft tile size the 0.499x
+        // finding was recorded on; at 8 km cells the truncated zenith
+        // lobe's skirt, cos_min = 0.2, still reaches the 4 km-away
+        // cloud walls and the class is covered without a lateral lobe).
+        // History, measured at THIS budget (8 x 8000 vs 8 x 4e5):
+        // - recorded draft (2026-07-04 tree): hybrid 3.764e-6 with a
+        //   FALSE-TIGHT 1.1% seed SE vs Multiple 7.543e-6 (0.499x),
+        //   the residual-3 starvation class;
+        // - HEAD worktree c6232fc, pre-lateral-lobe (2026-07-06):
+        //   hybrid 3.7338e-6 (seed CV 2.7%) vs converged Multiple
+        //   3.9173e-6 (CV 34%; 6.4e-6 at a 2000-photon budget with CV
+        //   174%, i.e. the draft-era reference class is tiny-budget
+        //   noise on this tree): ratio 0.953. The Multiple side of the
+        //   record HALVED between 07-04 and HEAD (the post-addendum
+        //   source-correction/recalibration commits moved absolute
+        //   scales; the hybrid value reproduces the draft exactly), so
+        //   the 0.499x deficit no longer manifests here;
+        // - this tree (lateral-escape seed lobe active, photon.rs):
+        //   hybrid 3.7688e-6 (CV 4.0%), ratio 0.962.
+        // The row therefore gates TWO-SIDED (3 SE + 5%): a regression
+        // into the recorded starvation class (<= 0.6x with a
+        // false-tight seed SE) fails the band by an order of
+        // magnitude, and inflation of any origin fails the upper side.
+        {
+            let (atm, owned) = checkerboard_field(1.0, 4);
+            let (lat, lon) = clear_cell_center(&owned, 4);
+            let view = owned.view();
+            let hybrid = SimulationConfig {
+                view_zenith: 0.0,
+                latitude: lat,
+                longitude: lon,
+                ..deep_config(8_000, false)
+            };
+            let multiple = SimulationConfig {
+                scattering_mode: ScatteringMode::Multiple,
+                photons_per_wavelength: 400_000,
+                ..hybrid.clone()
+            };
+            let w550 = wl_index(&atm, 550.0);
+            let (m_h, se_h) = perwl_mean_se(&atm, &hybrid, 97.0, Some(&view), w550, 8, false);
+            let (m_m, se_m) =
+                perwl_mean_se(&atm, &multiple, 97.0, Some(&view), w550, 8, true);
+            let se = (se_h * se_h + se_m * se_m).sqrt();
+            let diff = (m_h - m_m).abs();
+            let band = 3.0 * se + 0.05 * m_h.max(m_m);
+            eprintln!(
+                "G-S3-CB tau*1 SZA 97 vz 0 cell 16km (two-sided, zenith row): hybrid \
+                 {m_h:.5e} (se {se_h:.2e}) multiple {m_m:.5e} (se {se_m:.2e}) \
+                 ratio {:.3} diff {diff:.2e} band {band:.2e}",
+                m_h / m_m
+            );
+            if diff.is_nan() || diff >= band {
+                failures.push(format!(
+                    "tau*1 SZA 97 vz 0 (zenith row): hybrid {m_h:.5e} vs multiple \
+                     {m_m:.5e} (diff {diff:.3e} >= band {band:.3e})"
+                ));
+            }
+        }
+
         assert!(
             failures.is_empty(),
             "G-S3-CB: field-forced hybrid vs analog Multiple:\n{}",

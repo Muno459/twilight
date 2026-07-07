@@ -1211,6 +1211,63 @@ fn dwivedi_beta(sza_deg: f64) -> f64 {
     DWIVEDI_BETA_MAX * sigmoid((sza_deg - DWIVEDI_SZA_CENTER) / DWIVEDI_SZA_WIDTH)
 }
 
+// --- Lateral-escape seed lobe (broken 3D decks) ---
+//
+// Measured starvation geometry (RESULTS_DEEP_REGIME.md, residual 3, the
+// G-S3-CB zenith finding): with the observer under a CLEAR 8 km cell of a
+// checkerboard tau* = 1 deck at SZA 97, every LOS seed is gas-only and
+// every existing seed lobe points along the clear column or toward the
+// below-horizon sun (sun-centric phase, zenith, terminator); none aims
+// LATERALLY at the cloud walls 4 km away or at the sunlit gaps between
+// cells. Secondary chains seeded in or under a broken deck therefore die
+// under it and the cloud-mediated radiance class becomes an unsampled
+// heavy tail: the hybrid read 0.499x of the analog Multiple reference
+// with a FALSE-TIGHT 1.1 percent seed SE, while the analog random walk
+// eventually diffuses out through the gaps. The lateral-escape lobe adds
+// an azimuthally isotropic, horizontally concentrated component (the
+// same Dwivedi geometry the bounce loop already uses for terminator
+// escape) to the SEED direction mixture, folded through the SAME
+// one-sample balance-heuristic MIS as the other components (see
+// seed_mixture_pdf), so the estimator stays exactly unbiased. It is
+// active ONLY where the starvation exists: a HETEROGENEOUS (broken)
+// 3D field (per-run flag, see field_is_broken), a cloud-coupled seed
+// vertex (in-cloud or under the deck top), and the deep-twilight regime
+// (local SZA >= ZENITH_SZA_START, the forced-mode gate). Everywhere
+// else alpha_l = 0 and the seed mixture, its thresholds, and its RNG
+// consumption are bit-identical to the historical code.
+
+/// Seed-mixture share of the lateral-escape lobe when active.
+///
+/// Value, from the measured starvation geometry: at the G-S3-CB zenith
+/// case the hybrid recovered only 0.499x of the Multiple reference, so
+/// the starved lateral/cloud-mediated class carries roughly HALF the
+/// signal and needs a seed allocation of the same order as the combined
+/// clear-column machinery. 0.35 mirrors DWIVEDI_FRAC_MAX, the
+/// bounce-level allocation already validated for the same
+/// horizontal-escape job, and keeps 65 percent of the seed budget on
+/// the externally validated phase/zenith/terminator lobes.
+const LATERAL_ESCAPE_SHARE: f64 = 0.35;
+
+/// Dwivedi concentration of the lateral-escape lobe.
+///
+/// beta = 3 (DWIVEDI_BETA_MAX) puts ~78 percent of the lobe's mass
+/// within 30 degrees of horizontal. From a seed 0-2 km under an 8 km
+/// checkerboard cell the cloud walls and the sunlit gaps subtend
+/// elevations |cos_z| < ~0.3 (4-12 km lateral vs 0-2 km vertical),
+/// inside that band; the exp(-beta |cos_z|) tail keeps the full sphere
+/// covered so the MIS weight stays bounded.
+const LATERAL_ESCAPE_BETA: f64 = 3.0;
+
+/// Field-heterogeneity gate for the lateral-escape lobe: a z level is
+/// "broken" when its horizontal voxel mean falls below this fraction of
+/// its max (uniform level: mean == max, ratio 1.0; the 50/50
+/// checkerboard: 0.5). A horizontally uniform field must NOT activate
+/// the lobe: no gaps or walls exist for it to aim at, and
+/// G-S3-EQ1D-DEEP pins the uniform-field == 1D-deck agreement at
+/// SHARED seeds (common random numbers), which only survives if
+/// uniform-field streams stay bit-identical.
+const LATERAL_BROKEN_MEAN_RATIO: f64 = 0.75;
+
 /// Dwivedi PDF: probability density in sr^-1 for a direction with
 /// `cos_z = dir . local_up`, given concentration parameter `beta`.
 ///
@@ -2690,6 +2747,13 @@ pub fn hybrid_scatter_radiance(
         None => &atm.cloud_extinction,
     };
 
+    // Lateral-escape seed lobe eligibility (ONE voxel scan per driver
+    // call): only a heterogeneous (broken) field activates the lobe;
+    // clear sky, 1D decks, and horizontally uniform fields keep
+    // bit-identical streams (see field_is_broken and the constants
+    // block at LATERAL_ESCAPE_SHARE).
+    let lateral_field = field.is_some_and(field_is_broken);
+
     // Dual path: full Stokes [I,Q,U,V] when polarized, scalar when not.
     let mut stokes_total = StokesVector::unpolarized(0.0);
     let mut scalar_total = 0.0_f64;
@@ -2874,6 +2938,7 @@ pub fn hybrid_scatter_radiance(
             let chain_cloud = ChainCloud {
                 beta_seed: beta_cloud,
                 g_seed: g_cloud_step,
+                lateral: lateral_field,
             };
             let scale_m = (beta_scat + beta_cloud) * t_obs * sub_ds;
             if polarized {
@@ -2996,6 +3061,7 @@ fn trace_secondary_chain(
 
     // --- SZA-adaptive 3-branch parameters ---
     let cos_sza = sun_dir.dot(local_up);
+    let sza_deg_seed = libm::acos(cos_sza.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
     let bp = branch_params_for_sza(cos_sza);
 
     // Branch probabilities:
@@ -3006,6 +3072,19 @@ fn trace_secondary_chain(
     let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
     let alpha_t = bp.zenith_frac * bp.term_share;
 
+    // Lateral-escape lobe (broken 3D decks only; see the constants
+    // block at LATERAL_ESCAPE_SHARE): mirrors the scalar chain exactly,
+    // including RNG parity (inactive: alpha_l == 0.0, keep == 1.0, and
+    // the alphas, thresholds, and draws are bit-identical to history).
+    let alpha_l = lateral_escape_share(
+        &cloud,
+        field,
+        sza_deg_seed,
+        start_pos.length() - atm.surface_radius(),
+    );
+    let keep = 1.0 - alpha_l;
+    let (alpha_p, alpha_z, alpha_t) = (alpha_p * keep, alpha_z * keep, alpha_t * keep);
+
     // Terminator axis (only used if term_share > 0, but cheap to compute)
     let term_axis = terminator_axis(local_up, sun_dir, bp.tilt_rad);
 
@@ -3013,7 +3092,7 @@ fn trace_secondary_chain(
     let xi_jitter = xorshift_f64(&mut rng.dir);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
-    // 3-branch mixture sampling with the UNBIASED one-sample MIS weight.
+    // 4-branch mixture sampling with the UNBIASED one-sample MIS weight.
     //
     // The target is J = INTEGRAL P(omega.view)/4pi * L_{1+}(omega) d omega.
     // We draw omega from the mixture q (see seed_mixture_pdf) and weight by
@@ -3032,21 +3111,32 @@ fn trace_secondary_chain(
         };
         let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         scatter_direction(sun_dir, ct, phi_init)
-    } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
+    } else if xi_mix < alpha_p + alpha_z || (alpha_t < 1e-12 && alpha_l < 1e-12) {
         // Zenith-lobe sample
         let (d, _cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
         d
-    } else {
+    } else if xi_mix < alpha_p + alpha_z + alpha_t || alpha_l < 1e-12 {
         // Terminator-lobe sample
         let (d, _cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
         d
+    } else {
+        // Lateral-escape sample: azimuthally isotropic Dwivedi lobe
+        // around the local vertical (three rng.dir draws; the branch is
+        // reachable only when alpha_l > 0, so inactive seeds keep the
+        // historical draw pattern).
+        let xi1 = xorshift_f64(&mut rng.dir);
+        let xi2 = xorshift_f64(&mut rng.dir);
+        let xi_sign = xorshift_f64(&mut rng.dir);
+        let (cos_z, phi_l) = dwivedi_sample(xi1, xi2, xi_sign, LATERAL_ESCAPE_BETA);
+        scatter_direction(local_up, cos_z, phi_l)
     };
 
     // Unbiased seed weight: evaluates the seed coupling to the OBSERVER
     // (prev_dir_in is the LOS view direction; the physical scattering
     // cosine at the seed vertex is omega . view).
     let q_seed = seed_mixture_pdf(
-        dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, start_optics,
+        dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, alpha_l,
+        start_optics,
     );
 
     // Cloud-seed mixture: see the derivation block at the scalar chain
@@ -3704,16 +3794,31 @@ fn trace_secondary_chain_scalar(
     let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
     let alpha_t = bp.zenith_frac * bp.term_share;
 
+    // Lateral-escape lobe (broken 3D decks only; see the constants
+    // block at LATERAL_ESCAPE_SHARE): when active it takes alpha_l of
+    // the seed mixture and the three historical components keep their
+    // relative proportions. Inactive (alpha_l == 0.0): keep == 1.0 and
+    // the alphas, thresholds, and RNG draws are bit-identical to the
+    // historical mixture.
+    let alpha_l = lateral_escape_share(
+        &cloud,
+        field,
+        sza_deg_local,
+        start_pos.length() - atm.surface_radius(),
+    );
+    let keep = 1.0 - alpha_l;
+    let (alpha_p, alpha_z, alpha_t) = (alpha_p * keep, alpha_z * keep, alpha_t * keep);
+
     let term_axis = terminator_axis(local_up, sun_dir, bp.tilt_rad);
 
     // --- Stratified initial direction sampling ---
     let xi_jitter = xorshift_f64(&mut rng.dir);
     let xi_mix = (ray_idx as f64 + xi_jitter) / total_rays as f64;
 
-    // 3-branch importance sampling. See trace_secondary_chain for derivation.
+    // 4-branch importance sampling. See trace_secondary_chain for derivation.
     // At SZA <= 96: alpha_p=0.5, alpha_z=0.5, alpha_t=0. Both weights = 1.0.
     // Unbiased one-sample MIS seed (see seed_mixture_pdf): sample omega
-    // from the 3-component mixture, weight by P(omega.view)/4pi / q(omega).
+    // from the mixture, weight by P(omega.view)/4pi / q(omega).
     // Samplers and RNG consumption order unchanged from the old code.
     let dir = if xi_mix < alpha_p {
         // Phase-component sample (sun-centric proposal)
@@ -3724,15 +3829,26 @@ fn trace_secondary_chain_scalar(
         };
         let phi_init = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng.dir);
         scatter_direction(sun_dir, ct, phi_init)
-    } else if xi_mix < alpha_p + alpha_z || alpha_t < 1e-12 {
+    } else if xi_mix < alpha_p + alpha_z || (alpha_t < 1e-12 && alpha_l < 1e-12) {
         let (d, _cos_z) = sample_zenith_biased(local_up, bp.n_zenith, &mut rng.dir);
         d
-    } else {
+    } else if xi_mix < alpha_p + alpha_z + alpha_t || alpha_l < 1e-12 {
         let (d, _cos_t) = sample_zenith_biased(term_axis, bp.m_term, &mut rng.dir);
         d
+    } else {
+        // Lateral-escape sample: azimuthally isotropic Dwivedi lobe
+        // around the local vertical (three rng.dir draws; the branch is
+        // reachable only when alpha_l > 0, so inactive seeds keep the
+        // historical draw pattern).
+        let xi1 = xorshift_f64(&mut rng.dir);
+        let xi2 = xorshift_f64(&mut rng.dir);
+        let xi_sign = xorshift_f64(&mut rng.dir);
+        let (cos_z, phi_l) = dwivedi_sample(xi1, xi2, xi_sign, LATERAL_ESCAPE_BETA);
+        scatter_direction(local_up, cos_z, phi_l)
     };
     let q_seed = seed_mixture_pdf(
-        dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, start_optics,
+        dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, alpha_l,
+        start_optics,
     );
 
     // ── Cloud-seed mixture: the estimator, derived ──────────────────────
@@ -4406,6 +4522,71 @@ fn field_shell_majorants(
     maj
 }
 
+/// Per-run heterogeneity gate for the lateral-escape seed lobe: true
+/// when any z level of the field has a horizontal voxel mean below
+/// LATERAL_BROKEN_MEAN_RATIO times its max. ONE pass over the voxel
+/// grid per driver call (the same cost class as field_shell_majorants).
+///
+/// A horizontally uniform level has mean == max (each f32 -> f64 cast
+/// is exact; the accumulation error is ~1e-13 relative, far from the
+/// 0.75 threshold) and never trips the gate, so uniform fields keep
+/// bit-identical RNG streams (G-S3-EQ1D-DEEP's common-random-numbers
+/// agreement depends on this). Deliberately conservative: a uniform
+/// finite patch over a clear background reads uniform here (its voxel
+/// rows are uniform) and keeps the historical estimator; only genuinely
+/// broken voxel decks (checkerboard fixtures, real SEVIRI scenes)
+/// activate the lobe.
+fn field_is_broken(field: &Cloud3DField) -> bool {
+    let n_level = field.nlat * field.nlon;
+    if n_level == 0 {
+        return false;
+    }
+    for iz in 0..field.nz {
+        let row = &field.sigma[iz * n_level..(iz + 1) * n_level];
+        let mut max = 0.0f64;
+        let mut sum = 0.0f64;
+        for &v in row {
+            let v = v as f64;
+            sum += v;
+            if v > max {
+                max = v;
+            }
+        }
+        if max > 0.0 && sum < LATERAL_BROKEN_MEAN_RATIO * max * n_level as f64 {
+            return true;
+        }
+    }
+    false
+}
+
+/// Lateral-escape lobe share for ONE seed vertex: LATERAL_ESCAPE_SHARE
+/// when every gate holds, else exactly 0.0 (the seed mixture, its
+/// thresholds, and its RNG consumption are then bit-identical to the
+/// historical code). Gates, in order:
+/// - per-run broken-field flag (3D field present AND heterogeneous;
+///   see field_is_broken),
+/// - deep-twilight regime (local SZA >= ZENITH_SZA_START, the
+///   forced-mode gate: shallower fields keep historical streams),
+/// - cloud-COUPLED seed vertex: in-cloud (beta_seed > 0) or under the
+///   deck top, where chains must travel laterally to reach the gaps
+///   and sunlit walls of a broken deck. Seeds above the deck see the
+///   open sky and keep the historical mixture.
+#[inline]
+fn lateral_escape_share(
+    cloud: &ChainCloud,
+    field: Option<&Cloud3DField>,
+    sza_deg_local: f64,
+    seed_alt_m: f64,
+) -> f64 {
+    if !cloud.lateral || sza_deg_local < ZENITH_SZA_START {
+        return 0.0;
+    }
+    match field {
+        Some(f) if cloud.beta_seed > 0.0 || seed_alt_m < f.z_top_m() => LATERAL_ESCAPE_SHARE,
+        _ => 0.0,
+    }
+}
+
 /// Vertex outcome of a FIELD forced flight's truncated null-collision
 /// classification (`field_forced_classify`).
 enum FieldVertex {
@@ -4540,6 +4721,14 @@ struct ChainCloud {
     /// Delta-scaled asymmetry g* for a cloud-seeded vertex (field `g_at`
     /// at the step midpoint, or `atm.cloud_g_scaled` in 1D).
     g_seed: f64,
+    /// Per-run lateral-escape lobe eligibility: true ONLY when a 3D
+    /// field is present AND heterogeneous (`field_is_broken`, computed
+    /// once per driver call). The chains additionally gate on the
+    /// deep-twilight SZA and a cloud-coupled seed vertex before mixing
+    /// the lobe in (`lateral_escape_share`). Always false in the ALIS
+    /// driver: the ALIS chain has no lateral lobe (it stays analog
+    /// under fields; the lobe belongs to the per-wavelength chains).
+    lateral: bool,
 }
 
 impl ChainCloud {
@@ -4548,6 +4737,7 @@ impl ChainCloud {
     const CLEAR: ChainCloud = ChainCloud {
         beta_seed: 0.0,
         g_seed: 0.0,
+        lateral: false,
     };
 }
 
@@ -4852,8 +5042,10 @@ fn trace_secondary_chain_alis(
     // distribution regardless of which wavelength we score) - the per-
     // wavelength ratio only carries the numerator P_w(omega.view)/P_hero.
     let cos_seed_view = dir.dot(view_dir);
+    // alpha_l = 0.0: the ALIS chain carries no lateral-escape lobe
+    // (see ChainCloud::lateral), so its mixture stays 3-component.
     let q_seed = seed_mixture_pdf(
-        dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, hero_optics,
+        dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, 0.0, hero_optics,
     );
     let hero_phase_view = scalar_phase_value(cos_seed_view, hero_optics);
 
@@ -4963,7 +5155,7 @@ fn trace_secondary_chain_alis(
         } else if q_seed > 1e-300 {
             let optics_w = &atm.optics[start_shell][w];
             seed_mixture_pdf(
-                dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, optics_w,
+                dir, sun_dir, local_up, term_axis, &bp, alpha_p, alpha_z, alpha_t, 0.0, optics_w,
             ) / q_seed
         } else {
             1.0
@@ -6042,6 +6234,9 @@ pub fn hybrid_scatter_radiance_alis(
             let chain_cloud = ChainCloud {
                 beta_seed: beta_cloud,
                 g_seed: g_cloud_step,
+                // The ALIS chain carries no lateral-escape lobe (see
+                // ChainCloud::lateral): always false here.
+                lateral: false,
             };
 
             for ray in 0..rays_this_sub {
@@ -6495,13 +6690,14 @@ fn truncated_power_cos_pdf(cos_theta: f64, n: f64) -> f64 {
     (n + 1.0) * libm::pow(cos_theta, n) / (2.0 * core::f64::consts::PI * norm)
 }
 
-/// Density [1/sr] of the 3-component seed-direction mixture at `omega`.
+/// Density [1/sr] of the seed-direction mixture at `omega`.
 ///
 /// The seed direction for an orders-2+ secondary chain is drawn from
 ///
 ///   q(omega) = alpha_p * P(omega . sun)/4pi          (phase, sun-centric)
 ///            + alpha_z * trunc_pow_cos(omega . up)    (zenith lobe)
 ///            + alpha_t * trunc_pow_cos(omega . term)  (terminator lobe)
+///            + alpha_l * dwivedi(omega . up)          (lateral escape)
 ///
 /// and the UNBIASED one-sample (balance-heuristic) weight for the target
 /// integrand integral P(omega . view)/4pi * L(omega) d omega is
@@ -6516,6 +6712,14 @@ fn truncated_power_cos_pdf(cos_theta: f64, n: f64) -> f64 {
 /// cosine-hemisphere-referenced) and never evaluated the seed coupling
 /// P(omega . view) at all - a structural bias in the multiple-scattering
 /// term and a major firefly source.
+///
+/// The lateral-escape component (alpha_l, broken 3D decks only: see the
+/// constants block at LATERAL_ESCAPE_SHARE) is the Dwivedi horizontal
+/// lobe at LATERAL_ESCAPE_BETA around the local vertical, azimuthally
+/// isotropic and normalized over the full sphere (dwivedi_pdf). Its pdf
+/// MUST be folded in here whenever the lobe can be selected: the
+/// balance heuristic is only unbiased when q is the exact density the
+/// seed was drawn from.
 #[allow(clippy::too_many_arguments)]
 fn seed_mixture_pdf(
     omega: Vec3,
@@ -6526,6 +6730,7 @@ fn seed_mixture_pdf(
     alpha_p: f64,
     alpha_z: f64,
     alpha_t: f64,
+    alpha_l: f64,
     optics: &crate::atmosphere::ShellOptics,
 ) -> f64 {
     let mut q = alpha_p * scalar_phase_value(omega.dot(sun_dir), optics) * INV_4PI;
@@ -6534,6 +6739,9 @@ fn seed_mixture_pdf(
     }
     if alpha_t > 1e-12 {
         q += alpha_t * truncated_power_cos_pdf(omega.dot(term_axis), bp.m_term);
+    }
+    if alpha_l > 1e-12 {
+        q += alpha_l * dwivedi_pdf(omega.dot(local_up), LATERAL_ESCAPE_BETA);
     }
     q
 }
@@ -6868,10 +7076,25 @@ mod tests {
             let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng);
             let r = libm::sqrt((1.0 - z * z).max(0.0));
             let omega = Vec3::new(r * libm::cos(phi), r * libm::sin(phi), z);
-            let q = seed_mixture_pdf(
-                omega, sun, up, term_axis, &bp, alpha_p, alpha_z, alpha_t, &optics,
-            );
-            assert!(q > 0.0, "mixture pdf must be > 0 everywhere, got {}", q);
+            // Both with and without the lateral-escape component (its
+            // exp tail is strictly positive too, but coverage must not
+            // DEPEND on it).
+            for alpha_l in [0.0, LATERAL_ESCAPE_SHARE] {
+                let keep = 1.0 - alpha_l;
+                let q = seed_mixture_pdf(
+                    omega,
+                    sun,
+                    up,
+                    term_axis,
+                    &bp,
+                    alpha_p * keep,
+                    alpha_z * keep,
+                    alpha_t * keep,
+                    alpha_l,
+                    &optics,
+                );
+                assert!(q > 0.0, "mixture pdf must be > 0 everywhere, got {}", q);
+            }
         }
     }
 
@@ -6891,24 +7114,40 @@ mod tests {
         let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
         let alpha_t = bp.zenith_frac * bp.term_share;
         let term_axis = terminator_axis(up, sun, bp.tilt_rad);
-        let mut rng = 777u64;
-        let n = 400_000;
-        let mut sum = 0.0;
-        for _ in 0..n {
-            let z = 2.0 * xorshift_f64(&mut rng) - 1.0;
-            let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng);
-            let r = libm::sqrt((1.0 - z * z).max(0.0));
-            let omega = Vec3::new(r * libm::cos(phi), r * libm::sin(phi), z);
-            sum += seed_mixture_pdf(
-                omega, sun, up, term_axis, &bp, alpha_p, alpha_z, alpha_t, &optics,
+        // Historical 3-component mixture AND the lateral-escape-active
+        // 4-component mixture (broken 3D decks): both are probability
+        // densities and must integrate to 1 over the sphere.
+        for alpha_l in [0.0, LATERAL_ESCAPE_SHARE] {
+            let keep = 1.0 - alpha_l;
+            let mut rng = 777u64;
+            let n = 400_000;
+            let mut sum = 0.0;
+            for _ in 0..n {
+                let z = 2.0 * xorshift_f64(&mut rng) - 1.0;
+                let phi = 2.0 * core::f64::consts::PI * xorshift_f64(&mut rng);
+                let r = libm::sqrt((1.0 - z * z).max(0.0));
+                let omega = Vec3::new(r * libm::cos(phi), r * libm::sin(phi), z);
+                sum += seed_mixture_pdf(
+                    omega,
+                    sun,
+                    up,
+                    term_axis,
+                    &bp,
+                    alpha_p * keep,
+                    alpha_z * keep,
+                    alpha_t * keep,
+                    alpha_l,
+                    &optics,
+                );
+            }
+            let integral = 4.0 * core::f64::consts::PI * sum / n as f64;
+            assert!(
+                (integral - 1.0).abs() < 0.02,
+                "mixture pdf MC integral (alpha_l = {}) = {}, expected 1",
+                alpha_l,
+                integral
             );
         }
-        let integral = 4.0 * core::f64::consts::PI * sum / n as f64;
-        assert!(
-            (integral - 1.0).abs() < 0.02,
-            "mixture pdf MC integral = {}, expected 1",
-            integral
-        );
     }
 
     // ── xorshift_f64 RNG ──
@@ -7324,6 +7563,68 @@ mod tests {
             dlon_deg: 1.0,
             g_default: 0.46,
         }
+    }
+
+    /// The lateral-escape lobe's heterogeneity gate: a uniform voxel
+    /// deck (mean == max on every level) must read NOT broken (its RNG
+    /// streams must stay bit-identical, see G-S3-EQ1D-DEEP), a 50/50
+    /// checkerboard (mean = max/2 < 0.75 max) must read broken, and an
+    /// empty field must read not broken.
+    #[test]
+    fn field_is_broken_gates_on_level_heterogeneity() {
+        let uni = std::vec![FF_SIGMA_C as f32; 2 * 10 * 10];
+        assert!(!field_is_broken(&ff_field(&uni, &[])));
+
+        let mut cb = std::vec![0f32; 2 * 10 * 10];
+        for iz in 0..2 {
+            for ilat in 0..10 {
+                for ilon in 0..10 {
+                    if (ilat + ilon) % 2 == 0 {
+                        cb[(iz * 10 + ilat) * 10 + ilon] = FF_SIGMA_C as f32;
+                    }
+                }
+            }
+        }
+        assert!(field_is_broken(&ff_field(&cb, &[])));
+
+        let empty = std::vec![0f32; 2 * 10 * 10];
+        assert!(!field_is_broken(&ff_field(&empty, &[])));
+    }
+
+    /// The lateral-escape lobe's per-seed gates: exactly 0.0 (bit-exact
+    /// historical streams) unless the per-run broken-field flag, the
+    /// deep-twilight SZA, and a cloud-coupled seed vertex ALL hold.
+    #[test]
+    fn lateral_escape_share_gates_on_flag_sza_and_coupling() {
+        let uni = std::vec![FF_SIGMA_C as f32; 2 * 10 * 10];
+        let f = ff_field(&uni, &[]); // z 1000..2000 m
+        let on = ChainCloud {
+            beta_seed: 0.0,
+            g_seed: 0.46,
+            lateral: true,
+        };
+        // All gates hold: under-deck seed (500 m < z_top 2000 m).
+        assert_eq!(
+            lateral_escape_share(&on, Some(&f), 97.0, 500.0),
+            LATERAL_ESCAPE_SHARE
+        );
+        // In-cloud seed counts as coupled even above z_top bookkeeping.
+        let in_cloud = ChainCloud {
+            beta_seed: 1e-4,
+            ..on
+        };
+        assert_eq!(
+            lateral_escape_share(&in_cloud, Some(&f), 97.0, 2_500.0),
+            LATERAL_ESCAPE_SHARE
+        );
+        // Per-run flag off (clear sky, 1D decks, uniform fields).
+        assert_eq!(lateral_escape_share(&ChainCloud::CLEAR, Some(&f), 97.0, 500.0), 0.0);
+        // Shallow SZA (below the forced-mode gate).
+        assert_eq!(lateral_escape_share(&on, Some(&f), 95.9, 500.0), 0.0);
+        // Seed above the deck top (sees open sky).
+        assert_eq!(lateral_escape_share(&on, Some(&f), 97.0, 2_500.0), 0.0);
+        // No field bound.
+        assert_eq!(lateral_escape_share(&on, None, 97.0, 500.0), 0.0);
     }
 
     /// Mean and standard error of `trace_secondary_chain_scalar` over n
