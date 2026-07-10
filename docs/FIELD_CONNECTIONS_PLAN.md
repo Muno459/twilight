@@ -1,7 +1,11 @@
 # Voxel-field connection estimator: design
 
-Status: IMPLEMENTED on branch field-conns (98bebc9, 2026-07-10), gate
-verdicts pending. The design below was written first and the
+Status: MERGED to main (4ccd737, 2026-07-10) with all four G-FC gates
+green: G-FC-0 bitcheck (only deep field rows differ), G-FC-1 partition
+invariant 0.31 sigma with cv 6.16 -> 0.855, G-FC-2 field-vs-1D 0.46
+sigma, G-FC-3 field referee cells at 128 seeds (tau1/103 gated at
+1.185 +- 0.085 cv 0.81, previously 1024 seeds; tau3/103 1.229 +- 0.13
+cv 1.16, previously 512): roughly 6 to 16x less variance per seed. The design below was written first and the
 implementation followed it: Cloud3DField::advance_to_combined_tau (exact
 piecewise-constant combined inversion), scout/advance field parameters
 (chains pass None), voxel vertex-type draw, field threading through the
@@ -10,8 +14,7 @@ stays 1D-only). All activation predicates are identical to main when no
 field is present; fast suites and clippy green. The G-FC gate ladder
 (bitcheck vs main, partition invariant under a uniform field at SZA 99.5,
 field-vs-1D equivalence at 101, field referee cells at 128 seeds) is
-queued on the verification box; the branch does NOT merge to main until
-all four pass.
+all passed on the verification box (2026-07-10) and the branch merged.
 
 ## Goal
 
