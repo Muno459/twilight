@@ -191,23 +191,29 @@ impl Default for KhaytParams {
             // is 17 deg, SQM twilight end 17.99+-0.16) calibrates ~4x.
             // Out-of-sample check: Padborg/UK June should land at
             // OpenFajr's summer 12.3-12.7 deg without retuning.
-            // RECALIBRATED 2026-07-06 on the final engine by the
-            // constant's defining protocol: the calibration cluster
-            // (Riyadh KACST, Hail, Aswan) rerun across an extended
-            // factor ladder (40..80); the interior minimum of the
-            // weighted cluster residual selects 70 (RMS 0.252 deg;
-            // the curve rises on both sides: 0.264 at 65, 0.319 at
-            // 75). Full record: validation/criterion_runs/
-            // edge_factor_v2/RECAL_SUMMARY.json; the historical 45
+            // RECALIBRATED 2026-07-07 on the final engine by a
+            // full-campaign fit (superseding the earlier 3-site
+            // Mecca-cluster protocol, which selected 70 but was
+            // dominated by Hail, an outlier whose observed dawn
+            // 14.01 deg is far shallower than every other desert
+            // campaign 14.5-14.8; that outlier's leverage biased the
+            // cluster fit high). Exact GPU runs at a fine factor
+            // ladder across the independent desert campaigns give an
+            // out-of-sample residual minimum at f = 56.5 (RMS 0.133
+            // deg, near-zero bias), stable under leave-one-out
+            // (mean 56.4, range 55.2-57.0); the earlier 70 carries a
+            // ~0.3-0.4 deg out-of-sample bias, 2-3x the per-site
+            // scatter. The per-site inversion geometric mean (58)
+            // independently agrees. Record: tools/confirm_edge_factor.py,
+            // validation/criterion_runs/edge_factor/. The historical 45
             // belongs to the pre-hyperaccuracy transport frame.
             // TWILIGHT_KHAYT_EDGE_APPEARANCE overrides the default
-            // for calibration analyses; production runs leave the
-            // variable unset.
+            // for calibration analyses; production runs leave it unset.
             edge_factor_appearance: edge_appearance_override(
                 std::env::var("TWILIGHT_KHAYT_EDGE_APPEARANCE")
                     .ok()
                     .as_deref(),
-                70.0,
+                56.0,
             ),
             edge_factor_disappearance: 4.0,
             spread_required: 5,
@@ -569,17 +575,47 @@ fn night_baseline(scan: &KhaytScan) -> Vec<PatchLum> {
         .collect()
 }
 
-/// Bracket of the LAST downward crossing of margin = 1.0 (curve
-/// decreasing with SZA; ascending scan order): index i with
-/// margin[i] >= 1 > margin[i+1].
+/// Bracket of the downward crossing of margin = 1.0 that ends the
+/// contiguous margin >= 1 run containing the curve's MAXIMUM (ascending
+/// scan order; the physical event curve rises to one peak and decays).
+///
+/// The historical version returned the LAST downward crossing anywhere
+/// on the curve, which assumed the margin decays monotonically past the
+/// peak. In the deep tail that assumption fails: sub-percept red margins
+/// near the cone-gate collapse can flicker between hard zero and
+/// spuriously large values (their detection target is noise-floor
+/// scale), and refined points inserted by an EARLIER event's solve (the
+/// point pool is shared across events) can mint an isolated deep
+/// "crossing" pinned at the gate collapse. The 2026-07-09 Mecca-June
+/// case reported shafaq al-ahmar at the red-cone-gate collapse
+/// (depression 17.4, deeper than al-abyad, physically backwards) instead
+/// of the true distinctness crossing near 15.0. Anchoring the bracket to
+/// the run containing the maximum keeps monotone curves bit-identical
+/// (last = only crossing) and makes isolated tail pops unable to form a
+/// bracket.
 fn bracket_index(curve: &[MarginSample]) -> Option<usize> {
-    let mut bi = None;
-    for i in 0..curve.len().saturating_sub(1) {
-        if curve[i].margin >= 1.0 && curve[i + 1].margin < 1.0 {
-            bi = Some(i);
-        }
+    if curve.len() < 2 {
+        return None;
     }
-    bi
+    // Index of the maximum margin (ties: shallowest).
+    let imax = curve
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.margin.total_cmp(&b.margin))
+        .map(|(i, _)| i)?;
+    if curve[imax].margin < 1.0 {
+        return None; // never distinct anywhere
+    }
+    // Walk to the end of the contiguous margin >= 1 run from the peak.
+    let mut i = imax;
+    while i + 1 < curve.len() && curve[i + 1].margin >= 1.0 {
+        i += 1;
+    }
+    if i + 1 < curve.len() {
+        Some(i)
+    } else {
+        None // still distinct at the deepest scanned point
+    }
 }
 
 /// Both bracket endpoints statistically indistinguishable from the
@@ -1051,6 +1087,45 @@ pub fn detect_refined(
 mod tests {
     use super::*;
 
+    /// Regression for the 2026-07-09 Mecca-June shafaq al-ahmar bug: an
+    /// isolated spurious margin pop deep in the tail (a gate-collapse
+    /// flicker on points inserted by another event's refinement) must NOT
+    /// steal the bracket from the true crossing that ends the peak's run.
+    #[test]
+    fn bracket_anchors_to_the_peak_run_not_the_last_crossing() {
+        let ms = |sza: f64, margin: f64| MarginSample {
+            sza,
+            margin,
+            excess: 0.0,
+            target: 1.0,
+            gate: f64::INFINITY,
+            rel_se: 0.0,
+        };
+        // Peak at 103, true crossing in [103, 105]; spurious isolated
+        // pop at 107.36 (crossing pinned at a deeper gate collapse).
+        let curve = vec![
+            ms(99.0, 49.0),
+            ms(101.0, 15.0),
+            ms(103.0, 123.0),
+            ms(105.0, 0.7),
+            ms(107.0, 0.0),
+            ms(107.36, 1.2),
+            ms(107.44, 0.0),
+            ms(109.0, 0.0),
+        ];
+        let i = bracket_index(&curve).expect("crossing exists");
+        assert_eq!(curve[i].sza, 103.0, "must bracket the peak-run crossing");
+        // Monotone curve: unchanged behavior (last = only crossing).
+        let mono = vec![ms(101.0, 8.0), ms(103.0, 2.0), ms(105.0, 0.5)];
+        assert_eq!(bracket_index(&mono), Some(1));
+        // Never distinct: no bracket.
+        let dark = vec![ms(101.0, 0.4), ms(103.0, 0.2)];
+        assert_eq!(bracket_index(&dark), None);
+        // Distinct through the end of the scan: no bracket.
+        let open = vec![ms(101.0, 3.0), ms(103.0, 2.0)];
+        assert_eq!(bracket_index(&open), None);
+    }
+
     fn flat(scan_szas: &[f64], band: f64, refs: f64) -> KhaytScan {
         KhaytScan {
             szas: scan_szas.to_vec(),
@@ -1146,7 +1221,9 @@ mod tests {
         let picked = KhaytParams::default().edge_factor_appearance;
         std::env::remove_var("TWILIGHT_KHAYT_EDGE_APPEARANCE");
         assert_eq!(picked, 18.0);
-        assert_eq!(KhaytParams::default().edge_factor_appearance, 70.0);
+        // Production default: the 2026-07-07 full-campaign recalibration
+        // (see KhaytParams::default for the record).
+        assert_eq!(KhaytParams::default().edge_factor_appearance, 56.0);
     }
 
     #[test]

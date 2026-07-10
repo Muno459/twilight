@@ -2649,6 +2649,214 @@ mod tests {
         }
     }
 
+    /// G-BDPT-1D: the combined-channel BDPT light subpath (ALIS chain) must
+    /// stay unbiased under a 1D gray deck and cut the seed variance that
+    /// leaves the deep cells LOW-POWER. Arm A = BDPT-on ALIS
+    /// (`hybrid_scatter_radiance_alis`, field None so the 1D deck is active);
+    /// arm B = the independent analog `Multiple` (`trace_photon`) reference,
+    /// the same estimator-A-vs-estimator-B contract as G-HYB-MULT /
+    /// G-FORCED-1D. Passes when `|m_bdpt - m_mult| <= 3*sqrt(se_a^2+se_b^2)
+    /// + 0.05*max`; also prints both CVs so the variance win is visible.
+    /// Env: BDPT_SEEDS, BDPT_PHOTONS, BDPT_SZA, BDPT_TAU, BDPT_WL.
+    #[test]
+    #[ignore = "G-BDPT-1D: heavy MC. run: cargo test -p twilight-cpu --release -- --ignored --nocapture g_bdpt_under_1d_cloud_matches_multiple"]
+    fn g_bdpt_under_1d_cloud_matches_multiple() {
+        use twilight_core::photon;
+        let getenv = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
+        let seeds: usize = getenv("BDPT_SEEDS", "24").parse().unwrap();
+        let photons: usize = getenv("BDPT_PHOTONS", "4000").parse().unwrap();
+        let sza: f64 = getenv("BDPT_SZA", "103").parse().unwrap();
+        let tau_star: f64 = getenv("BDPT_TAU", "3").parse().unwrap();
+        let wl: f64 = getenv("BDPT_WL", "550").parse().unwrap();
+
+        let atm = deep_atm_1d(tau_star);
+        let w = wl_index(&atm, wl);
+        // Scalar config -> the ALIS chain (the only chain with BDPT).
+        let config = deep_config(photons, false);
+        let (obs, sun, view) = compute_geometry(&config, sza);
+
+        // Diagnostic: BDPT_FORCE_GAS=1 drops cloud-vertex scoring (biased) to
+        // attribute the variance tail. Default off = correct estimator.
+        if std::env::var("BDPT_FORCE_GAS").as_deref() == Ok("1") {
+            twilight_core::photon::BDPT_FORCE_GAS_VERTICES
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Phase 2 (i): deck-aware light importance boost (default 1.0 = off).
+        let deck_boost: f64 = std::env::var("BDPT_DECK_BOOST")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
+        twilight_core::photon::BDPT_DECK_IMPORTANCE_BOOST
+            .store(deck_boost.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        twilight_core::photon::BDPT_CLOUD_VERTEX_COUNT
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        // Phase 2: active light-subpath vertex count (1 or 2). Default 1.
+        let verts: usize = std::env::var("BDPT_VERTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        twilight_core::photon::BDPT_ACTIVE_LIGHT_VERTS
+            .store(verts, std::sync::atomic::Ordering::Relaxed);
+
+        // Spike-attribution gates (scoring-only, RNG-neutral; BIASED when
+        // narrowed -- attribution runs only). Terms sum to the full run.
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let geti = |k: &str, d: usize| -> usize {
+                std::env::var(k).ok().and_then(|s| s.parse().ok()).unwrap_or(d)
+            };
+            twilight_core::photon::BDPT_DIAG_NEE_MIN_BOUNCE
+                .store(geti("BDPT_NEE_MIN", 0), Relaxed);
+            twilight_core::photon::BDPT_DIAG_NEE_MAX_BOUNCE
+                .store(geti("BDPT_NEE_MAX", usize::MAX), Relaxed);
+            twilight_core::photon::BDPT_DIAG_SPLIT_NEE_OFF
+                .store(std::env::var("BDPT_SPLIT_OFF").as_deref() == Ok("1"), Relaxed);
+            twilight_core::photon::BDPT_DIAG_GROUND_NEE_OFF
+                .store(std::env::var("BDPT_GROUND_OFF").as_deref() == Ok("1"), Relaxed);
+            twilight_core::photon::BDPT_DIAG_CONNECTIONS_OFF
+                .store(std::env::var("BDPT_CONN_OFF").as_deref() == Ok("1"), Relaxed);
+            // BDPT_DIAG=1: arm the weight-anatomy probe at the scored w.
+            twilight_core::photon::BDPT_DIAG_SCORE_WL.store(
+                if std::env::var("BDPT_DIAG").as_deref() == Ok("1") {
+                    w
+                } else {
+                    usize::MAX
+                },
+                Relaxed,
+            );
+            twilight_core::photon::BDPT_DIAG_MAX_C.store(0, Relaxed);
+        }
+        // BDPT_SEED_ONLY=idx: run just that seed index (its salt depends only
+        // on the index, so the run reproduces the same seed's value exactly).
+        // BDPT_SEED_START=k: run seed indices k..k+seeds (pool independent
+        // batches across runs that individually fit the background cap).
+        let seed_only: Option<usize> = std::env::var("BDPT_SEED_ONLY")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let seed_start: usize = std::env::var("BDPT_SEED_START")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let seed_list: Vec<usize> = match seed_only {
+            Some(idx) => vec![idx],
+            None => (seed_start..seed_start + seeds).collect(),
+        };
+        let seeds = seed_list.len();
+
+        // Arm A: BDPT-on ALIS under the 1D deck (field = None).
+        // BDPT_STOKES=1: run the polarized STOKES hybrid instead -- the
+        // EXACT deep-referee estimator (hybrid_perwl with seed_salt), to
+        // validate the chain-connection port on the referee path itself.
+        let stokes_arm = std::env::var("BDPT_STOKES").as_deref() == Ok("1");
+        let stokes_config = deep_config(photons, true);
+        let a: Vec<f64> = seed_list
+            .into_par_iter()
+            .map(|seed| {
+                if stokes_arm {
+                    let mut c = stokes_config.clone();
+                    c.seed_salt = seed as u64;
+                    return hybrid_perwl(&atm, &c, sza, None, w);
+                }
+                let salt = (seed as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let sza_bits = mix_salt(sza.to_bits(), salt);
+                let mut rng = sza_bits
+                    .wrapping_add(w as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1);
+                let r = photon::hybrid_scatter_radiance_alis(
+                    &atm, obs, view, sun, photons, &mut rng, None,
+                );
+                if w < SOLAR_IRRADIANCE.len() {
+                    r[w] * SOLAR_IRRADIANCE[w]
+                } else {
+                    r[w]
+                }
+            })
+            .collect();
+        let m_a = a.iter().sum::<f64>() / seeds as f64;
+        let var_a = a.iter().map(|x| (x - m_a).powi(2)).sum::<f64>() / seeds as f64;
+        let se_a = (var_a / seeds as f64).sqrt();
+
+        // Heavy-tail diagnostic: sort per-seed values to expose skew.
+        let mut sorted = a.clone();
+        sorted.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let amin = sorted[0];
+        let amed = sorted[seeds / 2];
+        let amax = sorted[seeds - 1];
+        let cv_a = if m_a.abs() > 1e-30 {
+            var_a.sqrt() / m_a.abs()
+        } else {
+            0.0
+        };
+        let max_over_mean = if m_a.abs() > 1e-30 { amax / m_a } else { 0.0 };
+        let n_tiny = a.iter().filter(|&&x| x < 0.01 * m_a).count();
+
+        // Optional analog Multiple reference (slow; BDPT_ANALOG=1 to include).
+        if std::env::var("BDPT_ANALOG").as_deref() == Ok("1") {
+            let (mb, sb) = perwl_mean_se(&atm, &config, sza, None, w, seeds as u64, true);
+            let cvb = if mb.abs() > 1e-30 {
+                sb * (seeds as f64).sqrt() / mb.abs()
+            } else {
+                0.0
+            };
+            eprintln!("BDPTMULT m={mb:.4e} cv={cvb:.3}");
+        }
+
+        // Cached MYSTIC reference (BDPT_REF) for the real unbiasedness check.
+        let myref: f64 = std::env::var("BDPT_REF")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(f64::NAN);
+
+        let cloud_verts = twilight_core::photon::BDPT_CLOUD_VERTEX_COUNT
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Argmax seed index (for BDPT_SEED_ONLY attribution reruns).
+        let argmax_seed = seed_only.unwrap_or_else(|| {
+            a.iter()
+                .enumerate()
+                .max_by(|(_, x), (_, y)| x.partial_cmp(y).unwrap())
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        });
+        eprintln!(
+            "BDPTCSV tau={tau_star} sza={sza} wl={wl} seeds={seeds} photons={photons} \
+             deck_boost={deck_boost} verts={verts} | \
+             m={m_a:.4e} se={se_a:.3e} cv={cv_a:.3} | \
+             min={amin:.2e} med={amed:.2e} max={amax:.2e} max/mean={max_over_mean:.1} \
+             n<1%mean={n_tiny}/{seeds} argmax_seed={argmax_seed} | \
+             cloud_verts={cloud_verts} | \
+             MYSTIC={myref:.3e} ratio={:.3}",
+            m_a / myref
+        );
+
+        // Weight-anatomy report (BDPT_DIAG=1): the factor anatomy of the
+        // max-contribution main-particle NEE at the scored wavelength.
+        if std::env::var("BDPT_DIAG").as_deref() == Ok("1") {
+            use std::sync::atomic::Ordering::Relaxed;
+            let g = |i: usize| {
+                f64::from_bits(twilight_core::photon::BDPT_DIAG_MAX_INFO[i].load(Relaxed))
+            };
+            eprintln!(
+                "BDPTDIAG max_c={:.3e} hero_w={:.3e} wr_w={:.3e} t_suns={:.3e} \
+                 phase={:.3e} bounce={} alt_km={:.1} n_rr={} rr_factor={:.3e} \
+                 vspg_factor={:.3e} et_factor={:.3e} hero_wl={} nee_weight={:.3e}",
+                f64::from_bits(twilight_core::photon::BDPT_DIAG_MAX_C.load(Relaxed)),
+                g(0),
+                g(1),
+                g(2),
+                g(3),
+                g(4) as i64,
+                g(5) / 1000.0,
+                g(6) as i64,
+                g(7),
+                g(8),
+                g(9),
+                g(10) as i64,
+                g(11),
+            );
+        }
+    }
+
     /// Variance-ledger harness: seed-CV of the production STOKES hybrid
     /// per referee wavelength, env-configured (CV_FIELD = synthetic |
     /// padborg, CV_SZAS, CV_SEEDS, CV_PHOTONS). Prints

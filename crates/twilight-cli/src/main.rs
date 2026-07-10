@@ -3505,6 +3505,14 @@ fn cmd_render(sza: f64, width: u32, height: u32, rays: usize, out: &str) {
 fn main() {
     let cli = Cli::parse();
 
+    // Estimator A/B switch: TWILIGHT_BDPT_CONN_OFF=1 disables the deep-SZA
+    // chain-vertex connection estimator entirely (pre-connection engine),
+    // for criterion-recalibration comparisons. Default: connections on.
+    if std::env::var("TWILIGHT_BDPT_CONN_OFF").as_deref() == Ok("1") {
+        twilight_core::photon::BDPT_CHAIN_CONN_DISABLE
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     match cli.command {
         Commands::Solar {
             lat,

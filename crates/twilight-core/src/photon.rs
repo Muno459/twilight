@@ -1630,7 +1630,7 @@ struct SplitParticleAlis {
 /// Tested with 2 vertices: regressed SZA 100-108 CV by 2.7-8.6x. The second
 /// vertex produces rare high-weight connections that inflate both mean and
 /// variance. Confirmed twice (once before MIS fix, once after).
-const BDPT_MAX_LIGHT_VERTICES: usize = 1;
+const BDPT_MAX_LIGHT_VERTICES: usize = 2;
 
 /// Number of independent light subpaths traced per call to
 /// `hybrid_scatter_radiance_alis`. With BDPT_MAX_LIGHT_VERTICES=1, each
@@ -1673,13 +1673,51 @@ const BDPT_SZA_START: f64 = 99.0;
 /// SZA at which BDPT reaches full strength.
 const BDPT_SZA_FULL: f64 = 105.0;
 
+/// TOA entry window of a light-subpath sampler: r_frac uniform on
+/// [1 - r_delta, 1) (terminator rim), entry azimuth uniform within
+/// +-phi_half of the observer's projected direction. The MIS densities'
+/// support tests must use the SAME window as the sampler that produced
+/// the vertices, so the window travels with them explicitly.
+#[derive(Clone, Copy)]
+struct BdptEntryWindow {
+    r_delta: f64,
+    phi_half: f64,
+}
+
+/// Narrow window for the LOS-step connections (order 2): concentrated at
+/// the rim nearest the observer, where order-2 connection transmittance
+/// is non-negligible.
+const BDPT_LOS_WINDOW: BdptEntryWindow = BdptEntryWindow {
+    r_delta: 0.03,
+    phi_half: core::f64::consts::PI / 16.0,
+};
+
+/// Window for the chain-vertex connection registry (orders >= 3).
+///
+/// MEASURED (2026-07-08, SZA103 tau*=3 seeds 32-63): a WIDE window
+/// (r_delta 0.10, phi_half pi/4) was tried to cover residual sun-run
+/// seeds and made things strictly worse -- the 13x larger area diluted
+/// every connection (median seed fell 5x, near-zero seeds returned)
+/// while the sun-run tail survived UNCHANGED, because the balance weight
+/// correctly keeps NEE dominant at efficient last hops (the Veach
+/// balance for this family: prefix pdfs cancel, only the last-vertex
+/// densities compare; a rare walk that already stands next to sunlit
+/// air extends there with p_ext >> p_L regardless of window). The
+/// residual tail is the genuine deep-eye-prefix path family, which no
+/// last-vertex connection can sample efficiently; window width is not
+/// the lever. Kept at the narrow (LOS) window, where the corridor's
+/// conn density is strong.
+const BDPT_REG_WINDOW: BdptEntryWindow = BdptEntryWindow {
+    r_delta: 0.03,
+    phi_half: core::f64::consts::PI / 16.0,
+};
+
 /// A recorded scatter vertex on a light subpath.
 ///
 /// Stores position, incoming direction, shell index, hero weight, and
 /// per-wavelength ALIS weight ratios. The incoming direction is needed
 /// to evaluate the phase function at the connection point.
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // pdf_fwd reserved for balance-heuristic MIS refinement
 struct LightVertex {
     /// Position of the scatter event (in Earth-centered coordinates).
     pos: Vec3,
@@ -1695,9 +1733,14 @@ struct LightVertex {
     hero_weight: f64,
     /// ALIS weight ratios: `weight_ratio[w] = weight_w / hero_weight`.
     weight_ratio: [f64; 64],
-    /// Forward PDF (probability density of generating this vertex from the
-    /// light source). Used for MIS weight computation.
-    pdf_fwd: f64,
+    /// Whether this vertex is a gray-cloud scatter (vs a gas scatter),
+    /// drawn from the combined-channel extinction conditional. A cloud
+    /// vertex uses the gray HG phase (wavelength-flat) for the connection
+    /// and is pure-scattering (no gas SSA); see the `use_forced`
+    /// derivation this mirrors.
+    is_cloud: bool,
+    /// Gray-cloud HG asymmetry at this vertex (valid iff `is_cloud`).
+    g_cloud: f64,
 }
 
 /// Returns the SZA-adaptive BDPT strength fraction.
@@ -1710,6 +1753,358 @@ fn bdpt_strength(sza_deg: f64) -> f64 {
         (sza_deg - (BDPT_SZA_START + BDPT_SZA_FULL) * 0.5)
             / ((BDPT_SZA_FULL - BDPT_SZA_START) * 0.25),
     )
+}
+
+/// Sun-facing disk basis + observer-projected preferred azimuth used by the
+/// light-subpath entry sampler. Factored out so the MIS density
+/// (`bdpt_light_vertex_density`) tests its support window in EXACTLY the
+/// sampler's coordinates -- any mismatch would zero-weight paths the sampler
+/// can generate (or vice versa) and bias the blend.
+fn bdpt_entry_frame(sun_dir: Vec3, observer_pos: Vec3) -> (Vec3, Vec3, f64) {
+    // The disk normal is -sun_dir (pointing toward the sun from the disk).
+    let disk_normal = sun_dir.scale(-1.0); // points toward sun
+    let arbitrary = if libm::fabs(disk_normal.y) < 0.9 {
+        Vec3::new(0.0, 1.0, 0.0)
+    } else {
+        Vec3::new(1.0, 0.0, 0.0)
+    };
+    let disk_u = disk_normal.cross(arbitrary).normalize();
+    let disk_v = disk_normal.cross(disk_u);
+
+    // Project observer position onto the terminator plane to get the
+    // preferred azimuthal direction for entry point sampling.
+    let obs_proj_u = observer_pos.dot(disk_u);
+    let obs_proj_v = observer_pos.dot(disk_v);
+    let obs_proj_len = libm::sqrt(obs_proj_u * obs_proj_u + obs_proj_v * obs_proj_v);
+    let pref_phi = if obs_proj_len > 1e-6 {
+        libm::atan2(obs_proj_v, obs_proj_u)
+    } else {
+        0.0
+    };
+    (disk_u, disk_v, pref_phi)
+}
+
+/// Per-run context for the bounce-0 connection<->NEE balance-heuristic MIS
+/// (BDPT under clear sky / 1D deck, single light vertex).
+///
+/// The BDPT connection and the backward chain's bounce-0 NEE estimate the
+/// SAME order-2 integral (sun -> X -> Y -> observer, Y on the LOS). The
+/// per-path weight replaces the former fixed SZA-sigmoid blend: near
+/// connections (small |X - Y|) are deferred to NEE, which samples them
+/// without the 1/d^2 blow-up, cancelling the heavy-tail spike that
+/// dominated the deep-cell variance.
+///
+/// The weight is a pure function W(X, coarse LOS step) evaluated from this
+/// shared context by BOTH sides, so w_bdpt + w_back = 1 holds exactly per
+/// path (partition of unity => the blend is unbiased for ANY density
+/// approximations inside the weight; their accuracy affects variance only).
+/// Deliberate approximations, identical on both sides: VSPG's within-beam
+/// redistribution and the Dwivedi flight stretch are omitted, and all
+/// weight-internal pdfs/transmittances use one fixed reference channel
+/// (`ref_wl`) -- a hero-dependent weight would break the partition across
+/// the two sides' different hero schedules.
+struct BdptMisCtx {
+    sun_dir: Vec3,
+    disk_u: Vec3,
+    disk_v: Vec3,
+    pref_phi: f64,
+    toa_radius: f64,
+    /// Fixed reference channel for weight-internal quantities (num_wl / 2,
+    /// the same mid-grid convention as the forward importance map).
+    ref_wl: usize,
+    /// Light-subpath count (the BDPT technique's per-step sample count).
+    n_light: f64,
+}
+
+/// Coarse-LOS-step half of the MIS weight arguments: the step's segment
+/// endpoints and the backward technique's chain count for that step.
+#[derive(Clone, Copy)]
+struct BdptMisSeg {
+    seg_a: Vec3,
+    seg_b: Vec3,
+    n_eye: f64,
+}
+
+/// Volumetric density (up to factors common with the backward technique) of
+/// the 1-vertex light subpath placing its forced-scatter vertex at `x`:
+///
+///   p_L(X) = T_ref(E -> X) / (entry_weight(E) * (1 - T_ref(E -> B)))
+///
+/// where E is X back-projected to the TOA along +sun_dir (the beam is
+/// collimated, so X determines its entry point exactly), B is the beam's
+/// far boundary (ground or TOA exit) and entry_weight the sampler's area
+/// weight (the per-perpendicular-area entry density is cos_inc/entry_weight
+/// divided by cos_inc). sigma_scat(X) and the vertex-type conditional are
+/// dropped: they multiply the backward density identically and cancel in
+/// the balance ratio.
+///
+/// Returns 0.0 outside the entry sampler's (r_frac, phi) support window.
+/// REQUIRED for unbiasedness: a nonzero weight where the light sampler
+/// cannot generate X would down-weight the backward side with nothing
+/// compensating. `window` must be the window of the SAMPLER whose density
+/// is being evaluated (LOS connections: BDPT_LOS_WINDOW; chain-connection
+/// registry: BDPT_REG_WINDOW).
+fn bdpt_light_vertex_density(
+    atm: &AtmosphereModel,
+    ctx: &BdptMisCtx,
+    window: &BdptEntryWindow,
+    x: Vec3,
+) -> f64 {
+    use crate::geometry::ray_sphere_intersect;
+    use crate::single_scatter::transmittance_between_points_spectrum;
+
+    // Back-project X to its TOA entry point along +sun_dir.
+    let entry = match ray_sphere_intersect(x, ctx.sun_dir, ctx.toa_radius) {
+        Some(hit) if hit.t_far > 0.0 => x + ctx.sun_dir * hit.t_far,
+        _ => return 0.0,
+    };
+    let z_along_sun = entry.dot(ctx.sun_dir);
+    if z_along_sun <= 0.0 {
+        return 0.0; // dark-side projection: outside the sampler's support
+    }
+    let toa_r_sq = ctx.toa_radius * ctx.toa_radius;
+    let r_disk_sq = (toa_r_sq - z_along_sun * z_along_sun).max(0.0);
+    let r_frac = libm::sqrt(r_disk_sq) / ctx.toa_radius;
+    if r_frac < 1.0 - window.r_delta || r_frac >= 1.0 {
+        return 0.0;
+    }
+    let e_u = entry.dot(ctx.disk_u);
+    let e_v = entry.dot(ctx.disk_v);
+    let mut dphi = libm::atan2(e_v, e_u) - ctx.pref_phi;
+    if dphi > core::f64::consts::PI {
+        dphi -= 2.0 * core::f64::consts::PI;
+    } else if dphi < -core::f64::consts::PI {
+        dphi += 2.0 * core::f64::consts::PI;
+    }
+    if libm::fabs(dphi) > window.phi_half {
+        return 0.0;
+    }
+    let entry_weight = window.r_delta * 2.0 * window.phi_half * toa_r_sq * r_frac;
+
+    // Combined-channel (gas + gray 1D deck Beer-Lambert) transmittances at
+    // the reference channel. Passing ref_wl + 1 computes only the channels
+    // up to and including ref_wl (the spectrum helper takes a count).
+    let t_ex = transmittance_between_points_spectrum(
+        atm,
+        entry,
+        x,
+        ctx.ref_wl + 1,
+        None,
+        CloudTransmittance::BeerLambert,
+    )[ctx.ref_wl];
+
+    // Beam far boundary B along -sun_dir from the entry (ground truncates;
+    // pulled back 1 m so the helper's ground-block test cannot trip).
+    let beam_dir = ctx.sun_dir.scale(-1.0);
+    let t_exit = match ray_sphere_intersect(entry, beam_dir, atm.surface_radius()) {
+        Some(g) if g.t_near > 1e-3 => g.t_near,
+        _ => match ray_sphere_intersect(entry, beam_dir, ctx.toa_radius) {
+            Some(t) if t.t_far > 0.0 => t.t_far,
+            _ => return 0.0,
+        },
+    };
+    let boundary = entry + beam_dir * (t_exit - 1.0).max(0.0);
+    let t_eb = transmittance_between_points_spectrum(
+        atm,
+        entry,
+        boundary,
+        ctx.ref_wl + 1,
+        None,
+        CloudTransmittance::BeerLambert,
+    )[ctx.ref_wl];
+
+    // Forced-scatter truncation normalization; the 1e-9 floor guards the
+    // near-vacuum beam (1 - T -> 0), where w_bdpt -> 1 is the right limit
+    // anyway (the backward technique has ~no chance of sampling such X).
+    let denom = entry_weight * (1.0 - t_eb).max(1e-9);
+    (t_ex / denom).max(0.0)
+}
+
+/// Balance-heuristic BDPT weight for the order-2 path with light vertex X,
+/// paired against the coarse LOS step `seg` (whose chains and connections
+/// estimate the same per-step integral):
+///
+///   w_bdpt = n_L p_L / (n_L p_L + n_E p_E),
+///   p_E(X | step) = q_seed(Y_c, omega) * T_ref(Y_c -> X) / d^2
+///
+/// with Y_c the CLOSEST point of the step segment to X (not the midpoint:
+/// the closest point bounds the g_term_ds near-segment singularity over the
+/// whole step, and makes the weight constant across the step so the
+/// partition of unity is exact per (X, step) regardless of each side's
+/// in-step quadrature). q_seed is the backward chain's actual seed-mixture
+/// direction pdf at Y_c, evaluated at the reference channel.
+///
+/// The complementary backward weight is 1 - w_bdpt, computed by the chain
+/// through this SAME function.
+fn bdpt_mis_weight(
+    atm: &AtmosphereModel,
+    ctx: &BdptMisCtx,
+    seg: &BdptMisSeg,
+    x: Vec3,
+    p_light: f64,
+) -> f64 {
+    use crate::single_scatter::transmittance_between_points_spectrum;
+
+    if p_light <= 0.0 {
+        return 0.0;
+    }
+
+    // Closest point Y_c on the step segment to X.
+    let ab = seg.seg_b - seg.seg_a;
+    let len_sq = ab.length_sq();
+    let t = if len_sq > 0.0 {
+        ((x - seg.seg_a).dot(ab) / len_sq).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let yc = seg.seg_a + ab * t;
+    let dxy = x - yc;
+    let d_sq = dxy.length_sq().max(100.0); // 10 m floor, mirrors the connection gate
+    let omega = dxy.scale(1.0 / libm::sqrt(d_sq));
+
+    // Backward seed-mixture direction pdf at Y_c toward X, mirroring the
+    // chain's seed construction exactly (geometry-only inputs; the phase
+    // component uses the reference channel's optics).
+    let q_dir = match atm.shell_index(yc.length()) {
+        Some(shell) => {
+            let local_up = yc.normalize();
+            let cos_sza = ctx.sun_dir.dot(local_up);
+            let bp = branch_params_for_sza(cos_sza);
+            let alpha_p = 1.0 - bp.zenith_frac;
+            let alpha_z = bp.zenith_frac * (1.0 - bp.term_share);
+            let alpha_t = bp.zenith_frac * bp.term_share;
+            let term_axis = terminator_axis(local_up, ctx.sun_dir, bp.tilt_rad);
+            seed_mixture_pdf(
+                omega,
+                ctx.sun_dir,
+                local_up,
+                term_axis,
+                &bp,
+                alpha_p,
+                alpha_z,
+                alpha_t,
+                0.0,
+                &atm.optics[shell][ctx.ref_wl],
+            )
+        }
+        // Y_c outside the shell grid (LOS endpoint pokes out): any
+        // consistent fallback keeps the partition exact; isotropic is fine.
+        None => INV_4PI,
+    };
+
+    let t_yx = transmittance_between_points_spectrum(
+        atm,
+        yc,
+        x,
+        ctx.ref_wl + 1,
+        None,
+        CloudTransmittance::BeerLambert,
+    )[ctx.ref_wl];
+
+    let p_eye = seg.n_eye * q_dir * t_yx / d_sq;
+    let p_l = ctx.n_light * p_light;
+    p_l / (p_l + p_eye)
+}
+
+/// Maximum light-vertex registry size for chain-vertex connections.
+/// A stride-sampled subset of the light subpaths' vertices (each an
+/// independent importance-weighted sample of the light-transport process),
+/// kept from the guide-training pass and connected to backward-chain
+/// vertices at every bounce.
+const BDPT_REG_MAX: usize = 512;
+
+/// Per-run + per-coarse-step MIS arguments handed to the backward chain.
+///
+/// `ctx`/`seg` drive the bounce-0 NEE <-> LOS-connection pairing (order 2).
+/// `reg`/`reg_p` drive the chain-vertex <-> light-vertex connections
+/// (orders k+3 >= 3): conn-at-X_k pairs with NEE-at-X_{k+1}, each order
+/// getting its own exact partition of unity through
+/// `bdpt_chain_conn_weight`, evaluated identically on both sides.
+struct BdptChainMisArgs<'a> {
+    ctx: &'a BdptMisCtx,
+    seg: BdptMisSeg,
+    reg: &'a [LightVertex],
+    reg_p: &'a [f64],
+    /// Success fraction of the registry pass: reg.len() / attempts.
+    /// The registry keeps only subpaths that yielded a vertex, so a
+    /// uniform pick estimates the SUCCESS-CONDITIONED mean; the correct
+    /// light-process expectation averages over ATTEMPTS (empty subpaths
+    /// contribute zero), so every connection score carries this factor.
+    /// (Found 2026-07-08: omitting it overcounted connections by
+    /// 1/P(success) = +29% at SZA 99.5 against the fixed-blend estimator
+    /// at 4.8 sigma, growing with depth exactly as observed at the deep
+    /// referee cells.)
+    reg_frac: f64,
+}
+
+/// Chain-connection arguments for the POLARIZED (Stokes) chain: the same
+/// registry pairing as `BdptChainMisArgs` minus the bounce-0 LOS segment
+/// (the polarized driver has no LOS-step BDPT connections, so order 2
+/// keeps its plain NEE and only orders >= 3 gain the connection pair).
+/// `ctx.ref_wl` is the traced wavelength itself (the polarized driver is
+/// per-wavelength), so the weight-internal densities are exact rather
+/// than a reference-channel proxy.
+struct StokesConnArgs<'a> {
+    ctx: &'a BdptMisCtx,
+    reg: &'a [LightVertex],
+    reg_p: &'a [f64],
+    /// Success fraction of the registry pass (see BdptChainMisArgs::reg_frac).
+    reg_frac: f64,
+}
+
+/// Balance-heuristic weight for the chain-vertex connection strategy on the
+/// order-(k+3) path whose light-most scatter vertex is `v` (a light vertex
+/// for the connection strategy; the bounce-(k+1) chain vertex for the NEE
+/// strategy), extended from chain vertex X_k = `from_pos`:
+///
+///   w_conn = p_L(v) / (p_L(v) + p_ext(v | X_k)),
+///   p_ext  = phase_ref(cos(dir_in_at_Xk, Xk->v)) * INV_4PI
+///            * T_ref(Xk -> v) / d^2
+///
+/// Both strategies draw exactly one sample of `v` per chain bounce (the
+/// connection picks one registry vertex; the chain's own flight places one
+/// X_{k+1}), so no count factors appear. sigma_scat(v) and the vertex-type
+/// conditional are common to both densities and dropped. The direction pdf
+/// uses the ref-channel phase at X_k (gas) or the gray HG lobe (cloud
+/// collision at X_k) -- a proxy for the chain's full phase+Dwivedi+guide
+/// mixture, identical on both sides (density approximations inside a
+/// partition of unity affect variance only).
+#[allow(clippy::too_many_arguments)]
+fn bdpt_chain_conn_weight(
+    atm: &AtmosphereModel,
+    ctx: &BdptMisCtx,
+    from_pos: Vec3,
+    from_dir_in: Vec3,
+    from_is_cloud: bool,
+    from_g_cloud: f64,
+    from_shell: usize,
+    v_pos: Vec3,
+    p_light_v: f64,
+) -> f64 {
+    use crate::single_scatter::transmittance_between_points_spectrum;
+
+    if p_light_v <= 0.0 {
+        return 0.0;
+    }
+    let diff = v_pos - from_pos;
+    let d_sq = diff.length_sq().max(100.0); // 10 m floor, as elsewhere
+    let dir = diff.scale(1.0 / libm::sqrt(d_sq));
+    let cos_theta = from_dir_in.dot(dir);
+    let p_dir = if from_is_cloud {
+        cloud_phase_value(cos_theta, from_g_cloud) * INV_4PI
+    } else {
+        scalar_phase_value(cos_theta, &atm.optics[from_shell][ctx.ref_wl]) * INV_4PI
+    };
+    let t_ref = transmittance_between_points_spectrum(
+        atm,
+        from_pos,
+        v_pos,
+        ctx.ref_wl + 1,
+        None,
+        CloudTransmittance::BeerLambert,
+    )[ctx.ref_wl];
+    let p_ext = p_dir * t_ref / d_sq;
+    p_light_v / (p_light_v + p_ext)
 }
 
 /// Trace a single light subpath from the sunlit TOA into the atmosphere.
@@ -1746,17 +2141,15 @@ fn trace_light_subpath(
     vertices: &mut [LightVertex; BDPT_MAX_LIGHT_VERTICES],
     subpath_idx: usize,
     num_subpaths: usize,
-    // UNUSED, and honestly so: this walk is forced-scattering with NO
-    // cloud-vertex handling, while its connection legs
-    // (transmittance_between_points_spectrum) are cloud-attenuated. BDPT
-    // is disabled whenever ANY gray cloud channel is present (3D field or
-    // 1D shell deck; see `bdpt_active` in the driver). NOTE: the shared
-    // scout/advance machinery is now combined-channel (gas + gray 1D
-    // cloud), so under a deck this walk would sample the combined tau but
-    // score every vertex as gas -- converting it needs the same vertex-
-    // type draw the chains gained (photon.rs `use_forced` derivation);
-    // until then the driver gate stands. The parameter stays so the
-    // conversion lands without another signature change.
+    // TOA entry window of this sampler (LOS connections: narrow;
+    // chain-connection registry: wide). The matching MIS density must be
+    // evaluated with the SAME window.
+    window: &BdptEntryWindow,
+    // UNUSED for 3D fields: this walk handles the 1D deck via the
+    // combined-channel vertex-type draw (see below), but has no 3D-field
+    // DDA; BDPT stays off when a 3D field is present (`bdpt_active` gates
+    // on field.is_none()). The parameter stays so a future 3D conversion
+    // lands without another signature change.
     _field: Option<&Cloud3DField>,
 ) -> usize {
     let toa_radius = atm.toa_radius();
@@ -1778,27 +2171,10 @@ fn trace_light_subpath(
     // For the azimuthal direction on the disk, we importance-sample toward
     // the observer's projected position on the terminator plane.
 
-    // Build coordinate system on the sun-facing disk.
-    // The disk normal is -sun_dir (pointing toward the sun from the disk).
-    let disk_normal = sun_dir.scale(-1.0); // points toward sun
-    let arbitrary = if libm::fabs(disk_normal.y) < 0.9 {
-        Vec3::new(0.0, 1.0, 0.0)
-    } else {
-        Vec3::new(1.0, 0.0, 0.0)
-    };
-    let disk_u = disk_normal.cross(arbitrary).normalize();
-    let disk_v = disk_normal.cross(disk_u);
-
-    // Project observer position onto the terminator plane to get preferred
-    // azimuthal direction for entry point sampling.
-    let obs_proj_u = observer_pos.dot(disk_u);
-    let obs_proj_v = observer_pos.dot(disk_v);
-    let obs_proj_len = libm::sqrt(obs_proj_u * obs_proj_u + obs_proj_v * obs_proj_v);
-    let pref_phi = if obs_proj_len > 1e-6 {
-        libm::atan2(obs_proj_v, obs_proj_u)
-    } else {
-        0.0
-    };
+    // Sun-facing disk basis + observer-projected preferred azimuth,
+    // shared with the MIS density (bdpt_light_vertex_density) so the
+    // entry-window support test uses EXACTLY the sampler's coordinates.
+    let (disk_u, disk_v, pref_phi) = bdpt_entry_frame(sun_dir, observer_pos);
 
     // Sample radial position on the illuminated disk. Concentrate near the
     // terminator (r_frac -> 1.0) because:
@@ -1810,10 +2186,10 @@ fn trace_light_subpath(
     //    projection, well within connection range.
     //
     // Sample r_frac uniformly from [1-delta, 1) where delta is small.
-    // PDF(r_frac) = 1/delta on [1-delta, 1).
-    const BDPT_R_DELTA: f64 = 0.03; // r_frac in [0.97, 1.0)
+    // PDF(r_frac) = 1/delta on [1-delta, 1). (The window is a parameter:
+    // the MIS density's support test must match this sampler exactly.)
     let xi_r = xorshift_f64(&mut rng.tau);
-    let r_frac = 1.0 - BDPT_R_DELTA * xi_r; // uniform in [1-delta, 1]
+    let r_frac = 1.0 - window.r_delta * xi_r; // uniform in [1-delta, 1]
                                             // Clamp away from exactly 1.0 to avoid r_sq >= toa_r_sq guard
     let r_frac = if r_frac > 0.9999 { 0.9999 } else { r_frac };
     let r_disk = toa_radius * r_frac;
@@ -1835,14 +2211,13 @@ fn trace_light_subpath(
     // is within ~1000-1400 km of the observer's high-altitude LOS steps.
     //
     // PDF(phi) = 1 / (2 * delta_phi) on [pref_phi - delta, pref_phi + delta].
-    const BDPT_PHI_HALF_WIDTH: f64 = core::f64::consts::PI / 16.0;
     // Stratified jittered sampling: divide the azimuthal strip into
     // num_subpaths equal bins and place this subpath's sample within
     // its assigned bin. This ensures uniform terminator coverage and
     // eliminates random clustering of entry points.
-    let bin_width = 2.0 * BDPT_PHI_HALF_WIDTH / num_subpaths as f64;
+    let bin_width = 2.0 * window.phi_half / num_subpaths as f64;
     let xi_phi = xorshift_f64(&mut rng.tau);
-    let phi_disk = pref_phi - BDPT_PHI_HALF_WIDTH + (subpath_idx as f64 + xi_phi) * bin_width;
+    let phi_disk = pref_phi - window.phi_half + (subpath_idx as f64 + xi_phi) * bin_width;
 
     // Position on the disk (in sun-facing plane at distance toa_radius from center).
     let disk_x = r_disk * libm::cos(phi_disk);
@@ -1897,15 +2272,10 @@ fn trace_light_subpath(
     if cos_inc < 1e-10 {
         return 0; // grazing entry, degenerate
     }
-    let entry_weight = BDPT_R_DELTA * 2.0 * BDPT_PHI_HALF_WIDTH * toa_r_sq * r_frac;
+    let entry_weight = window.r_delta * 2.0 * window.phi_half * toa_r_sq * r_frac;
 
-    // Entry PDF per unit sphere area (for MIS pdf_accumulated tracking).
-    // p(A) = cos_inc / entry_weight
-    let entry_pdf = if entry_weight > 1e-30 {
-        cos_inc / entry_weight
-    } else {
-        1e-30
-    };
+    // (The per-path MIS recomputes the light-subpath density from the vertex
+    // position via bdpt_light_vertex_density; no running pdf is tracked.)
 
     // Initialize hero weight and ALIS weight ratios.
     let mut hero_weight = entry_weight;
@@ -1922,7 +2292,6 @@ fn trace_light_subpath(
     let inward = entry_pos.normalize().scale(-1.0); // unit vector toward Earth center
     let mut pos = entry_pos + inward * 10.0; // 10 m radially inward
     let mut dir = entry_dir;
-    let mut pdf_accumulated = entry_pdf;
 
     // Walk through atmosphere using forced scattering with VSPG.
     //
@@ -1938,7 +2307,8 @@ fn trace_light_subpath(
     //
     // The observer's SZA drives VSPG importance: at SZA 103+, high-altitude
     // shells get up to 50x the natural sampling probability.
-    for _bounce in 0..BDPT_MAX_LIGHT_VERTICES {
+    let active_verts = bdpt_active_light_verts();
+    for _bounce in 0..active_verts {
         // Scout: compute total optical depth and VSPG segments along ray.
         // Uses observer's SZA for importance so that high-altitude scatters
         // are boosted (where connections to the deep-twilight eye path work).
@@ -1947,6 +2317,9 @@ fn trace_light_subpath(
             tau_hi: 0.0,
             importance: 1.0,
         }; VSPG_MAX_SEGMENTS];
+        let deck_boost = f64::from_bits(
+            BDPT_DECK_IMPORTANCE_BOOST.load(core::sync::atomic::Ordering::Relaxed),
+        );
         let (tau_maxes, _hit_ground, n_vspg_segs) = scout_with_vspg_segments_alis(
             atm,
             pos,
@@ -1955,6 +2328,7 @@ fn trace_light_subpath(
             num_wl,
             sza_deg_obs,
             &mut vspg_segs,
+            deck_boost,
         );
 
         let tau_max_h = tau_maxes[hero_wl];
@@ -1991,37 +2365,67 @@ fn trace_light_subpath(
         pos = sp;
         dir = sd;
 
-        // ALIS extinction ratio correction at scatter site: accounts for
-        // the fact that each wavelength has different extinction, so the
-        // probability of scattering at this exact position differs.
+        // Combined-channel vertex-type draw (mirrors the `use_forced`
+        // derivation in the backward ALIS chain, photon.rs ~5346). Under a
+        // 1D gray deck the scout/advance already sample the COMBINED (gas +
+        // gray cloud) tau, so a vertex is a cloud scatter with probability
+        // sigma_c / (sigma_c + sigma_gas_hero) at the collision shell. The
+        // draw is taken ONLY when the shell carries cloud, so clear-sky RNG
+        // streams stay bit-identical. Type probabilities cancel the hero's
+        // per-type coefficient, so hero_weight is untouched; the
+        // per-wavelength type mismatch is carried by weight_ratio below.
         let sigma_h = atm.optics[scatter_shell][hero_wl].extinction;
-        if sigma_h > 1e-30 {
-            let tau_h_pos = taus_at_pos[hero_wl];
+        let sigma_c = atm.cloud_extinction[scatter_shell];
+        if sigma_c > 0.0 {
+            // Reachability diagnostic: this light vertex landed in the deck.
+            BDPT_CLOUD_VERTEX_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+        let mut is_cloud = false;
+        let mut g_cloud = 0.0f64;
+        if sigma_c > 0.0 && xorshift_f64(&mut rng.tau) < sigma_c / (sigma_c + sigma_h) {
+            is_cloud = true;
+            // 1D deck: shell-constant gray HG asymmetry (field is None here).
+            g_cloud = atm.cloud_g_scaled;
+        }
+        // Diagnostic attribution only (default off): drop cloud-vertex scoring
+        // while keeping the RNG draw above, to isolate the cloud-vertex share
+        // of the deep-cell variance tail. Biased when enabled.
+        if BDPT_FORCE_GAS_VERTICES.load(core::sync::atomic::Ordering::Relaxed) {
+            is_cloud = false;
+        }
+
+        // ALIS extinction ratio correction at the scatter site. The combined
+        // tau differences ARE the gas differences (the shared gray cloud tau
+        // cancels in taus_at_pos[w] - tau_h_pos): a cloud vertex is gray, so
+        // it carries the transmittance ratio ONLY, while a gas vertex adds
+        // the gas extinction ratio exactly as the gas-only forced flight did.
+        let tau_h_pos = taus_at_pos[hero_wl];
+        if is_cloud {
+            for w in 0..num_wl {
+                weight_ratio[w] *= libm::exp(-(taus_at_pos[w] - tau_h_pos));
+            }
+        } else if sigma_h > 1e-30 {
             for w in 0..num_wl {
                 let sigma_w = atm.optics[scatter_shell][w].extinction;
                 weight_ratio[w] *= (sigma_w / sigma_h) * libm::exp(-(taus_at_pos[w] - tau_h_pos));
             }
         }
 
-        // Apply SSA: probability of scattering vs absorption.
+        // Apply SSA (absorption) at GAS vertices only; a gray cloud vertex is
+        // pure scattering by construction (the deck's absorption is folded
+        // into the shell optics, matching the analog race and the chains).
         let hero_optics = &atm.optics[scatter_shell][hero_wl];
-        hero_weight *= hero_optics.ssa;
-        for w in 0..num_wl {
-            let ssa_ratio = if hero_optics.ssa > 1e-30 {
-                atm.optics[scatter_shell][w].ssa / hero_optics.ssa
-            } else {
-                0.0
-            };
-            weight_ratio[w] *= ssa_ratio;
+        if !is_cloud {
+            hero_weight *= hero_optics.ssa;
+            for w in 0..num_wl {
+                let ssa_ratio = if hero_optics.ssa > 1e-30 {
+                    atm.optics[scatter_shell][w].ssa / hero_optics.ssa
+                } else {
+                    0.0
+                };
+                weight_ratio[w] *= ssa_ratio;
+            }
         }
-
-        // Update forward PDF (isotropic approximation for future MIS).
-        let scatter_pdf = if sigma_h > 1e-30 {
-            sigma_h * INV_4PI
-        } else {
-            INV_4PI
-        };
-        pdf_accumulated *= scatter_pdf;
 
         // Record vertex BEFORE sampling new direction (dir_in = current dir).
         if n_vertices < BDPT_MAX_LIGHT_VERTICES {
@@ -2031,7 +2435,8 @@ fn trace_light_subpath(
                 shell_idx: scatter_shell,
                 hero_weight,
                 weight_ratio,
-                pdf_fwd: pdf_accumulated,
+                is_cloud,
+                g_cloud,
             };
             n_vertices += 1;
         }
@@ -2054,14 +2459,6 @@ fn trace_light_subpath(
                 weight_ratio[w] *= phase_w / phase_hero;
             }
         }
-
-        // Include phase in forward PDF.
-        let phase_fwd = scalar_phase_value(cos_theta, hero_optics) * INV_4PI;
-        pdf_accumulated *= if phase_fwd > 1e-30 {
-            phase_fwd / scatter_pdf
-        } else {
-            1.0
-        };
 
         dir = new_dir;
     }
@@ -2106,6 +2503,105 @@ const VSPG_MAX_SEGMENTS: usize = 128;
 /// the count is a diagnostic aggregate, not a synchronization point.
 pub static VSPG_OVERFLOW_EVENTS: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
+
+/// Diagnostic toggle: when true, the BDPT light subpath scores every vertex
+/// as a GAS vertex even under a deck (dropping cloud-vertex contributions).
+/// This is DELIBERATELY BIASED and exists only to attribute the deep-cell
+/// variance tail (cloud-vertex forward-peaked near-connections vs generic
+/// geometry). Set from twilight-cpu tests; default false (correct estimator).
+pub static BDPT_FORCE_GAS_VERTICES: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Deck-aware light-subpath importance boost (f64 bits; default 1.0 = off).
+/// Multiplies VSPG importance for cloud-carrying shells in the LIGHT subpath
+/// scout only, to test whether the forced-scatter can place vertices in the
+/// deck (Phase 2 (i)). Default 1.0 keeps clear-sky and current deck behavior
+/// bit-identical. Set from twilight-cpu tests.
+pub static BDPT_DECK_IMPORTANCE_BOOST: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0x3FF0_0000_0000_0000); // 1.0f64 bits
+
+/// Diagnostic counter: number of BDPT light-subpath vertices that landed in
+/// the deck (cloud vertices). Zero across a run = the light ray never reaches
+/// the deck, i.e. deck-aware importance cannot help (structural limit).
+pub static BDPT_CLOUD_VERTEX_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Runtime active light-subpath vertex count (1 or 2), capped by
+/// `BDPT_MAX_LIGHT_VERTICES`. Default 1 keeps clear-sky and single-vertex
+/// behavior BIT-IDENTICAL; set to 2 to enable the 2-vertex light subpath
+/// (Phase 2: reach the observer-side deck) plus its connection MIS. Drives
+/// the light-subpath bounce loop AND the backward-chain `bdpt_covered`
+/// coordination, so the two stay consistent.
+pub static BDPT_ACTIVE_LIGHT_VERTS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(1);
+
+/// Runtime active light-vertex count, clamped to `[1, BDPT_MAX_LIGHT_VERTICES]`.
+#[inline]
+fn bdpt_active_light_verts() -> usize {
+    BDPT_ACTIVE_LIGHT_VERTS
+        .load(core::sync::atomic::Ordering::Relaxed)
+        .clamp(1, BDPT_MAX_LIGHT_VERTICES)
+}
+
+/// Spike-attribution diagnostics (BIASED when narrowed; default = full
+/// estimator). These gates zero SCORING only -- every RNG draw is untouched,
+/// so a narrowed run walks bit-identical paths and the per-term totals sum
+/// to the full run's value. Used by the deep-cell tail attribution harness
+/// (g_bdpt_under_1d_cloud_matches_multiple, BDPT_DIAG_* envs).
+///
+/// ALIS-chain NEE contributes only when
+///   NEE_MIN_BOUNCE <= bounce_idx < NEE_MAX_BOUNCE
+/// (bounce_idx = per-particle counter: order k+2 for the main particle).
+pub static BDPT_DIAG_NEE_MIN_BOUNCE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static BDPT_DIAG_NEE_MAX_BOUNCE: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+/// Zero the NEE of split particles (is_main = false) in the ALIS chain.
+pub static BDPT_DIAG_SPLIT_NEE_OFF: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Zero the ALIS chain's ground-reflection NEE + all post-ground scoring.
+pub static BDPT_DIAG_GROUND_NEE_OFF: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Zero the BDPT connection contributions (light subpaths still trace and
+/// still train the path guide, so chain sampling is unchanged).
+pub static BDPT_DIAG_CONNECTIONS_OFF: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Estimator A/B switch: disables the chain-vertex connection machinery
+/// ENTIRELY (no registry, no per-path MIS context) so both chains fall
+/// back to the pre-connection estimator exactly -- unlike
+/// BDPT_DIAG_CONNECTIONS_OFF, which zeroes conn scoring but leaves the
+/// NEE complements active (biased). For A/B production comparisons
+/// (criterion recalibration checks). Default false = connections on.
+pub static BDPT_CHAIN_CONN_DISABLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Weight-anatomy probe: when `BDPT_DIAG_SCORE_WL != usize::MAX`, every
+/// main-particle ALIS NEE at that wavelength index computes its scored
+/// contribution and, on a new per-process maximum, records the factor
+/// anatomy below (f64 bits). Single-threaded per seed in the attribution
+/// harness, so the read-compare-store race is moot. Zero impact when off.
+pub static BDPT_DIAG_SCORE_WL: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+pub static BDPT_DIAG_MAX_C: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+/// Anatomy registers for the max-contribution NEE:
+/// [hero_weight, wr_w, t_suns_w, phase_w, bounce, alt_m,
+///  n_rr, rr_factor, vspg_factor, et_factor, hero_wl, nee_weight]
+pub static BDPT_DIAG_MAX_INFO: [core::sync::atomic::AtomicU64; 12] = [
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+    core::sync::atomic::AtomicU64::new(0),
+];
 
 /// Altitude (meters) below which VSPG importance is 1.0 (no boost).
 /// Below 15 km, the troposphere is dense and chains scatter frequently
@@ -2559,6 +3055,9 @@ fn scout_with_vspg_segments_alis(
     num_wl: usize,
     sza_deg: f64,
     segments: &mut [VspgSegment; VSPG_MAX_SEGMENTS],
+    // Multiplies VSPG importance for cloud-carrying shells (deck-aware light
+    // sampling, Phase 2 (i)). 1.0 = unchanged; used only by the light subpath.
+    deck_boost: f64,
 ) -> ([f64; 64], bool, usize) {
     let surface_radius = atm.surface_radius();
     let num_shells = atm.num_shells;
@@ -2586,12 +3085,16 @@ fn scout_with_vspg_segments_alis(
                 }
                 let hero_tau_shell = tau[hero_wl] - hero_tau_before;
 
-                // Collect VSPG segment using hero wavelength tau.
+                // Collect VSPG segment using hero wavelength tau. Deck-aware:
+                // cloud-carrying shells get an extra importance factor so the
+                // light subpath can place vertices in the deck (deck_boost=1.0
+                // leaves clear shells and the backward chain bit-identical).
                 if num_seg < VSPG_MAX_SEGMENTS && hero_tau_shell > 1e-30 {
+                    let deck = if cext > 0.0 { deck_boost } else { 1.0 };
                     segments[num_seg] = VspgSegment {
                         tau_lo: hero_tau_before,
                         tau_hi: tau[hero_wl],
-                        importance: vspg_importance(shell.altitude_mid, sza_deg),
+                        importance: vspg_importance(shell.altitude_mid, sza_deg) * deck,
                     };
                     num_seg += 1;
                 } else if hero_tau_shell > 1e-30 {
@@ -2753,6 +3256,92 @@ pub fn hybrid_scatter_radiance(
     // bit-identical streams (see field_is_broken and the constants
     // block at LATERAL_ESCAPE_SHARE).
     let lateral_field = field.is_some_and(field_is_broken);
+
+    // --- Chain-vertex <-> light-vertex connection registry (deep only) ---
+    //
+    // The polarized chain gains the same order >= 3 connection estimator
+    // the ALIS chain carries (the deep-cell signal lives at orders 6-11,
+    // reached by rare "sun-run" walks that starve plain backward NEE; see
+    // docs/BDPT_UNDER_CLOUD_PLAN.md). Per-wavelength driver => the
+    // registry is traced at THIS wavelength (hero == wavelength_idx), so
+    // lv.hero_weight is the absolute weight here and the weight-internal
+    // densities are exact. The registry seed derives from the CURRENT
+    // rng_state without advancing it: every chain keeps its historical
+    // seed, connections only add scores. Below BDPT_SZA_START (or with a
+    // 3D field, or unpolarized) nothing changes at all.
+    let sza_deg_obs = libm::acos(cos_sza_obs.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
+    let conn_active = polarized
+        && sza_deg_obs >= BDPT_SZA_START
+        && secondary_rays > 0
+        && field.is_none()
+        && !BDPT_CHAIN_CONN_DISABLE.load(core::sync::atomic::Ordering::Relaxed);
+    let dummy_reg_lv = LightVertex {
+        pos: Vec3::new(0.0, 0.0, 0.0),
+        dir_in: Vec3::new(0.0, 0.0, 1.0),
+        shell_idx: 0,
+        hero_weight: 0.0,
+        weight_ratio: [0.0f64; 64],
+        is_cloud: false,
+        g_cloud: 0.0,
+    };
+    let mut light_registry = [dummy_reg_lv; BDPT_REG_MAX];
+    let mut registry_p = [0.0f64; BDPT_REG_MAX];
+    let mut reg_len = 0usize;
+    let conn_ctx = if conn_active {
+        let (disk_u, disk_v, pref_phi) = bdpt_entry_frame(sun_dir, observer_pos);
+        let ctx = BdptMisCtx {
+            sun_dir,
+            disk_u,
+            disk_v,
+            pref_phi,
+            toa_radius,
+            ref_wl: wavelength_idx,
+            // Unused by the chain-connection weight (no LOS pairing here).
+            n_light: 1.0,
+        };
+        let reg_base_seed = splitmix64(*rng_state ^ 0x5EED_4E61_57B7_11DE);
+        for reg_idx in 0..BDPT_REG_MAX {
+            let subpath_seed = splitmix64(reg_base_seed.wrapping_add(reg_idx as u64));
+            let mut light_rng = McRng::from_seed(subpath_seed);
+            let mut subpath_verts = [dummy_reg_lv; BDPT_MAX_LIGHT_VERTICES];
+            let n_verts = trace_light_subpath(
+                atm,
+                sun_dir,
+                observer_pos,
+                wavelength_idx,
+                wavelength_idx + 1,
+                sza_deg_obs,
+                &mut light_rng,
+                &mut subpath_verts,
+                reg_idx,
+                BDPT_REG_MAX,
+                &BDPT_REG_WINDOW,
+                field,
+            );
+            if n_verts > 0 && subpath_verts[0].hero_weight.abs() > 1e-30 {
+                let p = bdpt_light_vertex_density(
+                    atm,
+                    &ctx,
+                    &BDPT_REG_WINDOW,
+                    subpath_verts[0].pos,
+                );
+                if p > 0.0 {
+                    light_registry[reg_len] = subpath_verts[0];
+                    registry_p[reg_len] = p;
+                    reg_len += 1;
+                }
+            }
+        }
+        Some(ctx)
+    } else {
+        None
+    };
+    let conn_args = conn_ctx.as_ref().map(|ctx| StokesConnArgs {
+        ctx,
+        reg: &light_registry[..reg_len],
+        reg_p: &registry_p[..reg_len],
+        reg_frac: reg_len as f64 / BDPT_REG_MAX as f64,
+    });
 
     // Dual path: full Stokes [I,Q,U,V] when polarized, scalar when not.
     let mut stokes_total = StokesVector::unpolarized(0.0);
@@ -2963,6 +3552,7 @@ pub fn hybrid_scatter_radiance(
                         chain_cloud,
                         cloud_maj,
                         fim,
+                        conn_args.as_ref(),
                     );
                     mc_stokes = mc_stokes.add(&chain_stokes);
                 }
@@ -3053,6 +3643,11 @@ fn trace_secondary_chain(
     // Forward-informed importance for the weight windows (None: the
     // altitude+CADIS heuristic; see crate::importance).
     fim: Option<&crate::importance::SolarImportanceMap>,
+    // Chain-vertex <-> light-vertex connection registry (orders >= 3, deep
+    // twilight only). Some => each main-chain vertex connects to one
+    // registry vertex and bounce >= 1 NEEs carry the balance complement;
+    // None => historical behavior, draw-for-draw identical.
+    conn: Option<&StokesConnArgs>,
 ) -> crate::scattering::StokesVector {
     use crate::scattering::{scatter_stokes_fast, scattering_plane_cos_sin, StokesVector};
     use crate::single_scatter::shadow_ray_transmittance;
@@ -3262,16 +3857,36 @@ fn trace_secondary_chain(
     };
 
     // Process all particles: main first, then split copies (LIFO order).
+    let mut main_processed = false;
     while stack_len > 0 {
         stack_len -= 1;
+        let is_main = !main_processed;
+        main_processed = true;
         let mut pos = stack[stack_len].pos;
         let mut current_dir = stack[stack_len].dir;
         let mut prev_dir = stack[stack_len].prev_dir;
         let mut stokes = stack[stack_len].stokes;
         let mut weight = stack[stack_len].weight;
         let mut local_rng = stack[stack_len].rng;
+        // Previous main-chain vertex (X_k) for the order-(k+3) pairing of
+        // this bounce's NEE against the connection made AT that vertex
+        // (mirrors the ALIS chain; see BdptChainMisArgs).
+        let mut prev_pos = Vec3::new(0.0, 0.0, 0.0);
+        let mut prev_vertex_dir_in = Vec3::new(0.0, 0.0, 1.0);
+        let mut prev_is_cloud = false;
+        let mut prev_g_cloud = 0.0f64;
+        let mut prev_shell = 0usize;
+        let mut prev_valid = false;
+        // Registry-pick stream: derived from the chain's tau stream WITHOUT
+        // advancing it, so every pre-existing draw (and thus every path)
+        // stays bit-identical; connections only ADD scores.
+        let mut conn_rng = splitmix64(local_rng.tau ^ 0xB1D1_C099_5EED_C0DE) | 1;
 
     for _scatter in 0..BOUNCE_SAFETY_LIMIT {
+        // Per-flight ground flag: a ground reflection during THIS flight
+        // breaks the straight X_k -> X_{k+1} extension, so this bounce's
+        // NEE keeps full weight under the connection pairing.
+        let mut flight_grounded = false;
         // --- Weight window population control ---
         // Placed at the TOP of the bounce (skipping the seed vertex,
         // which the scalar chain also leaves unchecked): between the end
@@ -3551,6 +4166,7 @@ fn trace_secondary_chain(
                         prev_dir = current_dir;
                         current_dir = sample_hemisphere(normal, &mut local_rng.dir);
                         stokes = StokesVector::unpolarized(1.0);
+                        flight_grounded = true;
                         tau_c_remaining =
                             -libm::log(1.0 - xorshift_f64(&mut local_rng.tau) + 1e-30);
                         continue;
@@ -3615,9 +4231,151 @@ fn trace_secondary_chain(
                 )
             };
 
-            let scale = weight * t_sun_secondary * INV_4PI;
+            // Order-(k+3) pairing: this bounce's NEE shares its integral
+            // with the connection made AT the previous vertex; apply the
+            // exact complement of that connection's balance weight (same
+            // shared function). Ground-bounced flights and non-main
+            // particles keep full weight (see the ALIS chain derivation).
+            let nee_weight = match conn {
+                Some(c)
+                    if is_main
+                        && _scatter > 0
+                        && prev_valid
+                        && !flight_grounded
+                        && !c.reg.is_empty() =>
+                {
+                    let p_l =
+                        bdpt_light_vertex_density(atm, c.ctx, &BDPT_REG_WINDOW, pos);
+                    if p_l > 0.0 {
+                        1.0 - bdpt_chain_conn_weight(
+                            atm,
+                            c.ctx,
+                            prev_pos,
+                            prev_vertex_dir_in,
+                            prev_is_cloud,
+                            prev_g_cloud,
+                            prev_shell,
+                            pos,
+                            p_l,
+                        )
+                    } else {
+                        1.0
+                    }
+                }
+                _ => 1.0,
+            };
+
+            let scale = nee_weight * weight * t_sun_secondary * INV_4PI;
             total_stokes = total_stokes.add(&nee_stokes.scale(scale));
         }
+
+        // --- Chain-vertex <-> light-vertex connection (order k+3) ---
+        //
+        // Connect THIS main-chain vertex to one uniformly picked registry
+        // light vertex: sun -> lv -> X_k -> ... -> seed. Same estimator as
+        // the ALIS chain (one pick estimates the registry mean; each
+        // registry vertex carries its own importance weight; balance
+        // weight pairs against the NEXT bounce's NEE). Polarization: the
+        // eye-side vertex gets the full Mueller treatment exactly like the
+        // NEE (with the beam direction lv -> X_k in place of the sun); the
+        // light-side vertex contributes its scalar phase intensity -- the
+        // incident-beam polarization coupling is dropped, the same
+        // documented I-approximation class as this chain's unpolarized
+        // seed. RNG: only conn_rng advances (derived, non-consuming).
+        if let Some(c) = conn {
+            if is_main
+                && !c.reg.is_empty()
+                && !BDPT_DIAG_CONNECTIONS_OFF.load(core::sync::atomic::Ordering::Relaxed)
+            {
+                let pick = xorshift_f64(&mut conn_rng) * c.reg.len() as f64;
+                let j = (pick as usize).min(c.reg.len() - 1);
+                let lv = &c.reg[j];
+                let p_l = c.reg_p[j];
+                if p_l > 0.0 && lv.hero_weight.abs() > 1e-30 {
+                    let w_conn = bdpt_chain_conn_weight(
+                        atm,
+                        c.ctx,
+                        pos,
+                        current_dir,
+                        cloud_collision,
+                        g_cloud_here,
+                        scatter_shell,
+                        lv.pos,
+                        p_l,
+                    );
+                    if w_conn > 0.0 {
+                        let diff = lv.pos - pos;
+                        let d_sq = diff.length_sq().max(100.0);
+                        let dist = libm::sqrt(d_sq);
+                        let dir_conn = diff.scale(1.0 / dist);
+                        let cos_eye = current_dir.dot(dir_conn);
+                        let cos_light = lv.dir_in.dot(dir_conn.scale(-1.0));
+                        let t_conn = crate::single_scatter::transmittance_between_points_spectrum(
+                            atm,
+                            pos,
+                            lv.pos,
+                            wavelength_idx + 1,
+                            field,
+                            CloudTransmittance::BeerLambert,
+                        )[wavelength_idx];
+                        if t_conn > 1e-30 {
+                            let conn_stokes = if cloud_collision {
+                                let p = cloud_phase_value(cos_eye, g_cloud_here);
+                                StokesVector::unpolarized(stokes.intensity() * p)
+                            } else {
+                                // Incident beam propagates lv -> X_k, i.e.
+                                // along -dir_conn (mirrors -sun_dir in NEE).
+                                let (cn, sn) = scattering_plane_cos_sin(
+                                    prev_dir,
+                                    current_dir,
+                                    dir_conn.scale(-1.0),
+                                );
+                                scatter_stokes_fast(
+                                    &stokes,
+                                    cos_eye,
+                                    optics.rayleigh_fraction,
+                                    optics.asymmetry,
+                                    cn,
+                                    sn,
+                                )
+                            };
+                            let phase_light = if lv.is_cloud {
+                                cloud_phase_value(cos_light, lv.g_cloud)
+                            } else {
+                                scalar_phase_value(
+                                    cos_light,
+                                    &atm.optics[lv.shell_idx][wavelength_idx],
+                                )
+                            };
+                            // lv.hero_weight is the absolute weight at the
+                            // traced wavelength (the registry is traced with
+                            // hero == wavelength_idx, so its spectral ratio
+                            // is identically 1 there).
+                            let scale = w_conn
+                                * c.reg_frac
+                                * weight
+                                * (t_conn / d_sq)
+                                * lv.hero_weight
+                                * phase_light
+                                * INV_4PI
+                                * INV_4PI;
+                            if scale.is_finite() {
+                                total_stokes = total_stokes.add(&conn_stokes.scale(scale));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Record this vertex as X_k for the next bounce's pairing
+        // (current_dir is still the incoming flight direction here).
+        prev_pos = pos;
+        prev_vertex_dir_in = current_dir;
+        prev_is_cloud = cloud_collision;
+        prev_g_cloud = g_cloud_here;
+        prev_shell = scatter_shell;
+        prev_valid = true;
 
         // Sample new direction and update Stokes state. A cloud collision
         // is a depolarizing HG: sample the lobe, reset polarization, and
@@ -4286,7 +5044,7 @@ fn trace_secondary_chain_scalar(
                 weight *= optics.ssa;
             }
 
-            let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
+            let bdpt_covered = is_main && bounce_idx < bdpt_active_light_verts();
             let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
             if !skip_nee {
                 let t_sun_secondary = shadow_ray_transmittance(
@@ -4677,32 +5435,11 @@ fn field_forced_classify(
     FieldVertex::Killed
 }
 
-/// True when ANY gray cloud channel is active for a run: a 3D field is
-/// present, or the 1D per-shell cloud extinction is nonzero somewhere.
-///
-/// Sole remaining consumer: the BDPT light subpath gate (`bdpt_active`).
-/// The light subpath samples GAS-only proposals and cannot compose with
-/// the unforced gray channel (1D or field), so it stays disabled under
-/// any cloud; converting it is a separate tracked follow-up.
-///
-/// HISTORY: forced-collision mode in the chains used to gate on this too
-/// (the original sin was forced flights sampling GAS-only scout tau and
-/// crossing decks as transparent; the conservative fix disabled forced
-/// mode under any cloud, at the cost of one-sided variance starvation
-/// under 1D decks at SZA >= 97, externally measured at 0.16-0.22x vs
-/// MYSTIC). The per-wavelength chains now fold the shell-constant 1D deck
-/// into the combined transport channel (exact) and run 3D fields through
-/// per-shell majorants plus truncated null-collision delta tracking
-/// (see the scalar chain's `use_forced` derivation): forced mode gates on
-/// SZA alone there. ALIS keeps the field gate (per-wavelength null ratios
-/// would need an all-wavelength majorant; see trace_secondary_chain_alis).
-#[inline]
-fn has_cloud_channel(atm: &AtmosphereModel, field: Option<&Cloud3DField>) -> bool {
-    field.is_some()
-        || atm.cloud_extinction[..atm.num_shells.min(crate::atmosphere::MAX_SHELLS)]
-            .iter()
-            .any(|&c| c > 0.0)
-}
+// `has_cloud_channel` was removed with the BDPT-under-1D-deck conversion:
+// its sole consumer (the BDPT gate) now gates on `field.is_none()` because
+// the light subpath composes with the 1D deck via the combined-channel
+// vertex-type draw and stays off only under a 3D field (ALIS is analog-only
+// there). The chains gate forced mode on SZA / `field.is_none()` directly.
 
 /// Cloud context handed from the hybrid drivers to the secondary chains.
 ///
@@ -4984,6 +5721,13 @@ fn trace_secondary_chain_alis(
     total_rays: usize,
     num_wl: usize,
     nee_r2_weight: f64,
+    // Per-path MIS arguments (bounce-0 LOS pairing + the light-vertex
+    // registry for order >= 3 chain connections). Some => the bounce-0 NEE
+    // weight is 1 - bdpt_mis_weight(X, step), bounce k+1 >= 1 NEE weights
+    // are 1 - bdpt_chain_conn_weight(...), and each main-chain vertex
+    // connects to one registry light vertex. None => the fixed
+    // `nee_r2_weight` blend (non-BDPT callers, BDPT_VERTS=2 diagnostic).
+    mis: Option<&BdptChainMisArgs>,
     guide: Option<&crate::path_guide::PathGuide>,
     // The chain delta-tracks the gray cloud channel (field DDA or 1D
     // shells); NEE shadow rays are cloud-attenuated Beer-Lambert.
@@ -5260,8 +6004,37 @@ fn trace_secondary_chain_alis(
         let mut pr = stack[stack_len].pdf_ratio;
         let mut local_rng = stack[stack_len].rng;
         let mut bounce_idx: usize = 0;
+        // True once a ground reflection breaks the straight seed->vertex
+        // flight. A ground-bounced bounce-0 path (sun -> X -> ground -> Y)
+        // is NOT sampled by the BDPT connection, so its NEE keeps full
+        // weight under the per-path MIS (and the straight-line density
+        // formula would not describe it anyway).
+        let mut ground_bounced = false;
+        // Weight-anatomy shadows (attribution probe; negligible cost, only
+        // read when BDPT_DIAG_SCORE_WL is armed).
+        let mut diag_n_rr = 0.0f64;
+        let mut diag_rr_factor = 1.0f64;
+        let mut diag_vspg_factor = 1.0f64;
+        let mut diag_et_factor = 1.0f64;
+        // Previous main-chain vertex (X_k) for the order-(k+3) pairing of
+        // this bounce's NEE against the connection made AT that vertex.
+        let mut prev_pos = Vec3::new(0.0, 0.0, 0.0);
+        let mut prev_dir_in = Vec3::new(0.0, 0.0, 1.0);
+        let mut prev_is_cloud = false;
+        let mut prev_g_cloud = 0.0f64;
+        let mut prev_shell = 0usize;
+        let mut prev_valid = false;
+        // Registry-pick stream: derived from the chain's tau stream WITHOUT
+        // advancing it, so every pre-existing RNG draw (and thus every path)
+        // stays bit-identical; connections only ADD scores.
+        let mut conn_rng = splitmix64(local_rng.tau ^ 0xB1D1_C099_5EED_C0DE) | 1;
 
         loop {
+            // Per-flight ground flag: a ground reflection during THIS flight
+            // breaks the straight X_k -> X_{k+1} extension, so this bounce's
+            // NEE keeps full weight (the connection pairing covers only the
+            // direct-extension channel).
+            let mut flight_grounded = false;
             // --- Decide scatter mode for this bounce ---
             // Fused scout + VSPG: single shell walk collects both per-wl
             // tau_maxes and VSPG segments (hero wavelength), eliminating
@@ -5284,6 +6057,8 @@ fn trace_secondary_chain_alis(
                     num_wl,
                     sza_deg_local,
                     &mut vspg_segs,
+                    // Backward chain keeps standard VSPG (no deck boost).
+                    1.0,
                 );
                 tau_maxes = tms;
                 n_vspg_segs = ns;
@@ -5329,6 +6104,7 @@ fn trace_secondary_chain_alis(
                     &mut local_rng.tau,
                 );
                 hero_weight *= vspg_w;
+                diag_vspg_factor *= vspg_w;
                 let (sp, sd, ss, taus_at_pos) =
                     advance_to_optical_depth_alis(atm, pos, current_dir, tau_s, hero_wl, num_wl);
                 pos = sp;
@@ -5418,8 +6194,9 @@ fn trace_secondary_chain_alis(
                             // Gas survived [0, dist] without colliding: apply
                             // the gas survival ratio (gray cloud ratio = 1).
                             if alpha_et > 0.0 && sigma_h >= 1e-20 {
-                                hero_weight *=
-                                    libm::exp(-alpha_et * sigma_h * cos_bias * dist);
+                                let f = libm::exp(-alpha_et * sigma_h * cos_bias * dist);
+                                hero_weight *= f;
+                                diag_et_factor *= f;
                             }
                             for w in 0..num_wl {
                                 let sigma_w = atm.optics[shell_idx][w].extinction;
@@ -5442,8 +6219,10 @@ fn trace_secondary_chain_alis(
 
                     if free_path >= boundary_dist {
                         if alpha_et > 0.0 && sigma_h >= 1e-20 {
-                            hero_weight *=
+                            let f =
                                 libm::exp(-alpha_et * sigma_h * cos_bias * boundary_dist);
+                            hero_weight *= f;
+                            diag_et_factor *= f;
                         }
                         // Chain deck crossings: cloud scattering is now
                         // explicit (the race above); no transmittance factor.
@@ -5467,8 +6246,12 @@ fn trace_secondary_chain_alis(
                             pos = normal * (surface_radius + 1e-3);
 
                             // Ground-bounce NEE: Lambertian BRDF = albedo/pi.
+                            // (Spike-attribution gate: scoring-only, no RNG.)
                             let cos_sun_ground = sun_dir.dot(normal);
-                            if cos_sun_ground > 0.0 {
+                            if cos_sun_ground > 0.0
+                                && !BDPT_DIAG_GROUND_NEE_OFF
+                                    .load(core::sync::atomic::Ordering::Relaxed)
+                            {
                                 let t_suns_gb = shadow_ray_transmittance_spectrum(
                                     atm,
                                     pos,
@@ -5503,6 +6286,8 @@ fn trace_secondary_chain_alis(
                                 wr[w] *= albedo_ratio;
                             }
                             current_dir = sample_hemisphere(normal, &mut local_rng.dir);
+                            ground_bounced = true;
+                            flight_grounded = true;
                             tau_c_remaining =
                                 -libm::log(1.0 - xorshift_f64(&mut local_rng.tau) + 1e-30);
                             continue;
@@ -5512,8 +6297,10 @@ fn trace_secondary_chain_alis(
 
                     // Hero gas scatter within this shell.
                     if alpha_et > 0.0 && sigma_h >= 1e-20 {
-                        hero_weight *= (sigma_h / sigma_prime_h)
+                        let f = (sigma_h / sigma_prime_h)
                             * libm::exp(-alpha_et * sigma_h * cos_bias * free_path);
+                        hero_weight *= f;
+                        diag_et_factor *= f;
                     }
                     for w in 0..num_wl {
                         let sigma_w = atm.optics[shell_idx][w].extinction;
@@ -5555,8 +6342,20 @@ fn trace_secondary_chain_alis(
                 }
             }
 
-            let bdpt_covered = is_main && bounce_idx < BDPT_MAX_LIGHT_VERTICES;
-            let skip_nee = bdpt_covered && nee_r2_weight < 1e-30;
+            let bdpt_covered = is_main && bounce_idx < bdpt_active_light_verts();
+            // Spike-attribution gates (default = everything on). Scoring-only:
+            // no RNG is touched, so narrowed runs walk identical paths.
+            let diag_nee_on = {
+                use core::sync::atomic::Ordering::Relaxed;
+                bounce_idx >= BDPT_DIAG_NEE_MIN_BOUNCE.load(Relaxed)
+                    && bounce_idx < BDPT_DIAG_NEE_MAX_BOUNCE.load(Relaxed)
+                    && (is_main || !BDPT_DIAG_SPLIT_NEE_OFF.load(Relaxed))
+                    && (!ground_bounced || !BDPT_DIAG_GROUND_NEE_OFF.load(Relaxed))
+            };
+            // Fixed-blend mode may skip an all-but-zero-weight NEE; the
+            // per-path weight is never uniformly ~0, so it never skips.
+            let skip_nee =
+                !diag_nee_on || (bdpt_covered && mis.is_none() && nee_r2_weight < 1e-30);
             if !skip_nee {
                 let t_suns = shadow_ray_transmittance_spectrum(
                     atm,
@@ -5568,11 +6367,62 @@ fn trace_secondary_chain_alis(
                 );
                 let cos_angle_nee = sun_dir.dot(current_dir);
 
-                // On the first BDPT_MAX_LIGHT_VERTICES bounces of the main
-                // particle, apply the MIS weight (w_back) since BDPT provides
-                // independent estimates for these orders. Higher-order bounces
-                // get full weight since BDPT does not cover them.
-                let nee_weight = if bdpt_covered { nee_r2_weight } else { 1.0 };
+                // Per-path mode (mis Some), main particle:
+                //   bounce 0: pairs against the LOS-step BDPT connection
+                //     (order 2) -- weight = 1 - bdpt_mis_weight(X, step),
+                //     the SAME function the connection pass evaluates.
+                //     Ground-bounced seed->X paths are not BDPT-samplable:
+                //     full weight.
+                //   bounce k+1 >= 1: pairs against the chain-vertex
+                //     connection made AT the previous vertex X_k (order
+                //     k+3) -- weight = 1 - bdpt_chain_conn_weight(...),
+                //     again the exact complement of the connection's
+                //     weight. Ground-bounced flights keep full weight
+                //     (disjoint path family).
+                // Fallback (mis None): the fixed SZA-sigmoid blend on
+                // BDPT-covered bounces (BDPT_VERTS=2 diagnostic), 1.0
+                // elsewhere.
+                let nee_weight = if let Some(m) = mis {
+                    if !is_main {
+                        1.0
+                    } else if bounce_idx == 0 {
+                        if ground_bounced {
+                            1.0
+                        } else {
+                            let p_l = bdpt_light_vertex_density(
+                                atm,
+                                m.ctx,
+                                &BDPT_LOS_WINDOW,
+                                pos,
+                            );
+                            1.0 - bdpt_mis_weight(atm, m.ctx, &m.seg, pos, p_l)
+                        }
+                    } else if prev_valid && !flight_grounded && !m.reg.is_empty() {
+                        let p_l =
+                            bdpt_light_vertex_density(atm, m.ctx, &BDPT_REG_WINDOW, pos);
+                        if p_l > 0.0 {
+                            1.0 - bdpt_chain_conn_weight(
+                                atm,
+                                m.ctx,
+                                prev_pos,
+                                prev_dir_in,
+                                prev_is_cloud,
+                                prev_g_cloud,
+                                prev_shell,
+                                pos,
+                                p_l,
+                            )
+                        } else {
+                            1.0
+                        }
+                    } else {
+                        1.0
+                    }
+                } else if bdpt_covered {
+                    nee_r2_weight
+                } else {
+                    1.0
+                };
                 let mis_w = spectral_mis_weight(&pr, num_wl);
                 // Gray cloud phase is wavelength flat: one value for all w.
                 let cloud_phase = if cloud_collision {
@@ -5597,7 +6447,160 @@ fn trace_secondary_chain_alis(
                             * INV_4PI;
                     }
                 }
+
+                // Weight-anatomy probe (attribution harness only): record the
+                // factor anatomy of the max-contribution main-particle NEE at
+                // the armed wavelength. Scoring-neutral, RNG-neutral.
+                {
+                    use core::sync::atomic::Ordering::Relaxed;
+                    let dw = BDPT_DIAG_SCORE_WL.load(Relaxed);
+                    if dw < num_wl && is_main && t_suns[dw] > 1e-30 {
+                        let phase_dw = if cloud_collision {
+                            cloud_phase
+                        } else {
+                            scalar_phase_value(cos_angle_nee, &atm.optics[scatter_shell][dw])
+                        };
+                        let c = (mis_w
+                            * nee_weight
+                            * hero_weight
+                            * wr[dw]
+                            * t_suns[dw]
+                            * phase_dw
+                            * INV_4PI)
+                            .abs();
+                        if c > f64::from_bits(BDPT_DIAG_MAX_C.load(Relaxed)) {
+                            BDPT_DIAG_MAX_C.store(c.to_bits(), Relaxed);
+                            let alt_here = pos.length() - surface_radius;
+                            let vals = [
+                                hero_weight,
+                                wr[dw],
+                                t_suns[dw],
+                                phase_dw,
+                                bounce_idx as f64,
+                                alt_here,
+                                diag_n_rr,
+                                diag_rr_factor,
+                                diag_vspg_factor,
+                                diag_et_factor,
+                                hero_wl as f64,
+                                nee_weight,
+                            ];
+                            for (reg, v) in BDPT_DIAG_MAX_INFO.iter().zip(vals.iter()) {
+                                reg.store(v.to_bits(), Relaxed);
+                            }
+                        }
+                    }
+                }
             }
+            // --- Chain-vertex <-> light-vertex connection (order k+3) ---
+            //
+            // Connect THIS main-chain vertex X_k to one uniformly picked
+            // registry light vertex: path sun -> lv -> X_k -> ... -> seed.
+            // One pick estimates the registry mean, and each registry
+            // vertex carries its own 1/p_L importance weight, so no count
+            // factors appear. The balance weight pairs this against the
+            // NEXT bounce's NEE (same order); its complement is applied
+            // there through the SAME weight function. This is what covers
+            // the deep orders: the chain no longer has to physically walk
+            // to sunlit air -- the connection crosses in one deterministic
+            // transmittance segment. RNG: only conn_rng advances (derived,
+            // non-consuming), so all pre-existing paths are bit-identical.
+            if let Some(m) = mis {
+                if is_main
+                    && !m.reg.is_empty()
+                    && !BDPT_DIAG_CONNECTIONS_OFF.load(core::sync::atomic::Ordering::Relaxed)
+                {
+                    let pick = xorshift_f64(&mut conn_rng) * m.reg.len() as f64;
+                    let j = (pick as usize).min(m.reg.len() - 1);
+                    let lv = &m.reg[j];
+                    let p_l = m.reg_p[j];
+                    if p_l > 0.0 && lv.hero_weight.abs() > 1e-30 {
+                        let w_conn = bdpt_chain_conn_weight(
+                            atm,
+                            m.ctx,
+                            pos,
+                            current_dir,
+                            cloud_collision,
+                            g_cloud_here,
+                            scatter_shell,
+                            lv.pos,
+                            p_l,
+                        );
+                        if w_conn > 0.0 {
+                            let diff = lv.pos - pos;
+                            let d_sq = diff.length_sq().max(100.0);
+                            let dist = libm::sqrt(d_sq);
+                            let dir_conn = diff.scale(1.0 / dist);
+                            // Eye-side scatter at X_k: incoming current_dir
+                            // (flight into X_k) toward lv; light-side at lv:
+                            // lv.dir_in toward X_k (= -dir_conn). Both follow
+                            // the p_in . p_out convention used everywhere.
+                            let cos_eye = current_dir.dot(dir_conn);
+                            let cos_light = lv.dir_in.dot(dir_conn.scale(-1.0));
+                            let t_conn = crate::single_scatter::transmittance_between_points_spectrum(
+                                atm,
+                                pos,
+                                lv.pos,
+                                num_wl,
+                                field,
+                                CloudTransmittance::BeerLambert,
+                            );
+                            let smis = spectral_mis_weight(&pr, num_wl);
+                            let cloud_phase_eye = if cloud_collision {
+                                cloud_phase_value(cos_eye, g_cloud_here)
+                            } else {
+                                0.0
+                            };
+                            let cloud_phase_light = if lv.is_cloud {
+                                cloud_phase_value(cos_light, lv.g_cloud)
+                            } else {
+                                0.0
+                            };
+                            for w in 0..num_wl {
+                                if t_conn[w] <= 1e-30 {
+                                    continue;
+                                }
+                                let phase_eye_w = if cloud_collision {
+                                    cloud_phase_eye
+                                } else {
+                                    scalar_phase_value(cos_eye, &atm.optics[scatter_shell][w])
+                                };
+                                let phase_light_w = if lv.is_cloud {
+                                    cloud_phase_light
+                                } else {
+                                    scalar_phase_value(cos_light, &atm.optics[lv.shell_idx][w])
+                                };
+                                let contrib = smis
+                                    * w_conn
+                                    * m.reg_frac
+                                    * hero_weight
+                                    * wr[w]
+                                    * phase_eye_w
+                                    * INV_4PI
+                                    * (t_conn[w] / d_sq)
+                                    * lv.hero_weight
+                                    * lv.weight_ratio[w]
+                                    * phase_light_w
+                                    * INV_4PI;
+                                if contrib.is_finite() {
+                                    total[w] += contrib;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Record this vertex as X_k for the next bounce's pairing
+            // (current_dir is still the incoming flight direction here;
+            // the new direction is sampled below).
+            prev_pos = pos;
+            prev_dir_in = current_dir;
+            prev_is_cloud = cloud_collision;
+            prev_g_cloud = g_cloud_here;
+            prev_shell = scatter_shell;
+            prev_valid = true;
+
             bounce_idx += 1;
 
             // Sample new direction: up to 3-way one-sample MIS:
@@ -5790,6 +6793,8 @@ fn trace_secondary_chain_alis(
                     } else {
                         -w_target
                     };
+                    diag_n_rr += 1.0;
+                    diag_rr_factor *= w_target / abs_hw;
                 } else {
                     break; // Chain killed by RR
                 }
@@ -5886,13 +6891,6 @@ pub fn hybrid_scatter_radiance_alis(
     let num_steps = HYBRID_LOS_STEPS.min((los_end / 500.0) as usize + 20);
     let ds = los_end / num_steps as f64;
 
-    // Any gray cloud channel this run? Computed once; disables the BDPT
-    // light subpath (a gas-only proposal; see bdpt_active). The CHAINS no
-    // longer gate on this: the 1D shell deck composes with forced mode
-    // through the combined transport channel, and only a 3D field keeps
-    // forced mode off (gated on field.is_none() in the chains).
-    let cloud_channel = has_cloud_channel(atm, field);
-
     // --- LOS ray-budget redistribution (importance sampling by altitude) ---
     //
     // At deep twilight, MC chains starting at low-altitude LOS points are
@@ -5949,14 +6947,17 @@ pub fn hybrid_scatter_radiance_alis(
     // to each LOS step to provide an alternative path to the sun.
     use crate::single_scatter::transmittance_between_points_spectrum;
 
-    // BDPT is DISABLED under ANY gray cloud channel (3D field or 1D shell
-    // deck): the light subpath is forced-scattering only and cloud-blind
-    // (gas-only proposals), while its connection legs are cloud-attenuated;
-    // composing the two is the same biased composition as forced mode in
-    // the chains. NEE-only (backward chains, w_back = 1) is unbiased, just
-    // noisier; never blend two models of the same integral. The plan
-    // authorizes this fallback until the light subpath is converted.
-    let bdpt_active = sza_deg_obs >= BDPT_SZA_START && secondary_rays > 0 && !cloud_channel;
+    // BDPT composes with a 1D gray deck now that the light subpath carries
+    // the combined-channel vertex-type draw (cloud vs gas from the extinction
+    // conditional, gray HG phase + transmittance-only spectral ratio at cloud
+    // vertices; see trace_light_subpath). The connection legs are the same
+    // cloud-attenuated BeerLambert transmittance, so both sides now model the
+    // combined channel and the composition is unbiased. It stays OFF under a
+    // 3D FIELD: the ALIS tracer is analog-only there (per-wavelength null
+    // ratios blow up under an all-wavelength majorant, see use_forced), so the
+    // light subpath has no combined-channel proposal to compose with. Clear
+    // sky and 1D decks are both field.is_none().
+    let bdpt_active = sza_deg_obs >= BDPT_SZA_START && secondary_rays > 0 && field.is_none();
 
     // MIS Blend: backward chains and BDPT compute exactly the same
     // multi-scattering integral. To prevent a 2x additive bias, we blend them.
@@ -5983,6 +6984,31 @@ pub fn hybrid_scatter_radiance_alis(
         0.0
     };
 
+    // Per-path bounce-0 MIS (balance heuristic) replaces the fixed SZA
+    // sigmoid blend whenever BDPT runs its production single-light-vertex
+    // configuration: the BDPT connection and the backward bounce-0 NEE then
+    // sample the same order-2 integral, and the per-path weight cancels the
+    // near-connection 1/d^2 spike that dominated the deep-cell variance
+    // (see docs/BDPT_UNDER_CLOUD_PLAN.md). The fixed blend remains for the
+    // BDPT_VERTS=2 diagnostic, whose order-3 pairing is not implemented.
+    let mis_ctx = if bdpt_active
+        && bdpt_active_light_verts() == 1
+        && !BDPT_CHAIN_CONN_DISABLE.load(core::sync::atomic::Ordering::Relaxed)
+    {
+        let (disk_u, disk_v, pref_phi) = bdpt_entry_frame(sun_dir, observer_pos);
+        Some(BdptMisCtx {
+            sun_dir,
+            disk_u,
+            disk_v,
+            pref_phi,
+            toa_radius,
+            ref_wl: num_wl / 2,
+            n_light: num_light_subpaths as f64,
+        })
+    } else {
+        None
+    };
+
     // --- Path guide: train from BDPT light vertices ---
     //
     // Each BDPT light vertex records a position and incoming direction where
@@ -5997,16 +7023,30 @@ pub fn hybrid_scatter_radiance_alis(
     use crate::path_guide::PathGuide;
     let mut path_guide = PathGuide::new();
 
+    // Light-vertex registry for chain-vertex connections (orders >= 3):
+    // a DEDICATED wide-window subpath set (BDPT_REG_WINDOW), because
+    // backward chains score from sunlit air far outside the narrow LOS
+    // window (the measured residual tail was sun-runs missing its +-11 deg
+    // azimuth corridor). Each registry vertex is an independent
+    // importance-weighted light-transport sample of the WIDE sampler; the
+    // pairing density on both sides uses the wide window consistently.
+    // Collected only in per-path MIS mode (mis_ctx Some => verts == 1).
+    let dummy_reg_lv = LightVertex {
+        pos: Vec3::new(0.0, 0.0, 0.0),
+        dir_in: Vec3::new(0.0, 0.0, 1.0),
+        shell_idx: 0,
+        hero_weight: 0.0,
+        weight_ratio: [0.0f64; 64],
+        is_cloud: false,
+        g_cloud: 0.0,
+    };
+    let mut light_registry = [dummy_reg_lv; BDPT_REG_MAX];
+    let mut registry_p = [0.0f64; BDPT_REG_MAX];
+    let mut reg_len = 0usize;
+
     let guide_ref: Option<&PathGuide> = if bdpt_active {
         let light_base_seed = splitmix64(*rng_state ^ 0xBDFF_BDFF_BDFF_BDFF);
-        let dummy_lv = LightVertex {
-            pos: Vec3::new(0.0, 0.0, 0.0),
-            dir_in: Vec3::new(0.0, 0.0, 1.0),
-            shell_idx: 0,
-            hero_weight: 0.0,
-            weight_ratio: [0.0f64; 64],
-            pdf_fwd: 0.0,
-        };
+        let dummy_lv = dummy_reg_lv;
 
         // First pass: trace all light subpaths and train the guide.
         for subpath_idx in 0..num_light_subpaths {
@@ -6025,6 +7065,7 @@ pub fn hybrid_scatter_radiance_alis(
                 &mut subpath_verts,
                 subpath_idx,
                 num_light_subpaths,
+                &BDPT_LOS_WINDOW,
                 field,
             );
             for v in 0..n_verts {
@@ -6042,6 +7083,47 @@ pub fn hybrid_scatter_radiance_alis(
             }
         }
         path_guide.normalize();
+        // Registry pass: dedicated wide-window subpaths (phi-stratified
+        // over the wide window by the subpath binning), own decorrelated
+        // seed stream, guide left untouched. Densities precomputed with
+        // the SAME wide window (the p_L side of the chain-connection
+        // balance weight).
+        if let Some(ctx) = mis_ctx.as_ref() {
+            let reg_base_seed = splitmix64(*rng_state ^ 0x5EED_4E61_57B7_11DE);
+            for reg_idx in 0..BDPT_REG_MAX {
+                let hero_wl = reg_idx % num_wl;
+                let subpath_seed = splitmix64(reg_base_seed.wrapping_add(reg_idx as u64));
+                let mut light_rng = McRng::from_seed(subpath_seed);
+                let mut subpath_verts = [dummy_lv; BDPT_MAX_LIGHT_VERTICES];
+                let n_verts = trace_light_subpath(
+                    atm,
+                    sun_dir,
+                    observer_pos,
+                    hero_wl,
+                    num_wl,
+                    sza_deg_obs,
+                    &mut light_rng,
+                    &mut subpath_verts,
+                    reg_idx,
+                    BDPT_REG_MAX,
+                    &BDPT_REG_WINDOW,
+                    field,
+                );
+                if n_verts > 0 && subpath_verts[0].hero_weight.abs() > 1e-30 {
+                    let p = bdpt_light_vertex_density(
+                        atm,
+                        ctx,
+                        &BDPT_REG_WINDOW,
+                        subpath_verts[0].pos,
+                    );
+                    if p > 0.0 {
+                        light_registry[reg_len] = subpath_verts[0];
+                        registry_p[reg_len] = p;
+                        reg_len += 1;
+                    }
+                }
+            }
+        }
         Some(&path_guide)
     } else {
         None
@@ -6091,6 +7173,23 @@ pub fn hybrid_scatter_radiance_alis(
         } else {
             0
         };
+
+        // Per-coarse-step MIS arguments: the bounce-0 segment pairing (the
+        // chains of every substep pair against this SAME coarse segment and
+        // its coarse chain count, matching the BDPT connection pass exactly
+        // so the two sides' weights sum to 1 per (path, step)) plus the
+        // light-vertex registry for the order >= 3 chain connections.
+        let mis_args = mis_ctx.as_ref().map(|ctx| BdptChainMisArgs {
+            ctx,
+            seg: BdptMisSeg {
+                seg_a: step_start,
+                seg_b: step_start + view_dir * ds,
+                n_eye: rays_this_step as f64,
+            },
+            reg: &light_registry[..reg_len],
+            reg_p: &registry_p[..reg_len],
+            reg_frac: reg_len as f64 / BDPT_REG_MAX as f64,
+        });
 
         // Distribute the coarse step's chain budget over its substeps
         // proportionally to each substep's estimated contribution (source
@@ -6275,6 +7374,7 @@ pub fn hybrid_scatter_radiance_alis(
                     rays_this_sub,
                     num_wl,
                     w_back,
+                    mis_args.as_ref(),
                     guide_ref,
                     field,
                     chain_cloud,
@@ -6376,7 +7476,8 @@ pub fn hybrid_scatter_radiance_alis(
             shell_idx: 0,
             hero_weight: 0.0,
             weight_ratio: [0.0f64; 64],
-            pdf_fwd: 0.0,
+            is_cloud: false,
+            g_cloud: 0.0,
         };
 
         // Process subpaths in batches to keep stack usage under ~600 KB.
@@ -6410,6 +7511,7 @@ pub fn hybrid_scatter_radiance_alis(
                     &mut subpath_verts,
                     subpath_idx,
                     num_light_subpaths,
+                    &BDPT_LOS_WINDOW,
                     field,
                 );
                 for v in 0..n_verts {
@@ -6422,6 +7524,20 @@ pub fn hybrid_scatter_radiance_alis(
 
             if n_batch_verts == 0 {
                 continue;
+            }
+
+            // Per-vertex light-subpath density for the per-path MIS weight:
+            // p_L depends only on the vertex position, so it is computed
+            // once per vertex and reused across every LOS step.
+            let mut batch_p_light = [0.0f64; BATCH_VERT_CAP];
+            if let Some(ctx) = mis_ctx.as_ref() {
+                for (pl, lv) in batch_p_light
+                    .iter_mut()
+                    .zip(batch_vertices.iter())
+                    .take(n_batch_verts)
+                {
+                    *pl = bdpt_light_vertex_density(atm, ctx, &BDPT_LOS_WINDOW, lv.pos);
+                }
             }
 
             // Re-walk the LOS to evaluate connections for this batch's vertices.
@@ -6443,8 +7559,10 @@ pub fn hybrid_scatter_radiance_alis(
                     None => continue,
                 };
 
-                // BDPT LOS re-walk. BDPT runs only when NO gray cloud
-                // channel is present (field or 1D deck), so this cloud
+                // BDPT LOS re-walk. BDPT runs only when field.is_none()
+                // (clear sky, or the 1D deck whose scattering is baked into
+                // the combined optics channel). A SEPARATE gray cloud
+                // field/channel is therefore absent, so this cloud
                 // accumulation is identically zero; it is kept so the
                 // re-walk stays structurally aligned with the main walk
                 // (Beer-Lambert cloud in chain mode) for the conversion.
@@ -6464,6 +7582,32 @@ pub fn hybrid_scatter_radiance_alis(
                 if !any_visible {
                     break;
                 }
+
+                // Per-path MIS segment for this coarse step, mirroring the
+                // main loop's construction EXACTLY (same segment endpoints,
+                // same chain-count expression) so the weight the backward
+                // chains computed for this step is the complement of the one
+                // applied here.
+                let mis_seg_step = mis_ctx.as_ref().map(|ctx| {
+                    let n_eye = if use_los_importance && los_importance[step] > 0.0 {
+                        let frac = los_importance[step] / sum_los_imp;
+                        let n = libm::round(total_mc_budget as f64 * frac) as usize;
+                        n.max(1)
+                    } else if !use_los_importance && secondary_rays > 0 {
+                        secondary_rays
+                    } else {
+                        0
+                    };
+                    let seg_a = observer_pos + view_dir * (step as f64 * ds);
+                    (
+                        ctx,
+                        BdptMisSeg {
+                            seg_a,
+                            seg_b: seg_a + view_dir * ds,
+                            n_eye: n_eye as f64,
+                        },
+                    )
+                });
 
                 for lv_idx in 0..n_batch_verts {
                     let lv = &batch_vertices[lv_idx];
@@ -6492,7 +7636,18 @@ pub fn hybrid_scatter_radiance_alis(
                     let y2 = 0.5 * ds - u;
                     let g_term_ds = (libm::atan2(y2, d_perp) - libm::atan2(y1, d_perp)) / d_perp;
 
-                    let cos_theta_eye = connection_dir.dot(view_dir.scale(-1.0));
+                    // Scattering angle at the eye vertex Y: light propagates
+                    // X->Y (direction -connection_dir), then Y->observer
+                    // (direction -view_dir), so cos(theta) = (-connection_dir)
+                    // . (-view_dir) = connection_dir . view_dir. This matches
+                    // the backward chain's seed convention (cos_seed_view =
+                    // dir . view_dir) and the order-1 NEE (sun_dir . view_dir).
+                    // The previous -view_dir argument was sign-flipped:
+                    // invisible for Rayleigh (phase symmetric in cos) but
+                    // wrong for any HG aerosol component at Y's shell, and it
+                    // made the two order-2 estimators disagree on the
+                    // integrand, which would bias ANY blend of them.
+                    let cos_theta_eye = connection_dir.dot(view_dir);
                     let cos_theta_light = lv.dir_in.dot(connection_dir.scale(-1.0));
 
                     let t_conn = transmittance_between_points_spectrum(
@@ -6503,6 +7658,23 @@ pub fn hybrid_scatter_radiance_alis(
                         field,
                         CloudTransmittance::BeerLambert,
                     );
+
+                    // Per-path balance-heuristic weight for this connection
+                    // (hero-independent, so it sits outside the w loop). The
+                    // backward chains of this step applied its complement to
+                    // their bounce-0 NEE; the fixed sigmoid remains only for
+                    // the BDPT_VERTS=2 diagnostic (mis_ctx None).
+                    let w_conn = match mis_seg_step.as_ref() {
+                        Some((ctx, seg)) => {
+                            bdpt_mis_weight(atm, ctx, seg, lv.pos, batch_p_light[lv_idx])
+                        }
+                        None => w_bdpt,
+                    };
+                    if w_conn <= 0.0
+                        || BDPT_DIAG_CONNECTIONS_OFF.load(core::sync::atomic::Ordering::Relaxed)
+                    {
+                        continue;
+                    }
 
                     for w in 0..num_wl {
                         let optics_eye = &atm.optics[shell_idx][w];
@@ -6519,7 +7691,14 @@ pub fn hybrid_scatter_radiance_alis(
 
                         let phase_eye = scalar_phase_value(cos_theta_eye, optics_eye);
                         let optics_light = &atm.optics[lv.shell_idx][w];
-                        let phase_light = scalar_phase_value(cos_theta_light, optics_light);
+                        let phase_light = if lv.is_cloud {
+                            // Gray cloud phase is wavelength-flat: one HG value
+                            // for all w (the spectral variation is carried by
+                            // lv.weight_ratio, gas transmittance-only ratio).
+                            cloud_phase_value(cos_theta_light, lv.g_cloud)
+                        } else {
+                            scalar_phase_value(cos_theta_light, optics_light)
+                        };
 
                         let contrib = t_obs
                             * beta_scat_eye
@@ -6534,7 +7713,7 @@ pub fn hybrid_scatter_radiance_alis(
                             * inv_num_light_subpaths;
 
                         if contrib.is_finite() {
-                            radiance[w] += w_bdpt * contrib;
+                            radiance[w] += w_conn * contrib;
                         }
                     }
                 }
@@ -7382,11 +8561,11 @@ mod tests {
         // ALIS scout: gray deck must not change per-wavelength tau
         // DIFFERENCES (the crux of the ALIS forced ratio).
         let (taus_c, _, _) =
-            scout_with_vspg_segments_alis(&atm, pos, dir, 1, 3, 97.0, &mut segs);
+            scout_with_vspg_segments_alis(&atm, pos, dir, 1, 3, 97.0, &mut segs, 1.0);
         let mut atm_clear = atm.clone();
         atm_clear.cloud_extinction[1] = 0.0;
         let (taus_g, _, _) =
-            scout_with_vspg_segments_alis(&atm_clear, pos, dir, 1, 3, 97.0, &mut segs);
+            scout_with_vspg_segments_alis(&atm_clear, pos, dir, 1, 3, 97.0, &mut segs, 1.0);
         for w in 0..3 {
             let d_cloudy = taus_c[w] - taus_c[1];
             let d_gas = taus_g[w] - taus_g[1];
@@ -7502,7 +8681,7 @@ mod tests {
         // ALIS scout variant: identical overflow discipline on hero taus.
         let before2 = VSPG_OVERFLOW_EVENTS.load(Ordering::Relaxed);
         let (taus, hg2, n_seg2) =
-            scout_with_vspg_segments_alis(&atm, pos, dir, 0, 1, 97.0, &mut segs);
+            scout_with_vspg_segments_alis(&atm, pos, dir, 0, 1, 97.0, &mut segs, 1.0);
         assert!(!hg2);
         assert_eq!(n_seg2, VSPG_MAX_SEGMENTS);
         assert!(VSPG_OVERFLOW_EVENTS.load(Ordering::Relaxed) > before2);
@@ -9216,6 +10395,7 @@ mod tests {
                 3,
                 sza_deg,
                 &mut vspg_segs,
+                1.0,
             );
             std::eprintln!(
                 "  Scout from rim: tau_hero={:.6e}, hit_ground={}, n_segs={}",
@@ -9233,6 +10413,7 @@ mod tests {
                 3,
                 sza_deg,
                 &mut vspg_segs,
+                1.0,
             );
             std::eprintln!(
                 "  Scout from center: tau_hero={:.6e}, hit_ground={}, n_segs={}",
@@ -9262,7 +10443,8 @@ mod tests {
                     shell_idx: 0,
                     hero_weight: 0.0,
                     weight_ratio: [0.0; 64],
-                    pdf_fwd: 0.0,
+                    is_cloud: false,
+                    g_cloud: 0.0,
                 }; BDPT_MAX_LIGHT_VERTICES];
                 let nv = trace_light_subpath(
                     &atm,
@@ -9275,6 +10457,7 @@ mod tests {
                     &mut verts,
                     sp,
                     num_subpaths,
+                    &BDPT_LOS_WINDOW,
                     None,
                 );
                 total_verts += nv;
@@ -9883,6 +11066,7 @@ mod tests {
             let (result, _) = trace_secondary_chain_alis(
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
                 None,
+                None,
                 ChainCloud::CLEAR,
                 None,
             );
@@ -10363,6 +11547,7 @@ mod tests {
             let mut mc = McRng::from_seed(rng);
             let (result, _) = trace_secondary_chain_alis(
                 &atm, observer, sun_dir, observer.normalize(), hero_wl, 0, &mut mc, ray, n, num_wl, 1.0, None,
+                None,
                 None,
                 ChainCloud::CLEAR,
                 None,

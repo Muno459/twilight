@@ -1084,7 +1084,11 @@ def deep_run_twilight(tau_star: float, path: str) -> dict:
     table: dict = {}
     if path == "1d":
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        # DEEP_WORKERS x RAYON_NUM_THREADS should ~= core count on the
+        # campaign box (e.g. 48 x 2 on a 96-vCPU c7a.24xlarge); the local
+        # default stays gentle.
+        workers = int(os.environ.get("DEEP_WORKERS", "4"))
+        with ThreadPoolExecutor(max_workers=workers) as ex:
             tables = list(ex.map(
                 lambda s: g3_run_twilight(tau_star, "hybrid", s, DEEP_SZAS,
                                           DEEP_HYB_PHOTONS),

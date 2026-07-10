@@ -73,12 +73,12 @@ cargo build --release
 Output (Mecca, clear sky):
 
 ```
-  Fajr (khayt al-abyad): 04:29:09 ±3.0min  (SZA 104.85°, depression 14.85°)
+  Fajr (khayt al-abyad): 04:29:51 ±0.4min  (SZA 104.71°, depression 14.71°)
     └ white thread distinct from black + lateral spread (2:187, mustatir)
-    └ false dawn (al-fajr al-kadhib) visible from 04:27:14 - do not pray Fajr yet
-  Isha (shafaq ahmar):   20:15:48  (depression 15.50°)
+    └ false dawn (al-fajr al-kadhib) visible from 04:28:30 - do not pray Fajr yet
+  Isha (shafaq ahmar):   20:12:59 ±5.3min  (SZA 104.96°, depression 14.96°)
     └ red band no longer distinct - Shafi'i/Maliki/Hanbali (primary)
-  Isha (shafaq abyad):   20:25:56  (depression 17.46°)
+  Isha (shafaq abyad):   20:25:13 ±0.5min  (SZA 107.33°, depression 17.33°)
     └ white band no longer distinct - Hanafi
 ```
 
@@ -97,10 +97,10 @@ reproduction command).
 
 | Event | Engine | Independent measurement |
 |---|---|---|
-| Fajr sadiq (desert network) | **14.10 to 14.51°** across 10 sites | KACST 14.6 ± 0.3° · Hail 14.0 ± 0.3° · Aswan camera 14.90 ± 0.17° · every desert site matched within 0.4° |
-| Isha al-abyad, Mecca | **17.46°** | SQM twilight-end 17.99 ± 0.16° · classical muwaqqit mode 17° |
-| Isha al-ahmar, Mecca | **15.50°** | visual literature 12 to 15° ("colors gone before 15") |
-| **Fajr, Birmingham UK** (out-of-sample, zero retuning, all 42 panel dates) | **mean residual +0.41°, RMS 0.87°** | **OpenFajr (CCD camera + 19-member scholar/observer panel); June trough 12.5 to 12.6° vs panel 12.3 to 12.7°** |
+| Fajr sadiq (desert network) | **14.00 to 14.82°** across 10 sites | KACST 14.6 ± 0.3° · Hail 14.0 ± 0.3° · Aswan camera 14.90 ± 0.17° · every scored desert site matched within 0.45° |
+| Isha al-abyad, Mecca | **17.33°** | SQM twilight-end 17.99 ± 0.16° · classical muwaqqit mode 17° |
+| Isha al-ahmar, Mecca | **14.96°** | visual literature 12 to 15° ("colors gone before 15") |
+| **Fajr, Birmingham UK** (out-of-sample, zero retuning, all 42 panel dates) | **mean residual +0.54°, RMS 0.95°** | **OpenFajr (CCD camera + 19-member scholar/observer panel); June trough 11.9 to 12.6° vs panel 12.3 to 12.7°** |
 
 The Birmingham row matters most: the seasonal "summer relaxation" that UK
 scholars apply as a hand-rule (14.5° in winter, about 12.5° in summer)
@@ -132,7 +132,7 @@ test.
 | MYSTIC (spherical Monte Carlo) | SZA 95 to 100° | **1 to 14 %**, backward mode, 1e8 photons |
 | DISORT + MYSTIC, cloud slab (same delta-scaled HG problem) | tau* 1 / 3 / 10, SZA 30 to 60° | **144 of 144 points within 3 % + 2 SE**, both MC estimators |
 | SHDOM, true-3D cloud cube | checkerboard + broken deck | **64/64 + 48/48 points in band** |
-| MYSTIC ultra-deep, cloud decks at twilight | tau* 1 and 3, SZA 101 to 103, 3e8 to **1e9 photons** | every cell statistically consistent with its referee; a 128-seed campaign is tightening the deepest bands |
+| MYSTIC ultra-deep, cloud decks at twilight | tau* 1 and 3, SZA 101 to 103, 3e8 to **1e9 photons** | **all sixteen cells PASS, 1d and 3D-field** (ratios 0.87 to 1.19); the two SZA 103 field cells closed by seed statistics alone (1024 and 512 seeds, field estimator unchanged) |
 | Measured twilight skies (Patat, Koomen) | zenith decay into deep twilight | **1.2 to 5.5 %** per-magnitude decay error |
 
 ## Live data
@@ -329,14 +329,23 @@ established local calendars. Known limits, stated plainly:
   ships with the engine (`twilight-cli sqm predict|compare` and the
   campaign protocol in docs/SQM_CAMPAIGN.md); what remains is a meter on a
   roof and clear nights.
-- **The deepest thick-cloud cells remain statistically weak.** Under a
-  tau* = 3 deck at solar zenith angle 101 to 103 the 550 nm chain variance
-  is heavy-tailed: the estimator agrees with the 1e9-photon MYSTIC referee
-  where it has power (650 nm now sits on the referee after the directional
-  MIS port) but several 550 nm cells remain LOW-POWER at affordable seed
-  budgets. Campaign-scale seeds or sun-side bidirectional transport would
-  close them; the gate taxonomy in `validation/RESULTS_DEEP_REGIME.md`
-  tracks exactly which cells are proven and which are pending.
+- **The 3D-field path keeps the analog chain.** The former heavy-tail
+  limitation on the 1d deck cells was resolved by the bidirectional
+  connection estimator for scattering orders three and above: light
+  subpaths traced from the sunlit top of atmosphere form a vertex
+  registry, every backward-chain collision beyond SZA 99 connects to one
+  registry vertex, and each order combines the connection with its
+  next-event counterpart through an exact per-path balance-heuristic MIS
+  (both weights come from one shared function and sum to one). All
+  sixteen deep cells now PASS the MYSTIC referee (ratios 0.87 to 1.19):
+  the twelve 1d cells at 1024 seeds and the four 3D-field cells at 1024
+  (tau* 1) and 512 (tau* 3) seeds, including the two SZA 103 field cells
+  formerly reported LOW-POWER, with the field estimator unchanged; the
+  shortfall was seed budget, not bias. The connections
+  require the 1d combined channel, so the field path converges at
+  practical budgets only through large seed campaigns; extending the
+  registry connections to voxel fields is the identified next step. The
+  gate taxonomy in `validation/RESULTS_DEEP_REGIME.md` tracks every cell.
 - **Zenith views over broken decks starve the importance sampler** (a
   documented residual with a false-tight error signature; slant views,
   which the khayt band uses, are unaffected).
@@ -348,10 +357,14 @@ established local calendars. Known limits, stated plainly:
   The GPU uses the heuristic window target only; the CPU keeps the
   forward-informed importance map and the full stack, so it remains the
   variance reference in the deepest cells.
-- **Sea-horizon sites carry a documented open offset** (Tubruq): a 1D
-  aerosol column cannot represent the directional marine boundary layer
-  along the dawn path; the maritime aerosol type remains the honest input
-  for sea horizons.
+- **Sea-horizon sites carry a partially closed offset** (Tubruq): a
+  georeferenced marine boundary-layer haze slab over the sea cells along
+  the dawn path (`tools/marine_boundary_layer.py`, climatological maritime
+  AOD 0.12 at 550 nm, 700 m scale height) shifts the computed sea-horizon
+  dawn by -0.54° averaged over three seasons, closing roughly half the
+  +1.2° residual; the remaining ~+0.5° stays open (episodically thicker
+  marine haze than climatology, or a different visual task over a
+  featureless sea horizon).
 - **Shafaq al-ahmar** rests on the weakest observational dataset (no
   color-resolved modern campaign exists); the evening calibration leans on
   instrumental rather than panel data.
@@ -370,9 +383,9 @@ python3 tools/criterion_edge_factor.py --analyze
 
 # Field-campaign checks
 ./target/release/twilight-cli pray --lat 21.4225 --lon 39.8262 --date 2026-06-13 \
-  --de440 data/de440.bsp --scattering hybrid   # Mecca: 14.85/17.46/15.50
+  --de440 data/de440.bsp --scattering hybrid   # Mecca: 14.61/17.33/14.96
 ./target/release/twilight-cli pray --lat 52.44 --lon=-1.93 --date 2026-06-13 \
-  --de440 data/de440.bsp --scattering hybrid   # Birmingham June: 12.50
+  --de440 data/de440.bsp --scattering hybrid   # Birmingham June: 12.78
 
 # Full test suite (both GPU backends and their parity gates)
 cargo test --workspace --release
