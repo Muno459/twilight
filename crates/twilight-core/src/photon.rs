@@ -1848,6 +1848,7 @@ fn bdpt_light_vertex_density(
     atm: &AtmosphereModel,
     ctx: &BdptMisCtx,
     window: &BdptEntryWindow,
+    field: Option<&Cloud3DField>,
     x: Vec3,
 ) -> f64 {
     use crate::geometry::ray_sphere_intersect;
@@ -1889,7 +1890,7 @@ fn bdpt_light_vertex_density(
         entry,
         x,
         ctx.ref_wl + 1,
-        None,
+        field,
         CloudTransmittance::BeerLambert,
     )[ctx.ref_wl];
 
@@ -1909,7 +1910,7 @@ fn bdpt_light_vertex_density(
         entry,
         boundary,
         ctx.ref_wl + 1,
-        None,
+        field,
         CloudTransmittance::BeerLambert,
     )[ctx.ref_wl];
 
@@ -2023,6 +2024,11 @@ const BDPT_REG_MAX: usize = 512;
 struct BdptChainMisArgs<'a> {
     ctx: &'a BdptMisCtx,
     seg: BdptMisSeg,
+    /// Whether the bounce-0 NEE pairs against the LOS-step connections
+    /// (true only for the 1D/clear paths; under a 3D field the LOS
+    /// connection machinery is off and order 2 keeps plain NEE, so the
+    /// registry connections cover orders >= 3 only).
+    los_pairing: bool,
     reg: &'a [LightVertex],
     reg_p: &'a [f64],
     /// Success fraction of the registry pass: reg.len() / attempts.
@@ -2073,6 +2079,7 @@ struct StokesConnArgs<'a> {
 fn bdpt_chain_conn_weight(
     atm: &AtmosphereModel,
     ctx: &BdptMisCtx,
+    field: Option<&Cloud3DField>,
     from_pos: Vec3,
     from_dir_in: Vec3,
     from_is_cloud: bool,
@@ -2100,7 +2107,7 @@ fn bdpt_chain_conn_weight(
         from_pos,
         v_pos,
         ctx.ref_wl + 1,
-        None,
+        field,
         CloudTransmittance::BeerLambert,
     )[ctx.ref_wl];
     let p_ext = p_dir * t_ref / d_sq;
@@ -2145,12 +2152,10 @@ fn trace_light_subpath(
     // chain-connection registry: wide). The matching MIS density must be
     // evaluated with the SAME window.
     window: &BdptEntryWindow,
-    // UNUSED for 3D fields: this walk handles the 1D deck via the
-    // combined-channel vertex-type draw (see below), but has no 3D-field
-    // DDA; BDPT stays off when a 3D field is present (`bdpt_active` gates
-    // on field.is_none()). The parameter stays so a future 3D conversion
-    // lands without another signature change.
-    _field: Option<&Cloud3DField>,
+    // 3D cloud field: the scout and the forced-collision inversion walk
+    // it exactly per straight shell chord (DDA; no majorant); the
+    // vertex-type draw reads the voxel extinction at the collision.
+    field: Option<&Cloud3DField>,
 ) -> usize {
     let toa_radius = atm.toa_radius();
     let mut n_vertices = 0usize;
@@ -2329,6 +2334,7 @@ fn trace_light_subpath(
             sza_deg_obs,
             &mut vspg_segs,
             deck_boost,
+            field,
         );
 
         let tau_max_h = tau_maxes[hero_wl];
@@ -2361,7 +2367,7 @@ fn trace_light_subpath(
         // Advance to the sampled scatter position, tracking per-wavelength
         // optical depths for ALIS corrections.
         let (sp, sd, scatter_shell, taus_at_pos) =
-            advance_to_optical_depth_alis(atm, pos, dir, tau_s, hero_wl, num_wl);
+            advance_to_optical_depth_alis(atm, pos, dir, tau_s, hero_wl, num_wl, field);
         pos = sp;
         dir = sd;
 
@@ -2375,17 +2381,25 @@ fn trace_light_subpath(
         // per-type coefficient, so hero_weight is untouched; the
         // per-wavelength type mismatch is carried by weight_ratio below.
         let sigma_h = atm.optics[scatter_shell][hero_wl].extinction;
-        let sigma_c = atm.cloud_extinction[scatter_shell];
+        // Cloud extinction at the collision: the voxel value under a 3D
+        // field (shells then carry zero cloud), the shell value under a
+        // 1D deck. The type conditional is the same either way.
+        let sigma_c = match field {
+            Some(f) => f.sigma_at(pos),
+            None => atm.cloud_extinction[scatter_shell],
+        };
         if sigma_c > 0.0 {
-            // Reachability diagnostic: this light vertex landed in the deck.
+            // Reachability diagnostic: this light vertex landed in cloud.
             BDPT_CLOUD_VERTEX_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         let mut is_cloud = false;
         let mut g_cloud = 0.0f64;
         if sigma_c > 0.0 && xorshift_f64(&mut rng.tau) < sigma_c / (sigma_c + sigma_h) {
             is_cloud = true;
-            // 1D deck: shell-constant gray HG asymmetry (field is None here).
-            g_cloud = atm.cloud_g_scaled;
+            g_cloud = match field {
+                Some(f) => f.g_at(pos),
+                None => atm.cloud_g_scaled,
+            };
         }
         // Diagnostic attribution only (default off): drop cloud-vertex scoring
         // while keeping the RNG draw above, to isolate the cloud-vertex share
@@ -3058,6 +3072,11 @@ fn scout_with_vspg_segments_alis(
     // Multiplies VSPG importance for cloud-carrying shells (deck-aware light
     // sampling, Phase 2 (i)). 1.0 = unchanged; used only by the light subpath.
     deck_boost: f64,
+    // 3D cloud field for the LIGHT-SUBPATH scout: each straight shell
+    // chord adds the field's DDA cloud tau (gray, shared across
+    // wavelengths) exactly. Chains pass None (they stay analog under
+    // fields; see docs/FIELD_CONNECTIONS_PLAN.md).
+    field: Option<&Cloud3DField>,
 ) -> ([f64; 64], bool, usize) {
     let surface_radius = atm.surface_radius();
     let num_shells = atm.num_shells;
@@ -3078,10 +3097,17 @@ fn scout_with_vspg_segments_alis(
             Some((dist, is_outward)) => {
                 // Accumulate per-wavelength COMBINED tau (gas + gray 1D
                 // cloud; the cloud term is shared across wavelengths).
+                // Under a 3D field the shells carry zero cloud and the
+                // chord's exact DDA cloud tau is added instead (gray, so
+                // likewise shared across wavelengths).
                 let cext = atm.cloud_extinction[shell_idx];
+                let ctau_field = match field {
+                    Some(f) => f.tau_along(pos, dir, dist),
+                    None => 0.0,
+                };
                 let hero_tau_before = tau[hero_wl];
                 for (w, tau_w) in tau.iter_mut().enumerate().take(num_wl) {
-                    *tau_w += (atm.optics[shell_idx][w].extinction + cext) * dist;
+                    *tau_w += (atm.optics[shell_idx][w].extinction + cext) * dist + ctau_field;
                 }
                 let hero_tau_shell = tau[hero_wl] - hero_tau_before;
 
@@ -3090,7 +3116,11 @@ fn scout_with_vspg_segments_alis(
                 // light subpath can place vertices in the deck (deck_boost=1.0
                 // leaves clear shells and the backward chain bit-identical).
                 if num_seg < VSPG_MAX_SEGMENTS && hero_tau_shell > 1e-30 {
-                    let deck = if cext > 0.0 { deck_boost } else { 1.0 };
+                    let deck = if cext > 0.0 || ctau_field > 0.0 {
+                        deck_boost
+                    } else {
+                        1.0
+                    };
                     segments[num_seg] = VspgSegment {
                         tau_lo: hero_tau_before,
                         tau_hi: tau[hero_wl],
@@ -3267,13 +3297,13 @@ pub fn hybrid_scatter_radiance(
     // lv.hero_weight is the absolute weight here and the weight-internal
     // densities are exact. The registry seed derives from the CURRENT
     // rng_state without advancing it: every chain keeps its historical
-    // seed, connections only add scores. Below BDPT_SZA_START (or with a
-    // 3D field, or unpolarized) nothing changes at all.
+    // seed, connections only add scores. Below BDPT_SZA_START (or
+    // unpolarized) nothing changes at all; under a 3D field the registry
+    // subpaths walk the field exactly (FIELD_CONNECTIONS_PLAN.md).
     let sza_deg_obs = libm::acos(cos_sza_obs.clamp(-1.0, 1.0)) * 180.0 / core::f64::consts::PI;
     let conn_active = polarized
         && sza_deg_obs >= BDPT_SZA_START
         && secondary_rays > 0
-        && field.is_none()
         && !BDPT_CHAIN_CONN_DISABLE.load(core::sync::atomic::Ordering::Relaxed);
     let dummy_reg_lv = LightVertex {
         pos: Vec3::new(0.0, 0.0, 0.0),
@@ -3323,6 +3353,7 @@ pub fn hybrid_scatter_radiance(
                     atm,
                     &ctx,
                     &BDPT_REG_WINDOW,
+                    field,
                     subpath_verts[0].pos,
                 );
                 if p > 0.0 {
@@ -4244,12 +4275,14 @@ fn trace_secondary_chain(
                         && !flight_grounded
                         && !c.reg.is_empty() =>
                 {
-                    let p_l =
-                        bdpt_light_vertex_density(atm, c.ctx, &BDPT_REG_WINDOW, pos);
+                    let p_l = bdpt_light_vertex_density(
+                        atm, c.ctx, &BDPT_REG_WINDOW, field, pos,
+                    );
                     if p_l > 0.0 {
                         1.0 - bdpt_chain_conn_weight(
                             atm,
                             c.ctx,
+                            field,
                             prev_pos,
                             prev_vertex_dir_in,
                             prev_is_cloud,
@@ -4295,6 +4328,7 @@ fn trace_secondary_chain(
                     let w_conn = bdpt_chain_conn_weight(
                         atm,
                         c.ctx,
+                        field,
                         pos,
                         current_dir,
                         cloud_collision,
@@ -5610,6 +5644,11 @@ fn advance_to_optical_depth_alis(
     tau_target: f64,
     hero_wl: usize,
     num_wl: usize,
+    // 3D field for the LIGHT-SUBPATH forced flight: the within-shell
+    // inversion goes through the field's exact combined DDA inversion
+    // (piecewise-constant extinction along the straight chord; no
+    // majorant, no null collisions). Chains pass None.
+    field: Option<&Cloud3DField>,
 ) -> (Vec3, Vec3, usize, [f64; 64]) {
     let surface_radius = atm.surface_radius();
     let num_shells = atm.num_shells;
@@ -5632,18 +5671,42 @@ fn advance_to_optical_depth_alis(
 
         match next_shell_boundary(pos, dir, shell.r_inner, shell.r_outer) {
             Some((boundary_dist, is_outward)) => {
-                let tau_shell_hero = hero_extinction * boundary_dist;
+                // Chord cloud tau from the field (0.0 without one; the
+                // shells then carry any 1D deck through cext).
+                let ctau_chord = match field {
+                    Some(f) => f.tau_along(pos, dir, boundary_dist),
+                    None => 0.0,
+                };
+                let tau_shell_hero = hero_extinction * boundary_dist + ctau_chord;
 
                 if hero_tau + tau_shell_hero >= tau_target {
                     // Scatter point is within this shell.
                     let tau_remaining = tau_target - hero_tau;
-                    let dist = if hero_extinction > 1e-30 {
-                        tau_remaining / hero_extinction
-                    } else {
-                        boundary_dist
+                    let (dist, ctau_at) = match field {
+                        Some(f) => match f.advance_to_combined_tau(
+                            pos,
+                            dir,
+                            boundary_dist,
+                            tau_remaining,
+                            hero_extinction,
+                        ) {
+                            Some((s, c)) => (s, c),
+                            // Numerical edge (target grazes the chord
+                            // end): land on the boundary.
+                            None => (boundary_dist, ctau_chord),
+                        },
+                        None => (
+                            if hero_extinction > 1e-30 {
+                                tau_remaining / hero_extinction
+                            } else {
+                                boundary_dist
+                            },
+                            0.0,
+                        ),
                     };
                     for (w, tau_w) in tau_accumulated.iter_mut().enumerate().take(num_wl) {
-                        *tau_w += (atm.optics[shell_idx][w].extinction + cext) * dist;
+                        *tau_w +=
+                            (atm.optics[shell_idx][w].extinction + cext) * dist + ctau_at;
                     }
                     pos = pos + dir * dist;
                     return (pos, dir, shell_idx, tau_accumulated);
@@ -5652,7 +5715,8 @@ fn advance_to_optical_depth_alis(
                 // Cross boundary
                 hero_tau += tau_shell_hero;
                 for (w, tau_w) in tau_accumulated.iter_mut().enumerate().take(num_wl) {
-                    *tau_w += (atm.optics[shell_idx][w].extinction + cext) * boundary_dist;
+                    *tau_w +=
+                        (atm.optics[shell_idx][w].extinction + cext) * boundary_dist + ctau_chord;
                 }
 
                 let boundary_pos = pos + dir * boundary_dist;
@@ -6057,8 +6121,10 @@ fn trace_secondary_chain_alis(
                     num_wl,
                     sza_deg_local,
                     &mut vspg_segs,
-                    // Backward chain keeps standard VSPG (no deck boost).
+                    // Backward chain keeps standard VSPG (no deck boost)
+                    // and no field walk (chains stay analog under fields).
                     1.0,
+                    None,
                 );
                 tau_maxes = tms;
                 n_vspg_segs = ns;
@@ -6105,8 +6171,9 @@ fn trace_secondary_chain_alis(
                 );
                 hero_weight *= vspg_w;
                 diag_vspg_factor *= vspg_w;
-                let (sp, sd, ss, taus_at_pos) =
-                    advance_to_optical_depth_alis(atm, pos, current_dir, tau_s, hero_wl, num_wl);
+                let (sp, sd, ss, taus_at_pos) = advance_to_optical_depth_alis(
+                    atm, pos, current_dir, tau_s, hero_wl, num_wl, None,
+                );
                 pos = sp;
                 current_dir = sd;
                 scatter_shell = ss;
@@ -6386,24 +6453,27 @@ fn trace_secondary_chain_alis(
                     if !is_main {
                         1.0
                     } else if bounce_idx == 0 {
-                        if ground_bounced {
+                        if ground_bounced || !m.los_pairing {
                             1.0
                         } else {
                             let p_l = bdpt_light_vertex_density(
                                 atm,
                                 m.ctx,
                                 &BDPT_LOS_WINDOW,
+                                field,
                                 pos,
                             );
                             1.0 - bdpt_mis_weight(atm, m.ctx, &m.seg, pos, p_l)
                         }
                     } else if prev_valid && !flight_grounded && !m.reg.is_empty() {
-                        let p_l =
-                            bdpt_light_vertex_density(atm, m.ctx, &BDPT_REG_WINDOW, pos);
+                        let p_l = bdpt_light_vertex_density(
+                            atm, m.ctx, &BDPT_REG_WINDOW, field, pos,
+                        );
                         if p_l > 0.0 {
                             1.0 - bdpt_chain_conn_weight(
                                 atm,
                                 m.ctx,
+                                field,
                                 prev_pos,
                                 prev_dir_in,
                                 prev_is_cloud,
@@ -6518,6 +6588,7 @@ fn trace_secondary_chain_alis(
                         let w_conn = bdpt_chain_conn_weight(
                             atm,
                             m.ctx,
+                            field,
                             pos,
                             current_dir,
                             cloud_collision,
@@ -6991,7 +7062,11 @@ pub fn hybrid_scatter_radiance_alis(
     // near-connection 1/d^2 spike that dominated the deep-cell variance
     // (see docs/BDPT_UNDER_CLOUD_PLAN.md). The fixed blend remains for the
     // BDPT_VERTS=2 diagnostic, whose order-3 pairing is not implemented.
-    let mis_ctx = if bdpt_active
+    // Per-path MIS machinery: active independently of the LOS-connection
+    // gate so the registry connections also serve 3D-field runs (the LOS
+    // pairing itself stays 1D-only via `los_pairing` below).
+    let mis_ctx = if sza_deg_obs >= BDPT_SZA_START
+        && secondary_rays > 0
         && bdpt_active_light_verts() == 1
         && !BDPT_CHAIN_CONN_DISABLE.load(core::sync::atomic::Ordering::Relaxed)
     {
@@ -7083,51 +7158,55 @@ pub fn hybrid_scatter_radiance_alis(
             }
         }
         path_guide.normalize();
-        // Registry pass: dedicated wide-window subpaths (phi-stratified
-        // over the wide window by the subpath binning), own decorrelated
-        // seed stream, guide left untouched. Densities precomputed with
-        // the SAME wide window (the p_L side of the chain-connection
-        // balance weight).
-        if let Some(ctx) = mis_ctx.as_ref() {
-            let reg_base_seed = splitmix64(*rng_state ^ 0x5EED_4E61_57B7_11DE);
-            for reg_idx in 0..BDPT_REG_MAX {
-                let hero_wl = reg_idx % num_wl;
-                let subpath_seed = splitmix64(reg_base_seed.wrapping_add(reg_idx as u64));
-                let mut light_rng = McRng::from_seed(subpath_seed);
-                let mut subpath_verts = [dummy_lv; BDPT_MAX_LIGHT_VERTICES];
-                let n_verts = trace_light_subpath(
-                    atm,
-                    sun_dir,
-                    observer_pos,
-                    hero_wl,
-                    num_wl,
-                    sza_deg_obs,
-                    &mut light_rng,
-                    &mut subpath_verts,
-                    reg_idx,
-                    BDPT_REG_MAX,
-                    &BDPT_REG_WINDOW,
-                    field,
-                );
-                if n_verts > 0 && subpath_verts[0].hero_weight.abs() > 1e-30 {
-                    let p = bdpt_light_vertex_density(
-                        atm,
-                        ctx,
-                        &BDPT_REG_WINDOW,
-                        subpath_verts[0].pos,
-                    );
-                    if p > 0.0 {
-                        light_registry[reg_len] = subpath_verts[0];
-                        registry_p[reg_len] = p;
-                        reg_len += 1;
-                    }
-                }
-            }
-        }
         Some(&path_guide)
     } else {
         None
     };
+
+    // Registry pass for the chain-vertex connections: dedicated subpaths
+    // (phi-stratified over the window by the subpath binning), own
+    // decorrelated seed stream, guide untouched. Runs whenever the
+    // per-path MIS is active, INCLUDING under a 3D field (the light
+    // subpath walks the field exactly; see FIELD_CONNECTIONS_PLAN.md).
+    // Densities precomputed with the SAME window.
+    if let Some(ctx) = mis_ctx.as_ref() {
+        let dummy_lv = dummy_reg_lv;
+        let reg_base_seed = splitmix64(*rng_state ^ 0x5EED_4E61_57B7_11DE);
+        for reg_idx in 0..BDPT_REG_MAX {
+            let hero_wl = reg_idx % num_wl;
+            let subpath_seed = splitmix64(reg_base_seed.wrapping_add(reg_idx as u64));
+            let mut light_rng = McRng::from_seed(subpath_seed);
+            let mut subpath_verts = [dummy_lv; BDPT_MAX_LIGHT_VERTICES];
+            let n_verts = trace_light_subpath(
+                atm,
+                sun_dir,
+                observer_pos,
+                hero_wl,
+                num_wl,
+                sza_deg_obs,
+                &mut light_rng,
+                &mut subpath_verts,
+                reg_idx,
+                BDPT_REG_MAX,
+                &BDPT_REG_WINDOW,
+                field,
+            );
+            if n_verts > 0 && subpath_verts[0].hero_weight.abs() > 1e-30 {
+                let p = bdpt_light_vertex_density(
+                    atm,
+                    ctx,
+                    &BDPT_REG_WINDOW,
+                    field,
+                    subpath_verts[0].pos,
+                );
+                if p > 0.0 {
+                    light_registry[reg_len] = subpath_verts[0];
+                    registry_p[reg_len] = p;
+                    reg_len += 1;
+                }
+            }
+        }
+    }
 
     // Per-wavelength accumulated optical depth from observer.
     let mut tau_obs = [0.0f64; 64];
@@ -7186,6 +7265,9 @@ pub fn hybrid_scatter_radiance_alis(
                 seg_b: step_start + view_dir * ds,
                 n_eye: rays_this_step as f64,
             },
+            // The bounce-0 pairing exists only where the LOS connections
+            // run (1D/clear); under a field order 2 keeps plain NEE.
+            los_pairing: bdpt_active,
             reg: &light_registry[..reg_len],
             reg_p: &registry_p[..reg_len],
             reg_frac: reg_len as f64 / BDPT_REG_MAX as f64,
@@ -7536,7 +7618,8 @@ pub fn hybrid_scatter_radiance_alis(
                     .zip(batch_vertices.iter())
                     .take(n_batch_verts)
                 {
-                    *pl = bdpt_light_vertex_density(atm, ctx, &BDPT_LOS_WINDOW, lv.pos);
+                    *pl =
+                        bdpt_light_vertex_density(atm, ctx, &BDPT_LOS_WINDOW, field, lv.pos);
                 }
             }
 
@@ -8561,11 +8644,11 @@ mod tests {
         // ALIS scout: gray deck must not change per-wavelength tau
         // DIFFERENCES (the crux of the ALIS forced ratio).
         let (taus_c, _, _) =
-            scout_with_vspg_segments_alis(&atm, pos, dir, 1, 3, 97.0, &mut segs, 1.0);
+            scout_with_vspg_segments_alis(&atm, pos, dir, 1, 3, 97.0, &mut segs, 1.0, None);
         let mut atm_clear = atm.clone();
         atm_clear.cloud_extinction[1] = 0.0;
         let (taus_g, _, _) =
-            scout_with_vspg_segments_alis(&atm_clear, pos, dir, 1, 3, 97.0, &mut segs, 1.0);
+            scout_with_vspg_segments_alis(&atm_clear, pos, dir, 1, 3, 97.0, &mut segs, 1.0, None);
         for w in 0..3 {
             let d_cloudy = taus_c[w] - taus_c[1];
             let d_gas = taus_g[w] - taus_g[1];
@@ -8681,7 +8764,7 @@ mod tests {
         // ALIS scout variant: identical overflow discipline on hero taus.
         let before2 = VSPG_OVERFLOW_EVENTS.load(Ordering::Relaxed);
         let (taus, hg2, n_seg2) =
-            scout_with_vspg_segments_alis(&atm, pos, dir, 0, 1, 97.0, &mut segs, 1.0);
+            scout_with_vspg_segments_alis(&atm, pos, dir, 0, 1, 97.0, &mut segs, 1.0, None);
         assert!(!hg2);
         assert_eq!(n_seg2, VSPG_MAX_SEGMENTS);
         assert!(VSPG_OVERFLOW_EVENTS.load(Ordering::Relaxed) > before2);
@@ -10396,6 +10479,7 @@ mod tests {
                 sza_deg,
                 &mut vspg_segs,
                 1.0,
+                None,
             );
             std::eprintln!(
                 "  Scout from rim: tau_hero={:.6e}, hit_ground={}, n_segs={}",
@@ -10414,6 +10498,7 @@ mod tests {
                 sza_deg,
                 &mut vspg_segs,
                 1.0,
+                None,
             );
             std::eprintln!(
                 "  Scout from center: tau_hero={:.6e}, hit_ground={}, n_segs={}",

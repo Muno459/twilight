@@ -2669,7 +2669,18 @@ mod tests {
         let tau_star: f64 = getenv("BDPT_TAU", "3").parse().unwrap();
         let wl: f64 = getenv("BDPT_WL", "550").parse().unwrap();
 
-        let atm = deep_atm_1d(tau_star);
+        // BDPT_FIELD=1: run the equivalent uniform 3D FIELD instead of the
+        // 1D deck (the G-FC gate surface: registry connections under a
+        // field vs the same physics as 1D).
+        let use_field = std::env::var("BDPT_FIELD").as_deref() == Ok("1");
+        let (atm, field_store) = if use_field {
+            let (a, o) = deep_field(tau_star);
+            (a, Some(o))
+        } else {
+            (deep_atm_1d(tau_star), None)
+        };
+        let field_view = field_store.as_ref().map(|o| o.view());
+        let field = field_view.as_ref();
         let w = wl_index(&atm, wl);
         // Scalar config -> the ALIS chain (the only chain with BDPT).
         let config = deep_config(photons, false);
@@ -2755,7 +2766,7 @@ mod tests {
                 if stokes_arm {
                     let mut c = stokes_config.clone();
                     c.seed_salt = seed as u64;
-                    return hybrid_perwl(&atm, &c, sza, None, w);
+                    return hybrid_perwl(&atm, &c, sza, field, w);
                 }
                 let salt = (seed as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let sza_bits = mix_salt(sza.to_bits(), salt);
@@ -2764,7 +2775,7 @@ mod tests {
                     .wrapping_mul(6364136223846793005)
                     .wrapping_add(1);
                 let r = photon::hybrid_scatter_radiance_alis(
-                    &atm, obs, view, sun, photons, &mut rng, None,
+                    &atm, obs, view, sun, photons, &mut rng, field,
                 );
                 if w < SOLAR_IRRADIANCE.len() {
                     r[w] * SOLAR_IRRADIANCE[w]
