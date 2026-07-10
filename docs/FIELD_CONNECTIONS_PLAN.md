@@ -1,9 +1,17 @@
 # Voxel-field connection estimator: design
 
-Status: DESIGN (2026-07-10). Identified as future work in paper 1's
-limitations after the 1D connection estimator closed the one-dimensional
-deep referee cells (docs/BDPT_UNDER_CLOUD_PLAN.md). Nothing here is
-implemented.
+Status: IMPLEMENTED on branch field-conns (98bebc9, 2026-07-10), gate
+verdicts pending. The design below was written first and the
+implementation followed it: Cloud3DField::advance_to_combined_tau (exact
+piecewise-constant combined inversion), scout/advance field parameters
+(chains pass None), voxel vertex-type draw, field threading through the
+densities and weights, and the los_pairing flag (bounce-0 LOS pairing
+stays 1D-only). All activation predicates are identical to main when no
+field is present; fast suites and clippy green. The G-FC gate ladder
+(bitcheck vs main, partition invariant under a uniform field at SZA 99.5,
+field-vs-1D equivalence at 101, field referee cells at 128 seeds) is
+queued on the verification box; the branch does NOT merge to main until
+all four pass.
 
 ## Goal
 
