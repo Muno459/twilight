@@ -14,26 +14,28 @@ Polarize:   Stokes [I,Q,U,V]
 GPU:        Apple M2 Pro (Metal)
 Compute:    GPU (Metal; per-kernel CPU fallback)
 Computing...
-Done in 171632 ms (ephemeris: SPA (fallback), compute: GPU (Metal; per-kernel CPU fallback))
+Done in 44584 ms (ephemeris: SPA (fallback), compute: GPU (Metal; per-kernel CPU fallback))
 
 Prayer Times (MCRT-derived):
 -----------------------------------------------------------------
   Sunrise:              05:06:49
   Sunset:               21:20:22
 
-  Celestial background: fajr-side 7.205e-4 cd/m^2, isha-side 7.324e-4 (dark-sky const 2.200e-4) - re-floating thresholds.
-  Fajr (khayt al-abyad): 02:32:26  (SZA 104.50°, depression 14.50°)
+  Celestial background: fajr-side 8.136e-4 cd/m^2, isha-side 8.224e-4 (dark-sky const 2.200e-4) - re-floating thresholds.
+  Fajr (khayt al-abyad): 02:39:45 ±1.0min  (SZA 104.12°, depression 14.12°)
     └ white thread distinct from black + lateral spread (2:187, mustatir)
-  Isha (shafaq ahmar):   23:52:34  (SZA 104.50°, depression 14.50°)
+  Isha (shafaq ahmar):   00:01:54 (+1d) ±2.0min  (SZA 104.95°, depression 14.95°)
     └ red band no longer distinct - Shafi'i/Maliki/Hanbali (primary)
-  Isha (shafaq abyad):   23:52:34  (SZA 104.50°, depression 14.50°)
+  Isha (shafaq abyad):   23:58:53 ±0.5min  (SZA 104.81°, depression 14.81°)
     └ white band no longer distinct - Hanafi
 
   Legacy absolute-threshold method (comparison):
-  Fajr (true dawn):     02:34:36 ±<0.1min  (SZA 104.39°, depression 14.39°)
-  Isha (al-abyad):      23:41:03 ±<0.1min  (SZA 103.87°, depression 13.87°)
+  Fajr (true dawn):     02:34:20 ±1.9min  (SZA 104.40°, depression 14.40°)
+    └ high-latitude mode: sky never reaches full darkness; this is the
+      TVI-detectable onset of dawn brightening above tonight's sky floor
+  Isha (al-abyad):      23:36:42 ±0.4min  (SZA 103.61°, depression 13.61°)
     └ Hanafi school - white twilight disappears
-  Isha (al-ahmar):      23:40:18 ±<0.1min  (SZA 103.83°, depression 13.83°)
+  Isha (al-ahmar):      23:37:23 ±0.6min  (SZA 103.65°, depression 13.65°)
     └ Shafi'i/Maliki/Hanbali - red glow disappears
 -----------------------------------------------------------------
 

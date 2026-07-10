@@ -14,37 +14,37 @@ Polarize:   Stokes [I,Q,U,V]
 GPU:        Apple M2 Pro (Metal)
 Compute:    GPU (Metal; per-kernel CPU fallback)
 Computing...
-Done in 199203 ms (ephemeris: SPA (fallback), compute: GPU (Metal; per-kernel CPU fallback))
+Done in 54933 ms (ephemeris: SPA (fallback), compute: GPU (Metal; per-kernel CPU fallback))
 
 Prayer Times (MCRT-derived):
 -----------------------------------------------------------------
   Sunrise:              05:15:53
   Sunset:               20:53:24
 
-  Celestial background: fajr-side 7.067e-4 cd/m^2, isha-side 8.469e-4 (dark-sky const 2.200e-4) - re-floating thresholds.
-  Fajr (khayt al-abyad): 03:03:22  (SZA 104.70°, depression 14.70°)
+  Celestial background: fajr-side 6.948e-4 cd/m^2, isha-side 8.354e-4 (dark-sky const 2.200e-4) - re-floating thresholds.
+  Fajr (khayt al-abyad): 03:04:52 ±1.2min  (SZA 104.59°, depression 14.59°)
     └ white thread distinct from black + lateral spread (2:187, mustatir)
-    └ false dawn (al-fajr al-kadhib) visible from 02:58:49 - do not pray Fajr yet
-  Isha (shafaq ahmar):   23:04:46  (SZA 104.50°, depression 14.50°)
+    └ false dawn (al-fajr al-kadhib) visible from 02:57:08 - do not pray Fajr yet
+  Isha (shafaq ahmar):   23:12:22 ±1.9min  (SZA 105.05°, depression 15.05°)
     └ red band no longer distinct - Shafi'i/Maliki/Hanbali (primary)
-  Isha (shafaq abyad):   23:40:25  (SZA 106.79°, depression 16.79°)
+  Isha (shafaq abyad):   23:47:14 ±0.3min  (SZA 107.14°, depression 17.14°)
     └ white band no longer distinct - Hanafi
 
   Legacy absolute-threshold method (comparison):
-  Fajr (true dawn):     03:01:07 ±<0.1min  (SZA 104.87°, depression 14.87°)
-  Isha (al-abyad):      22:56:12 ±<0.1min  (SZA 103.85°, depression 13.85°)
+  Fajr (true dawn):     02:59:10 ±2.8min  (SZA 105.01°, depression 15.01°)
+  Isha (al-abyad):      22:58:41 ±1.4min  (SZA 104.04°, depression 14.04°)
     └ Hanafi school - white twilight disappears
-  Isha (al-ahmar):      22:55:20 ±<0.1min  (SZA 103.78°, depression 13.78°)
+  Isha (al-ahmar):      22:55:03 ±0.7min  (SZA 103.75°, depression 13.75°)
     └ Shafi'i/Maliki/Hanbali - red glow disappears
 -----------------------------------------------------------------
 
 Comparison with conventional fixed-angle methods:
 -----------------------------------------------------------------
   Fajr 18° (MWL/ISNA)          N/A  (diff: ---)
-  Fajr 15° (Egypt)             02:59:20  (diff: +1.8 min)
+  Fajr 15° (Egypt)             02:59:20  (diff: -0.2 min)
   Fajr 19.5° (Umm al-Qura)     N/A  (diff: ---)
-  Isha 17° (MWL)               23:44:30  (diff: -49.2 min)
-  Isha 17.5° (Egypt)           23:54:54  (diff: -59.6 min)
+  Isha 17° (MWL)               23:44:30  (diff: -49.4 min)
+  Isha 17.5° (Egypt)           23:54:54  (diff: -59.9 min)
   Isha 18° (ISNA)              N/A  (diff: ---)
 -----------------------------------------------------------------
 

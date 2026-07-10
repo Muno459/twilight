@@ -16,7 +16,7 @@ Skyglow:    Bortle 6, zenith 0.65 mcd/m^2, LED fraction 50%
 GPU:        Apple M2 Pro (Metal)
 Compute:    GPU (Metal; per-kernel CPU fallback)
 Computing...
-Done in 79823 ms (ephemeris: SPA (fallback), compute: GPU (Metal; per-kernel CPU fallback))
+Done in 57541 ms (ephemeris: SPA (fallback), compute: GPU (Metal; per-kernel CPU fallback))
 
 Prayer Times (MCRT-derived):
 -----------------------------------------------------------------
@@ -27,22 +27,21 @@ Prayer Times (MCRT-derived):
   ** PERSISTENT TWILIGHT: Sun only reaches 14.3° max depression (104.3° SZA)
      Twilight never fully ends on this date at this latitude.
 
-  Celestial background: fajr-side 6.441e-3 cd/m^2, isha-side 1.063e-2 (dark-sky const 2.200e-4) - re-floating thresholds.
-  Fajr (khayt al-abyad): 03:21:35  (SZA 99.21°, depression 9.21°)
+  Celestial background: fajr-side 6.714e-3 cd/m^2, isha-side 1.061e-2 (dark-sky const 2.200e-4) - re-floating thresholds.
+  Fajr (khayt al-abyad): 02:33:21 ±7.1min  (SZA 102.28°, depression 12.28°)
     └ white thread distinct from black + lateral spread (2:187, mustatir)
-    └ false dawn (al-fajr al-kadhib) visible from 03:18:22 - do not pray Fajr yet
-  Isha (shafaq ahmar):   23:35:23  (SZA 101.56°, depression 11.56°)
+  Isha (shafaq ahmar):   00:04:15 (+1d) ±2.4min  (SZA 103.01°, depression 13.01°)
     └ red band no longer distinct - Shafi'i/Maliki/Hanbali (primary)
-  Isha (shafaq abyad):   23:36:25  (SZA 101.62°, depression 11.62°)
+  Isha (shafaq abyad):   23:59:32 ±30.7min  (SZA 102.81°, depression 12.81°)
     └ white band no longer distinct - Hanafi
 
   Legacy absolute-threshold method (comparison):
-  Fajr (true dawn):     02:32:03  (SZA 102.34°, depression 12.34°)
+  Fajr (true dawn):     02:12:39 ±7.3min  (SZA 103.19°, depression 13.19°)
     └ high-latitude mode: sky never reaches full darkness; this is the
       TVI-detectable onset of dawn brightening above tonight's sky floor
-  Isha (al-abyad):      23:29:10  (SZA 101.19°, depression 11.19°)
+  Isha (al-abyad):      23:51:31 ±6.1min  (SZA 102.43°, depression 12.43°)
     └ Hanafi school - white twilight disappears
-  Isha (al-ahmar):      23:36:29  (SZA 101.63°, depression 11.63°)
+  Isha (al-ahmar):      23:42:04 ±5.1min  (SZA 101.94°, depression 11.94°)
     └ Shafi'i/Maliki/Hanbali - red glow disappears
 -----------------------------------------------------------------
 
