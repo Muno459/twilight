@@ -258,6 +258,51 @@ impl<'a> Cloud3DField<'a> {
         None
     }
 
+    /// Same traversal, inverting the COMBINED optical depth
+    /// `sigma_uniform * t + tau_cloud(t) = tau_target`, where
+    /// `sigma_uniform` is a constant (per-shell gas) extinction added on
+    /// top of the field's voxel sigma. Returns `(t, cloud_tau_consumed)`
+    /// so the caller can split the combined depth back into gas and
+    /// cloud parts (the gray cloud share cancels in per-wavelength
+    /// ratios; the gas share does not). THE inverse of
+    /// `sigma_uniform * t + tau_along(t)`, sharing the stepping exactly:
+    /// forced-collision sampling must invert the same function it was
+    /// normalized with. Exact (no majorant, no null collisions): the
+    /// combined extinction is piecewise constant along the ray.
+    pub fn advance_to_combined_tau(
+        &self,
+        p0: Vec3,
+        dir: Vec3,
+        t_max: f64,
+        tau_target: f64,
+        sigma_uniform: f64,
+    ) -> Option<(f64, f64)> {
+        if tau_target <= 0.0 {
+            return Some((0.0, 0.0));
+        }
+        let mut tau = 0.0f64; // combined
+        let mut ctau = 0.0f64; // cloud-only
+        let mut t = 0.0f64;
+        let min_step = self.min_step();
+        let has_macro = !self.macrocell_max.is_empty();
+        for _ in 0..40_000 {
+            if t >= t_max {
+                return None;
+            }
+            let (t_next, sigma) = self.next_segment(p0, dir, t, t_max, min_step, has_macro);
+            let comb = sigma + sigma_uniform;
+            let dtau = comb * (t_next - t);
+            if tau + dtau >= tau_target {
+                let ds = (tau_target - tau) / comb.max(1e-300);
+                return Some((t + ds, ctau + sigma * ds));
+            }
+            tau += dtau;
+            ctau += sigma * (t_next - t);
+            t = t_next;
+        }
+        None
+    }
+
     /// Minimum step: a fraction of the smallest cell dimension, so the
     /// boundary-distance fallback can never stall.
     #[inline]
