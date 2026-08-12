@@ -985,19 +985,24 @@ fn cmd_mcrt(
     let compute_label = {
         #[cfg(feature = "gpu")]
         {
-            if gpu_backend.is_some() {
+            if let Some(backend) = gpu_backend.as_ref() {
                 // Honest label: a backend initialized, but individual
                 // kernels may still fall back to CPU on dispatch failure.
-                "GPU (Metal; per-kernel CPU fallback)"
+                // Name the backend that actually initialized rather than
+                // assuming Metal; on non-Apple hosts this is wgpu.
+                format!(
+                    "GPU ({}; per-kernel CPU fallback)",
+                    backend.device_info().backend
+                )
             } else {
-                "CPU (rayon)"
+                "CPU (rayon)".to_string()
             }
         }
         #[cfg(not(feature = "gpu"))]
         {
             // gpu feature off: the GPU flags exist but cannot take effect.
             let _ = (force_cpu, gpu_backend);
-            "CPU (rayon)"
+            "CPU (rayon)".to_string()
         }
     };
     println!("Compute:      {}", compute_label);
@@ -2328,19 +2333,24 @@ fn cmd_pray(args: PrayArgs) {
     let compute_label = {
         #[cfg(feature = "gpu")]
         {
-            if gpu_backend.is_some() {
+            if let Some(backend) = gpu_backend.as_ref() {
                 // Honest label: a backend initialized, but individual
                 // kernels may still fall back to CPU on dispatch failure.
-                "GPU (Metal; per-kernel CPU fallback)"
+                // Name the backend that actually initialized rather than
+                // assuming Metal; on non-Apple hosts this is wgpu.
+                format!(
+                    "GPU ({}; per-kernel CPU fallback)",
+                    backend.device_info().backend
+                )
             } else {
-                "CPU (rayon)"
+                "CPU (rayon)".to_string()
             }
         }
         #[cfg(not(feature = "gpu"))]
         {
             // gpu feature off: the GPU flags exist but cannot take effect.
             let _ = (args.cpu, args.gpu_backend);
-            "CPU (rayon)"
+            "CPU (rayon)".to_string()
         }
     };
     println!("Compute:    {}", compute_label);
