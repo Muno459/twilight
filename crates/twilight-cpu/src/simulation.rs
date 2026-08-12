@@ -2655,8 +2655,9 @@ mod tests {
     /// (`hybrid_scatter_radiance_alis`, field None so the 1D deck is active);
     /// arm B = the independent analog `Multiple` (`trace_photon`) reference,
     /// the same estimator-A-vs-estimator-B contract as G-HYB-MULT /
-    /// G-FORCED-1D. Passes when `|m_bdpt - m_mult| <= 3*sqrt(se_a^2+se_b^2)
-    /// + 0.05*max`; also prints both CVs so the variance win is visible.
+    /// G-FORCED-1D. Passes when the difference of means stays within
+    /// `3*sqrt(se_a^2+se_b^2) + 0.05*max`; also prints both CVs so the
+    /// variance win is visible.
     /// Env: BDPT_SEEDS, BDPT_PHOTONS, BDPT_SZA, BDPT_TAU, BDPT_WL.
     #[test]
     #[ignore = "G-BDPT-1D: heavy MC. run: cargo test -p twilight-cpu --release -- --ignored --nocapture g_bdpt_under_1d_cloud_matches_multiple"]
@@ -2868,17 +2869,6 @@ mod tests {
         }
     }
 
-    /// Variance-ledger harness: seed-CV of the production STOKES hybrid
-    /// per referee wavelength, env-configured (CV_FIELD = synthetic |
-    /// padborg, CV_SZAS, CV_SEEDS, CV_PHOTONS). Prints
-    /// `CVCSV,field,sza,wl,mean,se,cv_pct` lines. Run in THIS tree
-    /// (field-forced) and in a HEAD worktree (field chains analog) to
-    /// produce the forced-vs-analog CV comparison.
-    #[test]
-    #[ignore = "variance-ledger harness; run explicitly, see RESULTS_DEEP_REGIME.md"]
-    /// Degree-of-polarization dump for the paper's polarization figure:
-    /// zenith view, clear sky, backward MC Stokes at three SZA.
-    /// `cargo test -p twilight-cpu --release dop_dump -- --ignored --nocapture`
     /// Importance-map dump on the REAL clear-sky atmosphere (the paper
     /// figure; the toy Rayleigh test atmosphere is too transparent to
     /// show the corridor structure).
@@ -2897,6 +2887,9 @@ mod tests {
         }
     }
 
+    /// Degree-of-polarization dump for the paper's polarization figure:
+    /// zenith view, clear sky, backward MC Stokes at three SZA.
+    /// `cargo test -p twilight-cpu --release dop_dump -- --ignored --nocapture`
     #[test]
     #[ignore = "diagnostic dump, run explicitly"]
     fn dop_dump() {
@@ -2923,6 +2916,14 @@ mod tests {
         }
     }
 
+    /// Variance-ledger harness: seed-CV of the production STOKES hybrid
+    /// per referee wavelength, env-configured (CV_FIELD = synthetic |
+    /// padborg, CV_SZAS, CV_SEEDS, CV_PHOTONS). Prints
+    /// `CVCSV,field,sza,wl,mean,se,cv_pct` lines. Run in THIS tree
+    /// (field-forced) and in a HEAD worktree (field chains analog) to
+    /// produce the forced-vs-analog CV comparison.
+    #[test]
+    #[ignore = "variance-ledger harness; run explicitly, see RESULTS_DEEP_REGIME.md"]
     fn cv_ledger_field() {
         let getenv = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
         let which = getenv("CV_FIELD", "synthetic");
