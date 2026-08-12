@@ -1,0 +1,26 @@
+data_files_path /home/ubuntu/libRadtran-2.0.6/data/
+atmosphere_file /home/ubuntu/libRadtran-2.0.6/data/atmmod/afglus.dat
+source solar /home/ubuntu/twilight/validation/g2_solar_tsis_tw.dat per_nm
+albedo 0.15
+wavelength 450.0 450.0
+mol_abs_param crs
+no_absorption mol
+wc_file 1D /home/ubuntu/twilight/validation/g2_wc_slab.dat
+wc_properties hu
+wc_modify tau set 3.000000
+wc_modify ssa set 0.996406
+wc_modify gg set 0.459459
+rte_solver montecarlo
+mc_spherical 1D
+mc_photons 300000000
+mc_backward
+mc_vroom on
+mc_std
+sza 101.00
+phi0 0.0
+umu -1.000000
+phi 0.0
+zout 0.0
+output_user lambda uu
+quiet
+mc_randomseed 7201
