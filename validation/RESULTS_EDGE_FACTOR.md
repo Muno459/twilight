@@ -1,5 +1,18 @@
 # The khayt appearance edge factor: three independent attacks on the one tuned number
 
+> **Frame note (2026-08-12).** This document analyses the constant in the
+> pre-hyperaccuracy transport frame, where its value was 45. The production
+> value is now **56** (`crates/twilight-cpu/src/khayt.rs`), reached in two
+> steps: a three-site cluster protocol that selected 70, then the
+> 2026-07-07 full-campaign refit to 56.5 (RMS 0.133 deg, leave-one-out mean
+> 56.4, range 55.2-57.0) after the 70 was found to carry a 0.3-0.4 deg
+> out-of-sample bias under the leverage of the Hail outlier. The structural
+> findings below (cross-site invariance, no latitude trend) are properties
+> of the inversion and are what the README cites; the absolute figures
+> quoted here (geometric mean 41.6 against a calibrated 45.0) belong to the
+> old frame and do not transfer. Re-run
+> `python tools/confirm_edge_factor.py` for the current-frame ladder.
+
 The khayt criterion carries exactly one calibrated psychophysics
 constant: `KhaytParams::edge_factor_appearance = 45.0`, applied on
 `k_contrast = 0.4`, i.e. an **effective 18x** multiplier over the

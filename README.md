@@ -70,6 +70,14 @@ cargo build --release
   --weather --skyglow --de440 data/de440.bsp --scattering hybrid
 ```
 
+`--de440` is optional and the file is not in the repo (it is too large for
+git). Fetch it once from NAIF if you want the JPL ephemeris instead of the
+NREL SPA fallback; every command below works without the flag.
+
+```bash
+curl -o data/de440.bsp https://ssd.jpl.nasa.gov/ftp/eph/planets/bsp/de440.bsp
+```
+
 Output (Mecca, clear sky):
 
 ```
@@ -105,11 +113,11 @@ reproduction command).
 The Birmingham row matters most: the seasonal "summer relaxation" that UK
 scholars apply as a hand-rule (14.5° in winter, about 12.5° in summer)
 emerges from the physics across 31 degrees of latitude with no additional
-tuning. Across the full campaign sweep the median absolute residual is 0.38°
-of depression (eye 0.39°, instrument 0.37°). On the same 42-date
-Birmingham benchmark the fixed angles in worldwide use miss by 1.76°
-RMS (ISNA 15°) and 4.38° RMS (MWL 18°, undefined on 20 of the 42
-dates).
+tuning. Across the full campaign sweep the median absolute residual is
+0.26° of depression over the 14 scored rows (eye 0.28°, instrument
+0.26°). On the same 42-date Birmingham benchmark the fixed angles in
+worldwide use miss by 1.76° RMS (ISNA 15°) and 4.38° RMS (MWL 18°,
+undefined on 20 of the 42 dates).
 
 The criterion's one calibrated constant has itself been stress-tested:
 inverting each desert campaign independently for its own implied value
@@ -117,11 +125,17 @@ gives a cluster with a multiplicative spread of only 1.31 (n = 8
 sites, 25.8 to 32.1° N) and no latitude trend (r = +0.07): the
 constant is the invariant that eight independent observation programs
 agree on to within their own observational noise
-(`validation/RESULTS_EDGE_FACTOR.md`). The production value (70) is
-selected by the constant's defining protocol on the frozen final
-engine (calibration cluster only, interior minimum of the residual
-ladder, RMS 0.252°); every site outside the cluster remains a genuine
-test.
+(`validation/RESULTS_EDGE_FACTOR.md`). The production value (56) comes
+from a full-campaign fit on the frozen final engine: an out-of-sample
+residual minimum at f = 56.5 (RMS 0.133°), stable under leave-one-out
+(mean 56.4, range 55.2 to 57.0), and sitting centrally in the 53 to 60
+band that the per-site inversion implies (geometric mean 58). It
+supersedes the earlier three-site cluster protocol, which selected 70
+under the leverage of a single outlier (Hail, observed dawn 14.01°
+against 14.5 to 14.8° everywhere else in the desert network) and
+carries a 0.3 to 0.4° out-of-sample bias, two to three times the
+per-site scatter. Every site outside the three calibration anchors
+remains a genuine test.
 
 **Transport vs reference codes** (details in `validation/RESULTS*.md`):
 
@@ -383,7 +397,7 @@ python3 tools/criterion_edge_factor.py --analyze
 
 # Field-campaign checks
 ./target/release/twilight-cli pray --lat 21.4225 --lon 39.8262 --date 2026-06-13 \
-  --de440 data/de440.bsp --scattering hybrid   # Mecca: 14.61/17.33/14.96
+  --de440 data/de440.bsp --scattering hybrid   # Mecca: 14.71/17.33/14.96
 ./target/release/twilight-cli pray --lat 52.44 --lon=-1.93 --date 2026-06-13 \
   --de440 data/de440.bsp --scattering hybrid   # Birmingham June: 12.78
 

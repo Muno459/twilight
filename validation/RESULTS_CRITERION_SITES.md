@@ -1,5 +1,14 @@
 # Criterion vs published observation campaigns: the multi-site sweep
 
+> **Frame note (2026-08-12).** The engine values and residuals in this
+> document predate the 2026-07-07 recalibration of the appearance edge
+> factor (70 -> 56, `crates/twilight-cpu/src/khayt.rs`). They are kept as
+> the record of that campaign frame. For the current-engine table and its
+> medians, run `python tools/recompute_table1.py`, which regenerates
+> Table 1 of the application paper from `validation/criterion_runs/`:
+> pooled 0.26 deg over the 14 scored rows (eye 0.28, instrument 0.26),
+> independent subset 0.29 deg over 11 rows.
+
 Upgrades the criterion validation from two anchors (the Mecca-calibrated
 desert cluster + one Birmingham row) to every published dawn/dusk
 observation campaign that could be pinned to **coordinates + season +
