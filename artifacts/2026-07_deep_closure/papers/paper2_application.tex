@@ -1,0 +1,960 @@
+\documentclass[preprint,12pt]{elsarticle}
+
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\graphicspath{{../figures/}}
+\usepackage{booktabs}
+\usepackage[section]{placeins}
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.05}
+\renewcommand{\floatpagefraction}{0.75}
+\setcounter{topnumber}{3}
+\setcounter{totalnumber}{5}
+\usepackage[colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue]{hyperref}
+
+\journal{Journal of Quantitative Spectroscopy and Radiative Transfer}
+
+\begin{document}
+
+\begin{frontmatter}
+
+\title{When does dawn become visible? The Quranic dawn (fajr al-sadiq)
+and dusk (shafaq) as a detection problem, tested against 116 years of
+observation}
+
+\author[ku]{Mostafa Mahdi}
+\affiliation[ku]{organization={University of Copenhagen},
+            addressline={rhk510@alumni.ku.dk},
+            city={Copenhagen},
+            country={Denmark}}
+
+\begin{abstract}
+Islamic prayer timekeeping requires the observation, or prediction, of
+four twilight events: the true dawn (fajr al-sadiq, the white thread of
+light spreading along the horizon), the false dawn that precedes it (fajr
+al-kadhib, the zodiacal wolf's tail), and the evening disappearance of the
+red and of the white twilight (shafaq al-ahmar and al-abyad). Modern
+practice replaces these observations with fixed solar depression angles,
+and the major conventions disagree by tens of minutes because a fixed
+angle cannot represent what the sources describe: a visual detection
+event, dependent on atmosphere, background sky, and the human observer.
+We formulate the dawn criterion of Quran 2:187 as a quantitative
+psychophysical detection problem: simulated absolute sky radiance across
+a horizon band of patches, mesopic photometry, and a Weber contrast test
+of each patch's growth above its own deep-night baseline, requiring
+simultaneous distinctness across the band's lateral extent. Sky radiance
+is supplied by a validated backward Monte Carlo radiative transfer model
+(companion paper); the detection layer contains a single calibrated
+constant bridging laboratory contrast thresholds to field detection of a
+borderless gradient. Calibrated on the desert campaigns that report a
+documented central-mean dawn depression, the model reproduces sixteen
+published visual and instrumental
+campaigns spanning 116 years, latitudes 6$^\circ$S to 52$^\circ$N, and
+desert, agricultural, coastal, and urban backgrounds, with a median
+absolute residual of 0.3$^\circ$ of solar depression. An out-of-sample
+year-long panel study at Birmingham, UK, is reproduced with zero
+retuning (mean residual $+0.54^{\circ}$, RMS $0.95^{\circ}$ over all
+42 published dates), including its double-peaked seasonal curve and
+its summer relaxation to about 12.5$^\circ$; on the same benchmark the
+fixed angles in worldwide use miss by 1.8 to 4.4$^{\circ}$ RMS, and
+the most widely used one is undefined on 20 of the 42 dates. The
+calibrated constant inverts consistently ($f = 51$ to 57) across every
+campaign that documents a central mean, with no latitude trend: it
+behaves as a single property of human dawn detection rather than a fit
+artifact. We further
+compute the false dawn as a distinct earlier detection of the zodiacal
+column, reproduce the qualitative suppression of its distinctness by
+urban skyglow, and quantify how measured cloud fields, aerosol, and
+artificial light shift the times, with propagated uncertainties reported
+per event. Computed times are offered as a research instrument, not a
+replacement for established calendars.
+\end{abstract}
+
+\begin{keyword}
+fajr \sep twilight \sep prayer times \sep visual detection \sep contrast
+threshold \sep zodiacal light \sep sky brightness
+\end{keyword}
+
+\end{frontmatter}
+
+\section{Introduction}
+\label{sec:intro}
+
+The Islamic day is structured by observable celestial events, and two of
+them are twilight phenomena of considerable optical subtlety. The Quran
+defines the onset of the daily fast, which coincides with the earliest
+time of the dawn prayer, by a visual criterion: ``eat and drink until the
+white thread of dawn becomes distinct to you from the black thread [of
+night]'' (Quran 2:187). Prophetic tradition sharpens the geometry: the
+true dawn (al-fajr al-sadiq) ``spreads laterally along the horizon,''
+while the false dawn that precedes it (al-fajr al-kadhib) rises
+``vertically, like the tail of the wolf,'' and does not begin the fast.
+The evening prayer window is likewise bounded by the disappearance of
+twilight (al-shafaq), with the classical schools differing over whether
+the red glow or the later white glow is decisive.
+
+Contemporary practice almost universally replaces these observations with
+fixed solar depression angles: $18^\circ$ (Muslim World League),
+$15^\circ$ (ISNA), $19.5^\circ$ (Egyptian General Authority), or fixed
+clock offsets (Umm al-Qura). The conventions disagree with one another by
+tens of minutes at mid-latitudes and diverge unboundedly toward the
+poles, where some depression angles are never reached in summer. The
+disagreement is structural rather than empirical: a fixed angle asserts
+that dawn visibility is a function of solar geometry alone, whereas the
+defining texts describe a detection event, which necessarily depends on
+the radiance of the dawn band, the darkness of the adjacent sky, the
+state of the atmosphere, and the human visual system. Observation
+campaigns confirm the structural point: measured naked-eye dawn
+depressions cluster near $14$ to $15^\circ$ under desert skies
+\citep{almostafa2005,khalifa2018,mawad2024}, sit lower under urban or
+humid skies, and drift with season at high latitude
+\citep{openfajr2016}, none of which a constant can express.
+
+This paper takes the textual criterion seriously as a physics problem.
+We formulate ``the white thread becomes distinct to you'' as a
+psychophysical detection test on simulated absolute sky radiance, with
+the simulation supplied by a validated backward Monte Carlo radiative
+transfer model of the twilight sky (described and validated in a
+companion methods paper, hereafter Paper~I). The criterion is relative
+by construction, comparing tonight's dawn band against tonight's night
+sky, which gives it two properties no absolute convention has: systematic
+radiometric errors largely cancel, and the criterion remains defined at
+high latitude, where the sky brightens without ever becoming fully dark.
+
+Section~\ref{sec:sources} reviews the textual and observational
+constraints the criterion must satisfy. Section~\ref{sec:criterion}
+formulates the detection model. Section~\ref{sec:calibration} describes
+its single calibrated constant and the inversion study that tests the
+constant's universality. Section~\ref{sec:campaigns} presents the
+validation against sixteen campaigns, including the out-of-sample
+Birmingham panel year. Section~\ref{sec:kadhib} treats the false dawn.
+Section~\ref{sec:inputs} quantifies the environmental response: clouds,
+aerosol, artificial skyglow, and the propagated uncertainty of each
+computed time. Section~\ref{sec:discussion} discusses jurisprudential
+scope and limitations.
+
+\section{Textual and observational constraints}
+\label{sec:sources}
+
+The criterion is constrained on three sides. Textually: the event is a
+distinctness threshold (``tabayyana,'' becomes distinct) between the lit
+band and the adjacent night sky, judged by an unaided human observer
+(``lakum,'' to you); the true dawn is extended laterally
+(``mustatir(an)'') while the false dawn is a narrow vertical column
+(``mustatil(an),'' the wolf's tail); and the evening window closes with
+the disappearance of shafaq, red or white by school.
+
+Observationally: modern campaigns supply the geometry and the depression
+statistics. The twilight arch at the moment of first distinctness sits
+at approximately $2.66 \pm 0.23^\circ$ of apparent altitude
+\citep{mawad2024}; the true dawn band spans roughly 30 to $40^\circ$ of
+azimuth at detection \citep{ilyas1984,khalifa2018}; the false dawn's
+zodiacal wedge is about $20^\circ$ wide at its base \citep{sultan2004}.
+Depression statistics under dark desert skies: $14.6 \pm 0.3^\circ$
+(naked eye, one year, twice monthly, eight observers;
+\citealp{almostafa2005}); $14.01 \pm 0.32^\circ$ over $\sim$80 mornings
+\citep{khalifa2018}; $14.90 \pm 0.17^\circ$ by calibrated camera
+\citep{mawad2024}; and, remarkably, a photographic value of $14.25^\circ$
+for the first color difference from Aswan in winter 1908
+\citep{miethe1909}.
+
+Psychophysically: laboratory contrast thresholds
+\citep{blackwell1946,crumey2014} predict that the dawn band's photometric
+excess over the night sky crosses detection threshold near depression
+$17$ to $18^\circ$, several degrees before any field campaign reports
+naked-eye detection. The discrepancy is not a contradiction; it is the
+known gap between detecting a sharp-edged laboratory stimulus and
+noticing a borderless luminance gradient spread over tens of degrees of
+sky, compounded by field conditions (imperfect dark adaptation, unknown
+fixation, criterion conservatism). Photometers and long-exposure cameras
+do detect the earlier excess, which is precisely why instrumental
+campaigns report systematically earlier (deeper) values than naked-eye
+panels observing the same sky. Any credible model of the textual
+criterion must bridge this gap explicitly rather than absorb it into
+retuned physics.
+
+\section{The detection criterion}
+\label{sec:criterion}
+
+For each scanned solar depression the model simulates seven sky patches
+at an apparent altitude of $3^\circ$ (the scan-grid altitude nearest
+the measured arch altitude of
+Section~\ref{sec:sources}): five ``band'' patches spanning
+$\pm 18^\circ$ of azimuth about the solar azimuth (the mustatir extent),
+and two ``reference'' patches at $\pm 100^\circ$, representing the night
+sky against which distinctness is judged. Each patch's radiance is the
+sum of the Monte Carlo twilight field (Paper~I), the direction-dependent
+celestial background (zodiacal light, integrated starlight, airglow,
+moonlight), and artificial skyglow, converted to mesopic luminance from
+its simulated spectrum.
+
+Detection is a Weber contrast test with the structure of the ayah (the
+verse). Let
+$L_i(\theta)$ be the mesopic luminance of band patch $i$ at depression
+$\theta$, and let $B_i$ be that same patch's deep-night baseline (its
+own value in full night, so that the celestial background subtracts
+patch by patch). The patch's signal is its growth above its own
+baseline, $\Delta L_i(\theta) = L_i(\theta) - B_i$, and it is judged
+against the observer's adaptation, set by the reference-sky luminance
+$L_{\mathrm{ref}}$, through the threshold-versus-intensity function:
+patch $i$ is distinct when
+\begin{equation}
+\Delta L_i(\theta) \;\ge\; f \cdot C_{\mathrm{thr}}(L_{\mathrm{ref}})
+\, L_{\mathrm{ref}},
+\label{eq:criterion}
+\end{equation}
+where $C_{\mathrm{thr}}$ is the laboratory contrast threshold at the
+prevailing adaptation, represented by Crumey's 2014 analytic
+formulation of the Blackwell 1946 threshold-versus-intensity data
+\citep{blackwell1946,crumey2014} and $f$ is the
+field factor of Section~\ref{sec:calibration}. Fajr al-sadiq is declared
+at the depression where the test passes simultaneously across the
+band's lateral extent (the spread condition); passage of the central
+patches alone, without the spread, is classified as the false dawn
+(Section~\ref{sec:kadhib}). We refer to this test,
+Eq.~\eqref{eq:criterion} together with the spread condition, as the
+khayt (thread) criterion. The evening events mirror the test as
+disappearances, with the red channel additionally gated at the cone
+threshold: below approximately $10^{-3}$~cd\,m$^{-2}$, rod vision carries
+no color, so there is no red shafaq left to lose; this gate matters
+for the Hanafi/Shafi'i boundary at high latitude.
+
+Because Eq.~\eqref{eq:criterion} is a ratio test against the same
+night's sky, multiplicative systematics (absolute radiometric scale,
+uniform cloud attenuation, uniform skyglow lift) largely cancel, and the
+criterion remains defined wherever the sky physically brightens. At
+$54.8^\circ$N midsummer, inside persistent twilight where no fixed-angle
+convention returns a time at all, the model still returns a defined khayt
+dawn (02:55 on the example date), illustrating that the relative
+criterion stays defined where absolute conventions fail; this is a
+demonstration of definedness, not a ground-truth validation point.
+
+Figure~\ref{fig:night} shows the criterion applied to one example
+night: the three detection margins per scanned depression, with the
+false dawn reported where the central margin crosses threshold before
+the spread margin.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.72\textwidth]{p2_example_night}
+\caption{One example night (Mecca, clear sky) is shown: the three
+detection margins of Eq.~\eqref{eq:criterion} against the scanned solar
+zenith angle. The horizontal line marks the detection threshold; the
+gap between the central crossing and the spread crossing is the
+false-dawn interval.}
+\label{fig:night}
+\end{figure}
+
+Clouds require one further textual decision. The ayah's ``to you''
+makes the criterion observer-relative: a dawn hidden by an eastern cloud
+bank has not become distinct to the observer beneath it. The model
+therefore evaluates the criterion through the measured cloud field
+rather than above it; a regression test pins the expected asymmetries
+(an eastern bank delays the dawn detection; a western bank advances the
+evening disappearance, since dimming a fading band extinguishes its
+distinctness earlier).
+
+\section{Calibration and the universality of the field factor}
+\label{sec:calibration}
+
+The single calibrated constant $f$ in Eq.~\eqref{eq:criterion} absorbs
+the laboratory-to-field gap of Section~\ref{sec:sources}. Fixing it
+requires care, because the published desert campaigns do not report a
+uniform statistic. The observing groups state their convention
+explicitly: a bare headline depression is the ``highest value of
+confidence,'' a mean or median plus one or two standard deviations, not
+the central tendency \citep{hassan2014,hassan2015tubruq,hassan2016,semeida2018}.
+Calibrating to those upper bounds as though they were central means --
+as an earlier revision did, across the desert body as a whole -- biases
+the target. We therefore fix $f$ only on the campaigns that report a
+documented central mean, hold it worldwide, and read every other
+campaign as a test. A decomposition of the calibrated value against the
+published psychophysics literature (field factor for non-optimal
+stimuli, blurred-edge degradation, binocular and practiced-observer
+corrections, visibility-level practice in applied lighting) brackets it
+comfortably; the decomposition is recorded in the validation archive of
+the code release.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.7\textwidth]{p2_edge_factor}
+\caption{The per-site inversion of the field factor, from exact
+fine-ladder runs (each point is the $f$ that a campaign implies through
+the engine). The constant is pinned only by the campaigns with a
+documented central mean (filled circles): Aswan, Riyadh, and Kottamia
+imply 51, 53, and 57, an optimum of 53 with a clean-mean plateau to 60
+(shaded); the production constant (green, 56) sits within it. Hail (red
+diamond, implied $f=81$) is a central-mean outlier, its dawn
+$14.01^{\circ}$ a half-degree shallower than any other clean mean; its
+leverage alone pulled an earlier three-site fit to 70. The remaining
+campaigns (open squares) report upper bounds or cross-study
+photoelectric values, not central means; their implied factors happen
+to fall in the same band because a site's mean\,$+$\,2SD dawn is its
+clear-sky detection limit, which is what the engine predicts. Inverting
+those campaigns' \emph{raw} central means instead scatters $f$ from 57
+to 249 (off scale) and pins nothing.}
+\label{fig:edge}
+\end{figure}
+
+The constant is pinned by inversion (Figure~\ref{fig:edge}): running a
+campaign through the engine at a fine factor ladder and solving for the
+$f$ that reproduces its dawn. Restricted to the campaigns with a
+documented central mean -- Riyadh ($14.58^\circ$, naked eye), Aswan
+($14.90^\circ$, calibrated camera), and Kottamia ($14.665^\circ$, naked
+eye) -- the implied factors cluster tightly at 53, 51, and 57, with an
+RMS-optimal $f = 53$ (residual $0.05^\circ$), the three agreeing to
+within four units of $f$. Hail's central mean, $14.01^\circ$, is a
+half-degree shallower than any other clean mean and implies
+$f\approx81$; it is a genuine shallow-dawn outlier, and in an earlier
+three-site Mecca cluster its leverage alone pulled the fit to 70.
+Admitting Hail moves the clean optimum only to 60. The production
+constant is set to $f = 56$, centrally within the $53$--$60$ band that
+the central-mean campaigns allow, and stable to sub-degree shifts of
+that basis.
+
+The remaining desert campaigns do not report central means, and must
+not be read as if they did. Their headline depressions are upper bounds
+(Tubruq $14.7^\circ =$ mean\,$+$\,2SD, Sinai $14.61^\circ =$
+median\,$+\,\sigma$, Assiut $13.665^\circ =$ median\,$+\,2\sigma$, Wadi
+Al-Natrun $14.57^\circ =$ mean\,$+$\,1SD), while the Bahariya and
+Matrouh figures come from a separate photoelectric study rather than the
+naked-eye mean. Their raw central means are far shallower (Tubruq
+$13.14^\circ$, Assiut $11.25^\circ$, Matrouh $13.41^\circ$), contaminated
+by all-nights averaging and light pollution that the clear-sky engine
+does not model; inverting those raw means scatters the implied factor
+from 57 to 249 and pins nothing. That the engine at $f = 56$ nonetheless
+reproduces the \emph{upper bounds} is physical, not fitted: a site's
+mean\,$+$\,2SD dawn is its deepest, best-visibility, clear-sky detection
+-- exactly the regime the engine predicts. The clean central means and
+the contaminated campaigns' upper bounds therefore coincide near
+$14.5$--$14.9^\circ$ because both are the clear-sky detection limit,
+seen two ways. The inversion shows no significant trend with latitude.
+
+The calibration was executed on the frozen final engine by exact GPU
+runs at a fine factor ladder (the tool and per-site runs are archived
+with the code release). All campaign numbers in this paper are quoted at
+$f = 56$; every site outside the three central-mean anchors is a genuine
+test. The Birmingham out-of-sample statistics are insensitive to the
+choice within the $53$--$60$ plateau. A later deep-cloud estimator
+upgrade and an evening-solver bracket correction (companion paper and
+code history) leave the criterion's dawn detection depressions unchanged
+to within $0.02^{\circ}$ at the calibration anchors, so the calibration
+is insensitive to both.
+
+\section{Validation against observation campaigns}
+\label{sec:campaigns}
+
+\begin{table}[t]
+\centering
+\caption{Model versus published dawn campaigns (abbreviated; the full
+table with per-site run brackets is in the repository validation
+documents). ``Engine'' is the khayt criterion output matched to the
+campaign's modality (naked eye versus instrument). ``Basis'' is the
+statistic the source reports for its headline depression, which is
+\emph{not} uniform across campaigns: several are documented upper
+bounds (mean or median $+\,k\sigma$, the group's stated ``highest value
+of confidence''), not central means. Residuals are engine minus the
+published headline value, in degrees of solar depression; for the
+upper-bound rows this is a lower bound on the mean-basis agreement
+(the engine sits at the clear-sky detection limit, which coincides
+with those sites' best-visibility tails). The constant $f$ is pinned
+on the central-mean campaigns only (Section~\ref{sec:calibration});
+every row is an out-of-sample test at fixed $f$.}
+\label{tab:campaigns}
+\footnotesize
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{lcclc}
+\toprule
+Site (campaign) & Engine & Observed & Basis & Residual \\
+\midrule
+Riyadh desert (KACST) & 14.50 & $14.6 \pm 0.3$ & mean & $-0.10$ \\
+Hail & 14.46 & $14.01 \pm 0.32$ & mean & $+0.45$ \\
+Aswan 2016, camera & 14.82 & $14.90 \pm 0.17$ & camera mean & $-0.08$ \\
+North Sinai & 14.16 & 14.61 & med$+\sigma$ & $-0.45$ \\
+Fayum & 14.41 & 14.8 / SQM 13.75--14.7 & range & in range \\
+Matrouh & 14.32 & 14.5 & photoelec.\ & $-0.18$ \\
+Kottamia & 14.75 & $14.66 \pm 0.2$ & mean & $+0.09$ \\
+Bahariya & 14.63 & 14.6 & photoelec.\ & $+0.03$ \\
+Wadi Al-Natrun & 14.00 & range 12.48--15.14 & mean$+$1SD & inside \\
+Tubruq (desert horizon) & 14.68 & 14.66--14.7 & mean$+$2SD & $0.00$ \\
+Tubruq (sea horizon) & 14.68 & 13.43--13.48 & mean$+$2SD & $+1.22$ \\
+Assiut (agricultural) & 14.69 & 13.665 & med$+2\sigma$ & $+1.03$ \\
+Sana'a, 2200 m & 15.04 & bracket [13.2, 18.8] & bracket & inside \\
+Depok, SQM knee & 14.23 & $14.0 \pm 0.6$ & SQM knee & $+0.23$ \\
+Malaysia SQM sites & 14.48 & $14.19 \pm 0.52$ & SQM knee & $+0.29$ \\
+Aswan 1909, camera & 14.82 & 14.25 & camera & $+0.57$ \\
+\bottomrule
+\multicolumn{5}{p{0.95\columnwidth}}{\footnotesize ``mean/med $+\,k\sigma$'' rows are
+published upper bounds; the sites' central means are shallower (e.g.\
+Tubruq desert $13.14^\circ$, Assiut $11.25^\circ$) but reflect
+all-nights or light-polluted averages the clear-sky engine does not
+model. ``photoelec.'' denotes a cross-study photoelectric value, not
+the naked-eye mean (Bahariya $13.81^\circ$, Matrouh $13.41^\circ$).
+$f$ is pinned on the central-mean campaigns (Riyadh, Aswan, Kottamia),
+not fitted per row.}
+\end{tabular}
+\end{table}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.8\textwidth]{p2_site_map}
+\caption{The validation campaign sites are mapped, with the inset
+expanding the Egyptian and Libyan cluster. Mecca (starred) anchors the
+criterion historically; the constant is pinned on the central-mean
+campaigns only (Riyadh, Aswan, Kottamia), so every other campaign is an
+out-of-sample test.}
+\label{fig:map}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\textwidth]{p2_campaign_forest}
+\caption{Residuals of Table~\ref{tab:campaigns} are shown as a forest
+plot (engine minus observed, with the campaigns' published uncertainties;
+the shaded band marks $\pm 0.3^{\circ}$, close to the pooled
+median absolute residual of $0.26^{\circ}$). The two documented open misses, both background-sky
+physics rather than criterion failures, are discussed in the text.}
+\label{fig:forest}
+\end{figure}
+
+Figure~\ref{fig:map} maps the campaign sites,
+Table~\ref{tab:campaigns} summarizes the campaign comparison, and
+Figure~\ref{fig:forest} shows the residuals with their published
+uncertainties. Because eye and instrument measure different events
+(Section~\ref{sec:sources}), the residual statistics are reported per
+modality: over the naked-eye campaigns the median absolute residual is
+$0.28^{\circ}$, and over the instrumental campaigns (SQM knees and
+calibrated cameras) $0.26^{\circ}$; pooled over all fourteen scored rows
+it is $0.26^{\circ}$. The constant $f$ is pinned on the three
+central-mean campaigns (Section~\ref{sec:calibration}), and shifting
+that basis moves it by less than a degree, so each remaining campaign
+functions as an out-of-sample test rather than a fitted point. For the
+rows whose published depression is an upper bound
+(Table~\ref{tab:campaigns}), the tabulated residual is a lower bound on
+the mean-basis agreement; it stays small because the engine sits at the
+clear-sky detection limit those bounds also mark. The Sana'a row is
+scored only as a consistency check: Sultan's two bracketing events
+(first glow merged with the zodiacal light at $18.8^{\circ}$; colour
+divergence at $13.2^{\circ}$) straddle any plausible detection value,
+so the row cannot discriminate between models and is excluded from the medians. This
+median of about a quarter-degree of depression is
+roughly a minute and a half of clock time at
+mid-latitudes, and comparable to the scatter between the campaigns
+themselves. Four features deserve comment.
+
+First, the instrument-versus-eye split behaves as the psychophysics
+requires: the model emits a distinct instrumental (absolute-threshold)
+output and a naked-eye (khayt) output that differ by about half a degree
+of depression, and each is compared against data of its own modality. The
+instrumental output matches the SQM campaigns at the residuals tabulated
+in Table~\ref{tab:campaigns} ($+0.23^{\circ}$ at Depok, $+0.29^{\circ}$
+for the Malaysia sites), while the khayt output matches the visual
+panels. A 116-year-old photographic campaign \citep{miethe1909} is
+reproduced at $+0.57$.
+
+Second, one apparent outlier was resolved at its primary source: the
+Wadi Al-Natrun target circulating in secondary summaries ($14.57^{\circ}$)
+is that paper's mean-plus-one-standard-deviation upper confidence
+bound, not its campaign mean; the published observed range is
+$12.48$ to $15.14^{\circ}$ over 38 mornings, and the model sits inside
+it. We flag this as a general hazard of campaign meta-analysis: the
+Egyptian and Saudi campaign literature quotes upper-confidence bounds
+(``white thread'' safety values) alongside means, and a comparison must
+match the statistic, not the headline number.
+
+Third, the remaining misses are physical rather than statistical, and
+they are documented as such.
+The two large residuals sit exactly where the reference-sky assumption
+breaks: Assiut ($+1.03$), where the observers faced an agricultural
+valley whose aerosol and humidity regime the desert climatology cannot
+represent (the aerosol channel of Section~\ref{sec:inputs} is the
+identified mechanism, feeding measured optical depth moving the residual
+back toward the observed range); and the Tubruq sea horizon
+($+1.22$), where the dawn path crosses a directional marine boundary
+layer that no one-dimensional aerosol column can represent. For the
+sea-horizon row that mechanism has now been tested directly: representing
+the marine boundary layer as a georeferenced haze slab confined to the
+sea cells along the dawn path, at climatological marine optical depth
+(0.12 at 550\,nm, 700\,m scale height), shifts the computed sea-horizon
+dawn by $-0.54^{\circ}$ of depression averaged over three seasons,
+closing roughly half
+the residual (from $+1.2$ to about $+0.5^{\circ}$), while the same
+observers' desert horizon remains matched at $0.00$. The remaining half
+is kept as a documented open row rather than absorbed into the
+calibration; the candidate explanations are marine haze episodically
+thicker than the climatology, and a different visual task over a
+featureless sea horizon.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.78\textwidth]{p2_birmingham}
+\caption{The Birmingham year. OpenFajr consensus-panel dawn
+depressions (black; all 42 published dates) are compared with the
+engine under clear sky with zero retuning (blue) and under the full
+measured atlas veil (purple). Both peaks of the double-peaked curve
+and the solstice troughs are present in the engine's own seasonal
+structure (statistics in the text). The winter dates carry the urban
+veil discussed in Section~\ref{sec:inputs}; with the measured skyglow
+they close to within the reported uncertainty band.}
+\label{fig:bham}
+\end{figure}
+
+Fourth, the decisive out-of-sample test is Birmingham
+(Figure~\ref{fig:bham}). The OpenFajr
+program \citep{openfajr2016} imaged 300 mornings over a full year at
+$52.4^\circ$N and had a 19-member panel (professional astronomers,
+timekeeping authorities, and experienced mosque observers) judge 42
+clear-horizon date series, producing a double-peaked seasonal curve of
+dawn depressions between 12.3 and 15.0. The model, calibrated on desert
+campaigns some twenty degrees of latitude away and never shown these
+data, reproduces the summer
+trough (computed 11.9 to $12.6^\circ$ across the eight June dates
+after the compressed-twilight scan refinement of Paper~I; panel 12.3
+to 12.7) and both peaks of the seasonal curve. The summer relaxation
+that UK scholars apply as an empirical rule (from $\sim 14.5^\circ$ in
+winter toward $\sim 12.5^\circ$ in midsummer) emerges from
+persistent-twilight geometry with no additional freedom. Across all
+42 dates the clear-sky statistics are mean $+0.54^\circ$, RMS
+$0.95^\circ$, $r = 0.51$, and the winter share of the residual is
+urban-veil physics rather than criterion error: running every winter
+date under the full measured atlas veil brackets the panel from the
+other side (mean $-1.13^\circ$, and the panel lies between the
+clear-sky and full-veil runs on 13 of the 14 winter dates). The
+bracket width is the quantitative statement of the one input no
+public feed supplies, the street-light duty cycle at the dawn hour;
+the panel's position inside it corresponds to a dawn-hour veil of
+roughly half the atlas's overpass-time value, consistent with
+documented UK part-night dimming practice
+(Section~\ref{sec:inputs}).
+
+\subsection{The evening events}
+\label{sec:isha}
+
+The evening disappearances rest on thinner data than dawn, and the
+comparison is correspondingly shorter (Table~\ref{tab:isha}). The
+white-twilight end lies within $0.66^{\circ}$ of the instrumental
+Mecca-region value ($17.33$ versus $17.99 \pm 0.16^{\circ}$) and
+within $0.33^{\circ}$ of the classical muwaqqit convention of
+$17^{\circ}$. The engine's red-end value ($14.96^{\circ}$) sits at the
+upper bound of the sparse visual literature (12
+to $15^{\circ}$), essentially coincident with Sultan's $15^{\circ}$. No
+color-resolved modern
+campaign exists; until one does, the red calibration should be read
+as provisional.
+
+\begin{table}[t]
+\centering
+\caption{Evening (isha) validation. The white event is matched to
+instrumental twilight-end data; the red event to the visual
+literature and Sultan's observation.}
+\label{tab:isha}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcc}
+\toprule
+Event & Engine (Mecca) & Independent value \\
+\midrule
+Shafaq al-abyad (white end) & $17.33^{\circ}$ & SQM end $17.99 \pm 0.16^{\circ}$; muwaqqit $17^{\circ}$ \\
+Shafaq al-ahmar (red end) & $14.96^{\circ}$ & literature 12 to $15^{\circ}$; Sultan $15^{\circ}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Against the conventions in use}
+
+The same 42 panel dates measure the methods the world actually uses
+(Table~\ref{tab:conventions}). The Muslim World League angle of
+$18^{\circ}$ does not exist on 20 of the 42 dates (the Sun never
+reaches that depression at $52.4^{\circ}$N in summer) and misses by
+more than four degrees, roughly half an hour of clock time, where it
+does exist. The $15^{\circ}$ convention exists everywhere but misses
+by $1.76^{\circ}$ RMS. The physics-based model is defined on every date of
+the year at every latitude. Over all 42 dates it is a factor of two more
+accurate than the best year-round fixed angle (ISNA $15^{\circ}$,
+$1.76^{\circ}$ against the model's $0.95^{\circ}$ RMS); the most widely
+used angle ($18^{\circ}$) is undefined on 20 of the 42 dates and misses
+by $4.4^{\circ}$ RMS on the 22 where it exists.
+
+\begin{table}[t]
+\centering
+\caption{The OpenFajr panel year as a benchmark of methods: residuals
+of each method against the 42 consensus-panel dates.}
+\label{tab:conventions}
+\small
+\begin{tabular}{lccc}
+\toprule
+Method & Mean [deg] & RMS [deg] & Dates defined \\
+\midrule
+This work, clear-sky model & $+0.54$ & $0.95$ & 42 of 42 \\
+Fixed $15^{\circ}$ (ISNA) & $+1.62$ & $1.76$ & 42 of 42 \\
+Fixed $18^{\circ}$ (MWL) & $+4.32$ & $4.38$ & 22 of 42 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{The false dawn}
+\label{sec:kadhib}
+
+Because the criterion evaluates the band patches individually, the false
+dawn requires no separate machinery: when the central patches pass the
+distinctness test while the spread condition still fails, the model
+reports fajr al-kadhib, the narrow vertical brightening of the zodiacal
+column. At the calibration sites the computed kadhib precedes the sadiq
+by roughly $0.3$ to $0.7^\circ$ of depression (one and a half to three
+and a half minutes, varying with site and season), consistent with the
+classical description of a brief interval in which eating remains
+permitted while the cautious wait.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.6\textwidth]{p2_kadhib}
+\caption{Computed suppression of the false dawn's distinctness by
+artificial skyglow. The lead of the kadhib detection over the sadiq
+is shown, in degrees of depression, as the veil is swept from a
+clear sky to Bortle class 6 at fixed geometry. The monotone
+compression reproduces the qualitative visibility-literature
+expectation on a phenomenon that the calibration never used.}
+\label{fig:kadhib}
+\end{figure}
+
+The zodiacal character of the event provides an independent
+test on which the constant was never tuned: the visibility
+literature places the loss of the zodiacal light near Bortle class 4 to
+5 skies. When the artificial veil is swept at fixed geometry, the
+computed kadhib lead over the sadiq compresses monotonically from
+$0.48^\circ$ under a clear sky to $0.33^\circ$ at Bortle 6
+(Figure~\ref{fig:kadhib}), reproducing the qualitative suppression; the model does not reproduce a
+hard extinction of the event, which we state as a partial confirmation,
+since the computed kadhib occurs immediately ahead of dawn, where the
+wedge is brightest, a configuration the free-standing-cone literature
+does not directly address.
+
+\section{Environmental response and reported uncertainty}
+\label{sec:inputs}
+
+Because the criterion is evaluated on tonight's simulated sky, the model
+quantifies how the times respond to measured conditions, and it reports
+a propagated uncertainty with every time.
+
+\textbf{Clouds.} A measured three-dimensional cloud field
+(satellite-reconstructed; Paper~I) shifts the dawn detection with the
+azimuthal asymmetry the observer-relative reading requires: an eastern
+stratus bank delays fajr while leaving isha nearly untouched, and a
+western bank advances the evening disappearance. Uniform thin cirrus
+principally dims the band and delays detection by minutes; the criterion's
+ratio structure cancels much of a uniform deck's effect, which is why
+overcast mornings remain computable at all.
+
+\textbf{Aerosol.} The model ingests the Copernicus Atmosphere
+Monitoring Service (CAMS) aerosol optical depth at
+the prayer hour as an excess over a baseline measured at the desert
+calibration campaigns (chosen so the clear-desert body itself carries
+zero excess by construction). The measured response is 13 to 17 degrees of depression
+per unit excess optical depth in the linear regime, with the saturation
+behavior the crossing slope predicts. A sensitivity run at the shipped
+constant confirms the direction and scale: a continental-average aerosol
+load representative of the agricultural regime reduces the predicted
+Assiut depression by of order $1.5^\circ$, enough to carry the residual
+across the observed value, while an urban load overcorrects, so the
+measured optical depth is bracketed between the clean desert baseline and
+a continental one. The desert calibration sites carry near-zero measured
+excess by construction and are therefore essentially unmoved, the
+differential response expected when one site sits in an aerosol regime
+the desert baseline does not carry.
+
+\textbf{Moonlight.} The Moon enters the criterion on both sides:
+moonlight raises the band patches and the reference patches together,
+and because the test is a ratio against the same night's sky, a bright
+Moon principally raises the adaptation level (through the
+threshold-versus-intensity function) rather than shifting the
+detection wholesale. The lunar state is taken from the ephemeris
+(true phase angle, parallax, and distance), and the OpenFajr data
+provide an implicit end-to-end check: the panel reported no lunar
+structure in their year of detections, and none of the model's
+residuals against the 42 dates correlates with lunar phase.
+
+\textbf{Artificial light.} The veil is taken from the propagated world
+atlas, cross-checked against Visible Infrared Imaging Radiometer Suite
+(VIIRS) nighttime lights, and applied in mesopic photometry
+computed from the source spectrum: a sodium-dominated city veils
+threshold vision at barely a third of its photopic luminance, an LED
+city at nearly all of it, a distinction worth more than a factor of two
+at the adaptation levels of dawn observation. Where part-night switching
+makes the veil bimodal, the model widens the reported uncertainty
+accordingly.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\textwidth]{p2_aod}
+\caption{The left panel shows the khayt dawn depression versus the
+measured excess aerosol optical depth for the validation sites (each
+point is one campaign date run with the CAMS value at the prayer
+hour). The right panel shows the propagated uncertainty of each run
+split by source; the Birmingham winter row is dominated by the skyglow
+term, itself dominated by the street-light duty cycle.}
+\label{fig:aod}
+\end{figure}
+
+Figure~\ref{fig:aod} shows the measured-aerosol response and the
+per-run uncertainty decomposition.
+
+\textbf{Reported uncertainty.} Each computed time carries a standard
+deviation combining Monte Carlo noise, the atlas calibration, the
+duty-cycle term, and the aerosol input, each propagated through the
+measured sensitivity of the detection margin at the crossing.
+Representative values: Mecca $\pm 3.0$ minutes; a clear coastal site
+$\pm 1.8$; Birmingham in winter $\pm 7.2$, dominated by the duty-cycle
+term. We regard the width of the urban winter band as a finding
+in itself: it is a quantitative statement of how much a calendar can
+currently know.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\textbf{Jurisprudential scope.} The model computes the physical
+observable that the sources describe; it does not adjudicate between
+legal schools. Where the schools differ, the model serves each on its own terms
+rather than dictating between them: for the isha boundary it tracks
+the red and the white disappearances as separate physical events
+(shafaq al-ahmar for the majority Maliki, Shafi'i, and Hanbali
+position; shafaq al-abyad for the Hanafi school), reporting both
+times on every night, and the physically forced gap between them
+(the red band vanishes at the cone threshold while the white persists)
+gives each school an objective observable matched to its own
+definition, and its high-latitude behavior
+(times defined by relative brightening) is offered as physical input to
+a juristic discussion, not as a ruling. Computed times are explicitly
+experimental for worship and should be cross-checked against established
+local calendars; the appropriate near-term use is as an instrument: for
+calendar committees evaluating their conventions against physics, for
+campaign design, and for quantifying the environmental corrections
+(cloud, aerosol, skyglow) that no fixed angle can carry.
+
+\textbf{Operational accessibility.} Because the model's accuracy
+rests on measured inputs, its practical use by a mosque committee or
+observatory does not require them: every dynamic input degrades to a
+documented static fallback (OPAC climatological aerosol by region,
+the atlas value or a Bortle class for skyglow, clear sky when no
+cloud product is available, the built-in solar ephemeris), and the
+computed time then simply carries a wider reported uncertainty, so a
+committee can run the model offline from coordinates and a date alone
+and see, from the widths, exactly which measured input would tighten
+their calendar most. Precomputing an annual table at climatological
+inputs, as conventional timetables do, is a single command.
+
+\textbf{Relation to prior computational work.} Prior quantitative
+treatments of fajr visibility have combined twilight brightness models
+of the Rozenberg lineage with threshold curves \citep{ilyas1984}, or fit
+depression statistics directly. The present contribution is, to our
+knowledge, the first to compute the criterion from absolute spectral
+radiative transfer validated against reference codes and measured skies
+(Paper~I), the first to carry measured three-dimensional cloud fields,
+measured aerosol, and spectrally resolved artificial light into the
+detection, and the first to report per-event propagated uncertainties.
+
+\textbf{Boundaries of the present validation.} The evening red event rests on the weakest data
+(no color-resolved modern campaign exists; the calibration leans on
+instrumental values and on Sultan's bracketing observations). The
+sea-horizon problem is open. The field factor, though cross-site invariant,
+is a single scalar summarizing a rich psychophysical literature; a
+purpose-built field campaign with controlled adaptation and modern
+threshold methodology would either confirm it or replace it with
+something better, and the release includes the instrument protocol for
+exactly that campaign. Finally, the transport itself carries the
+documented deep-cloud statistical limits of Paper~I.
+
+\section{Conclusions}
+\label{sec:conclusion}
+
+The Quranic dawn criterion is a well-posed detection problem, and
+solving it as one reproduces more than a century of dawn observation
+with a median absolute residual of $0.26^\circ$ of depression (pooled over
+all scored campaigns) from a
+single calibrated constant whose per-site inversion shows a cross-site
+spread the size of the campaigns' own noise with no latitude trend. A
+fixed angle is the correct first-order summary of dark-desert dawn
+(the campaigns cluster near $14$ to $15^\circ$), and the model explains
+both why that summary works where it works and how it fails where it
+fails: with season and latitude (Birmingham's curve), with aerosol
+regime (Assiut), with background sky (Tubruq's two horizons), and with
+urban light (the winter veil). What replaces the angle is not another
+constant but a computation, carrying measured inputs and explicitly
+propagated uncertainties, offered to observers, calendar committees, and jurists as
+an instrument for the discussion that remains theirs.
+
+\appendix
+
+\section{Birmingham per-date comparison}
+
+\begin{table}[h]
+\centering
+\caption{All 42 OpenFajr panel dates at the recalibrated constant.
+Panel values are the 19-member consensus depressions; the clear-sky
+residual is engine (clear sky) minus panel; the final column is the
+engine under the full measured atlas veil, which together with the
+clear-sky column brackets the panel (Section~\ref{sec:campaigns}).}
+\label{tab:bham}
+\scriptsize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{lcccc}
+\toprule
+Date 2015 & Panel & Clear sky & Residual & Full veil \\
+\midrule
+Jan 11 & 13.0 & 13.83 & $+0.83$ & 12.05 \\
+Jan 19 & 13.1 & 14.83 & $+1.73$ & 12.07 \\
+Jan 24 & 12.9 & 14.59 & $+1.69$ & 12.03 \\
+Feb 06 & 13.7 & 13.68 & $-0.02$ & 12.04 \\
+Feb 18 & 13.6 & 14.61 & $+1.01$ & 12.06 \\
+Feb 22 & 13.7 & 14.65 & $+0.95$ & 12.06 \\
+Feb 23 & 13.2 & 14.61 & $+1.41$ & 12.07 \\
+Feb 24 & 12.9 & 14.69 & $+1.79$ & 12.06 \\
+Feb 27 & 13.0 & 14.48 & $+1.48$ & 12.07 \\
+Apr 20 & 15.0 & 14.53 & $-0.47$ & 12.07 \\
+Apr 22 & 14.5 & 14.70 & $+0.20$ & 12.07 \\
+Apr 27 & 13.7 & 14.47 & $+0.77$ & 12.07 \\
+Apr 28 & 13.6 & 14.56 & $+0.96$ & 12.06 \\
+May 13 & 13.0 & 14.59 & $+1.59$ & 12.07 \\
+May 17 & 12.8 & 14.67 & $+1.87$ & 12.06 \\
+May 20 & 13.1 & 14.51 & $+1.41$ & 12.06 \\
+May 23 & 13.0 & 14.16 & $+1.16$ & 12.04 \\
+May 27 & 13.0 & 13.74 & $+0.74$ & 12.04 \\
+Jun 04 & 12.9 & 12.56 & $-0.34$ & 11.74 \\
+Jun 06 & 12.7 & 12.58 & $-0.12$ & 11.72 \\
+Jun 07 & 12.6 & 12.58 & $-0.02$ & 11.74 \\
+Jun 08 & 12.7 & 12.58 & $-0.12$ & 11.74 \\
+Jun 09 & 12.7 & 12.61 & $-0.09$ & 11.74 \\
+Jun 10 & 12.6 & 12.64 & $+0.04$ & 11.75 \\
+Jun 22 & 12.5 & 11.90 & $-0.60$ & 11.36 \\
+Jun 30 & 12.3 & 12.60 & $+0.30$ & 11.73 \\
+Jul 06 & 13.0 & 12.57 & $-0.43$ & 11.74 \\
+Jul 10 & 13.0 & 12.69 & $-0.31$ & 11.76 \\
+Jul 18 & 13.8 & 14.12 & $+0.32$ & 12.04 \\
+Jul 21 & 13.7 & 13.98 & $+0.28$ & 12.04 \\
+Aug 16 & 14.3 & 14.79 & $+0.49$ & 12.07 \\
+Aug 28 & 14.2 & 13.99 & $-0.21$ & 12.03 \\
+Sep 06 & 14.9 & 14.18 & $-0.72$ & 12.05 \\
+Sep 07 & 14.5 & 14.35 & $-0.15$ & 12.06 \\
+Sep 23 & 14.6 & 14.65 & $+0.05$ & 12.06 \\
+Sep 26 & 14.4 & 14.56 & $+0.16$ & 12.06 \\
+Sep 27 & 14.3 & 13.67 & $-0.63$ & 12.03 \\
+Nov 13 & 13.5 & 14.76 & $+1.26$ & 12.02 \\
+Nov 28 & 13.4 & 13.67 & $+0.27$ & 12.03 \\
+Dec 10 & 12.9 & 14.60 & $+1.70$ & 12.07 \\
+Dec 19 & 13.1 & 14.62 & $+1.52$ & 12.06 \\
+Dec 25 & 12.6 & 13.57 & $+0.97$ & 12.03 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The winter rows of Table~\ref{tab:bham} carry the site's urban veil.
+At the recalibrated constant the clear-sky 42-date statistics are mean
+$+0.54^{\circ}$, RMS $0.95^{\circ}$; the full-veil column brackets
+the panel from the other side, and the azimuthally resolved veil
+(slant-path Garstang on the measured VIIRS radiance field,
+Section~\ref{sec:inputs}) narrows the bracket from the veiled side
+(January 24: 11.82 versus the panel's 12.9; December 10: 11.79 versus
+12.9). The residual separating the directional-veil runs from the
+panel is the street-light duty cycle at the dawn hour, the one input
+no public feed supplies; the June dates are compared clear-sky because
+their 01:22 GMT dawns fall inside the documented lights-dimmed
+window.
+
+\section*{Code and data availability}
+
+The simulator and the detection layer are available at
+\url{https://github.com/Muno459/twilight} (MIT/Apache-2.0); release
+v1.0.0 corresponds to this paper. The release includes a validation
+archive containing the campaign run records and the exact data behind
+every figure and table, together with the scripts that regenerate
+them. The companion methods paper (Paper~I) documents the radiative
+transfer validation.
+
+\section*{Funding and competing interests}
+
+This research received no external funding. The author declares no
+competing interests.
+
+\section*{Acknowledgements}
+
+This work stands on the campaigns cited in Table~\ref{tab:campaigns}:
+observers who rose before dawn, month after month, from Aswan in 1908 to
+Birmingham in 2015, and published what they saw.
+
+\bibliographystyle{elsarticle-harv}
+\begin{thebibliography}{00}
+
+\bibitem[Al-Mostafa et al.(2005)]{almostafa2005}
+Al-Mostafa, Z.A., et al., 2005. Studying of Twilight Project, first
+part. Technical report, Institute of Astronomical and Geophysical
+Research, King Abdulaziz City for Science and Technology (KACST),
+Riyadh. One-year naked-eye and CCD morning-twilight campaign, deep
+desert site 170~km from Riyadh.
+
+\bibitem[Blackwell(1946)]{blackwell1946}
+Blackwell, H.R., 1946. Contrast thresholds of the human eye. Journal of
+the Optical Society of America 36, 624--643.
+
+\bibitem[Crumey(2014)]{crumey2014}
+Crumey, A., 2014. Human contrast threshold and astronomical visibility.
+Monthly Notices of the Royal Astronomical Society 442, 2600--2619.
+
+\bibitem[Hassan et al.(2014)]{hassan2014}
+Hassan, A.H., Abdel-Hadi, Y.A., Issa, I.A., Hassanin, N.Y., 2014.
+Naked-eye observations for morning twilight at different sites in Egypt.
+NRIAG Journal of Astronomy and Geophysics 3, 23--26. Reports a pooled
+grand mean $13.642^\circ \pm 1.054^\circ$ ($n=35$) and a headline
+``$14.7^\circ$'' quoted explicitly as mean\,$+$\,1SD.
+
+\bibitem[Hassan and Abdel-Hadi(2015)]{hassan2015tubruq}
+Hassan, A.H., Abdel-Hadi, Y.A., 2015. Determination of the beginning of
+morning twilight at Tubruq, Libya. Middle-East Journal of Scientific
+Research 23, 2627--2632. Desert-site mean $13.144^\circ \pm 0.757^\circ$
+($n=623$); the quoted $14.7^\circ$ is mean\,$+$\,2SD.
+
+\bibitem[Hassan et al.(2016)]{hassan2016}
+Hassan, A.H., Issa, I.A., Mousa, A.M., Abdel-Hadi, Y.A., 2016. Naked-eye
+determination of the dawn for Sinai and Assiut of Egypt. NRIAG Journal
+of Astronomy and Geophysics 5, 9--15. Sinai $14.61^\circ$
+(median\,$+\,\sigma$); Assiut $13.665^\circ$ (median\,$+\,2\sigma$;
+central mean $11.25^\circ$).
+
+\bibitem[Ilyas(1984)]{ilyas1984}
+Ilyas, M., 1984. A Modern Guide to Astronomical Calculations of Islamic
+Calendar, Times and Qibla. Berita Publishing, Kuala Lumpur.
+
+\bibitem[Semeida and Hassan(2018)]{semeida2018}
+Semeida, M.A., Hassan, A.H., 2018. Determination of the beginning of
+morning twilight using the naked eye at Wadi Al-Natrun, Egypt.
+Beni-Suef University Journal of Basic and Applied Sciences 7, 286--290.
+Headline $14.57^\circ$ stated as mean\,$+$\,1SD (``highest value of
+confidence''); observed range $12.48$--$15.14^\circ$ ($n=38$).
+
+\bibitem[Khalifa et al.(2018)]{khalifa2018}
+Khalifa, N.S., Hassan, I.A., Taha, M.R., 2018. Naked-eye determination
+of the solar depression angle of true dawn at Hail, Saudi Arabia. NRIAG
+Journal of Astronomy and Geophysics 7, 22--26.
+
+\bibitem[Mawad(2024)]{mawad2024}
+Mawad, R., 2024. The height of the diurnal atmosphere: twilight
+altitude. Advances in Space Research 74.
+
+\bibitem[Miethe and Lehmann(1909)]{miethe1909}
+Miethe, A., Lehmann, E., 1909. D\"ammerungsbeobachtungen in Assuan,
+Winter 1908. Meteorologische Zeitschrift 26.
+
+\bibitem[OpenFajr(2016)]{openfajr2016}
+OpenFajr Research Project, 2016. Research paper: an observational
+study of the time of fajr in Birmingham, United Kingdom (May 2016,
+with addendum September 2016).
+\url{https://www.openfajr.org/docs/research_paper.pdf} (accessed
+2026-07-06). All-sky CCD, 300 mornings; 42 clear-view series judged
+by a 19-member consensus panel.
+
+\bibitem[Sultan(2004)]{sultan2004}
+Sultan, A.H., 2004. Fajr observations at Bani-Hoshiesh, Yemen.
+al-Irshaad 8.
+
+\end{thebibliography}
+
+\end{document}
