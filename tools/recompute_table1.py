@@ -10,8 +10,10 @@ as the shipped table does (both Tubruq rows shared one Engine number).
 Residual = Engine - observed_central.
 
 Medians follow the paper's definitions: 14 scored rows (Wadi Al-Natrun
-'inside' and Sana'a 'bracket' excluded); independent = scored minus the
-three dagger calibration rows; per-modality eye/instrument.
+'inside' and Sana'a 'bracket' excluded); per-modality eye/instrument
+split over those same 14 scored rows (10 eye + 4 instrument);
+independent = scored minus the three dagger calibration rows, reported
+separately.
 """
 import pathlib, re, statistics, sys
 
@@ -68,10 +70,14 @@ for disp, runs, mod, obs, dagger, is_scored in ROWS:
     print(f"{disp:<24}{str(eng):>8}{str(obs):>9}{str(resid):>8}  {mod:<4} {tag:>8}")
     if is_scored and resid is not None:
         scored.append(resid)
+        # The paper's eye/instrument medians split the SCORED set (the same
+        # 14 rows as the pooled figure), not the independent subset: eye 10
+        # + instrument 4 = 14. Splitting the independent set instead drops
+        # the three anchors and moves the instrument median 0.26 -> 0.29,
+        # which is what made the tool disagree with Table 1.
+        (eye if mod == "eye" else inst).append(resid)
         if not dagger:
             indep.append(resid)
-            # paper's eye/instrument medians are over the INDEPENDENT set
-            (eye if mod == "eye" else inst).append(resid)
 
 med = lambda x: round(statistics.median([abs(v) for v in x]), 3) if x else None
 print("-"*62)
