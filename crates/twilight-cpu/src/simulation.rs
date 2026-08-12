@@ -2566,6 +2566,37 @@ mod tests {
         }
     }
 
+    /// Per-seed values of a single-wavelength estimator, in seed order.
+    ///
+    /// Two arms called with the same `k` see the SAME `seed_salt`
+    /// sequence, so their outputs are paired sample-by-sample. Callers
+    /// comparing two representations of one physical problem should use
+    /// this and form the paired difference: the difference's variance is
+    /// orders of magnitude below either arm's own variance, because the
+    /// shared randomness cancels.
+    fn perwl_seeds(
+        atm: &AtmosphereModel,
+        config: &SimulationConfig,
+        sza: f64,
+        field: Option<&Cloud3DField>,
+        w: usize,
+        k: u64,
+        multiple: bool,
+    ) -> Vec<f64> {
+        (0..k)
+            .into_par_iter()
+            .map(|seed| {
+                let mut c = config.clone();
+                c.seed_salt = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                if multiple {
+                    multiple_perwl(atm, &c, sza, field, w)
+                } else {
+                    hybrid_perwl(atm, &c, sza, field, w)
+                }
+            })
+            .collect()
+    }
+
     /// K-seed mean and standard error of a single-wavelength estimator.
     fn perwl_mean_se(
         atm: &AtmosphereModel,
@@ -3412,6 +3443,108 @@ mod tests {
         assert!(
             failures.is_empty(),
             "G-S3-EQ1D-DEEP: representations disagree:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// G-S3-EQ1D-PAIRED (physics gate 4c'): the uniform-3D-field and
+    /// 1D-deck representations of the SAME deck must agree, tested as a
+    /// PAIRED difference.
+    ///
+    /// Both arms are driven from identical seeds, so the shared
+    /// randomness cancels in the per-seed difference and its standard
+    /// error is orders of magnitude below either arm's own. The
+    /// independent-sample band `3*sqrt(se_a^2 + se_b^2)` used by
+    /// G-S3-EQ1D-DEEP discards that pairing, and the resulting band is
+    /// LARGER THAN THE MEAN ITSELF (measured on this tree: 2.65x the
+    /// mean at SZA 101, 3.62x at SZA 103), so that gate cannot fail for
+    /// any physically plausible discrepancy. This one can: the observed
+    /// paired agreement is at floating-point level, so a tolerance of a
+    /// few tenths of a percent is a real constraint.
+    ///
+    /// Coverage matters as much as the statistic. G-S3-EQ1D-DEEP runs
+    /// tau* = 3 scalar only, while the deep-tier field rows that sit
+    /// high against the MYSTIC referee are tau* = 1 POLARIZED. This gate
+    /// crosses both optical depths with both chain kinds.
+    ///
+    /// Env: EQ1D_SEEDS (default 6), EQ1D_PHOTONS (default 4000).
+    #[test]
+    #[ignore = "g_s3_eq1d_paired: heavy MC (minutes). run: cargo test -p twilight-cpu --release -- --ignored --nocapture g_s3_eq1d_paired"]
+    fn g_s3_eq1d_paired() {
+        let seeds: u64 = std::env::var("EQ1D_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6);
+        let photons: usize = std::env::var("EQ1D_PHOTONS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4_000);
+
+        let mut failures = Vec::new();
+        for tau in [1.0_f64, 3.0] {
+            let atm_1d = deep_atm_1d(tau);
+            let (atm_f, owned) = deep_field(tau);
+            let view = owned.view();
+            let w550 = wl_index(&atm_1d, 550.0);
+            for polarized in [false, true] {
+                let config = deep_config(photons, polarized);
+                for sza in [101.0_f64, 103.0] {
+                    let a =
+                        perwl_seeds(&atm_1d, &config, sza, None, w550, seeds, false);
+                    let b = perwl_seeds(
+                        &atm_f,
+                        &config,
+                        sza,
+                        Some(&view),
+                        w550,
+                        seeds,
+                        false,
+                    );
+                    // Per-seed symmetric relative difference; the pairing
+                    // is what makes this tight.
+                    let d: Vec<f64> = a
+                        .iter()
+                        .zip(b.iter())
+                        .map(|(x, y)| {
+                            let m = 0.5 * (x + y);
+                            if m == 0.0 {
+                                0.0
+                            } else {
+                                (y - x) / m
+                            }
+                        })
+                        .collect();
+                    let n = d.len() as f64;
+                    let mean = d.iter().sum::<f64>() / n;
+                    let var =
+                        d.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / n;
+                    let se = (var / n).sqrt();
+                    // 0.2 percent floor absorbs float-order effects
+                    // between shell optics and voxel DDA traversal.
+                    let band = 3.0 * se + 0.002;
+                    let kind = if polarized { "stokes" } else { "scalar" };
+                    eprintln!(
+                        "G-S3-EQ1D-PAIRED tau*{tau} SZA {sza} {kind}: \
+                         1d {:.5e} field {:.5e} paired_rel_diff {:+.3e} \
+                         se {:.2e} band {:.2e}",
+                        a.iter().sum::<f64>() / n,
+                        b.iter().sum::<f64>() / n,
+                        mean,
+                        se,
+                        band
+                    );
+                    if !mean.is_finite() || mean.abs() >= band {
+                        failures.push(format!(
+                            "tau*{tau} SZA {sza} {kind}: paired relative \
+                             difference {mean:+.3e} exceeds band {band:.3e}"
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "G-S3-EQ1D-PAIRED: field and 1D representations disagree:\n{}",
             failures.join("\n")
         );
     }
