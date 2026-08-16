@@ -277,9 +277,82 @@ struct SqmArgs {
     /// Time step in minutes
     #[arg(long, default_value = "5")]
     step_min: f64,
+    /// Meter beam full-width at half-maximum in degrees. 0 (default)
+    /// predicts the zenith POINT, which is what the meter measures only
+    /// in the limit of a narrow beam. Pass 20 for the lensed Unihedron
+    /// units (SQM-L/LE/LU/LU-DL) or 84 for the original wide-angle SQM,
+    /// and the prediction is integrated over the beam's angular response
+    /// instead. This matters in twilight and not at night: the twilight
+    /// sky carries a steep gradient toward the sun, so a wide cone reads
+    /// brighter than the zenith by an amount that GROWS with solar
+    /// depression (measured at Padborg, 550 nm, sunward: 2.9x at SZA 96
+    /// and 12.5x at SZA 100 at 42 degrees off zenith). Costs one MCRT
+    /// evaluation per beam sample per time step.
+    #[arg(long, default_value = "0")]
+    beam_fwhm: f64,
     /// Write the CSV to this file instead of stdout
     #[arg(long)]
     out: Option<String>,
+}
+
+/// Offsets and weights sampling a circular beam of the given FWHM.
+///
+/// Returns `(view_zenith_deg, view_azimuth_deg, weight)` triples whose
+/// weights sum to 1. The response is taken Gaussian in the off-axis
+/// angle, `R(psi) = exp(-4 ln2 (psi/FWHM)^2)`, which is the standard
+/// description of the Unihedron lensed optics and is what the published
+/// half-angle figures encode. Each ring is weighted by its response and
+/// by `sin(psi)` for solid angle; rings are sampled at four azimuths so
+/// the sunward gradient is captured rather than averaged away by
+/// assuming azimuthal symmetry.
+///
+/// `fwhm <= 0` degenerates to the single on-axis sample, which is the
+/// historical zenith-point behaviour.
+fn beam_samples(fwhm_deg: f64, solar_azimuth_deg: f64) -> Vec<(f64, f64, f64)> {
+    if fwhm_deg <= 0.0 {
+        return vec![(0.0, solar_azimuth_deg, 1.0)];
+    }
+    // Integrate to 1.2x FWHM: beyond that the Gaussian response has
+    // fallen below 1e-2 and contributes under a part in 1e3 of the total.
+    //
+    // Clamped to the visible hemisphere. A wide beam (the 84-degree
+    // original SQM) would otherwise place its outer rings past 90 degrees
+    // of zenith angle, i.e. pointing into the ground, and the sky model
+    // evaluated below the horizon returns a grazing-path radiance that
+    // swamps the whole integral. HORIZON_MARGIN keeps the outermost ring
+    // off the horizon itself, where the airmass integral is stiff and the
+    // meter's own housing occludes in any case.
+    const HORIZON_MARGIN_DEG: f64 = 85.0;
+    let outer = (1.2 * fwhm_deg).min(HORIZON_MARGIN_DEG);
+    let rings = 3;
+    let azimuths = 4;
+    let mut out = vec![];
+    // On-axis sample: solid angle element vanishes at psi = 0, so give it
+    // the weight of the disc it represents.
+    let d_psi = outer / rings as f64;
+    let sigma_factor = 4.0 * std::f64::consts::LN_2;
+    let response = |psi: f64| (-sigma_factor * (psi / fwhm_deg).powi(2)).exp();
+    let centre_w = {
+        let half = 0.5 * d_psi;
+        // integral of sin(psi) dpsi over [0, half), small-angle exact enough
+        (1.0 - half.to_radians().cos()) * response(0.0)
+    };
+    out.push((0.0, solar_azimuth_deg, centre_w));
+    for r in 1..=rings {
+        let psi = r as f64 * d_psi;
+        let w_ring = response(psi) * psi.to_radians().sin() * d_psi.to_radians();
+        for a in 0..azimuths {
+            let az = solar_azimuth_deg + 360.0 * a as f64 / azimuths as f64;
+            out.push((psi, az, w_ring / azimuths as f64));
+        }
+    }
+    let total: f64 = out.iter().map(|(_, _, w)| w).sum();
+    if total > 0.0 {
+        for s in out.iter_mut() {
+            s.2 /= total;
+        }
+    }
+    out
 }
 
 #[derive(Args)]
@@ -3050,6 +3123,14 @@ fn sqm_predict_curve(args: &SqmArgs) -> SqmCurve {
     };
     let threshold_config = twilight_threshold::threshold::ThresholdConfig::default();
     let (glow_cd, glow_desc) = sqm_skyglow_cd(args);
+    let beam = beam_samples(args.beam_fwhm, config.solar_azimuth);
+    if args.beam_fwhm > 0.0 {
+        println!(
+            "Beam:       {:.0} deg FWHM, {} samples per step (Gaussian response)",
+            args.beam_fwhm,
+            beam.len()
+        );
+    }
 
     let base_epoch = local_midnight_epoch(year, month, day, tz.offset_hours);
     let step_h = args.step_min.max(0.25) / 60.0;
@@ -3074,14 +3155,26 @@ fn sqm_predict_curve(args: &SqmArgs) -> SqmCurve {
         let sza = pos.zenith;
 
         let sun_cd = if sza <= 110.0 {
-            let result = simulation::simulate_at_sza(&atm, &config, sza, None);
-            let analysis = twilight_threshold::threshold::analyze_twilight(
-                sza,
-                &result.wavelengths_nm,
-                &result.radiance,
-                &threshold_config,
-            );
-            analysis.luminance_mesopic
+            // Beam integration: one MCRT evaluation per sample, combined
+            // by the meter's angular response. With --beam-fwhm 0 this is
+            // exactly the historical single zenith-point evaluation.
+            let mut acc = 0.0;
+            for &(vz, az, w) in &beam {
+                let mut c = config.clone();
+                c.view_zenith = vz;
+                if vz > 0.0 {
+                    c.view_azimuth = Some(az);
+                }
+                let result = simulation::simulate_at_sza(&atm, &c, sza, None);
+                let analysis = twilight_threshold::threshold::analyze_twilight(
+                    sza,
+                    &result.wavelengths_nm,
+                    &result.radiance,
+                    &threshold_config,
+                );
+                acc += w * analysis.luminance_mesopic;
+            }
+            acc
         } else {
             0.0
         };
@@ -3672,6 +3765,64 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── SQM beam response ──
+
+    #[test]
+    fn beam_zero_fwhm_is_the_zenith_point() {
+        let s = beam_samples(0.0, 270.0);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].0, 0.0, "on-axis");
+        assert!((s[0].2 - 1.0).abs() < 1e-12, "all weight on the point");
+    }
+
+    #[test]
+    fn beam_weights_are_normalized_and_on_axis_dominates() {
+        for fwhm in [20.0, 84.0] {
+            let s = beam_samples(fwhm, 270.0);
+            let total: f64 = s.iter().map(|(_, _, w)| w).sum();
+            assert!(
+                (total - 1.0).abs() < 1e-12,
+                "fwhm {fwhm}: weights sum to {total}"
+            );
+            // Every sample must look at SKY. A sample at or past 90 deg
+            // of zenith angle points into the ground, and the sky model
+            // evaluated there returns a grazing radiance that swamps the
+            // integral: an 84-degree beam integrated to 1.2x FWHM without
+            // this clamp predicted a "darkest" night of 8.97 mag/arcsec^2,
+            // brighter than daylight.
+            for (vz, _, w) in &s {
+                assert!(*vz >= 0.0, "vz {vz} not negative");
+                assert!(*vz < 90.0, "vz {vz} must stay above the horizon");
+                assert!(*vz <= 1.2 * fwhm + 1e-9, "vz {vz} inside integration radius");
+                assert!(*w > 0.0, "positive weight");
+            }
+            // The response is peaked, so the mean offset must sit well
+            // inside the FWHM: a beam whose weight ran to the rim would
+            // be sampling the wrong sky.
+            let mean_off: f64 = s.iter().map(|(vz, _, w)| vz * w).sum();
+            assert!(
+                mean_off < fwhm,
+                "fwhm {fwhm}: mean offset {mean_off} should sit inside the FWHM"
+            );
+        }
+    }
+
+    #[test]
+    fn beam_rings_sample_four_sun_relative_azimuths() {
+        let s = beam_samples(20.0, 100.0);
+        // Off-axis samples must come in complete azimuth quartets so the
+        // sunward gradient is captured rather than assumed symmetric.
+        let off: Vec<_> = s.iter().filter(|(vz, _, _)| *vz > 0.0).collect();
+        assert_eq!(off.len() % 4, 0, "azimuths come in quartets");
+        let rel: Vec<f64> = off.iter().take(4).map(|(_, az, _)| az - 100.0).collect();
+        for want in [0.0, 90.0, 180.0, 270.0] {
+            assert!(
+                rel.iter().any(|r| (r - want).abs() < 1e-9),
+                "missing sun-relative azimuth {want} in {rel:?}"
+            );
+        }
+    }
 
     // ── --cloud-field observer/footprint validation ──
 

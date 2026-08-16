@@ -24,8 +24,40 @@ calibration input for the engine's twilight thresholds.
 
 Both meters measure sky surface brightness in mag/arcsec^2 over a ~20
 degree (LU) full-width half-maximum cone. The narrower LU/LU-DL beam is
-preferred over the older L model because the prediction is for the
-zenith point.
+strongly preferred over the original wide-angle SQM (~84 degrees FWHM),
+and the reason is quantitative rather than aesthetic.
+
+The twilight sky carries a steep gradient toward the sun, so a wide cone
+reads brighter than the zenith by an amount that GROWS with solar
+depression. Measured with this engine (Padborg, clear sky, Bortle 4,
+`sqm predict --beam-fwhm`, difference against the zenith point):
+
+| solar depression | 20 deg beam | 84 deg beam |
+|---|---|---|
+| 0.8 deg | -0.04 mag | -0.73 mag |
+| 6.2 deg | -0.04 mag | -1.39 mag |
+| 8.9 deg | -0.05 mag | **-4.27 mag** |
+| 11.9 deg (night floor) | 0.00 mag | -2.04 mag |
+
+The wide meter is wrong by up to 4.3 magnitudes and its error swings 3.6
+magnitudes across the twilight range, which is precisely the range being
+calibrated. It cannot be corrected by a constant offset. The narrow
+meter needs only a 0.04 to 0.05 magnitude correction through twilight,
+falling to zero at the night floor.
+
+That residual is small but it is not nothing: it is half the meter's own
++-0.1 magnitude accuracy, and because it varies with depression it would
+otherwise appear in the offset table of section 6 as engine error. Pass
+`--beam-fwhm 20` to `sqm predict` and `sqm compare` and the prediction is
+integrated over the meter's angular response instead of evaluated at the
+zenith point. It costs one MCRT evaluation per beam sample per time step
+(13 samples), so generate the prediction ahead of the night rather than
+during it.
+
+Site geometry follows from the same numbers: with a 20 degree FWHM the
+response is already at half at 10 degrees off axis and negligible by 40,
+which is why section 2 asks only for a clear cone of roughly 40 degrees
+around the zenith rather than a fully open horizon.
 
 The optional red-filtered unit is the single highest-value addition:
 calibrated measurements of the RED twilight channel (shafaq al-ahmar,
