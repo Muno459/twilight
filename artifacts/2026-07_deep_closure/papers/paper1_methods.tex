@@ -147,23 +147,45 @@ sixteen in the most recent round, all closed, are recorded in the
 repository together with their fixes.
 
 To state the contributions plainly: to our knowledge this work
-provides (i) the deepest external radiative transfer comparison
+provides (i) a bidirectional connection estimator for the deep-twilight
+regime, coupling every backward-chain collision beyond the terminator to
+light subpaths traced from the sunlit top of atmosphere through an exact
+per-path balance-heuristic MIS, which is what makes the regime tractable
+at affordable budgets; (ii) exact voxel-by-voxel transport of measured
+three-dimensional cloud fields at twilight geometry, where the light
+path crosses the cloud field hundreds of kilometres from the observer
+and a horizontally uniform deck is not a usable approximation;
+(iii) the deepest external radiative transfer comparison
 attempted for cloud decks at twilight geometry (solar
 zenith angle $103^{\circ}$ against $10^{9}$-photon MYSTIC references,
 with every cell of the deep tier, one-dimensional and
 three-dimensional field paths alike, gated and statistically
 consistent;
-published comparisons stop near $100^{\circ}$ under clear skies);
-(ii) the only open transport code maintained as four parity-locked
-implementations with pre-registered statistical acceptance bands;
-(iii) the first twilight model validated simultaneously against
+published comparisons stop near $100^{\circ}$ under clear skies); and
+(iv) the first twilight model validated simultaneously against
 absolute pseudospherical reference codes, measured sky brightness, and a
-century of human dawn observation; and (iv) a variance-reduction
-stack whose measured effect in the heavy-tailed regime (a substantial
-recovery of mean radiance in the deep broken-field cells, under a
-verdict taxonomy that reports any non-constraining referee cell as
-low-power rather than as agreement) is documented
-alongside its mathematics.
+century of human dawn observation.
+
+We are deliberate about what the last of these can and cannot claim. The
+deep comparison establishes agreement at the tens-of-percent level, because
+the acceptance bands there are 25 to 46 percent wide and are dominated by
+the REFEREE's own Monte Carlo error rather than the model's (measured
+across the tier: referee relative standard error 5.9 to 10.7 percent
+against the model's 2.5 to 5.9 percent, with the referee the larger term
+in fifteen of sixteen cells). This is a weaker statement than the
+percent-level DISORT anchor at moderate solar zenith angle, and it is
+weaker because past $100^{\circ}$ the reference codes, not the model,
+are the limiting instrument. Section~\ref{sec:validation} reports the
+decomposition rather than the pass count alone.
+
+The engineering practice that supports these results -- four
+parity-locked implementations, pre-registered acceptance bands,
+bit-identity harnesses across refactors -- is described in
+Section~\ref{sec:gpu} and Section~\ref{sec:validation}. We report it as
+methodology rather than as a result: agreement among four
+implementations of the same physics constrains implementation error, not
+physical correctness, and only the external referees and the measured
+skies can speak to the latter.
 
 Section~\ref{sec:model} describes the forward model: atmosphere,
 scattering physics, background light sources, and the transport estimator.
@@ -885,6 +907,39 @@ standard error with the model-side seed spread, and rows whose bands
 cannot constrain a meaningful bias are labeled LOW-POWER rather than
 counted as agreement; the verdict taxonomy is applied mechanically,
 before the numbers are seen.
+
+A pass count alone would overstate what the deep tier settles, so we
+report which side of the comparison limits it. Decomposing the two
+terms of the acceptance band across all sixteen cells, the model's
+relative seed standard error runs from 2.5 to 5.9 percent (one
+three-dimensional field cell reaches 9.9), while the referee's runs
+from 5.9 to 10.7 percent. \emph{The referee is the larger term in
+fifteen of the sixteen cells.} The bands are consequently 25 to 46
+percent wide, and driving the model-side error to zero everywhere
+would narrow them only to 12 to 35 percent. Additional model seeds
+therefore cannot sharpen this comparison materially; a sharper
+reference would.
+
+Two consequences follow, and we state both rather than the pass count
+alone. First, the deep tier establishes agreement at the
+tens-of-percent level, a materially weaker claim than the
+percent-level DISORT anchor of Section~\ref{sec:ring1}, and the
+weakness is a property of the available references at these solar
+zenith angles rather than of the model. Second, the reported referee
+uncertainties are themselves worth testing. Pooling the eight
+fresh-seed $10^9$-photon replicas by inverse variance tightens the
+four refereed $\tau^{*}=3$ cells from 6.1--10.6 to 3.6--5.7 percent and
+narrows the affected bands by 24 percent, with every verdict unchanged
+and four of six ratios moving toward unity. The same pooling permits a
+consistency test of the quoted sigmas: three of the four cells give
+$\chi^2$ per degree of freedom between 0.29 and 0.63, but the deepest
+and reddest cell ($\tau^{*}=3$, SZA $103^\circ$, 650~nm) gives 4.56,
+meaning three independent $10^9$-photon estimates of one quantity
+disagree about 2.1 times more than their own error bars allow. That is
+the cell where the heavy tail is expected to defeat the central-limit
+assumption behind a Monte Carlo standard error, and it is a caution
+against reading the $3\sigma$ Gaussian bands as if the underlying
+distribution were established as normal.
 
 \subsection{Ring 3: human observation campaigns}
 \label{sec:ring3}
