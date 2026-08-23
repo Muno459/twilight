@@ -1014,17 +1014,32 @@ def deep_run_mystic_case(lrt: Path, solar: Path, wc: Path, tau_star: float,
     tag = f"deep_mystic_tau{tau_star:g}_sza{sza:g}_wl{wl:g}"
     workdir = OUT_DIR / "deep" / tag
     workdir.mkdir(parents=True, exist_ok=True)
-    deck = g3_mystic_deck(lrt, solar, wc, tau_star, sza, wl, photons)
     inp = workdir / "case.inp"
     done = workdir / "case.done"
-
-    def _strip_ph(text: str) -> str:
-        return "\n".join(l for l in text.splitlines()
-                          if not l.startswith("mc_photons"))
     cached_txt = done.read_text() if done.exists() else None
-    cached = (cached_txt is not None
-              and _strip_ph(cached_txt) == _strip_ph(deck)
-              and (workdir / "mc.rad.spc").exists())
+
+    if lrt is None:
+        # Cache-only mode (no libRadtran build): serve completed cases
+        # as-is. The deck-equality check is skipped deliberately; decks
+        # embed the producing machine's libRadtran paths, so it can only
+        # spuriously invalidate a cache made elsewhere.
+        if cached_txt is None or not (workdir / "mc.rad.spc").exists():
+            print(f"  MYSTIC {tag}: no cache and no libRadtran build - "
+                  f"cannot referee this cell", flush=True)
+            return None, None, photons
+        for l in cached_txt.splitlines():
+            if l.startswith("mc_photons"):
+                photons = int(l.split()[1])
+        cached = True
+    else:
+        deck = g3_mystic_deck(lrt, solar, wc, tau_star, sza, wl, photons)
+
+        def _strip_ph(text: str) -> str:
+            return "\n".join(l for l in text.splitlines()
+                              if not l.startswith("mc_photons"))
+        cached = (cached_txt is not None
+                  and _strip_ph(cached_txt) == _strip_ph(deck)
+                  and (workdir / "mc.rad.spc").exists())
     if cached:
         for l in cached_txt.splitlines():
             if l.startswith("mc_photons"):
@@ -1130,13 +1145,16 @@ def deep_run_twilight(tau_star: float, path: str) -> dict:
 
 def compare_deep(lrt):
     """DEEP campaign: both deck representations of the twilight Stokes
-    hybrid vs ultra-budget spherical backward MYSTIC at SZA 101/103."""
-    if lrt is None:
-        sys.exit("deep needs libRadtran (set LIBRADTRAN_DIR)")
+    hybrid vs ultra-budget spherical backward MYSTIC at SZA 101/103.
+
+    Runs without a libRadtran build when every referee case is cached
+    under validation/deep (the from-caches reproduction promised by
+    validation/README.md); a fresh referee run still needs
+    LIBRADTRAN_DIR."""
     from concurrent.futures import ThreadPoolExecutor
 
-    solar = g2_solar_file()
-    wc = g2_wc_file()
+    solar = g2_solar_file() if lrt is not None else None
+    wc = g2_wc_file() if lrt is not None else None
     print("=== DEEP: thick decks at SZA 101-103 (ultra-budget MYSTIC "
           "backward referee) ===")
     print(f"  referee: {DEEP_MYSTIC_PHOTONS:.0e} photons/case; twilight: "
