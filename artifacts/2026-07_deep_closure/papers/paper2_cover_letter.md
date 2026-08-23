@@ -18,12 +18,13 @@ companion methods manuscript), with a single calibrated constant bridging
 laboratory contrast thresholds to field detection. Calibrated once on the
 campaigns that document a central-mean dawn depression, the model
 reproduces sixteen published campaigns spanning 116 years and 58 degrees
-of latitude at a median absolute residual of 0.3 degrees of depression,
+of latitude at a median absolute residual of 0.26 degrees of depression
+over the fourteen scored rows,
 and reproduces a year-long out-of-sample panel study at Birmingham,
 including its double-peaked seasonal curve, with zero retuning. On the
-same benchmark the fixed angles in worldwide use miss by 1.8 to 4.4
-degrees RMS, and the most widely used one is undefined on 20 of the 42
-panel dates.
+same benchmark the fixed angles in worldwide use miss by 1.6 to 4.4
+degrees RMS where they exist; the most widely used one is undefined on
+15 of the 42 panel dates, and even the 15-degree convention on 8.
 
 The companion methods manuscript, submitted alongside, carries the
 transport model and its validation ladder; the two are written to stand

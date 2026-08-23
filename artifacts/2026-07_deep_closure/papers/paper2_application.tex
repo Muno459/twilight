@@ -23,9 +23,10 @@
 and dusk (shafaq) as a detection problem, tested against 116 years of
 observation}
 
-\author[ku]{Mostafa Mahdi}
+\author[ku]{Mostafa Mahdi\corref{cor1}}
+\ead{rhk510@alumni.ku.dk}
+\cortext[cor1]{Corresponding author.}
 \affiliation[ku]{organization={University of Copenhagen},
-            addressline={rhk510@alumni.ku.dk},
             city={Copenhagen},
             country={Denmark}}
 
@@ -58,12 +59,14 @@ year-long panel study at Birmingham, UK, is reproduced with zero
 retuning (mean residual $+0.54^{\circ}$, RMS $0.95^{\circ}$ over all
 42 published dates), including its double-peaked seasonal curve and
 its summer relaxation to about 12.5$^\circ$; on the same benchmark the
-fixed angles in worldwide use miss by 1.8 to 4.4$^{\circ}$ RMS, and
-the most widely used one is undefined on 20 of the 42 dates. The
-calibrated constant inverts consistently ($f = 51$ to 57) across every
-campaign that documents a central mean, with no latitude trend: it
-behaves as a single property of human dawn detection rather than a fit
-artifact. We further
+fixed angles in worldwide use miss by 1.6 to 4.4$^{\circ}$ RMS where
+they exist at all: the most widely used one is undefined on 15 of the
+42 dates, and even the $15^{\circ}$ convention is undefined on 8. The
+calibrated constant inverts consistently ($f = 51$ to 57) across the
+central-mean desert campaigns it is calibrated on, with one documented
+outlier (Hail, whose observed dawn is far shallower than every other
+desert campaign) and no latitude trend: it behaves as a single
+property of human dawn detection rather than a fit artifact. We further
 compute the false dawn as a distinct earlier detection of the zodiacal
 column, reproduce the qualitative suppression of its distinctness by
 urban skyglow, and quantify how measured cloud fields, aerosol, and
@@ -512,7 +515,7 @@ campaigns some twenty degrees of latitude away and never shown these
 data, reproduces the summer
 trough (computed 11.9 to $12.6^\circ$ across the eight June dates
 after the compressed-twilight scan refinement of Paper~I; panel 12.3
-to 12.7) and both peaks of the seasonal curve. The summer relaxation
+to 12.9) and both peaks of the seasonal curve. The summer relaxation
 that UK scholars apply as an empirical rule (from $\sim 14.5^\circ$ in
 winter toward $\sim 12.5^\circ$ in midsummer) emerges from
 persistent-twilight geometry with no additional freedom. Across all
@@ -565,17 +568,21 @@ Shafaq al-ahmar (red end) & $14.96^{\circ}$ & literature 12 to $15^{\circ}$; Sul
 \subsection{Against the conventions in use}
 
 The same 42 panel dates measure the methods the world actually uses
-(Table~\ref{tab:conventions}). The Muslim World League angle of
-$18^{\circ}$ does not exist on 20 of the 42 dates (the Sun never
-reaches that depression at $52.4^{\circ}$N in summer) and misses by
-more than four degrees, roughly half an hour of clock time, where it
-does exist. The $15^{\circ}$ convention exists everywhere but misses
-by $1.76^{\circ}$ RMS. The physics-based model is defined on every date of
-the year at every latitude. Over all 42 dates it is a factor of two more
-accurate than the best year-round fixed angle (ISNA $15^{\circ}$,
-$1.76^{\circ}$ against the model's $0.95^{\circ}$ RMS); the most widely
-used angle ($18^{\circ}$) is undefined on 20 of the 42 dates and misses
-by $4.4^{\circ}$ RMS on the 22 where it exists.
+(Table~\ref{tab:conventions}); an angle counts as defined on a date
+when the Sun actually reaches that depression during the night,
+computed with the same NREL SPA ephemeris as the engine. The Muslim
+World League angle of $18^{\circ}$ does not exist on 15 of the 42
+dates: at $52.4^{\circ}$N the Sun never reaches $18^{\circ}$ of
+depression once its declination exceeds about $19.6^{\circ}$, from
+mid-May to late July. Where it does exist it misses by more than four
+degrees, roughly half an hour of clock time. Even the $15^{\circ}$
+convention is undefined on 8 midsummer dates, and misses by
+$1.59^{\circ}$ RMS on the 34 where it exists. The physics-based model
+is defined on every date of the year at every latitude, and is more
+accurate than the best year-round fixed angle by a factor of about 1.7
+(ISNA $15^{\circ}$, $1.59^{\circ}$ against the model's $0.95^{\circ}$
+RMS on their common dates); the most widely used angle ($18^{\circ}$)
+misses by $4.41^{\circ}$ RMS on the 27 dates where it exists.
 
 \begin{table}[t]
 \centering
@@ -588,8 +595,8 @@ of each method against the 42 consensus-panel dates.}
 Method & Mean [deg] & RMS [deg] & Dates defined \\
 \midrule
 This work, clear-sky model & $+0.54$ & $0.95$ & 42 of 42 \\
-Fixed $15^{\circ}$ (ISNA) & $+1.62$ & $1.76$ & 42 of 42 \\
-Fixed $18^{\circ}$ (MWL) & $+4.32$ & $4.38$ & 22 of 42 \\
+Fixed $15^{\circ}$ (ISNA) & $+1.44$ & $1.59$ & 34 of 42 \\
+Fixed $18^{\circ}$ (MWL) & $+4.36$ & $4.41$ & 27 of 42 \\
 \bottomrule
 \end{tabular}
 \end{table}

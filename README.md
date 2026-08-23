@@ -108,16 +108,17 @@ reproduction command).
 | Fajr sadiq (desert network) | **14.00 to 14.82°** across 10 sites | KACST 14.6 ± 0.3° · Hail 14.0 ± 0.3° · Aswan camera 14.90 ± 0.17° · every scored desert site matched within 0.45° |
 | Isha al-abyad, Mecca | **17.33°** | SQM twilight-end 17.99 ± 0.16° · classical muwaqqit mode 17° |
 | Isha al-ahmar, Mecca | **14.96°** | visual literature 12 to 15° ("colors gone before 15") |
-| **Fajr, Birmingham UK** (out-of-sample, zero retuning, all 42 panel dates) | **mean residual +0.54°, RMS 0.95°** | **OpenFajr (CCD camera + 19-member scholar/observer panel); June trough 11.9 to 12.6° vs panel 12.3 to 12.7°** |
+| **Fajr, Birmingham UK** (out-of-sample, zero retuning, all 42 panel dates) | **mean residual +0.54°, RMS 0.95°** | **OpenFajr (CCD camera + 19-member scholar/observer panel); June trough 11.9 to 12.6° vs panel 12.3 to 12.9°** |
 
 The Birmingham row matters most: the seasonal "summer relaxation" that UK
 scholars apply as a hand-rule (14.5° in winter, about 12.5° in summer)
-emerges from the physics across 31 degrees of latitude with no additional
-tuning. Across the full campaign sweep the median absolute residual is
+emerges from the physics twenty degrees of latitude from the desert
+calibration campaigns with no additional tuning. Across the full campaign sweep the median absolute residual is
 0.26° of depression over the 14 scored rows (eye 0.28°, instrument
 0.26°). On the same 42-date Birmingham benchmark the fixed angles in
-worldwide use miss by 1.76° RMS (ISNA 15°) and 4.38° RMS (MWL 18°,
-undefined on 20 of the 42 dates).
+worldwide use miss by 1.59° RMS (ISNA 15°, itself undefined on 8 of
+the 42 dates) and 4.41° RMS (MWL 18°, undefined on 15 of the 42);
+definedness computed with the engine's own SPA ephemeris.
 
 The criterion's one calibrated constant has itself been stress-tested:
 inverting each desert campaign independently for its own implied value

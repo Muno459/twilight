@@ -34,13 +34,17 @@ Sources live in the twilight-papers repository.
 
 ## mystic_replicas/
 
-Eight fresh-seed 1e9-photon MYSTIC reruns of the four tau*=3 references
+Eight fresh-seed MYSTIC reruns of the four tau*=3 references
 (SZA 101/103 at 550 nm, SZA 101 at 450 nm, SZA 103 at 650 nm; two
-replicas each, distinct mc_randomseed), run with libRadtran 2.0.6 built
-on the AWS box. Each directory holds the exact case.inp plus mc.rad.spc
+replicas each, distinct mc_randomseed, each at its reference's own
+budget: 3e8 photons for the SZA 101 pair, 1e9 for the SZA 103 pair -
+see the case.inp files), run with libRadtran 2.0.6 built
+on the AWS box. (Correction 2026-08-16: this entry previously called
+all eight replicas 1e9-photon.) Each directory holds the exact case.inp plus mc.rad.spc
 and mc.rad.std.spc. Finding: the references reproduce within roughly one
-reported sigma except the cached tau3/SZA103/650 nm case, which sits 3.3
-sigma below its replicas (a low draw); the twilight results pass against
+reported sigma except the cached tau3/SZA103/650 nm case, which sits
+2.8 combined sigma below the pooled value of its replicas (a low draw;
+an earlier version of this entry quoted 3.3); the twilight results pass against
 both the cached and the replica-pooled references.
 
 ## Verdicts preserved elsewhere (raw logs were on terminated instances)

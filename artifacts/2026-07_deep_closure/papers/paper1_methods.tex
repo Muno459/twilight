@@ -25,9 +25,10 @@
 Carlo model with three-dimensional cloud transport, externally validated
 to solar zenith angle 103 degrees}
 
-\author[ku]{Mostafa Mahdi}
+\author[ku]{Mostafa Mahdi\corref{cor1}}
+\ead{rhk510@alumni.ku.dk}
+\cortext[cor1]{Corresponding author.}
 \affiliation[ku]{organization={University of Copenhagen},
-            addressline={rhk510@alumni.ku.dk},
             city={Copenhagen},
             country={Denmark}}
 
@@ -65,7 +66,8 @@ statistically consistent with its reference (ratios 0.87 to 1.19).
 Against measurements: the simulated zenith twilight decay reproduces
 published sky-brightness data to 1.2 to 5.5\% per magnitude of decay.
 Against human observation: a psychophysical detection layer, calibrated
-once against a single regional campaign cluster, reproduces the dawn
+once against desert campaigns reporting a documented central-mean dawn,
+reproduces the dawn
 detection times of sixteen published visual and instrumental campaigns
 with a median absolute residual of $0.26^\circ$ of solar depression over
 the fourteen scored rows, including an out-of-sample seasonal sweep at
@@ -169,10 +171,11 @@ century of human dawn observation.
 We are deliberate about what the last of these can and cannot claim. The
 deep comparison establishes agreement at the tens-of-percent level, because
 the acceptance bands there are 25 to 46 percent wide and are dominated by
-the REFEREE's own Monte Carlo error rather than the model's (measured
-across the tier: referee relative standard error 5.9 to 10.7 percent
-against the model's 2.5 to 5.9 percent, with the referee the larger term
-in fifteen of sixteen cells). This is a weaker statement than the
+the \emph{referee's} own Monte Carlo error rather than the model's
+(measured across the tier: referee relative standard error 5.9 to 10.7
+percent against the model's 2.6 to 5.9, one field cell excepted where
+the two are level at 9.9, so the referee is the larger term in fifteen
+of sixteen cells). This is a weaker statement than the
 percent-level DISORT anchor at moderate solar zenith angle, and it is
 weaker because past $100^{\circ}$ the reference codes, not the model,
 are the limiting instrument. Section~\ref{sec:validation} reports the
@@ -553,7 +556,7 @@ referee cells of Section~\ref{sec:cvresults}.
 \label{sec:cvresults}
 
 Table~\ref{tab:variance} reports the production estimator against the
-MYSTIC references (standard errors 6 to 10\%) for the hardest
+MYSTIC references (standard errors 5.9 to 10.7\%) for the hardest
 configuration we can referee externally: a uniform deck of
 delta-scaled optical depth $\tau^{*} = 3$ under twilight geometry, at
 1024 seeds of 16\,000 photons per wavelength (an eight-fold increase
@@ -581,24 +584,27 @@ and deliberately leaves the field path untouched; the field cells
 were closed with the field estimator unchanged, so the earlier
 low-power verdicts were a statement about seed budget, not about the
 estimator. The reference side was
-itself replicated: eight fresh-seed $10^9$-photon MYSTIC replicas of
-the four $\tau^{*}=3$ references reproduce the cached values within
-their reported errors, except the 650~nm SZA $103^\circ$ case, whose
-cached value sits 3.3 standard deviations below its two replicas (a
-low draw); the model passes against both the cached and the
-replica-pooled references. On a
+itself replicated: eight fresh-seed MYSTIC replicas of the four
+$\tau^{*}=3$ references (two per reference, at each reference's own
+budget of $3\times10^{8}$ or $10^{9}$ photons) reproduce the cached
+values within their reported errors, except the 650~nm SZA $103^\circ$
+case, whose cached value sits 2.8 combined standard deviations below
+the pooled value of its replicas (a low draw); the model passes
+against both the cached and the replica-pooled references. On a
 synthetic broken-cloud field the same machinery drives a large recovery
 of mean radiance relative to the analog estimator in the deep cells where
 zenith starvation otherwise biases it low, with the seed coefficient of
 variation reduced correspondingly; the per-configuration before-and-after
 values are recorded in the archived field ledgers. On clear sky at
 the dawn-detection
-depressions the seed coefficient of variation improves by factors of two
-to six.
+depressions the seed coefficient of variation improves by factors of up
+to five (median near two; the shallowest red cell is essentially
+unchanged at 1.05).
 
 \begin{table}[t]
 \centering
-\caption{Production estimator versus a $10^9$-photon MYSTIC referee.
+\caption{Production estimator versus dedicated MYSTIC referees of
+$3\times10^{8}$ (SZA $101^\circ$) and $10^{9}$ (SZA $103^\circ$) photons.
 Uniform cloud deck, delta-scaled optical depth $\tau^{*}=3$, zenith view,
 1024 seeds of 16\,000 photons per wavelength. Ratios are model/referee;
 uncertainties are seed standard errors. The referee gates a cell only
@@ -644,8 +650,11 @@ model-to-MYSTIC ratio with seed standard errors; referee budgets are
 $3\times10^{8}$ to $10^{9}$ photons. All sixteen cells, the
 one-dimensional and the three-dimensional field paths alike, are
 gated and statistically consistent (green; ratios 0.87 to 1.19). The
-two field cells at SZA $103^\circ$ that were low-power at 128 seeds
-close at 1024 and 512 seeds with the field estimator unchanged.}
+field cells referee the voxel path on the equivalent horizontally
+uniform field of the same deck and share the one-dimensional rows'
+reference values; the two at SZA $103^\circ$, low-power at earlier
+seed budgets, close at 1024 and 512 seeds with the field estimator
+unchanged.}
 \label{fig:deep}
 \end{figure}
 
@@ -802,8 +811,8 @@ on six degrees of freedom in the final configuration).
 \centering
 \caption{Transport validation against reference codes and measured skies.
 SE denotes standard error. The deep-regime rows are refereed by dedicated
-MYSTIC runs of $3\times10^8$ to $10^9$ photons with standard errors of 6
-to 10\%; the verdict taxonomy of Section~\ref{sec:cvresults} reports any
+MYSTIC runs of $3\times10^8$ to $10^9$ photons with standard errors of
+5.9 to 10.7\%; the verdict taxonomy of Section~\ref{sec:cvresults} reports any
 non-constraining cell as LOW-POWER rather than as agreement, and no cell
 of the final campaign carries that label.}
 \label{tab:refs}
@@ -911,12 +920,12 @@ before the numbers are seen.
 A pass count alone would overstate what the deep tier settles, so we
 report which side of the comparison limits it. Decomposing the two
 terms of the acceptance band across all sixteen cells, the model's
-relative seed standard error runs from 2.5 to 5.9 percent (one
+relative seed standard error runs from 2.6 to 5.9 percent (one
 three-dimensional field cell reaches 9.9), while the referee's runs
 from 5.9 to 10.7 percent. \emph{The referee is the larger term in
 fifteen of the sixteen cells.} The bands are consequently 25 to 46
 percent wide, and driving the model-side error to zero everywhere
-would narrow them only to 12 to 35 percent. Additional model seeds
+would narrow them only to 23 to 37 percent. Additional model seeds
 therefore cannot sharpen this comparison materially; a sharper
 reference would.
 
@@ -927,15 +936,20 @@ percent-level DISORT anchor of Section~\ref{sec:ring1}, and the
 weakness is a property of the available references at these solar
 zenith angles rather than of the model. Second, the reported referee
 uncertainties are themselves worth testing. Pooling the eight
-fresh-seed $10^9$-photon replicas by inverse variance tightens the
-four refereed $\tau^{*}=3$ cells from 6.1--10.6 to 3.6--5.7 percent and
-narrows the affected bands by 24 percent, with every verdict unchanged
-and four of six ratios moving toward unity. The same pooling permits a
+fresh-seed replicas (two per reference, run at each reference's own
+budget: $3\times10^{8}$ photons for the two SZA $101^\circ$
+references, $10^{9}$ for the two at SZA $103^\circ$) by inverse
+variance tightens the four replicated $\tau^{*}=3$ references (450 and
+550~nm at SZA $101^\circ$; 550 and 650~nm at SZA $103^\circ$) from
+6.1--10.6 to 3.6--5.7 percent relative standard error, narrowing the
+six affected tier rows (the 550~nm references are shared between the
+one-dimensional and field rows) by 24 percent in band, with every
+verdict unchanged and four of the six ratios moving toward unity. The same pooling permits a
 consistency test of the quoted sigmas: three of the four cells give
 $\chi^2$ per degree of freedom between 0.29 and 0.63, but the deepest
 and reddest cell ($\tau^{*}=3$, SZA $103^\circ$, 650~nm) gives 4.56,
-meaning three independent $10^9$-photon estimates of one quantity
-disagree about 2.1 times more than their own error bars allow. That is
+meaning three independent estimates of one quantity disagree about
+2.1 times more than their own error bars allow. That is
 the cell where the heavy tail is expected to defeat the central-limit
 assumption behind a Monte Carlo standard error, and it is a caution
 against reading the $3\sigma$ Gaussian bands as if the underlying
@@ -1047,10 +1061,15 @@ one-dimensional SZA $101^\circ$ cell to referee consistency,
 including the $550$~nm cell that at 128 seeds had read about forty
 percent low (undersampling of the heavy tail, not a bias); the
 one-dimensional SZA $103^\circ$ cells were then closed by the
-connection estimator; and the two broken-field cells at SZA
-$103^\circ$ ($\tau^{*} = 1$ and $3$, 550~nm), reported low-power at
-128 seeds, pass the $10^9$-photon referee at 1024 and 512 seeds
-respectively with the field estimator unchanged. The field path
+connection estimator; and the two three-dimensional field cells at SZA
+$103^\circ$ ($\tau^{*} = 1$ and $3$, 550~nm), low-power at earlier
+seed budgets, pass the $10^9$-photon referee at 1024 and 512 seeds
+respectively with the field estimator unchanged. These field cells
+referee the voxel path on the equivalent horizontally uniform field of
+the same deck, against the same reference values as the corresponding
+one-dimensional rows; the SHDOM cube comparisons referee genuinely
+heterogeneous fields, but at moderate solar zenith angle, so an
+external deep-twilight referee on a heterogeneous scene remains open. The field path
 therefore converges at practical budgets only through large seed
 campaigns; extending the registry connections to voxel fields, which
 would restore the one-dimensional convergence rate, is the identified

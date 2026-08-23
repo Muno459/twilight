@@ -21,7 +21,7 @@ couples backward chains to light subpaths traced from the sunlit
 terminator. The validation program spans reference codes (DISORT, MYSTIC,
 SHDOM), published sky-brightness measurements, and a century of human dawn
 observation; its deepest tier referees cloud decks at twilight geometry
-against MYSTIC runs of a billion photons to solar zenith angle 103
+against dedicated MYSTIC runs of 3e8 to 1e9 photons to solar zenith angle 103
 degrees, with every cell of the tier statistically consistent with its
 reference.
 

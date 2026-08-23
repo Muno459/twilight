@@ -20,7 +20,7 @@ Decomposing the two error terms across all 16 cells:
 
 | term | range across the tier |
 |---|---|
-| model relative SE (`se_m/m`) | 2.5 to 5.9 percent (one field cell 9.9) |
+| model relative SE (`se_m/m`) | 2.6 to 5.9 percent (one field cell 9.9) |
 | referee relative SE (`se_r/r`) | **5.9 to 10.7 percent** |
 
 In **15 of the 16 cells the MYSTIC reference is the dominant term**. The
@@ -29,7 +29,9 @@ the two are level (9.9 against 9.7).
 
 The consequence is the practical one: additional model seeds barely move
 the gate. Driving `se_m` to zero everywhere would only shrink the bands
-from 0.25-0.46 to 0.12-0.35. Compute spent on the engine is compute
+from 0.25-0.46 to 0.23-0.37 (the referee-only floor `3*se_r/r + 0.05`);
+the 0.12-0.35 range is the opposite floor, a perfect referee against
+the current model seeds. Compute spent on the engine is compute
 mostly wasted; the reference is the limiting instrument.
 
 A second consequence is about what "16/16 PASS" means. The bands are 25
@@ -41,7 +43,9 @@ differently.
 ## 2. Pooling the replicas the campaign already produced
 
 `artifacts/2026-07_deep_closure/mystic_replicas/` holds two fresh-seed
-1e9-photon replicas for each of four tau* = 3 references. The cached run
+replicas for each of four tau* = 3 references, run at each reference's
+own budget (3e8 photons for the two SZA 101 references, 1e9 for the two
+at SZA 103; confirmed from the replicas' own case.inp files). The cached run
 and its replicas are three independent estimates of the same quantity, so
 they pool by inverse variance:
 
