@@ -254,6 +254,29 @@ published is affected. But a piecewise-constant response should be
 disclosed rather than found by a referee, and the honest framing is that
 the criterion is smooth in f except at patch-count boundaries.
 
+## 6. Full heavy-gate re-certification on a second venue (2026-08-23)
+
+Every prior heavy-gate run was on the macOS/Metal development box or
+AWS Linux. The complete heavy physics-gate set has now been run on a
+third venue - native Windows, 24-thread 14900KF, RTX 4090 - on the
+shipped tree:
+
+- **13 of 13 CPU physics gates PASS** in 12,908 s: G-EQ1D, G-HYB-MULT
+  (1d and field decks, SZA 88/92/97), G-ALIS, G-FORCED-1D, G-GAP-MC,
+  G-BDPT, G-S3-MONO (both ladders), G-S3-CB (checkerboard, two-sided
+  rows plus the KNOWN-LIM tau*3/103 row reported not gated),
+  G-S3-SMOOTHNESS (chi2 9.7 on dof 6, 99.9 percent bound 22.46),
+  G-S3-EQ1D-DEEP, G-S3-EQ1D-PAIRED (all eight configurations), and the
+  stratus visibility gate.
+- **wgpu field MC parity PASSES on NVIDIA/Vulkan** (ratio 1.36 inside
+  the pre-registered [0.25, 2.2] band, 217 s, no TDR): the first run of
+  this gate on a consumer Windows GPU; previously validated only on
+  Metal and A10G.
+- Workspace suite 1177 passed / 0 failed; clippy clean under
+  deny-warnings on all targets; the deep tier regenerates from the
+  committed caches byte-identically (section on cache-only mode in the
+  tool).
+
 ## Where the next compute goes
 
 1. Pool every deep cell, not only the four that have replicas. Replicas
