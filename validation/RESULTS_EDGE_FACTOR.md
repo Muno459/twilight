@@ -394,6 +394,35 @@ event rides immediately ahead of dawn where the wedge is brightest;
 but the honest statement is that the cross-prediction is PARTIAL:
 trend confirmed, cutoff untested by this observable.
 
+### Attack 3 re-run at the production constant (2026-08-16)
+
+The ladder above is the f = 45 frame. Re-run on the shipped engine
+(f = 56 default, CPU reference path, same site/date/protocol via
+`python tools/criterion_edge_factor.py --attack3 --cpu`), with the lead
+quantified at the machinery level as the separation between the
+central-patch and spread margin crossings (the stdout kadhib onset
+applies an additional reporting gate and is not monotone at B6):
+
+| veil (VIIRS nW) | Bortle | khayt sadiq dep | margin central dep | lead (deg) |
+|---|---|---|---|---|
+| pristine | 1 | 14.54 | 15.20 | 0.50 |
+| 0.5 | 2 | 14.01 | 14.41 | 0.38 |
+| 2.0 | 4 | 13.68 | 14.04 | 0.33 |
+| 6.0 | 5 | 13.37 | 13.69 | 0.31 |
+| 15.0 | 6 | 12.98 | 13.37 | 0.29 |
+
+Monotone compression 0.50 -> 0.29, same qualitative verdict as the f=45
+frame (trend confirmed, hard extinction not reproduced, cross-prediction
+PARTIAL). NOAA time-to-depression self-check residuals <= 0.006 deg.
+This is the ladder the application paper quotes.
+
+Two tool fixes made for this re-run, both affecting anyone reproducing
+on Windows: `CAL_FACTOR` updated 45 -> 56 (it must track the shipped
+default, since run_one only sets the override env var when the factor
+differs from it), and engine stdout is now decoded as UTF-8 explicitly
+(the locale-codepage default mangled the degree sign and silently made
+every depression parse as None).
+
 ## 4. Confidence verdict
 
 > **Edge factor pinned by the field, bracketed by the literature,

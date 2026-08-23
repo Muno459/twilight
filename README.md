@@ -106,7 +106,7 @@ reproduction command).
 | Event | Engine | Independent measurement |
 |---|---|---|
 | Fajr sadiq (desert network) | **14.00 to 14.82°** across 10 sites | KACST 14.6 ± 0.3° · Hail 14.0 ± 0.3° · Aswan camera 14.90 ± 0.17° · every scored desert site matched within 0.45° |
-| Isha al-abyad, Mecca | **17.33°** | SQM twilight-end 17.99 ± 0.16° · classical muwaqqit mode 17° |
+| Isha al-abyad, Mecca | **17.33°** | SQM twilight-end 17.99 ± 0.16° (Niri et al. 2012, Sabah, Malaysia) · classical muwaqqit mode 17° |
 | Isha al-ahmar, Mecca | **14.96°** | visual literature 12 to 15° ("colors gone before 15") |
 | **Fajr, Birmingham UK** (out-of-sample, zero retuning, all 42 panel dates) | **mean residual +0.54°, RMS 0.95°** | **OpenFajr (CCD camera + 19-member scholar/observer panel); June trough 11.9 to 12.6° vs panel 12.3 to 12.9°** |
 

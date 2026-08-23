@@ -217,7 +217,7 @@ The engine constants this campaign calibrates live in
 `crates/twilight-cpu/src/khayt.rs` (`KhaytParams::default`), and each
 documents its current provenance in comments there:
 
-- `edge_factor_appearance` (currently 45.0): the morning
+- `edge_factor_appearance` (currently 56.0): the morning
   edge-discernibility factor, pinned today to the desert campaigns
   (KACST 14.6 +- 0.3, Hail 14.0 +- 0.3, Aswan camera 14.9 deg). Your
   observer first-distinctness/spread times, combined with the
@@ -225,7 +225,8 @@ documents its current provenance in comments there:
   instrument-grade brightness scale under it.
 - `edge_factor_disappearance` (currently 4.0): the evening factor,
   pinned to the classical 17 deg white-shafaq convention and SQM
-  twilight-end statistics (17.99 +- 0.16 deg).
+  twilight-end statistics (17.99 +- 0.16 deg; Niri et al. 2012,
+  measured at Tanjung Aru, Sabah, Malaysia).
 - `k_contrast` / `k_contrast_red` (0.4): extended-source contrast
   multipliers; the red channel data constrains `k_contrast_red`.
 

@@ -96,7 +96,7 @@ dense atmosphere, and essentially no singly scattered photon can reach the
 eye. What remains is light that was scattered at high altitude on the
 sunlit side of the terminator, transported laterally over hundreds of
 kilometers, and scattered again, possibly several times, into the line of
-sight. Plane-parallel methods are structurally unable to represent this
+sight (Figure~\ref{fig:geometry}). Plane-parallel methods are structurally unable to represent this
 transport; pseudospherical corrections extend them usefully to solar zenith
 angles (SZA) near $90^\circ$ to $95^\circ$ but not beyond. Fully spherical
 Monte Carlo codes such as MYSTIC \citep{mayer2009,emde2016} can in
@@ -416,7 +416,8 @@ illuminated altitudes. Left untreated, this produces heavy-tailed seed
 distributions whose sample variance understates the true error, the most
 dangerous failure mode a Monte Carlo code has, because it looks like
 convergence. The stack described below was built against this failure
-mode. Each component is
+mode; Figure~\ref{fig:lifecycle} places each component on the
+lifecycle of a single chain. Each component is
 unbiased by construction; the telescoping identities are stated in the
 code alongside the implementation and exercised by analytic unit gates.
 
@@ -646,7 +647,8 @@ windows).}
 \centering
 \includegraphics[width=\textwidth]{p1_deep_referee}
 \caption{Every cell of the deep-regime referee table, shown as the
-model-to-MYSTIC ratio with seed standard errors; referee budgets are
+model-to-MYSTIC ratio with combined error bars (model seed SE and
+referee SE propagated in quadrature); referee budgets are
 $3\times10^{8}$ to $10^{9}$ photons. All sixteen cells, the
 one-dimensional and the three-dimensional field paths alike, are
 gated and statistically consistent (green; ratios 0.87 to 1.19). The

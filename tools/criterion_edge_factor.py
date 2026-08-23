@@ -57,8 +57,17 @@ CLI = pathlib.Path(os.environ.get("TWILIGHT_CLI",
 RUNDIR = ROOT / "validation/criterion_runs/edge_factor"
 PRISTINE = ROOT / "validation/criterion_runs"
 
-CAL_FACTOR = 45.0            # the calibrated default under attack
-LADDER = [25.0, 60.0, 80.0]  # new-run factors; 45 comes from cache/verify
+# Appended to every engine invocation (set by --cpu); the CPU path is the
+# published-number reference, the GPU path a faster cross-check.
+EXTRA_ARGS = []
+
+# The calibrated default under attack. MUST match the engine's shipped
+# KhaytParams default (khayt.rs pins it by test): run_one only sets the
+# override env var when factor != CAL_FACTOR, so a stale value here makes
+# every "CAL_FACTOR" run silently execute at whatever the binary ships.
+# 45 was the pre-hyperaccuracy value; the 2026-07-07 refit shipped 56.
+CAL_FACTOR = 56.0
+LADDER = [25.0, 60.0, 80.0]  # new-run factors; CAL_FACTOR from cache/verify
 
 # ── Attack 1 sites ───────────────────────────────────────────────────
 # One date per campaign, chosen as the pristine-sweep date whose
@@ -156,18 +165,23 @@ def run_one(name, lat, lon, elev, date, factor, extra):
     """
     tag = "" if not extra else "_" + "_".join(a.strip("-") for a in extra)
     raw = RUNDIR / f"{name}_{date}_f{factor:g}{tag}.txt"
-    if raw.exists() and "depression" in raw.read_text():
-        return raw.read_text()
+    # Engine output and cache files are UTF-8. Decoding them with the
+    # Windows locale codepage (the text=True default there) turns the
+    # degree sign into two characters and silently breaks RE_KHAYT, so
+    # every depression parses as None on Windows.
+    if raw.exists() and "depression" in raw.read_text(encoding="utf-8"):
+        return raw.read_text(encoding="utf-8")
     env = dict(os.environ)
     if factor != CAL_FACTOR:
         env["TWILIGHT_KHAYT_EDGE_APPEARANCE"] = str(factor)
     env["TWILIGHT_KHAYT_DEBUG"] = "1"  # margin curves kept for audit
     cmd = [str(CLI), "pray", f"--lat={lat}", f"--lon={lon}",
-           f"--elevation={elev}", f"--date={date}"] + extra
-    proc = subprocess.run(cmd, capture_output=True, text=True,
+           f"--elevation={elev}", f"--date={date}"] + extra + EXTRA_ARGS
+    proc = subprocess.run(cmd, capture_output=True,
                           timeout=2400, env=env)
-    out = proc.stdout + proc.stderr
-    raw.write_text(out)
+    out = (proc.stdout.decode("utf-8", "replace")
+           + proc.stderr.decode("utf-8", "replace"))
+    raw.write_text(out, encoding="utf-8")
     if proc.returncode != 0:
         raise RuntimeError(f"{name} {date} f{factor}: exit {proc.returncode}")
     return out
@@ -420,10 +434,14 @@ def main():
     ap.add_argument("--only", action="append")
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--attack3", action="store_true")
+    ap.add_argument("--cpu", action="store_true",
+                    help="run the engine on the CPU reference path")
     ap.add_argument("--analyze", action="store_true",
                     help="parse cache only; no new runs")
     args = ap.parse_args()
     RUNDIR.mkdir(parents=True, exist_ok=True)
+    if args.cpu:
+        EXTRA_ARGS.append("--cpu")
 
     if args.attack3:
         name, lat, lon, elev, date = A3_SITE
