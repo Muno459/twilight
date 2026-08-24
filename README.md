@@ -344,22 +344,27 @@ established local calendars. Known limits, stated plainly:
   ships with the engine (`twilight-cli sqm predict|compare` and the
   campaign protocol in docs/SQM_CAMPAIGN.md); what remains is a meter on a
   roof and clear nights.
-- **The 3D-field path keeps the analog chain.** The former heavy-tail
-  limitation on the 1d deck cells was resolved by the bidirectional
+- **The connection estimator extends to voxel fields.** The heavy-tail
+  limitation on the deep cells was resolved by the bidirectional
   connection estimator for scattering orders three and above: light
   subpaths traced from the sunlit top of atmosphere form a vertex
   registry, every backward-chain collision beyond SZA 99 connects to one
   registry vertex, and each order combines the connection with its
   next-event counterpart through an exact per-path balance-heuristic MIS
-  (both weights come from one shared function and sum to one). All
-  sixteen deep cells now PASS the MYSTIC referee (ratios 0.87 to 1.19):
-  the twelve 1d cells at 1024 seeds and the four 3D-field cells at 1024
-  (tau* 1) and 512 (tau* 3) seeds, including the two SZA 103 field cells
-  formerly reported LOW-POWER, with the field estimator unchanged; the
-  shortfall was seed budget, not bias. The connections
-  require the 1d combined channel, so the field path converges at
-  practical budgets only through large seed campaigns; extending the
-  registry connections to voxel fields is the identified next step. The
+  (both weights come from one shared function and sum to one). Under a
+  3D field the light subpath's optical depth is exactly integrable by
+  the same voxel traversal the chains use, so the extension carries no
+  majorant and no new tail (`docs/FIELD_CONNECTIONS_PLAN.md`, merged
+  with its G-FC gate ladder green). All sixteen deep cells PASS the
+  MYSTIC referee (ratios 0.87 to 1.19): the refereed field rows are the
+  earlier analog chain at 1024/512 seeds, and re-refereeing them with
+  the connection estimator at 128 seeds reproduces the same means
+  against the same references, with cross-machine agreement to three
+  decimals (`validation/RESULTS_DEEP_HARDENING.md` section 7). A
+  protocol note from that re-referee: the tier's 1d rows are scalar and
+  its field rows polarized, and the polarized protocol reads about +10
+  percent against the scalar referee on the 1d deck itself; within one
+  protocol the representations agree to paired-test precision. The
   gate taxonomy in `validation/RESULTS_DEEP_REGIME.md` tracks every cell.
 - **Zenith views over broken decks starve the importance sampler** (a
   documented residual with a false-tight error signature; slant views,

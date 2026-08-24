@@ -2656,7 +2656,12 @@ mod tests {
         } else {
             (&atm_1d, None)
         };
-        let config0 = deep_config(photons, true);
+        // DEEP_POLARIZED=0 runs the scalar per-wavelength chain instead
+        // of the Stokes chain: the matched-budget arm that separates the
+        // vector-vs-scalar radiative transfer difference from everything
+        // else when comparing against a scalar referee.
+        let polarized = getenv("DEEP_POLARIZED", "1") != "0";
+        let config0 = deep_config(photons, polarized);
         let wids: Vec<usize> = wls.iter().map(|&w| wl_index(atm, w)).collect();
         let mut tasks = Vec::new();
         for seed in 1..=seeds {

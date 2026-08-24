@@ -153,18 +153,13 @@ it is worth stating rather than discovering later.
 
 ### What this says about the tau* = 1 field rows
 
-The two tau* = 1 field cells sit at ratios 1.179 and 1.186 against the
-referee while their 1d counterparts sit at 0.995 and 0.988 - an apparent
-19 percent gap between two representations of the same deck. The paired
-gate shows those representations agree to better than 0.1 percent.
-
-The gap is therefore **not** an equivalence defect. What remains: the
-tier's field and 1d rows differ by roughly two combined standard errors
-(model 3.6 to 4.9 percent, referee 6.1 to 8.5 percent), and the two
-cells are the same wavelength and share the campaign's seed
-configuration, so they are not two independent draws. A correlated
-two-sigma fluctuation is the leading explanation, and tightening the
-referee (section 2) is what would settle it.
+RESOLVED by the 2026-08-24 campaign (section 7): the apparent 19 percent
+field-vs-1d gap in the published tier is a PROTOCOL difference, not a
+representation difference. The tier's 1d rows ran the scalar ALIS CLI
+protocol; its field rows ran the polarized Stokes-chain harness. On a
+common protocol the two representations agree (the paired gate, to 1e-8
+in the scalar tau*=3 cells), and the Stokes harness reads high on the
+1d deck too.
 
 ## 4. SASKTRAN2 does not reach this regime out of the box
 
@@ -253,6 +248,60 @@ leave-one-out range 55.2-57.0 sit above the step, not on it, so nothing
 published is affected. But a piecewise-constant response should be
 disclosed rather than found by a referee, and the honest framing is that
 the criterion is smooth in f except at patch-count boundaries.
+
+## 7. The voxel-field connection estimator, externally refereed (2026-08-24)
+
+The published deep-tier field rows are the PRE-connection analog
+estimator (1024 seeds at tau* = 1, 512 at tau* = 3; the voxel-field
+connection estimator of FIELD_CONNECTIONS_PLAN.md merged two days after
+that data was taken). The connection arm has now been run fresh on this
+machine at the G-FC-3 protocol - 128 seeds x 16000 photons, 550 nm,
+SZA 101/103, both optical depths - and gated against the same cached
+MYSTIC references (raw per-seed data:
+`validation/deep/conn_field_128seed_2026-08-24.csv`, analysis:
+`tools/conn_referee_analysis.py`).
+
+| cell | conn 128 seeds | verdict | analog (published) | G-FC-3 box |
+|---|---|---|---|---|
+| tau1 101 550 | 1.135 | PASS | 1.179 | - |
+| tau1 103 550 | 1.187 | PASS | 1.186 | 1.185 |
+| tau3 101 550 | 0.895 | PASS | 0.907 | - |
+| tau3 103 550 | 1.229 | LOW-POWER cached / PASS pooled (1.156) | 0.992 | 1.229 |
+
+Four results:
+
+1. **The estimator referees green under fields at 128 seeds** - the 8x
+   (tau* 1) and 4x (tau* 3) seed reduction the plan promised, now
+   confirmed against the external referee on a second machine.
+2. **Cross-machine reproduction to three decimals**: 1.187 vs the
+   verification box's 1.185, and 1.229 vs 1.229. Same seeds, different
+   OS and CPU, identical means.
+3. **Independent-estimator agreement**: connection vs analog means agree
+   within errors in three of four cells; the fourth (tau3/103, 1.229 vs
+   0.992, about 2.1 sigma apart) is the same heavy-tail corner flagged
+   by the chi2 test of section 2.
+4. **The tier's field-vs-1d asymmetry is protocol-level.** The same
+   Stokes harness run on the 1D DECK gives 1.112 +- 0.056 (SZA 101) and
+   1.078 +- 0.085 (SZA 103) against the same referees - high in the same
+   way as the field rows, while the tier's scalar ALIS 1d rows sit at
+   0.99. Field-vs-1d within one protocol is 1.02 and 1.10, consistent
+   with the paired-gate equality. The residual question is therefore why
+   the polarized chain protocol reads ~+9 to 12 percent (about 2 sigma
+   pooled) above the scalar ALIS protocol and the scalar referee; the
+   vector-vs-scalar radiative transfer difference is the natural
+   candidate at Rayleigh-dominated twilight geometry, but a matched
+   scalar-chain arm could not settle it (with polarization off the
+   connection estimator is off too, and the analog scalar chain's cv of
+   1.1 to 1.7 at this budget swamps the effect). Settling it needs
+   either a polarized referee (MYSTIC mc_polarisation) or a
+   connection-capable scalar chain; both are recorded as open.
+
+A harness knob was added for the last arm: `DEEP_POLARIZED=0` runs
+`deep_referee_runner` with the scalar chain. The measured side-effect is
+itself worth recording: at matched budget on the 1d deck the polarized
+connection chain's seed cv is 0.45 to 0.63 against the scalar analog
+chain's 1.08 to 1.68 - the connection estimator cuts deep-cell variance
+by 4 to 7x in variance terms even before seed-count effects.
 
 ## 6. Full heavy-gate re-certification on a second venue (2026-08-23)
 

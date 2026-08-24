@@ -1051,27 +1051,39 @@ misrepresent what the inputs can support.
 Every boundary below is quantified, externally refereed where a
 referee exists, and maintained as a living section of the repository
 documentation; none affects the validated operating envelope of the
-preceding sections. (i) The three-dimensional field path retains the
-analog polarized chain: the Sun-side bidirectional connection
-estimator of Section~\ref{sec:components}, which removes the
-dependence of the deep signal on rare long lateral random walks,
-requires the one-dimensional combined channel and does not yet extend
-to heterogeneous voxel fields. The consequence is a convergence cost,
-not a bias. The history of the deep tier is instructive here: an
-eight-fold seed increase (to 1024 seeds) resolved every
-one-dimensional SZA $101^\circ$ cell to referee consistency,
-including the $550$~nm cell that at 128 seeds had read about forty
-percent low (undersampling of the heavy tail, not a bias); the
-one-dimensional SZA $103^\circ$ cells were then closed by the
-connection estimator; and the two three-dimensional field cells at SZA
-$103^\circ$ ($\tau^{*} = 1$ and $3$, 550~nm), low-power at earlier
-seed budgets, pass the $10^9$-photon referee at 1024 and 512 seeds
-respectively with the field estimator unchanged. These field cells
-referee the voxel path on the equivalent horizontally uniform field of
-the same deck, against the same reference values as the corresponding
-one-dimensional rows; the SHDOM cube comparisons referee genuinely
-heterogeneous fields, but at moderate solar zenith angle, so an
-external deep-twilight referee on a heterogeneous scene remains open. The field path
+preceding sections. (i) The Sun-side bidirectional connection
+estimator of Section~\ref{sec:components} extends to voxel fields:
+the light subpath's combined optical depth along its straight ray is
+exactly integrable by the same voxel traversal the chains use, so the
+forced light-vertex position is an exact inversion with no majorant
+and no new tail, and the connection transmittances evaluate through
+the field chord. The refereed deep-tier field rows of
+Section~\ref{sec:validation} predate this extension (they are the
+analog chain at 1024 and 512 seeds); re-refereeing the same cells with
+the connection estimator at 128 seeds reproduces them against the same
+MYSTIC references (ratios 1.135/1.187/0.895 consistent, one heavy-tail
+cell low-power against the cached reference and consistent against the
+replica-pooled one), with means reproducing across two independent
+machines to three decimals. The deep-tier history remains instructive
+about the analog chain this estimator replaced: an eight-fold seed
+increase (to 1024 seeds) resolved every one-dimensional SZA
+$101^\circ$ cell to referee consistency, including the $550$~nm cell
+that at 128 seeds had read about forty percent low (undersampling of
+the heavy tail, not a bias). These field cells referee the voxel path
+on the equivalent horizontally uniform field of the same deck, against
+the same reference values as the corresponding one-dimensional rows;
+the SHDOM cube comparisons referee genuinely heterogeneous fields, but
+at moderate solar zenith angle, so an external deep-twilight referee
+on a heterogeneous scene remains open (no published reference code
+solves spherical-shell transport with three-dimensional clouds past
+SZA $100^{\circ}$). One protocol note belongs with these rows: the
+tier's one-dimensional rows are a scalar estimator and its field rows
+a polarized one, and the polarized protocol reads systematically
+higher against the scalar referee (about $+9$ to $12$ percent at two
+pooled standard errors on the 1D deck itself); within a single
+protocol the two representations agree to the precision of a paired
+test. Whether that offset is the vector-versus-scalar radiative
+transfer difference awaits a polarized referee. The field path
 therefore converges at practical budgets only through large seed
 campaigns; extending the registry connections to voxel fields, which
 would restore the one-dimensional convergence rate, is the identified
