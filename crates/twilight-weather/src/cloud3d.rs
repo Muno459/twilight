@@ -293,8 +293,8 @@ pub fn load_field(path: &std::path::Path) -> Result<
         )));
     }
     let mut iwc = vec![0.0f32; n];
-    for (i, c) in bytes.chunks_exact(4).enumerate() {
-        let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+    for (i, c) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        let v = f32::from_le_bytes(*c);
         // IWC is a physical density: non-finite or negative values are
         // corrupt data and would poison the derived taus.
         if !v.is_finite() || v < 0.0 {

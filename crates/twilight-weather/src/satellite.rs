@@ -664,7 +664,7 @@ fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), WeatherError> {
         png::ColorType::Rgba => buf,
         png::ColorType::Rgb => {
             let mut out = Vec::with_capacity((w * h * 4) as usize);
-            for c in buf.chunks_exact(3) {
+            for c in buf.as_chunks::<3>().0 {
                 out.extend_from_slice(&[c[0], c[1], c[2], 255]);
             }
             out
@@ -731,7 +731,7 @@ fn sample_layer(
         // Transparent at our pixel: clear sky only if the tile carries
         // data SOMEWHERE; a tile with no opaque pixel at all has simply
         // not been ingested for this date yet.
-        let any_data = rgba.chunks_exact(4).any(|c| c[3] != 0);
+        let any_data = rgba.as_chunks::<4>().0.iter().any(|c| c[3] != 0);
         return Ok(if any_data {
             LayerSample::ClearPixel
         } else {

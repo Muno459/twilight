@@ -1,173 +1,60 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 520">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 440" width="1280" height="440">
+  <title>twilight</title>
   <defs>
-    <!-- Deep space to twilight gradient -->
     <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#06060f"/>
-      <stop offset="20%" stop-color="#0c0e24"/>
-      <stop offset="40%" stop-color="#1b1545"/>
-      <stop offset="58%" stop-color="#3d1d6e"/>
-      <stop offset="72%" stop-color="#8b3058"/>
-      <stop offset="82%" stop-color="#c4553f"/>
-      <stop offset="90%" stop-color="#de8a3a"/>
-      <stop offset="96%" stop-color="#edb555"/>
-      <stop offset="100%" stop-color="#f5d07a"/>
+      <stop offset="0" stop-color="#03040b"/>
+      <stop offset=".38" stop-color="#0a0d24"/>
+      <stop offset=".58" stop-color="#18183e"/>
+      <stop offset=".70" stop-color="#2e2352"/>
+      <stop offset=".80" stop-color="#4c2d5c"/>
+      <stop offset=".88" stop-color="#77405f"/>
+      <stop offset="1" stop-color="#a0585c"/>
     </linearGradient>
-
-    <!-- Sun glow below horizon -->
-    <radialGradient id="sun-glow" cx="28%" cy="88%" r="35%">
-      <stop offset="0%" stop-color="#f5d07a" stop-opacity="0.5"/>
-      <stop offset="30%" stop-color="#de8a3a" stop-opacity="0.2"/>
-      <stop offset="100%" stop-color="#1b1545" stop-opacity="0"/>
+    <radialGradient id="dawn" gradientUnits="userSpaceOnUse" cx="640" cy="358" r="760" gradientTransform="translate(0 358) scale(1 .34) translate(0 -358)">
+      <stop offset="0" stop-color="#ffe2b0" stop-opacity=".95"/>
+      <stop offset=".18" stop-color="#f4a865" stop-opacity=".75"/>
+      <stop offset=".45" stop-color="#b9566a" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#2a1f52" stop-opacity="0"/>
     </radialGradient>
-
-    <!-- Earth body -->
-    <radialGradient id="earth-fill" cx="50%" cy="30%" r="70%">
-      <stop offset="0%" stop-color="#111118"/>
-      <stop offset="100%" stop-color="#08080c"/>
-    </radialGradient>
-
-    <!-- Atmospheric shell glow -->
-    <radialGradient id="atm-glow" cx="50%" cy="100%" r="55%" fx="50%" fy="100%">
-      <stop offset="85%" stop-color="#f5d07a" stop-opacity="0"/>
-      <stop offset="93%" stop-color="#de8a3a" stop-opacity="0.06"/>
-      <stop offset="100%" stop-color="#f5d07a" stop-opacity="0.12"/>
-    </radialGradient>
-
-    <!-- Scattered light ray color -->
-    <linearGradient id="ray-blue" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#6688cc" stop-opacity="0"/>
-      <stop offset="30%" stop-color="#6688cc" stop-opacity="0.25"/>
-      <stop offset="100%" stop-color="#6688cc" stop-opacity="0"/>
+    <linearGradient id="thread" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#fff6e6" stop-opacity="0"/>
+      <stop offset=".22" stop-color="#fff6e6" stop-opacity=".35"/>
+      <stop offset=".5" stop-color="#ffffff" stop-opacity="1"/>
+      <stop offset=".78" stop-color="#fff6e6" stop-opacity=".35"/>
+      <stop offset="1" stop-color="#fff6e6" stop-opacity="0"/>
     </linearGradient>
-    <linearGradient id="ray-red" x1="0" y1="0" x2="1" y2="0">
-      <stop offset="0%" stop-color="#cc6644" stop-opacity="0"/>
-      <stop offset="40%" stop-color="#cc6644" stop-opacity="0.2"/>
-      <stop offset="100%" stop-color="#cc6644" stop-opacity="0"/>
+    <linearGradient id="spectrum" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#7a5cff" stop-opacity="0"/>
+      <stop offset=".12" stop-color="#6a6cff"/>
+      <stop offset=".3" stop-color="#3fb6ff"/>
+      <stop offset=".45" stop-color="#5fe0a0"/>
+      <stop offset=".6" stop-color="#f2e05a"/>
+      <stop offset=".75" stop-color="#ff9a3c"/>
+      <stop offset=".88" stop-color="#ff4a3a"/>
+      <stop offset="1" stop-color="#b0203a" stop-opacity="0"/>
     </linearGradient>
-
-    <filter id="soft">
-      <feGaussianBlur stdDeviation="1.2"/>
-    </filter>
-    <filter id="star-soft">
-      <feGaussianBlur stdDeviation="0.6"/>
-    </filter>
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0b0a12"/>
+      <stop offset="1" stop-color="#020205"/>
+    </linearGradient>
+    <filter id="blur6" x="-10%" y="-200%" width="120%" height="500%"><feGaussianBlur stdDeviation="6"/></filter>
+    <filter id="blur2" x="-10%" y="-200%" width="120%" height="500%"><feGaussianBlur stdDeviation="1.6"/></filter>
+    <filter id="glow" x="-20%" y="-50%" width="140%" height="200%"><feGaussianBlur stdDeviation="14"/></filter>
   </defs>
 
-  <!-- Sky -->
-  <rect width="1200" height="520" fill="url(#sky)"/>
-  <rect width="1200" height="520" fill="url(#sun-glow)"/>
+  <rect width="1280" height="440" fill="url(#sky)"/>
+  <rect width="1280" height="440" fill="url(#dawn)"/>
+  <g fill="#fff"><circle cx="391.1" cy="52.6" r="0.80" opacity="0.76"/><circle cx="889.0" cy="94.4" r="1.00" opacity="0.52"/><circle cx="28.5" cy="48.1" r="1.50" opacity="0.51"/><circle cx="940.0" cy="219.6" r="0.80" opacity="0.18"/><circle cx="914.8" cy="168.2" r="1.00" opacity="0.34"/><circle cx="255.6" cy="218.0" r="1.50" opacity="0.25"/><circle cx="348.2" cy="48.4" r="1.00" opacity="0.53"/><circle cx="659.9" cy="51.9" r="0.90" opacity="0.43"/><circle cx="635.0" cy="255.3" r="0.70" opacity="0.17"/><circle cx="987.7" cy="49.7" r="0.50" opacity="0.48"/><circle cx="67.0" cy="85.4" r="0.70" opacity="0.63"/><circle cx="891.5" cy="41.1" r="1.20" opacity="0.65"/><circle cx="718.5" cy="62.1" r="1.50" opacity="0.45"/><circle cx="859.8" cy="306.6" r="0.70" opacity="0.05"/><circle cx="389.5" cy="104.5" r="0.70" opacity="0.46"/><circle cx="574.8" cy="50.4" r="0.90" opacity="0.69"/><circle cx="851.6" cy="45.9" r="0.50" opacity="0.38"/><circle cx="513.2" cy="57.3" r="0.70" opacity="0.59"/><circle cx="610.5" cy="180.9" r="1.74" opacity="0.27"/><circle cx="1116.5" cy="221.6" r="0.60" opacity="0.21"/><circle cx="536.5" cy="1.6" r="0.90" opacity="0.62"/><circle cx="583.6" cy="279.8" r="0.50" opacity="0.08"/><circle cx="239.9" cy="11.9" r="0.80" opacity="0.61"/><circle cx="760.8" cy="237.9" r="0.70" opacity="0.18"/><circle cx="1120.0" cy="101.8" r="0.70" opacity="0.43"/><circle cx="468.5" cy="273.7" r="1.50" opacity="0.07"/><circle cx="64.4" cy="288.5" r="1.93" opacity="0.11"/><circle cx="456.3" cy="178.0" r="0.80" opacity="0.38"/><circle cx="893.1" cy="183.8" r="0.70" opacity="0.18"/><circle cx="206.4" cy="130.0" r="0.50" opacity="0.42"/><circle cx="355.6" cy="45.4" r="0.60" opacity="0.71"/><circle cx="1186.3" cy="73.9" r="1.91" opacity="0.45"/><circle cx="1093.0" cy="199.9" r="1.20" opacity="0.32"/><circle cx="1049.5" cy="80.5" r="1.00" opacity="0.67"/><circle cx="675.8" cy="169.3" r="1.00" opacity="0.33"/><circle cx="355.7" cy="246.8" r="0.60" opacity="0.19"/><circle cx="221.0" cy="124.1" r="0.60" opacity="0.29"/><circle cx="39.3" cy="164.0" r="1.50" opacity="0.44"/><circle cx="1253.6" cy="159.2" r="0.90" opacity="0.43"/><circle cx="124.9" cy="59.6" r="1.00" opacity="0.58"/><circle cx="313.5" cy="109.5" r="1.00" opacity="0.39"/><circle cx="131.0" cy="32.8" r="0.60" opacity="0.40"/><circle cx="381.4" cy="25.2" r="0.90" opacity="0.42"/><circle cx="762.8" cy="39.9" r="0.60" opacity="0.61"/><circle cx="225.1" cy="239.4" r="1.77" opacity="0.15"/><circle cx="136.1" cy="239.4" r="0.80" opacity="0.22"/><circle cx="1123.9" cy="247.4" r="0.80" opacity="0.11"/><circle cx="225.9" cy="182.5" r="1.91" opacity="0.26"/><circle cx="852.6" cy="160.6" r="0.60" opacity="0.39"/><circle cx="577.7" cy="61.8" r="1.20" opacity="0.42"/><circle cx="1103.1" cy="22.2" r="1.20" opacity="0.56"/><circle cx="266.9" cy="188.4" r="0.50" opacity="0.21"/><circle cx="50.4" cy="231.4" r="0.70" opacity="0.16"/><circle cx="601.0" cy="100.7" r="0.80" opacity="0.48"/><circle cx="1082.1" cy="49.2" r="0.70" opacity="0.49"/><circle cx="519.2" cy="105.6" r="0.90" opacity="0.49"/><circle cx="490.9" cy="169.1" r="0.80" opacity="0.35"/><circle cx="1017.7" cy="119.5" r="0.60" opacity="0.44"/><circle cx="88.4" cy="107.5" r="0.50" opacity="0.39"/><circle cx="1177.9" cy="62.7" r="0.60" opacity="0.67"/><circle cx="645.6" cy="106.1" r="1.50" opacity="0.52"/><circle cx="158.7" cy="302.7" r="1.50" opacity="0.07"/><circle cx="1027.8" cy="9.4" r="0.60" opacity="0.51"/><circle cx="1252.9" cy="17.6" r="0.70" opacity="0.78"/><circle cx="643.3" cy="1.2" r="1.50" opacity="0.50"/><circle cx="1211.6" cy="203.6" r="0.60" opacity="0.26"/><circle cx="59.1" cy="226.5" r="0.60" opacity="0.22"/><circle cx="736.9" cy="265.4" r="1.75" opacity="0.16"/><circle cx="126.5" cy="96.9" r="1.50" opacity="0.30"/><circle cx="755.8" cy="291.6" r="0.90" opacity="0.10"/><circle cx="295.8" cy="167.8" r="0.90" opacity="0.37"/><circle cx="1140.9" cy="129.2" r="1.20" opacity="0.50"/><circle cx="307.5" cy="63.7" r="0.80" opacity="0.59"/><circle cx="642.4" cy="90.0" r="1.20" opacity="0.41"/><circle cx="142.9" cy="11.4" r="0.60" opacity="0.81"/><circle cx="866.9" cy="225.0" r="0.70" opacity="0.14"/><circle cx="1085.5" cy="52.6" r="0.50" opacity="0.73"/><circle cx="1222.7" cy="286.5" r="0.90" opacity="0.09"/><circle cx="26.0" cy="245.8" r="2.05" opacity="0.10"/><circle cx="1195.3" cy="40.2" r="1.00" opacity="0.62"/><circle cx="842.3" cy="6.9" r="0.70" opacity="0.48"/><circle cx="375.8" cy="13.9" r="0.60" opacity="0.57"/><circle cx="235.4" cy="56.3" r="0.70" opacity="0.77"/><circle cx="792.8" cy="69.8" r="0.90" opacity="0.60"/><circle cx="41.8" cy="134.9" r="1.50" opacity="0.34"/><circle cx="345.5" cy="231.9" r="0.90" opacity="0.23"/><circle cx="659.2" cy="161.1" r="1.00" opacity="0.45"/><circle cx="442.9" cy="277.3" r="0.90" opacity="0.13"/><circle cx="726.4" cy="89.5" r="0.70" opacity="0.39"/><circle cx="396.9" cy="131.2" r="0.50" opacity="0.40"/><circle cx="252.2" cy="316.2" r="1.63" opacity="0.04"/><circle cx="759.6" cy="141.5" r="0.70" opacity="0.26"/><circle cx="365.9" cy="0.6" r="1.50" opacity="0.68"/><circle cx="723.7" cy="306.8" r="0.90" opacity="0.04"/><circle cx="929.5" cy="196.2" r="1.50" opacity="0.18"/><circle cx="932.7" cy="91.5" r="0.70" opacity="0.49"/><circle cx="488.7" cy="0.8" r="1.20" opacity="0.54"/><circle cx="661.0" cy="117.9" r="0.50" opacity="0.35"/><circle cx="843.5" cy="51.2" r="0.50" opacity="0.80"/><circle cx="1072.8" cy="105.6" r="0.70" opacity="0.38"/><circle cx="38.4" cy="63.2" r="0.60" opacity="0.65"/><circle cx="159.5" cy="95.1" r="1.20" opacity="0.62"/><circle cx="402.9" cy="298.5" r="1.00" opacity="0.04"/><circle cx="24.3" cy="138.9" r="1.87" opacity="0.44"/><circle cx="184.8" cy="21.8" r="1.20" opacity="0.46"/><circle cx="336.3" cy="168.9" r="1.20" opacity="0.37"/><circle cx="89.7" cy="127.4" r="1.20" opacity="0.47"/><circle cx="1240.4" cy="319.9" r="1.20" opacity="0.04"/><circle cx="59.6" cy="264.9" r="1.69" opacity="0.11"/><circle cx="925.3" cy="150.4" r="0.70" opacity="0.22"/><circle cx="661.9" cy="126.0" r="0.60" opacity="0.52"/><circle cx="1082.4" cy="168.0" r="1.00" opacity="0.43"/><circle cx="1165.2" cy="81.6" r="1.50" opacity="0.41"/><circle cx="992.4" cy="21.4" r="0.60" opacity="0.66"/><circle cx="509.6" cy="139.7" r="0.70" opacity="0.32"/><circle cx="55.6" cy="209.0" r="0.80" opacity="0.14"/><circle cx="593.4" cy="187.1" r="1.20" opacity="0.34"/><circle cx="1129.3" cy="19.6" r="0.90" opacity="0.56"/><circle cx="336.5" cy="181.5" r="0.80" opacity="0.26"/><circle cx="1009.9" cy="7.3" r="0.50" opacity="0.91"/><circle cx="138.5" cy="41.6" r="1.20" opacity="0.65"/><circle cx="40.3" cy="62.9" r="0.60" opacity="0.76"/><circle cx="154.9" cy="316.1" r="1.00" opacity="0.03"/><circle cx="805.7" cy="36.4" r="1.00" opacity="0.74"/><circle cx="229.2" cy="247.5" r="1.20" opacity="0.18"/><circle cx="1093.2" cy="58.0" r="0.50" opacity="0.50"/><circle cx="1097.4" cy="247.5" r="0.50" opacity="0.18"/><circle cx="581.2" cy="152.6" r="0.50" opacity="0.28"/><circle cx="1116.6" cy="205.6" r="1.00" opacity="0.21"/><circle cx="632.0" cy="189.3" r="0.90" opacity="0.34"/><circle cx="1026.2" cy="4.6" r="1.89" opacity="0.57"/><circle cx="1170.2" cy="78.5" r="1.20" opacity="0.45"/><circle cx="129.6" cy="84.1" r="0.70" opacity="0.66"/><circle cx="280.3" cy="179.7" r="1.50" opacity="0.38"/><circle cx="955.2" cy="129.9" r="1.20" opacity="0.45"/><circle cx="75.7" cy="156.0" r="0.80" opacity="0.46"/><circle cx="240.7" cy="93.6" r="1.00" opacity="0.52"/><circle cx="21.4" cy="243.5" r="1.67" opacity="0.15"/><circle cx="243.7" cy="302.0" r="0.50" opacity="0.06"/><circle cx="389.0" cy="107.5" r="1.00" opacity="0.57"/><circle cx="1218.2" cy="228.2" r="0.80" opacity="0.19"/><circle cx="20.7" cy="195.3" r="1.20" opacity="0.21"/><circle cx="52.7" cy="118.3" r="1.73" opacity="0.49"/><circle cx="1062.6" cy="92.2" r="1.50" opacity="0.59"/><circle cx="328.7" cy="109.1" r="1.20" opacity="0.49"/><circle cx="51.0" cy="196.5" r="0.90" opacity="0.21"/><circle cx="1062.5" cy="5.1" r="1.20" opacity="0.95"/><circle cx="210.9" cy="26.2" r="0.80" opacity="0.64"/><circle cx="366.3" cy="45.6" r="0.60" opacity="0.41"/></g>
 
-  <!-- Stars -->
-  <g fill="#fff" filter="url(#star-soft)">
-    <circle cx="78" cy="22" r="1.1"/><circle cx="195" cy="55" r="0.7"/>
-    <circle cx="310" cy="18" r="1.3"/><circle cx="425" cy="42" r="0.6"/>
-    <circle cx="540" cy="12" r="0.9"/><circle cx="612" cy="65" r="0.8"/>
-    <circle cx="734" cy="28" r="1.0"/><circle cx="830" cy="50" r="0.7"/>
-    <circle cx="948" cy="20" r="1.2"/><circle cx="1050" cy="58" r="0.6"/>
-    <circle cx="1130" cy="15" r="0.8"/><circle cx="145" cy="90" r="0.5"/>
-    <circle cx="480" cy="80" r="0.6"/><circle cx="870" cy="78" r="0.5"/>
-    <circle cx="1090" cy="88" r="0.7"/><circle cx="55" cy="68" r="0.6"/>
-    <circle cx="690" cy="38" r="0.5"/><circle cx="1005" cy="75" r="0.4"/>
-    <circle cx="250" cy="105" r="0.4"/><circle cx="770" cy="95" r="0.5"/>
-  </g>
+  <!-- the white thread: dawn light hugging the curved limb -->
+  <circle cx="640" cy="4552" r="4203" fill="none" stroke="url(#thread)" stroke-width="16" opacity=".55" filter="url(#blur6)"/>
+  <circle cx="640" cy="4552" r="4201" fill="none" stroke="url(#thread)" stroke-width="3.5" opacity=".9" filter="url(#blur2)"/>
+  <circle cx="640" cy="4552" r="4200" fill="url(#ground)"/>
+  <circle cx="640" cy="4552" r="4200" fill="none" stroke="url(#thread)" stroke-width="1.1"/>
 
-  <!-- Earth (large arc at bottom) -->
-  <ellipse cx="600" cy="820" rx="750" ry="400" fill="url(#earth-fill)" stroke="#1a1a2e" stroke-width="1"/>
-
-  <!-- Atmospheric shells (concentric arcs above Earth surface) -->
-  <g fill="none" opacity="0.18">
-    <ellipse cx="600" cy="820" rx="758" ry="406" stroke="#8888bb" stroke-width="0.6" stroke-dasharray="4,8"/>
-    <ellipse cx="600" cy="820" rx="775" ry="418" stroke="#9999cc" stroke-width="0.5" stroke-dasharray="4,10"/>
-    <ellipse cx="600" cy="820" rx="800" ry="435" stroke="#aaaadd" stroke-width="0.4" stroke-dasharray="4,12"/>
-    <ellipse cx="600" cy="820" rx="835" ry="458" stroke="#bbbbee" stroke-width="0.3" stroke-dasharray="4,16"/>
-  </g>
-
-  <!-- Atmosphere limb glow -->
-  <ellipse cx="600" cy="820" rx="755" ry="403" fill="none" stroke="#f5d07a" stroke-width="2" opacity="0.08"/>
-  <ellipse cx="600" cy="820" rx="753" ry="401" fill="none" stroke="#edb555" stroke-width="1" opacity="0.12"/>
-
-  <!-- Sun (below horizon, partially visible as glow) -->
-  <circle cx="220" cy="445" r="22" fill="#f5d07a" opacity="0.15" filter="url(#soft)"/>
-  <circle cx="220" cy="445" r="10" fill="#f5d07a" opacity="0.25"/>
-
-  <!-- Solar rays entering atmosphere (straight lines from sun direction) -->
-  <g opacity="0.12" stroke-width="0.7">
-    <line x1="240" y1="438" x2="520" y2="395" stroke="#f5d07a"/>
-    <line x1="240" y1="435" x2="580" y2="380" stroke="#edb555"/>
-    <line x1="242" y1="430" x2="640" y2="365" stroke="#de8a3a"/>
-    <line x1="245" y1="425" x2="700" y2="355" stroke="#c4553f"/>
-  </g>
-
-  <!-- Scatter points (where photons scatter toward observer) -->
-  <g opacity="0.35">
-    <circle cx="520" cy="395" r="2.5" fill="#6688cc" filter="url(#soft)"/>
-    <circle cx="580" cy="380" r="2.0" fill="#7799cc" filter="url(#soft)"/>
-    <circle cx="640" cy="365" r="2.0" fill="#cc8855" filter="url(#soft)"/>
-    <circle cx="700" cy="355" r="1.8" fill="#cc6644" filter="url(#soft)"/>
-  </g>
-
-  <!-- Scattered light paths (from scatter points toward observer) -->
-  <g opacity="0.08" stroke-width="0.8" stroke-dasharray="3,4">
-    <line x1="520" y1="395" x2="830" y2="410" stroke="#6688cc"/>
-    <line x1="580" y1="380" x2="830" y2="410" stroke="#7799cc"/>
-    <line x1="640" y1="365" x2="830" y2="410" stroke="#cc8855"/>
-    <line x1="700" y1="355" x2="830" y2="410" stroke="#cc6644"/>
-  </g>
-
-  <!-- Observer (small figure on Earth surface) -->
-  <g transform="translate(830,410)">
-    <line x1="0" y1="0" x2="0" y2="-10" stroke="#d0c4a8" stroke-width="1.2" opacity="0.5"/>
-    <circle cx="0" cy="-12" r="2" fill="#d0c4a8" opacity="0.5"/>
-    <!-- View direction indicator -->
-    <line x1="0" y1="-8" x2="-18" y2="-22" stroke="#d0c4a8" stroke-width="0.5" stroke-dasharray="2,2" opacity="0.3"/>
-  </g>
-
-  <!-- Labels -->
-  <g font-family="'SF Mono','Fira Code','JetBrains Mono','Cascadia Code','Consolas',monospace" opacity="0.3">
-    <!-- Shell labels -->
-    <text x="1020" y="398" font-size="7" fill="#8888bb">0 km</text>
-    <text x="1020" y="388" font-size="7" fill="#9999cc">10 km</text>
-    <text x="1020" y="372" font-size="7" fill="#aaaadd">30 km</text>
-    <text x="1020" y="350" font-size="7" fill="#bbbbee">100 km (TOA)</text>
-
-    <!-- Sun label -->
-    <text x="220" y="475" text-anchor="middle" font-size="7.5" fill="#f5d07a" opacity="1">sun (below horizon)</text>
-
-    <!-- Observer label -->
-    <text x="830" y="432" text-anchor="middle" font-size="7.5" fill="#d0c4a8" opacity="1">observer</text>
-
-    <!-- Scatter labels -->
-    <text x="520" y="415" text-anchor="middle" font-size="6.5" fill="#6688cc" opacity="0.8">Rayleigh</text>
-    <text x="700" y="345" text-anchor="middle" font-size="6.5" fill="#cc6644" opacity="0.8">O₃ absorption</text>
-  </g>
-
-  <!-- Project title -->
-  <text x="600" y="170" text-anchor="middle" font-family="'SF Mono','Fira Code','JetBrains Mono','Cascadia Code','Consolas',monospace" font-size="68" font-weight="700" fill="#f0e6d3" letter-spacing="10" opacity="0.92">twilight</text>
-
-  <!-- Subtitle -->
-  <text x="600" y="210" text-anchor="middle" font-family="'SF Mono','Fira Code','JetBrains Mono','Cascadia Code','Consolas',monospace" font-size="12.5" fill="#c4a882" letter-spacing="5" opacity="0.6">RADIATIVE TRANSFER FOR PRAYER TIMES</text>
-
-  <!-- Thin divider -->
-  <line x1="420" y1="235" x2="780" y2="235" stroke="#c4a882" stroke-width="0.3" opacity="0.2"/>
-
-  <!-- Wavelength spectrum bar (the 380-780nm range the engine computes) -->
-  <g transform="translate(420,248)">
-    <rect x="0" y="0" width="25" height="3" fill="#7700ff" rx="1" opacity="0.6"/>
-    <rect x="25" y="0" width="25" height="3" fill="#0044ff" rx="0" opacity="0.6"/>
-    <rect x="50" y="0" width="25" height="3" fill="#0088ff" rx="0" opacity="0.6"/>
-    <rect x="75" y="0" width="25" height="3" fill="#00ccaa" rx="0" opacity="0.6"/>
-    <rect x="100" y="0" width="25" height="3" fill="#44dd00" rx="0" opacity="0.6"/>
-    <rect x="125" y="0" width="25" height="3" fill="#aaee00" rx="0" opacity="0.6"/>
-    <rect x="150" y="0" width="25" height="3" fill="#ffdd00" rx="0" opacity="0.6"/>
-    <rect x="175" y="0" width="25" height="3" fill="#ffaa00" rx="0" opacity="0.6"/>
-    <rect x="200" y="0" width="25" height="3" fill="#ff6600" rx="0" opacity="0.6"/>
-    <rect x="225" y="0" width="25" height="3" fill="#ff2200" rx="0" opacity="0.6"/>
-    <rect x="250" y="0" width="25" height="3" fill="#cc0022" rx="0" opacity="0.6"/>
-    <rect x="275" y="0" width="25" height="3" fill="#990033" rx="0" opacity="0.6"/>
-    <rect x="300" y="0" width="25" height="3" fill="#660033" rx="0" opacity="0.6"/>
-    <rect x="325" y="0" width="35" height="3" fill="#440022" rx="1" opacity="0.6"/>
-    <text x="0" y="14" font-family="monospace" font-size="6.5" fill="#888" opacity="0.5">380 nm</text>
-    <text x="360" y="14" text-anchor="end" font-family="monospace" font-size="6.5" fill="#888" opacity="0.5">780 nm</text>
-    <text x="180" y="14" text-anchor="middle" font-family="monospace" font-size="6.5" fill="#888" opacity="0.5">41 spectral bands</text>
-  </g>
+  <!-- wordmark -->
+  <text x="640" y="190" text-anchor="middle" font-family="'Iowan Old Style','Palatino Linotype',Palatino,'Book Antiqua',Georgia,serif" font-size="104" font-weight="400" letter-spacing="6" fill="#ffd9a0" opacity=".22" filter="url(#glow)">twilight</text>
+  <text x="640" y="190" text-anchor="middle" font-family="'Iowan Old Style','Palatino Linotype',Palatino,'Book Antiqua',Georgia,serif" font-size="104" font-weight="400" letter-spacing="6" fill="#f6eee2">twilight</text>
+  <rect x="490" y="236" width="300" height="1.4" fill="url(#spectrum)" opacity=".9"/>
+  <text x="640" y="270" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="17" font-weight="500" letter-spacing="4.6" fill="#d9cfe6" opacity=".82">MONTE CARLO RADIATIVE TRANSFER OF THE TWILIGHT SKY</text>
 </svg>
